@@ -239,6 +239,10 @@ Every entry records the model family it was created under and keeps a per-family
 
 **In short:** the loop (scoped editors, lint for generalization, an experience library, composition only where a verifier exists) comes from Harness²; the prompts are derived from its Appendix H, not verbatim (D5, D6; deltas in `docs/research.md` §5). What rematch adds is the zero-rerun interactive mode with a deterministic predicate and raw counters (D10, D12), and a boundary that lets the harness propose without being trusted (D24). The cost: a single user is not blinded, so the counters measure only the recurrence of a specific redirect class, something you would not fake; and nothing is ever called verified.
 
+## History as a backend
+
+The ledger answers today's questions in milliseconds; it cannot answer *what did the library look like when that session ran*, nor combine two machines, nor index years of sessions. [ADR 001](docs/adr/001-lake.md) adds both without touching the hot path: every ledger write is journaled with the ledger's own clock, the journal is exported to Parquet (one [Bellwether](https://github.com/vncp/bellwether) root per table, files written once), and Bellwether's keys answer the historical questions the loop actually asks — `asof --valid --known` on `entries` for status-at-the-time without lookahead, `exact:signature` and `list:facets` on `outcomes` for the spec's three lookups, `expr:tool_cmd` on `events` for "which sessions ran this command". Only keys a current reader needs are declared; the ADR lists every other kind with the question that would justify it. Status: designed and reviewed; L1–L2 (journal, export, import, rebuild) next, L3–L4 (index, query, `rematch report`) after.
+
 ## Architecture
 
 <p align="center">
@@ -255,6 +259,7 @@ Every entry records the model family it was created under and keeps a per-family
 | `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, `skills sync` (the shared skills dir), doctor, uninstall, `retrieve`, built-in entries, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 60 unit + 43 end-to-end tests (239 cargo tests in all, plus 24 extension tests under `bun test`) |
 | `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
 | `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `skills/` (the shared skill links every harness loads), `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
+| `~/.rematch/lake/` (ADR 001, planned) | the journal exported to Parquet, one Bellwether root per table; `lake-index/` per machine | history as a backend: `report`, `why --asof`, cross-machine `transfer`/`shared`; never on the in-session path |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -290,7 +295,7 @@ Open questions from the spec that the build did not settle are at the end of [`d
 
 ## Docs
 
-[Manual](docs/MANUAL.md) · [research provenance](docs/research.md) · [design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
+[Manual](docs/MANUAL.md) · [ADR 001: the lake](docs/adr/001-lake.md) · [research provenance](docs/research.md) · [design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
 
 ## License
 
