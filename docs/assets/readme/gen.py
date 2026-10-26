@@ -71,13 +71,13 @@ def wordmark(theme):
     paper = t["bg"] if theme == "light" else "#0a0a0a"
     s = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 80" width="420" height="80" role="img" aria-labelledby="title">\n'
-        f'<title id="title">omp-evolve</title>\n'
+        f'<title id="title">rematch</title>\n'
         f'<rect x="4" y="8" width="64" height="64" rx="12" fill="{ink}"/>\n'
         # a loop that returns on itself: evidence → entry → evidence
         f'<path d="M36 22 A18 18 0 1 1 18 40" fill="none" stroke="{paper}" stroke-width="5" stroke-linecap="round"/>\n'
         f'<path d="M12 33 L18 42 L26 35" fill="none" stroke="{paper}" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>\n'
         f'<circle cx="36" cy="40" r="5" fill="{paper}"/>\n'
-        f'<text x="86" y="58" font-family="{FONT}" font-size="48" font-weight="600" letter-spacing="-0.01em" fill="{ink}">omp-evolve</text>\n'
+        f'<text x="86" y="58" font-family="{FONT}" font-size="48" font-weight="600" letter-spacing="-0.01em" fill="{ink}">rematch</text>\n'
         f'</svg>\n'
     )
     return s
@@ -86,7 +86,7 @@ def wordmark(theme):
 def loop(theme):
     t = THEMES[theme]
     w, h = 1100, 640
-    s = head(w, h, "The omp-evolve loop",
+    s = head(w, h, "The rematch loop",
              "In the session the extension traces every event, flags sessions that carried a redirect, a tool-error "
              "cluster or a takeover, loads provisional entries whose predicate matches, and runs approved hooks. "
              "Between sessions the binary classifies the redirect, triages the failure, runs one editor, lints, stages "
@@ -95,11 +95,11 @@ def loop(theme):
              "scripts and hooks with one tap, mark redirects, or turn it off.", t)
     s += panel(30, 56, 420, 420, t, "IN THE SESSION", "extension · index.ts · no model calls", [
         ("trace", "every input, tool result, turn, model change → traces/"),
-        ("flag", "redirect, tool-error cluster, takeover, /evolve mark → pending/"),
+        ("flag", "redirect, tool-error cluster, takeover, /rematch mark → pending/"),
         ("load", "staging/<branch>/ joins the skill paths on predicate match"),
         ("guard", "approved hooks run on tool_call; block with the rule's message"),
     ])
-    s += panel(650, 56, 420, 420, t, "BETWEEN SESSIONS", "omp-evolve · Rust · one static binary", [
+    s += panel(650, 56, 420, 420, t, "BETWEEN SESSIONS", "rematch · Rust · one static binary", [
         ("classify", "correction · preference · scope · none, batched, one call"),
         ("triage", "process vs content; domain vs invariant editor; the moment"),
         ("propose", "one editor, --no-tools, inputs in the prompt; KEEP_BASE valid"),
@@ -126,7 +126,7 @@ def loop(theme):
     # you
     s += f'<rect x="400" y="546" width="300" height="66" rx="12" fill="{t["panel"]}" stroke="{t["mid"]}"/>\n'
     s += text(550, 574, "You", 17, t["ink"], 600, "middle")
-    s += text(550, 596, "one-tap approvals · /evolve mark · /evolve off", 13, t["mid"], anchor="middle")
+    s += text(550, 596, "one-tap approvals · /rematch mark · /rematch off", 13, t["mid"], anchor="middle")
     s += f'<path d="M370 478 C370 540 384 579 394 579" fill="none" stroke="{t["mid"]}" stroke-width="1.5" marker-end="url(#arrow)"/>\n'
     s += text(360, 552, "digest", 13, t["mid"], anchor="end")
     s += f'<path d="M706 579 C716 579 730 540 730 482" fill="none" stroke="{t["mid"]}" stroke-width="1.5" marker-end="url(#arrow)"/>\n'
@@ -137,11 +137,11 @@ def loop(theme):
 def architecture(theme):
     t = THEMES[theme]
     w, h = 1100, 600
-    s = head(w, h, "omp-evolve architecture",
+    s = head(w, h, "rematch architecture",
              "omp emits extension events to the extension, which writes traces and asks the binary which staging "
              "directories match the working directory. The binary owns the ledger, the library, lint, staging, jobs, "
              "batch mode and PR output, and calls omp non-interactively for the editor, the classifier and batch "
-             "rollouts. State lives under ~/.omp/evolve; kept entries are copied into ~/.omp/agent.", t)
+             "rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent.", t)
     s += panel(30, 56, 230, 420, t, "OMP", "stock 18.12, or your fork", [
         ("events", "start · input · tool · turn · shutdown"),
         ("skills", "customDirectories, set before discovery"),
@@ -152,17 +152,17 @@ def architecture(theme):
         ("trace writer", "append-only JSONL, bounded fields"),
         ("prelabels", "interrupt · revert · negation · reprompt"),
         ("match → load", "pi.exec match --cwd at factory time"),
-        ("tool_call hooks", "evolve-hooks/<id>.ts, approved only"),
-        ("omp_evolve · /evolve", "long work returns a job id"),
+        ("tool_call hooks", "rematch-hooks/<id>.ts, approved only"),
+        ("rematch · /rematch", "long work returns a job id"),
     ])
-    s += panel(570, 56, 270, 420, t, "BINARY", "omp-evolve · Rust · never holds credentials", [
-        ("evolve-core", "trace · predicate · lint · library · ledger"),
+    s += panel(570, 56, 270, 420, t, "BINARY", "rematch · Rust · never holds credentials", [
+        ("rematch-core", "trace · predicate · lint · library · ledger"),
         ("reflect · count", "triage → edit → lint → stage → decide"),
         ("create · improve", "sessions | task | draft · split · unit edits"),
         ("batch", "worktree, candidates, composer, verifier"),
         ("scope", "ship · export · stale · split · transfer"),
     ])
-    s += panel(880, 56, 190, 420, t, "STATE", "~/.omp/evolve", [
+    s += panel(880, 56, 190, 420, t, "STATE", "~/.rematch", [
         ("traces/", "the only live input"),
         ("ledger.sqlite", "sessions · entries · counters"),
         ("staging/<branch>/", "loaded on match"),
@@ -264,16 +264,16 @@ def terminal(theme, name, title, lines, h):
 
 
 REFLECT_LINES = [
-    ("prompt", "omp-evolve reflect --pending --text"),
+    ("prompt", "rematch reflect --pending --text"),
     ("dim", "counted 1 session(s), 0 counter row(s)"),
     ("out", "session 01a1760d: classifier → correction (0.86) · triage process/domain · moment seq 10"),
     ("ok", "staged src-lib-public-functions (skill) from session 01a1760d · lint ok · 1 model call"),
     ("gap", ""),
-    ("prompt", "cat ~/.omp/evolve/staging/evolve-e2e-repo/src-lib-public-functions/SKILL.md"),
+    ("prompt", "cat ~/.rematch/staging/rematch-e2e-repo/src-lib-public-functions/SKILL.md"),
     ("dim", "---"),
     ("dim", "name: src-lib-public-functions"),
     ("dim", "description: Use when adding or modifying public functions in src/lib.py."),
-    ("dim", "evolve: {status: provisional, branch: evolve-e2e-repo, family: github-copilot/gemini-argon, version: 1}"),
+    ("dim", "rematch: {status: provisional, branch: rematch-e2e-repo, family: github-copilot/gemini-argon, version: 1}"),
     ("dim", "---"),
     ("out", "## Laws"),
     ("out", "- Export every public function name in `__all__` at the top of `src/lib.py`."),
@@ -282,16 +282,16 @@ REFLECT_LINES = [
 ]
 
 WHY_LINES = [
-    ("prompt", "omp-evolve library why 01a17614-a543-77f3-8ad1-d28bbdc2c2fe --text"),
+    ("prompt", "rematch library why 01a17614-a543-77f3-8ad1-d28bbdc2c2fe --text"),
     ("out", "session 01a17614 · github-copilot/gemini-4-argon · 4 turns · 4 tool calls (0 errors, 0 clusters) · 0 takeovers"),
     ("ok", "loaded src-lib-public-functions (provisional): glob hit · predicate hit · this session recurrence 0 harm 0"),
     ("accent", "  total matched 1 recurrence 0 harm 0"),
     ("gap", ""),
-    ("prompt", "omp-evolve library ls --text"),
-    ("out", "provisional skill  src-lib-public-functions [evolve-e2e-repo] matched 1 · recurrence 0 · harm 0"),
+    ("prompt", "rematch library ls --text"),
+    ("out", "provisional skill  src-lib-public-functions [rematch-e2e-repo] matched 1 · recurrence 0 · harm 0"),
     ("gap", ""),
-    ("prompt", "omp-evolve digest --cwd . --text"),
-    ("out", "staged skill src-lib-public-functions in evolve-e2e-repo: Use when adding or modifying public functions in src/lib.py."),
+    ("prompt", "rematch digest --cwd . --text"),
+    ("out", "staged skill src-lib-public-functions in rematch-e2e-repo: Use when adding or modifying public functions in src/lib.py."),
     ("dim", "approvals: none pending"),
 ]
 

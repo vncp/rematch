@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/wordmark-dark.svg">
-    <img alt="omp-evolve" src="docs/assets/readme/wordmark-light.svg" width="360">
+    <img alt="rematch" src="docs/assets/readme/wordmark-light.svg" width="360">
   </picture>
 </p>
 
@@ -28,25 +28,25 @@
 ## What you can do with it
 
 - **Do nothing.** Work in omp as usual. Every session is traced. A session that ended with a redirect, a tool-error cluster, or a takeover produces one bounded proposal at the start of the next session, staged as `provisional`. Later sessions that match load it. Counters decide whether it stays.
-- **Create a skill.** `/evolve create <name> --from sessions|task`. From three matching sessions, or from one reference run of a task you name. A description with neither becomes a `draft` that never loads until you activate it.
-- **Improve a skill from history.** `/evolve improve <skill>`. Registers it, audits where it loaded, clusters the redirects and errors that happened with it in context, proposes unit-level edits, stages the new version beside the old one. Refuses with a count if fewer than five traced sessions used it, and offers the mechanical split instead.
-- **Run a batch job with a verifier.** `/evolve run --task <id> --verifier <cmd>`. Reference rollout, two candidates, probe, compose, re-run; the verifier picks. Never a model's opinion of its own output.
-- **See why.** `/evolve why`, `/evolve status`, `/evolve library`. Which entries were loaded for the last deliverable, what was staged, kept, retired, and the raw counts per entry.
-- **Correct it or stop it.** `/evolve mark correction|preference|scope` overrides the classifier for the last turn. `/evolve off`, `OMP_EVOLVE=0`, `/evolve disable <id>`, `/evolve rollback <skill>`, `omp-evolve uninstall` are immediate.
+- **Create a skill.** `/rematch create <name> --from sessions|task`. From three matching sessions, or from one reference run of a task you name. A description with neither becomes a `draft` that never loads until you activate it.
+- **Improve a skill from history.** `/rematch improve <skill>`. Registers it, audits where it loaded, clusters the redirects and errors that happened with it in context, proposes unit-level edits, stages the new version beside the old one. Refuses with a count if fewer than five traced sessions used it, and offers the mechanical split instead.
+- **Run a batch job with a verifier.** `/rematch run --task <id> --verifier <cmd>`. Reference rollout, two candidates, probe, compose, re-run; the verifier picks. Never a model's opinion of its own output.
+- **See why.** `/rematch why`, `/rematch status`, `/rematch library`. Which entries were loaded for the last deliverable, what was staged, kept, retired, and the raw counts per entry.
+- **Correct it or stop it.** `/rematch mark correction|preference|scope` overrides the classifier for the last turn. `/rematch off`, `REMATCH=0`, `/rematch disable <id>`, `/rematch rollback <skill>`, `rematch uninstall` are immediate.
 
 ## Thirty-second start
 
 From a checkout of this repo, with omp 18.12 and a Rust toolchain:
 
 ```sh
-scripts/install.sh            # cargo build --release · omp plugin link extension/ · ~/.local/bin/omp-evolve
-omp-evolve import --history   # seed the ledger from your existing omp sessions (read-only)
-omp-evolve doctor --text      # omp version, resolved editor/classifier roles, extension linked, ledger schema
+scripts/install.sh            # cargo build --release · omp plugin link extension/ · ~/.local/bin/rematch
+rematch import --history      # seed the ledger from your existing omp sessions (read-only)
+rematch doctor --text         # omp version, resolved editor/classifier roles, extension linked, ledger schema
 ```
 
 Then use omp. The first proposal arrives after the first session that ends with a redirect.
 
-Optional, in `~/.omp/agent/config.yml`: `modelRoles.evolve-editor` for the strongest model you have and `modelRoles.evolve-classifier` for a fast one. Without them the editor falls back to `slow` → `default`, the classifier to `smol` → `tiny` → `default`.
+Optional, in `~/.omp/agent/config.yml`: `modelRoles.rematch-editor` for the strongest model you have and `modelRoles.rematch-classifier` for a fast one. Without them the editor falls back to `slow` → `default`, the classifier to `smol` → `tiny` → `default`.
 
 ## How it works
 
@@ -56,12 +56,12 @@ The session is the evidence. The extension writes every input, tool result and t
 
 <p align="center"><b>A harness-improvement loop that costs no reruns in interactive use. The real session is the reference rollout, the next matched session is the probe, and a reflection costs at most three model calls.</b></p>
 
-omp-evolve is an omp plugin: a TypeScript extension that omp loads, and a Rust binary the extension calls with a JSON envelope. The extension only records and toggles; the binary proposes and stages. Skill text activates in personal scope on its own. Anything executable (scripts, hooks) and anything beyond personal scope (team `.omp/`, your fork) waits for a one-tap approval or a merged PR. No fork of omp is required; the fork is one of the things it can propose changes to.
+rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust binary the extension calls with a JSON envelope. The extension only records and toggles; the binary proposes and stages. Skill text activates in personal scope on its own. Anything executable (scripts, hooks) and anything beyond personal scope (team `.omp/`, your fork) waits for a one-tap approval or a merged PR. No fork of omp is required; the fork is one of the things it can propose changes to.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/loop-dark.svg">
-    <img alt="The omp-evolve loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off." src="docs/assets/readme/loop-light.svg" width="100%">
+    <img alt="The rematch loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off." src="docs/assets/readme/loop-light.svg" width="100%">
   </picture>
 </p>
 
@@ -95,7 +95,7 @@ omp-evolve is an omp plugin: a TypeScript extension that omp loads, and a Rust b
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/reflect-dark.svg">
-    <img alt="Terminal: omp-evolve reflect --pending reports the classifier's verdict, the triage, and that src-lib-public-functions was staged with lint ok after one model call; the staged SKILL.md shows the evolve frontmatter block and three checkable laws about __all__ and docstrings." src="docs/assets/readme/reflect-light.svg" width="100%">
+    <img alt="Terminal: rematch reflect --pending reports the classifier's verdict, the triage, and that src-lib-public-functions was staged with lint ok after one model call; the staged SKILL.md shows the rematch frontmatter block and three checkable laws about __all__ and docstrings." src="docs/assets/readme/reflect-light.svg" width="100%">
   </picture>
 </p>
 <p align="center"><em>A reflection from a real session on a scratch repository, with gemini-4-argon as classifier and editor. Output condensed to the lines that matter.</em></p>
@@ -103,7 +103,7 @@ omp-evolve is an omp plugin: a TypeScript extension that omp loads, and a Rust b
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/why-dark.svg">
-    <img alt="Terminal: omp-evolve library why shows the next session with the entry loaded, glob hit and predicate hit, recurrence 0 harm 0, total matched 1; library ls lists the provisional entry with its raw counts; digest shows the staged line and no pending approvals." src="docs/assets/readme/why-light.svg" width="100%">
+    <img alt="Terminal: rematch library why shows the next session with the entry loaded, glob hit and predicate hit, recurrence 0 harm 0, total matched 1; library ls lists the provisional entry with its raw counts; digest shows the staged line and no pending approvals." src="docs/assets/readme/why-light.svg" width="100%">
   </picture>
 </p>
 <p align="center"><em>The next matched session. <code>why</code> explains the load and the count; <code>ls</code> shows the counts raw.</em></p>
@@ -123,7 +123,7 @@ omp-evolve is an omp plugin: a TypeScript extension that omp loads, and a Rust b
 
 | Step | What happens | Enforced by |
 |---|---|---|
-| **Flag** | At shutdown the extension flags the session only if it carried a signal: a pre-labelled redirect (`interrupt`, `revert`, `negation`, `reprompt`), three tool errors in any six consecutive results, or `/evolve mark`. Clean sessions produce nothing. | extension; a 2-second budget, so it writes one small file |
+| **Flag** | At shutdown the extension flags the session only if it carried a signal: a pre-labelled redirect (`interrupt`, `revert`, `negation`, `reprompt`), three tool errors in any six consecutive results, or `/rematch mark`. Clean sessions produce nothing. | extension; a 2-second budget, so it writes one small file |
 | **Classify** | One batched call labels each redirect `correction`, `preference`, `scope` or `none`. A session whose only redirects are `scope` or `none` carries no signal and gets no editor call. A mark overrides the classifier and is never overridden. | binary (`reflect.rs`) |
 | **Triage** | The first failure is either *process* (anything the agent produced with tools, tool-error clusters, takeovers, reverts, procedural text) or *content* (a corrected prose answer). Content failures are logged, not proposed on. Separately, the scope picks the editor: *domain* by default, *invariant* when the failure is about the agent's general way of working. | `trace::triage` |
 | **Predicate** | Repo path, the extensions of files touched in the evidence window, and up to ten stems ranked by tf-idf over the task turn, the touched files and the redirect. The hash of this predicate keys the rate limits. | `predicate::derive` |
@@ -156,19 +156,19 @@ Keep at `matched ≥ 4 · recurrence 0 · harm 0`. Four matched sessions with no
 
 | Status | Where it lives | Loaded |
 |---|---|---|
-| `draft` | `~/.omp/evolve/drafts/<name>/` | never |
-| `provisional` | `~/.omp/evolve/staging/<branch>/<name>/` | on predicate match, via the skill paths |
+| `draft` | `~/.rematch/drafts/<name>/` | never |
+| `provisional` | `~/.rematch/staging/<branch>/<name>/` | on predicate match, via the skill paths |
 | `kept` | `~/.omp/agent/skills/<name>/`, predecessor in `predecessors/` | natively, every match |
-| `stale` · `dormant` · `retired` | `~/.omp/evolve/archive/<status>/<id>/` | never; never deleted |
+| `stale` · `dormant` · `retired` | `~/.rematch/archive/<status>/<id>/` | never; never deleted |
 | `pinned` | wherever it is | a flag; never replaced automatically |
 
 ## Create and improve
 
-**Greenfield.** `omp-evolve create <name> --from sessions` searches the ledger (imported history plus traces) for sessions whose features match the request; with three or more, the skill is distilled from what worked and what was redirected. `--from task --task <id>` runs the task once in batch mode (one rollout, no candidates) to obtain a trace; this is the only create that costs a rollout. `--from description` stages a `draft`; `activate <name> --task <id>` or `--unverified` makes it `provisional`. The result is a skill package: a router `SKILL.md` with the trigger line and the checkable laws, `units/` for procedures and pitfalls, `facts/` for measured values with `as_of`, `scripts/` for anything deterministic. Below about 8 KB the package collapses to one file.
+**Greenfield.** `rematch create <name> --from sessions` searches the ledger (imported history plus traces) for sessions whose features match the request; with three or more, the skill is distilled from what worked and what was redirected. `--from task --task <id>` runs the task once in batch mode (one rollout, no candidates) to obtain a trace; this is the only create that costs a rollout. `--from description` stages a `draft`; `activate <name> --task <id>` or `--unverified` makes it `provisional`. The result is a skill package: a router `SKILL.md` with the trigger line and the checkable laws, `units/` for procedures and pitfalls, `facts/` for measured values with `as_of`, `scripts/` for anything deterministic. Below about 8 KB the package collapses to one file.
 
-**Brownfield.** `omp-evolve improve <skill>` registers the existing skill as a `provisional` entry in place (the file is never moved), audits the sessions that read it and the redirects and errors that happened with it in context, and proposes unit-level edits from the clustered redirects. A skill over 8 KB is split first, mechanically and with no model: router, `units/` by heading, `facts/`, long tables and rejected-hypothesis lists into a ledger-notes unit. The new version is a sibling beside the old one; omp shows the sibling under the bare name and the original under its namespaced name until the counters decide. A `pinned` skill is never replaced.
+**Brownfield.** `rematch improve <skill>` registers the existing skill as a `provisional` entry in place (the file is never moved), audits the sessions that read it and the redirects and errors that happened with it in context, and proposes unit-level edits from the clustered redirects. A skill over 8 KB is split first, mechanically and with no model: router, `units/` by heading, `facts/`, long tables and rejected-hypothesis lists into a ledger-notes unit. The new version is a sibling beside the old one; omp shows the sibling under the bare name and the original under its namespaced name until the counters decide. A `pinned` skill is never replaced.
 
-`omp-evolve import --forge <path>` registers compound-forge's fifteen skills as brownfield entries with predicates from their trigger text, and its `learnings/*.md` as lessons with their evidence hash.
+`rematch import --forge <path>` registers compound-forge's fifteen skills as brownfield entries with predicates from their trigger text, and its `learnings/*.md` as lessons with their evidence hash.
 
 ## Batch mode
 
@@ -200,7 +200,7 @@ Every entry records the model family it was created under and keeps a per-family
 
 ## How it compares
 
-| | Hand-written skills | compound-forge (SkillOpt / GEPA) | omp-evolve |
+| | Hand-written skills | compound-forge (SkillOpt / GEPA) | rematch |
 |---|---|---|---|
 | Where evidence comes from | your memory of what went wrong | a benchmark suite you maintain | the execution trace of the session that went wrong |
 | Cost per improvement | your time | dozens to hundreds of rollouts | ≤ 3 model calls, 0 reruns (interactive); 4–10 rollouts with a verifier (batch) |
@@ -208,24 +208,24 @@ Every entry records the model family it was created under and keeps a per-family
 | What can activate on its own | everything you write | nothing (proposals are reviewed) | skill text in personal scope; never scripts, hooks, team or fork changes |
 | Exit for a bad change | you notice | regression on the suite | counters retire it; rollback restores the predecessor; `off` stops everything |
 
-**In short:** the loop (scoped editors, lint for generalization, an experience library, composition only where a verifier exists) comes from Harness². What omp-evolve adds is the zero-rerun interactive mode with a deterministic predicate and raw counters, and a boundary that lets the harness propose without being trusted. The cost: a single user is not blinded, so the counters measure only the recurrence of a specific redirect class, something you would not fake; and nothing is ever called verified.
+**In short:** the loop (scoped editors, lint for generalization, an experience library, composition only where a verifier exists) comes from Harness². What rematch adds is the zero-rerun interactive mode with a deterministic predicate and raw counters, and a boundary that lets the harness propose without being trusted. The cost: a single user is not blinded, so the counters measure only the recurrence of a specific redirect class, something you would not fake; and nothing is ever called verified.
 
 ## Architecture
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/architecture-dark.svg">
-    <img alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and asks the binary which staging directories match before discovery. The Rust binary owns evolve-core, reflect and count, create and improve, batch and scope, and calls omp -p non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.omp/evolve; kept entries are copied into ~/.omp/agent/skills." src="docs/assets/readme/architecture-light.svg" width="100%">
+    <img alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and asks the binary which staging directories match before discovery. The Rust binary owns rematch-core, reflect and count, create and improve, batch and scope, and calls omp -p non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent/skills." src="docs/assets/readme/architecture-light.svg" width="100%">
   </picture>
 </p>
 
 | Unit | What it holds | Rule |
 |---|---|---|
-| `extension/index.ts` | trace writer, pre-labels, the skill-path override, approved hook modules, the `omp_evolve` tool and `/evolve` command, the digest | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
-| `crates/evolve-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 106 unit tests |
-| `crates/omp-evolve` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 47 unit + 17 end-to-end tests |
-| `improver/` | `editor.md`, `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.omp/evolve/improver/` on first run; read-only to the system |
-| `~/.omp/evolve/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`OMP_EVOLVE_ROOT`); home and work are separate libraries |
+| `extension/index.ts` | trace writer, pre-labels, the skill-path override, approved hook modules, the `rematch` tool and `/rematch` command, the digest | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
+| `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 106 unit tests |
+| `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 47 unit + 17 end-to-end tests |
+| `improver/` | `editor.md`, `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/` on first run; read-only to the system |
+| `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -236,12 +236,12 @@ The checks every change goes through:
 ```sh
 cargo test --workspace                        # 106 core · 47 binary · 17 end-to-end (scripted editors, fake omp)
 cargo clippy --workspace --all-targets -- -D warnings
-bun build extension/index.ts --no-bundle --outdir /tmp/evolve-ext-check
+bun build extension/index.ts --no-bundle --outdir /tmp/rematch-ext-check
 ```
 
 The end-to-end tests run the built binary against a temporary root: a synthetic trace with a redirect is reflected through a scripted editor, staged, matched, counted through four clean sessions and kept into the agent skills dir; the lint-fail script exercises exactly one retry; a wrong-model reply fails closed; `import --history` runs against anonymized goldens; `improve` refuses, splits, stages a sibling and refuses a pinned skill; the batch worker completes a `k=1` cycle with a fake omp and keeps the winner on the next run; `ship` creates the branch and commit; `export` refuses at work by default.
 
-What was run live against omp 18.12.6 before this README was written: the full interactive loop on a scratch repository (rpc-mode sessions with real redirects, gemini-4-argon editor and classifier, the entry loaded in the next session and counted), the forge import and the mechanical split of a 31 KB skill resolved as a package in a live session, one detached batch cycle with a script verifier, one team ship, and `/evolve` in the TUI.
+What was run live against omp 18.12.6 before this README was written: the full interactive loop on a scratch repository (rpc-mode sessions with real redirects, gemini-4-argon editor and classifier, the entry loaded in the next session and counted), the forge import and the mechanical split of a 31 KB skill resolved as a package in a live session, one detached batch cycle with a script verifier, one team ship, and `/rematch` in the TUI.
 
 ## Status
 

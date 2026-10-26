@@ -1,0 +1,325 @@
+//! Deterministic verifiers (SPEC "Batch mode": tests, a check script, a parity check
+//! against a known result, or a reconcile receipt; never a model's opinion).
+//!
+//! Spec strings accepted by `run --verifier` / `task add --verifier`:
+//! - `tests` / `test`: [`TestVerifier`] (cargo / pytest / bun autodetected from files)
+//! - `parity:<produced>=<expected>`: [`ParityVerifier`]; `<produced>` is relative to the
+//!   worktree, `<expected>` a file path or a 64-hex sha256
+//! - `receipt:<path>`: [`ReceiptVerifier`]; JSON file (relative to the worktree) with
+//!   `verdict: "pass"|"fail"` and optional `score`
+//! - `script:<cmd>` or any other string: [`ScriptVerifier`] (`sh -c <cmd>` in the worktree)
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{anyhow, bail, Context, Result};
+use rematch_core::features::head;
+use rematch_core::ledger::sha256_hex;
+use rematch_core::Verdict;
+use serde_json::Value;
+
+use super::tasks::Task;
+use crate::proc;
+
+/// Bytes of verifier output kept in a verdict's detail.
+const DETAIL_CHARS: usize = 2048;
+
+pub trait Verifier {
+    fn check(&self, task: &Task, worktree: &Path) -> Result<Verdict>;
+    /// Short label for receipts.
+    fn describe(&self) -> String;
+}
+
+/// `sh -c <cmd>` in the worktree; exit 0 = pass. The last stdout line that parses as a
+/// JSON object with a numeric `score` supplies the score.
+pub struct ScriptVerifier {
+    pub cmd: String,
+}
+
+/// Runs the project's test suite, detected from the files present.
+pub struct TestVerifier;
+
+/// sha256 of a produced file against an expected file or digest.
+pub struct ParityVerifier {
+    pub produced: PathBuf,
+    pub expected_file: PathBuf,
+}
+
+/// A JSON receipt written by the run: `{"verdict":"pass"|"fail", "score"?: n}`.
+pub struct ReceiptVerifier {
+    pub path: PathBuf,
+}
+
+pub fn parse_spec(spec: &str) -> Result<Box<dyn Verifier>> {
+    let s = spec.trim();
+    if s.is_empty() {
+        bail!("empty verifier");
+    }
+    if s == "tests" || s == "test" {
+        return Ok(Box::new(TestVerifier));
+    }
+    if let Some(rest) = s.strip_prefix("parity:") {
+        let (produced, expected) =
+            rest.split_once('=').ok_or_else(|| anyhow!("parity verifier needs parity:<produced>=<expected>"))?;
+        let (produced, expected) = (produced.trim(), expected.trim());
+        if produced.is_empty() || expected.is_empty() {
+            bail!("parity verifier needs parity:<produced>=<expected>");
+        }
+        if Path::new(produced).is_absolute() {
+            bail!("parity <produced> must be relative to the worktree");
+        }
+        if !is_sha256(expected) && !Path::new(expected).is_file() {
+            bail!("parity <expected> {expected:?} is neither a file nor a sha256");
+        }
+        return Ok(Box::new(ParityVerifier { produced: produced.into(), expected_file: expected.into() }));
+    }
+    if let Some(rest) = s.strip_prefix("receipt:") {
+        let p = rest.trim();
+        if p.is_empty() || Path::new(p).is_absolute() {
+            bail!("receipt verifier needs receipt:<path relative to the worktree>");
+        }
+        return Ok(Box::new(ReceiptVerifier { path: p.into() }));
+    }
+    let cmd = s.strip_prefix("script:").unwrap_or(s).trim();
+    if cmd.is_empty() {
+        bail!("empty script verifier");
+    }
+    Ok(Box::new(ScriptVerifier { cmd: cmd.to_string() }))
+}
+
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn verdict(pass: bool, score: Option<f64>, detail: String) -> Verdict {
+    if pass {
+        Verdict::Pass { score, detail }
+    } else {
+        Verdict::Fail { score, detail }
+    }
+}
+
+pub fn is_pass(v: &Verdict) -> bool {
+    matches!(v, Verdict::Pass { .. })
+}
+
+pub fn score_of(v: &Verdict) -> Option<f64> {
+    match v {
+        Verdict::Pass { score, .. } | Verdict::Fail { score, .. } => *score,
+    }
+}
+
+pub fn detail_of(v: &Verdict) -> &str {
+    match v {
+        Verdict::Pass { detail, .. } | Verdict::Fail { detail, .. } => detail,
+    }
+}
+
+/// Verifier time cap: the task's rollout cap, at least a minute.
+fn timeout(task: &Task) -> std::time::Duration {
+    task.max_time().max(std::time::Duration::from_secs(60))
+}
+
+fn run_in(mut cmd: Command, task: &Task, worktree: &Path) -> Result<proc::Bounded> {
+    cmd.current_dir(worktree)
+        .env("REMATCH_TASK", &task.id)
+        .env("REMATCH_WORKTREE", worktree)
+        .env("REMATCH_REPO", &task.repo);
+    proc::run_bounded(cmd, timeout(task))
+}
+
+fn output_detail(b: &proc::Bounded) -> String {
+    let mut s = String::new();
+    if b.killed {
+        s.push_str("[timed out] ");
+    }
+    match b.code {
+        Some(c) => s.push_str(&format!("exit {c}")),
+        None => s.push_str("killed by signal"),
+    }
+    let tail = |t: &str| {
+        let t = t.trim();
+        let start = t.char_indices().rev().nth(DETAIL_CHARS / 2).map_or(0, |(i, _)| i);
+        t[start..].to_string()
+    };
+    if !b.stdout.trim().is_empty() {
+        s.push_str("\nstdout: ");
+        s.push_str(&tail(&b.stdout));
+    }
+    if !b.stderr.trim().is_empty() {
+        s.push_str("\nstderr: ");
+        s.push_str(&tail(&b.stderr));
+    }
+    head(&s, DETAIL_CHARS)
+}
+
+fn score_from_stdout(stdout: &str) -> Option<f64> {
+    stdout
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+        .find_map(|v| v.get("score").and_then(Value::as_f64))
+}
+
+impl Verifier for ScriptVerifier {
+    fn check(&self, task: &Task, worktree: &Path) -> Result<Verdict> {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(&self.cmd);
+        let b = run_in(c, task, worktree)?;
+        let pass = b.code == Some(0) && !b.killed;
+        Ok(verdict(pass, score_from_stdout(&b.stdout), output_detail(&b)))
+    }
+
+    fn describe(&self) -> String {
+        format!("script:{}", self.cmd)
+    }
+}
+
+impl TestVerifier {
+    /// The test command for a worktree, by marker files.
+    pub fn detect(worktree: &Path) -> Option<Vec<&'static str>> {
+        let has = |f: &str| worktree.join(f).exists();
+        if has("Cargo.toml") {
+            return Some(vec!["cargo", "test", "--quiet"]);
+        }
+        if has("pyproject.toml") || has("pytest.ini") || has("setup.cfg") || has("setup.py") || has("tox.ini") {
+            return Some(vec!["python3", "-m", "pytest", "-q"]);
+        }
+        if has("package.json") && (has("bun.lock") || has("bun.lockb") || has("bunfig.toml")) {
+            return Some(vec!["bun", "test"]);
+        }
+        None
+    }
+}
+
+impl Verifier for TestVerifier {
+    fn check(&self, task: &Task, worktree: &Path) -> Result<Verdict> {
+        let argv = Self::detect(worktree)
+            .ok_or_else(|| anyhow!("no test runner detected in {} (Cargo.toml, pytest, bun)", worktree.display()))?;
+        let mut c = Command::new(argv[0]);
+        c.args(&argv[1..]);
+        let b = run_in(c, task, worktree)?;
+        let pass = b.code == Some(0) && !b.killed;
+        Ok(verdict(pass, None, format!("{}: {}", argv.join(" "), output_detail(&b))))
+    }
+
+    fn describe(&self) -> String {
+        "tests".into()
+    }
+}
+
+impl Verifier for ParityVerifier {
+    fn check(&self, _task: &Task, worktree: &Path) -> Result<Verdict> {
+        let expected_text = self.expected_file.to_string_lossy();
+        let expected = if is_sha256(&expected_text) {
+            expected_text.to_ascii_lowercase()
+        } else {
+            let bytes = std::fs::read(&self.expected_file)
+                .with_context(|| format!("read expected {}", self.expected_file.display()))?;
+            sha256_hex(&bytes)
+        };
+        let produced = worktree.join(&self.produced);
+        let Ok(bytes) = std::fs::read(&produced) else {
+            return Ok(verdict(false, None, format!("{} was not produced", self.produced.display())));
+        };
+        let got = sha256_hex(&bytes);
+        let pass = got == expected;
+        Ok(verdict(pass, None, format!("{} sha256 {got} (expected {expected})", self.produced.display())))
+    }
+
+    fn describe(&self) -> String {
+        format!("parity:{}={}", self.produced.display(), self.expected_file.display())
+    }
+}
+
+impl Verifier for ReceiptVerifier {
+    fn check(&self, _task: &Task, worktree: &Path) -> Result<Verdict> {
+        let p = worktree.join(&self.path);
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return Ok(verdict(false, None, format!("receipt {} missing", self.path.display())));
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            return Ok(verdict(false, None, format!("receipt {} is not JSON", self.path.display())));
+        };
+        let word = v.get("verdict").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+        let score = v.get("score").and_then(Value::as_f64);
+        let detail = format!("receipt {} verdict={word:?}", self.path.display());
+        match word.as_str() {
+            "pass" => Ok(verdict(true, score, detail)),
+            "fail" => Ok(verdict(false, score, detail)),
+            _ => Ok(verdict(false, score, format!("{detail} (expected pass|fail)"))),
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!("receipt:{}", self.path.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(dir: &Path) -> Task {
+        Task {
+            id: "t".into(),
+            repo: dir.to_path_buf(),
+            prompt: "p".into(),
+            verifier: None,
+            max_time_secs: 30,
+            tools: None,
+            seeds: vec![1],
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn batch_script_verifier_exit_and_score() {
+        let d = tempfile::tempdir().unwrap();
+        let t = task(d.path());
+        let v = parse_spec("echo noise; echo '{\"score\": 0.75}'").unwrap();
+        let r = v.check(&t, d.path()).unwrap();
+        assert!(is_pass(&r));
+        assert_eq!(score_of(&r), Some(0.75));
+        let v = parse_spec("script:test -f marker").unwrap();
+        assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
+        std::fs::write(d.path().join("marker"), "").unwrap();
+        assert!(is_pass(&v.check(&t, d.path()).unwrap()));
+    }
+
+    #[test]
+    fn batch_parity_and_receipt_verifiers() {
+        let d = tempfile::tempdir().unwrap();
+        let t = task(d.path());
+        let expected = d.path().join("expected.csv");
+        std::fs::write(&expected, "a,b\n").unwrap();
+        let v = parse_spec(&format!("parity:out.csv={}", expected.display())).unwrap();
+        assert!(!is_pass(&v.check(&t, d.path()).unwrap()), "missing output fails");
+        std::fs::write(d.path().join("out.csv"), "a,b\n").unwrap();
+        assert!(is_pass(&v.check(&t, d.path()).unwrap()));
+        let v = parse_spec(&format!("parity:out.csv={}", sha256_hex(b"other"))).unwrap();
+        assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
+        assert!(parse_spec("parity:out.csv=/no/such/file").is_err());
+
+        let v = parse_spec("receipt:receipt.json").unwrap();
+        assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
+        std::fs::write(d.path().join("receipt.json"), r#"{"verdict":"PASS","score":3}"#).unwrap();
+        let r = v.check(&t, d.path()).unwrap();
+        assert!(is_pass(&r));
+        assert_eq!(score_of(&r), Some(3.0));
+        std::fs::write(d.path().join("receipt.json"), r#"{"verdict":"fail"}"#).unwrap();
+        assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
+    }
+
+    #[test]
+    fn batch_test_runner_detection() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(TestVerifier::detect(d.path()).is_none());
+        std::fs::write(d.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(TestVerifier::detect(d.path()).unwrap()[0], "python3");
+        std::fs::write(d.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(TestVerifier::detect(d.path()).unwrap()[0], "cargo");
+        assert!(parse_spec("tests").is_ok());
+        assert!(parse_spec("  ").is_err());
+    }
+}

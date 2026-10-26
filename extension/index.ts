@@ -1,6 +1,6 @@
-// omp-evolve extension: traces main sessions into <root>/traces/<session_id>.jsonl (DESIGN §3),
+// rematch extension: traces main sessions into <root>/traces/<session_id>.jsonl (DESIGN §3),
 // loads matching staging dirs via `skills.customDirectories`, runs approved hooks on `tool_call`,
-// and exposes the `omp_evolve` tool, the `/evolve` command and the `alt+e` digest shortcut (DESIGN §10).
+// and exposes the `rematch` tool, the `/rematch` command and the `alt+e` digest shortcut (DESIGN §10).
 // It parses nothing the binary owns: every decision beyond the cheap prelabels lives in Rust.
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -12,9 +12,9 @@ import type { ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-co
 // ---------------------------------------------------------------------------------------------
 // Paths, kill switch, binary resolution
 
-export function evolveRoot(env: NodeJS.ProcessEnv = process.env): string {
-	if (env.OMP_EVOLVE_ROOT) return env.OMP_EVOLVE_ROOT;
-	return path.join(env.HOME || os.homedir(), ".omp", "evolve");
+export function rematchRoot(env: NodeJS.ProcessEnv = process.env): string {
+	if (env.REMATCH_ROOT) return env.REMATCH_ROOT;
+	return path.join(env.HOME || os.homedir(), ".rematch");
 }
 
 function isExecutable(p: string): boolean {
@@ -35,16 +35,16 @@ function extensionDir(): string {
 	}
 }
 
-/** `$OMP_EVOLVE_BIN` → `<ext>/../target/release` → `<ext>/../target/debug` → PATH. */
+/** `$REMATCH_BIN` → `<ext>/../target/release` → `<ext>/../target/debug` → PATH. */
 export function resolveBinary(env: NodeJS.ProcessEnv = process.env, extDir = extensionDir()): string | null {
-	if (env.OMP_EVOLVE_BIN) return isExecutable(env.OMP_EVOLVE_BIN) ? env.OMP_EVOLVE_BIN : null;
+	if (env.REMATCH_BIN) return isExecutable(env.REMATCH_BIN) ? env.REMATCH_BIN : null;
 	for (const profile of ["release", "debug"]) {
-		const candidate = path.normalize(path.join(extDir, "..", "target", profile, "omp-evolve"));
+		const candidate = path.normalize(path.join(extDir, "..", "target", profile, "rematch"));
 		if (isExecutable(candidate)) return candidate;
 	}
 	for (const dir of (env.PATH ?? "").split(path.delimiter)) {
 		if (!dir) continue;
-		const candidate = path.join(dir, "omp-evolve");
+		const candidate = path.join(dir, "rematch");
 		if (isExecutable(candidate)) return candidate;
 	}
 	return null;
@@ -74,7 +74,7 @@ function errorText(error: unknown): string {
 
 /** Decode `{ok, operation, data|error}`; a killed process or an exit/ok mismatch is a failure. */
 export function decode(result: ExecResult, operation: string): Envelope {
-	if (result.killed) return { ok: false, operation, error: "omp-evolve was interrupted (timeout or cancel)" };
+	if (result.killed) return { ok: false, operation, error: "rematch was interrupted (timeout or cancel)" };
 	const text = result.stdout.trim();
 	let value: unknown;
 	for (const candidate of [text, text.split("\n").filter(l => l.trim()).pop() ?? ""]) {
@@ -86,9 +86,9 @@ export function decode(result: ExecResult, operation: string): Envelope {
 		}
 	}
 	if (!isRecord(value) || typeof value.ok !== "boolean") {
-		return { ok: false, operation, error: `invalid omp-evolve response (exit ${result.code})` };
+		return { ok: false, operation, error: `invalid rematch response (exit ${result.code})` };
 	}
-	if (result.code !== 0 && value.ok) return { ok: false, operation, error: `omp-evolve exit ${result.code} with an ok envelope` };
+	if (result.code !== 0 && value.ok) return { ok: false, operation, error: `rematch exit ${result.code} with an ok envelope` };
 	return {
 		ok: value.ok,
 		operation: typeof value.operation === "string" ? value.operation : operation,
@@ -190,10 +190,10 @@ export function skillsInvoked(text: string): string[] {
 	return [...names];
 }
 
-// Prelabel regexes: verbatim with evolve-core `redirect.rs`.
+// Prelabel regexes: verbatim with rematch-core `redirect.rs`.
 export const REVERT = /\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i;
 export const NEGATION = /^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i;
-export const MARK = /^\/evolve\s+mark\s+(correction|preference|scope)\b/i;
+export const MARK = /^\/rematch\s+mark\s+(correction|preference|scope)\b/i;
 export const REPROMPT_JACCARD = 0.6;
 
 export function tokens(text: string): Set<string> {
@@ -320,7 +320,7 @@ export function validateArgs(args: unknown): string[] {
 	for (const a of args) {
 		if (typeof a !== "string" || a.includes("\0")) throw new Error("arguments must be separate strings without NUL bytes");
 		if (/^--(?:model|provider|omp(?:-bin)?|editor)(?:=|$)/.test(a)) {
-			throw new Error("model/provider/omp/editor overrides are not accepted through omp-evolve entry points");
+			throw new Error("model/provider/omp/editor overrides are not accepted through rematch entry points");
 		}
 	}
 	return args as string[];
@@ -332,7 +332,7 @@ function hasFlag(args: readonly string[], flag: string): boolean {
 
 /** Map an operation + arguments onto binary argv, injecting the session id / cwd it needs. */
 export function buildArgv(operation: string, rawArgs: readonly string[], sessionId: string | null, cwd: string): string[] {
-	if (!(OPERATIONS as readonly string[]).includes(operation)) throw new Error(`unknown omp-evolve operation: ${operation}`);
+	if (!(OPERATIONS as readonly string[]).includes(operation)) throw new Error(`unknown rematch operation: ${operation}`);
 	const args = validateArgs([...rawArgs]);
 	switch (operation) {
 		case "why":
@@ -372,12 +372,12 @@ export const COMMANDS = [
 	"rollback", "approve", "decline", "ship", "transfer", "digest", "doctor", "uninstall",
 ] as const;
 
-/** `/evolve <sub> …` → (operation, arguments). `disable|rollback|approve|decline` live under `library`. */
+/** `/rematch <sub> …` → (operation, arguments). `disable|rollback|approve|decline` live under `library`. */
 export function commandToOperation(words: readonly string[]): { operation: Operation; args: string[] } {
 	const [sub, ...rest] = words;
 	if (!sub) return { operation: "library", args: ["ls"] };
 	if (!(COMMANDS as readonly string[]).includes(sub)) {
-		throw new Error(`unknown /evolve subcommand "${sub}"; one of ${COMMANDS.join("|")}`);
+		throw new Error(`unknown /rematch subcommand "${sub}"; one of ${COMMANDS.join("|")}`);
 	}
 	if (sub === "disable" || sub === "rollback" || sub === "approve" || sub === "decline") {
 		return { operation: "library", args: [sub, ...rest] };
@@ -431,15 +431,15 @@ type SessionTrace = {
 	dirReady: boolean;
 };
 
-export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
-	const root = evolveRoot();
-	const hardOff = process.env.OMP_EVOLVE === "0";
+export default async function rematch(pi: ExtensionAPI): Promise<void> {
+	const root = rematchRoot();
+	const hardOff = process.env.REMATCH === "0";
 	let enabled = !hardOff && !fs.existsSync(path.join(root, "off"));
 	const bin = resolveBinary();
 
 	const log = (level: "warn" | "debug", msg: string, extra?: Json) => {
 		try {
-			pi.logger[level](`omp-evolve: ${msg}`, extra);
+			pi.logger[level](`rematch: ${msg}`, extra);
 		} catch {
 			// logging must never throw
 		}
@@ -447,7 +447,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 
 	async function call(argv: string[], opts: { timeout?: number; signal?: AbortSignal } = {}): Promise<Envelope> {
 		const operation = argv[0] ?? "";
-		if (!bin) return { ok: false, operation, error: "omp-evolve binary not found ($OMP_EVOLVE_BIN, target/{release,debug}, PATH)" };
+		if (!bin) return { ok: false, operation, error: "rematch binary not found ($REMATCH_BIN, target/{release,debug}, PATH)" };
 		try {
 			const result = await pi.exec(bin, argv, { timeout: opts.timeout ?? timeoutFor(operation), signal: opts.signal });
 			const value = decode(result, operation);
@@ -592,7 +592,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 		if (!loadedAnnotated) {
 			loadedAnnotated = true;
 			try {
-				pi.appendEntry("com.vncp.omp-evolve.loaded", { entries: loadedEntries, hooks: hooks.map(h => h.id) });
+				pi.appendEntry("com.vncp.rematch.loaded", { entries: loadedEntries, hooks: hooks.map(h => h.id) });
 			} catch (error) {
 				log("debug", `appendEntry loaded failed: ${errorText(error)}`);
 			}
@@ -623,16 +623,16 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 
 	async function presentDigest(ctx: ExtensionContext, env: Envelope): Promise<void> {
 		const lines = stringsOf(env.data?.lines);
-		for (const line of lines.slice(0, 5)) ctx.ui.notify(`omp-evolve: ${line}`, "info");
-		if (lines.length > 5) ctx.ui.notify(`omp-evolve: +${lines.length - 5} more (/evolve digest)`, "info");
+		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
+		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
 		for (const a of recordsOf(env.data?.approvals)) {
 			if (typeof a.id !== "string") continue;
 			const name = typeof a.name === "string" ? a.name : a.id;
 			const kind = typeof a.kind === "string" ? a.kind : "entry";
 			const body = [a.reason, a.diff].filter((x): x is string => typeof x === "string" && x.length > 0).join("\n\n");
-			const yes = await ctx.ui.confirm(`omp-evolve: approve ${kind} ${name}?`, body);
+			const yes = await ctx.ui.confirm(`rematch: approve ${kind} ${name}?`, body);
 			const r = await call(["library", yes ? "approve" : "decline", a.id]);
-			ctx.ui.notify(`omp-evolve: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
+			ctx.ui.notify(`rematch: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
 		}
 	}
 
@@ -640,11 +640,11 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 		if (!ctx.hasUI) return;
 		const env = await call(["digest", "--cwd", ctx.cwd], { timeout: 10_000 });
 		if (!env.ok) {
-			if (!quietWhenEmpty) ctx.ui.notify(`omp-evolve: digest failed: ${env.error}`, "warning");
+			if (!quietWhenEmpty) ctx.ui.notify(`rematch: digest failed: ${env.error}`, "warning");
 			return;
 		}
 		const empty = stringsOf(env.data?.lines).length === 0 && recordsOf(env.data?.approvals).length === 0;
-		if (empty && !quietWhenEmpty) ctx.ui.notify("omp-evolve: nothing new", "info");
+		if (empty && !quietWhenEmpty) ctx.ui.notify("rematch: nothing new", "info");
 		await presentDigest(ctx, env);
 	}
 
@@ -666,7 +666,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 		};
 	}
 
-	// --- tool + command (registered even when off, so `/evolve on` works) --------------------------
+	// --- tool + command (registered even when off, so `/rematch on` works) --------------------------
 	function recordMark(cls: string | null) {
 		if (!cls || !enabled || !trace) return;
 		write("mark", { class: cls });
@@ -675,7 +675,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 
 	async function toggle(on: boolean, ctx: ExtensionContext | undefined): Promise<Envelope> {
 		const operation = on ? "on" : "off";
-		if (on && hardOff) return { ok: false, operation, error: "OMP_EVOLVE=0 is set in the environment; unset it and restart omp" };
+		if (on && hardOff) return { ok: false, operation, error: "REMATCH=0 is set in the environment; unset it and restart omp" };
 		let env = await call([operation]);
 		if (!env.ok && !bin) {
 			// The kill switch must work without the binary: flip the marker ourselves.
@@ -711,13 +711,13 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 
 	const z = pi.zod;
 	pi.registerTool({
-		name: "omp_evolve",
-		label: "omp-evolve",
+		name: "rematch",
+		label: "rematch",
 		description:
-			"omp-evolve control plane: traces sessions, stages provisional skills/scripts/hooks grounded in traces, keeps or retires them by counters. " +
+			"rematch control plane: traces sessions, stages provisional skills/scripts/hooks grounded in traces, keeps or retires them by counters. " +
 			"operation = binary subcommand (doctor, status, library, why, digest, match, create, improve, activate, run, transfer, ship, mark, off, on, …); " +
 			'arguments = the remaining argv as separate strings, e.g. {"operation":"library","arguments":["ls"]}. Long work returns a job id; poll with status. ' +
-			"Approving scripts/hooks and uninstalling are reserved to the user (/evolve or the session-start digest).",
+			"Approving scripts/hooks and uninstalling are reserved to the user (/rematch or the session-start digest).",
 		parameters: z.object({ operation: z.enum(OPERATIONS), arguments: z.array(z.string()).optional() }),
 		approval: (params: unknown) => {
 			const p = isRecord(params) ? params : {};
@@ -730,9 +730,9 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 			try {
 				const args = params.arguments ?? [];
 				if (params.operation === "library" && ["approve", "decline", "pin", "unpin"].includes(args[0])) {
-					throw new Error(`library ${args[0]} is reserved to the user: /evolve ${args[0]} <id> or the session-start digest`);
+					throw new Error(`library ${args[0]} is reserved to the user: /rematch ${args[0]} <id> or the session-start digest`);
 				}
-				if (params.operation === "uninstall") throw new Error("uninstall is reserved to the user: /evolve uninstall");
+				if (params.operation === "uninstall") throw new Error("uninstall is reserved to the user: /rematch uninstall");
 				value = await runOperation(params.operation, args, ctx, signal);
 			} catch (error) {
 				value = { ok: false, operation: params.operation, error: errorText(error) };
@@ -741,19 +741,19 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 		},
 	});
 
-	pi.registerCommand("evolve", {
-		description: `omp-evolve: /evolve ${COMMANDS.join("|")} [args]`,
+	pi.registerCommand("rematch", {
+		description: `rematch: /rematch ${COMMANDS.join("|")} [args]`,
 		handler: async (raw, ctx) => {
 			let value: Envelope;
 			try {
 				const { operation, args } = commandToOperation(shellWords(raw ?? ""));
 				if (!enabled && !["on", "status", "doctor", "library", "why"].includes(operation)) {
-					throw new Error(hardOff ? "omp-evolve is off (OMP_EVOLVE=0)" : "omp-evolve is off; /evolve on to enable");
+					throw new Error(hardOff ? "rematch is off (REMATCH=0)" : "rematch is off; /rematch on to enable");
 				}
 				let finalArgs = args;
 				if (operation === "uninstall" && !args.includes("--yes")) {
-					const ok = ctx.hasUI && (await ctx.ui.confirm("omp-evolve: uninstall?", "Removes every file omp-evolve wrote, nothing else."));
-					if (!ok) throw new Error("uninstall not confirmed (run /evolve uninstall --yes)");
+					const ok = ctx.hasUI && (await ctx.ui.confirm("rematch: uninstall?", "Removes every file rematch wrote, nothing else."));
+					if (!ok) throw new Error("uninstall not confirmed (run /rematch uninstall --yes)");
 					finalArgs = [...args, "--yes"];
 				}
 				value = await runOperation(operation, finalArgs, ctx);
@@ -763,7 +763,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 			const lines = stringsOf(value.ok ? value.data?.lines : undefined);
 			const content = lines.length > 0 ? lines.join("\n") : JSON.stringify(value, null, 2);
 			try {
-				pi.sendMessage({ customType: "omp-evolve", content, display: true, details: value });
+				pi.sendMessage({ customType: "rematch", content, display: true, details: value });
 			} catch (error) {
 				log("warn", `sendMessage failed: ${errorText(error)}`);
 			}
@@ -774,7 +774,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 
 	// Registering a shortcut also makes the TUI load this extension eagerly (DESIGN §0).
 	pi.registerShortcut("alt+e", {
-		description: "omp-evolve: show the digest",
+		description: "rematch: show the digest",
 		handler: async ctx => {
 			try {
 				await showDigest(ctx, false);
@@ -794,7 +794,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 				const r = hook.test(event.input);
 				reason = typeof r === "string" && r ? r : null;
 			} catch (error) {
-				reason = `omp-evolve hook ${hook.id} failed: ${errorText(error)}`;
+				reason = `rematch hook ${hook.id} failed: ${errorText(error)}`;
 			}
 			if (!reason) continue;
 			if (isMain(ctx)) write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: hook.id, reason });
@@ -827,7 +827,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 			const text = typeof event.text === "string" ? event.text : "";
 			const idle = ctx.isIdle();
 			const label = prelabel(text, idle, trace.lastInput);
-			// Slash commands and `!`/`%` local executions are not user turns; only `/evolve mark`
+			// Slash commands and `!`/`%` local executions are not user turns; only `/rematch mark`
 			// (prelabel `mark:<class>`) and `/skill:<name>` invocations carry signal for the trace.
 			const trimmed = text.trimStart();
 			if (/^[/!%]/.test(trimmed) && !label.startsWith("mark:") && !/^\/skill:/i.test(trimmed)) return;
@@ -843,7 +843,7 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 			if (label === "none") return;
 			trace.reasons.add(label.startsWith("mark:") ? label : `redirect:${label}`);
 			try {
-				pi.appendEntry("com.vncp.omp-evolve.redirect", { seq, prelabel: label, text_head: head(text, 200) });
+				pi.appendEntry("com.vncp.rematch.redirect", { seq, prelabel: label, text_head: head(text, 200) });
 			} catch (error) {
 				log("debug", `appendEntry redirect failed: ${errorText(error)}`);
 			}

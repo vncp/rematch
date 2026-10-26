@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 640" width="1100" height="640" role="img" aria-labelledby="title desc">
-<title id="title">The omp-evolve loop</title>
+<title id="title">The rematch loop</title>
 <desc id="desc">In the session the extension traces every event, flags sessions that carried a redirect, a tool-error cluster or a takeover, loads provisional entries whose predicate matches, and runs approved hooks. Between sessions the binary classifies the redirect, triages the failure, runs one editor, lints, stages the entry as provisional, counts later matched sessions and decides keep, retire or dormant. An evidence boundary separates them: no proposal without a trace, no model call inside a session. You approve scripts and hooks with one tap, mark redirects, or turn it off.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9a9a9a"/></marker><marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6360f0"/></marker></defs>
 <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
@@ -12,7 +12,7 @@
 <text x="52" y="188.86" font-size="12.5" fill="#9a9a9a">every input, tool result, turn, model change → traces/</text>
 <line x1="52" y1="215.5" x2="428" y2="215.5" stroke="#262626"/>
 <text x="52" y="251.36" font-size="16" font-weight="600" fill="#f2f2f2">flag</text>
-<text x="52" y="270.36" font-size="12.5" fill="#9a9a9a">redirect, tool-error cluster, takeover, /evolve mark → pending/</text>
+<text x="52" y="270.36" font-size="12.5" fill="#9a9a9a">redirect, tool-error cluster, takeover, /rematch mark → pending/</text>
 <line x1="52" y1="297.0" x2="428" y2="297.0" stroke="#262626"/>
 <text x="52" y="332.86" font-size="16" font-weight="600" fill="#f2f2f2">load</text>
 <text x="52" y="351.86" font-size="12.5" fill="#9a9a9a">staging/&lt;branch&gt;/ joins the skill paths on predicate match</text>
@@ -21,7 +21,7 @@
 <text x="52" y="433.36" font-size="12.5" fill="#9a9a9a">approved hooks run on tool_call; block with the rule's message</text>
 <rect x="650" y="56" width="420" height="420" rx="12" fill="#121212" stroke="#262626"/>
 <text x="672" y="92" font-size="12" font-weight="600" letter-spacing="0.12em" fill="#9a9a9a">BETWEEN SESSIONS</text>
-<text x="672" y="115" font-size="13" fill="#6b6b6b">omp-evolve · Rust · one static binary</text>
+<text x="672" y="115" font-size="13" fill="#6b6b6b">rematch · Rust · one static binary</text>
 <line x1="672" y1="134" x2="1048" y2="134" stroke="#262626"/>
 <text x="672" y="157.90666666666667" font-size="16" font-weight="600" fill="#f2f2f2">classify</text>
 <text x="672" y="176.90666666666667" font-size="12.5" fill="#9a9a9a">correction · preference · scope · none, batched, one call</text>
@@ -56,7 +56,7 @@
 <text x="550" y="345" font-size="13" text-anchor="middle" fill="#9a9a9a">the digest</text>
 <rect x="400" y="546" width="300" height="66" rx="12" fill="#121212" stroke="#9a9a9a"/>
 <text x="550" y="574" font-size="17" font-weight="600" text-anchor="middle" fill="#f2f2f2">You</text>
-<text x="550" y="596" font-size="13" text-anchor="middle" fill="#9a9a9a">one-tap approvals · /evolve mark · /evolve off</text>
+<text x="550" y="596" font-size="13" text-anchor="middle" fill="#9a9a9a">one-tap approvals · /rematch mark · /rematch off</text>
 <path d="M370 478 C370 540 384 579 394 579" fill="none" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>
 <text x="360" y="552" font-size="13" text-anchor="end" fill="#9a9a9a">digest</text>
 <path d="M706 579 C716 579 730 540 730 482" fill="none" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>

@@ -1,4 +1,4 @@
-# omp-evolve — implementation contract
+# rematch — implementation contract
 
 Source of truth for every slice. The build spec is `docs/SPEC.md`; this file records
 the verified omp facts, the deviations forced by them, and the exact interfaces the
@@ -18,26 +18,26 @@ wins (it exists only where a technical constraint was verified).
 | `input` event: `{text, images, source}` at ingress, interactive+rpc only | Trace user turns here. `ctx.isIdle()` false at input ⇒ takeover/steer. |
 | Session JSONL: `~/.omp/agent/sessions/<slug>/<ts>_<uuid>.jsonl`; line 1 is a padded `{"type":"title"}` slot, line 2 `{"type":"session","version":3,"id","timestamp","cwd"}`; entries are a tree (`id`,`parentId`); `message.role` ∈ `user|assistant|toolResult` (camelCase); tool calls are `{"type":"toolCall","id","name","arguments"}` blocks in assistant content; assistant carries `provider`,`model`,`usage`,`stopReason`; `toolResult` carries `toolCallId`,`toolName`,`content`,`details.resolvedPath`,`isError` | Importer must locate the `session` record (not index 0), reconstruct the active branch from the last entry, and tolerate unknown `type`s. |
 | `--mode json -p --no-tools --model <provider/id>` emits JSONL events; assistant messages appear under `message_start|message_update|message_end|assistant_message` (`event.message.role=="assistant"`) and `agent_end.messages[]`; each has `provider`, `model`, optional `upstreamProvider/upstreamModel`, `errorMessage`, `stopReason` | EditorChannel verifies provider+model on **every** assistant message (forge `omp_runner` contract). |
-| Custom `modelRoles` keys are allowed in `~/.omp/agent/config.yml` and `<repo>/.omp/config.yml` | `evolve-editor` / `evolve-classifier` roles read by the binary from config.yml (no `modelRoles` API for externals). Fallbacks: editor→`slow`→`default`; classifier→`smol`→`tiny`→`default`. |
-| Native extension roots: `~/.omp/agent/extensions/{*.ts, <dir>/index.ts}`; a subdir's non-index `*.ts` is **not** discovered | `~/.omp/agent/extensions/evolve-hooks/<id>.ts` files are inert to omp; the main extension `tool_call` handler dynamically imports them (the spec's "run approved compiled verifiers"). |
-| `omp plugin install <local-path>` links the dir into `~/.omp/plugins/node_modules/<pkg.name>` and enables it in `omp-plugins.lock.json`; `package.json#omp.extensions` lists entries | Install: `omp plugin link <root>/extension` (or `install`). Binary on PATH via `~/.local/bin/omp-evolve` shim written by `scripts/install.sh`. |
+| Custom `modelRoles` keys are allowed in `~/.omp/agent/config.yml` and `<repo>/.omp/config.yml` | `rematch-editor` / `rematch-classifier` roles read by the binary from config.yml (no `modelRoles` API for externals). Fallbacks: editor→`slow`→`default`; classifier→`smol`→`tiny`→`default`. |
+| Native extension roots: `~/.omp/agent/extensions/{*.ts, <dir>/index.ts}`; a subdir's non-index `*.ts` is **not** discovered | `~/.omp/agent/extensions/rematch-hooks/<id>.ts` files are inert to omp; the main extension `tool_call` handler dynamically imports them (the spec's "run approved compiled verifiers"). |
+| `omp plugin install <local-path>` links the dir into `~/.omp/plugins/node_modules/<pkg.name>` and enables it in `omp-plugins.lock.json`; `package.json#omp.extensions` lists entries | Install: `omp plugin link <root>/extension` (or `install`). Binary on PATH via `~/.local/bin/rematch` shim written by `scripts/install.sh`. |
 | `omp anonymize` writes a shareable redacted copy of a session | `tests/goldens/` holds anonymized real sessions for the importer tests. |
 | Credentials, `agent.db`, `models.db` live in the agent dir | Batch isolation does **not** swap `PI_CODING_AGENT_DIR` (would lose auth). Isolation = fresh git worktree + `--config <overlay.yml>` (all skill providers off, `skills.customDirectories=[candidate]`, memory off) + `--no-extensions --no-rules --no-session`. |
 
 ## 1. Topology
 
 ```
-extension/index.ts  ──pi.exec JSON envelope──▶  omp-evolve (Rust, static)
-   │ writes ~/.omp/evolve/traces/<session>.jsonl        │ owns ledger.sqlite, staging/, library, improver, jobs
-   │ writes ~/.omp/evolve/pending/<session>.json         │ spawns `omp -p --no-tools --mode json` (editor, classifier)
+extension/index.ts  ──pi.exec JSON envelope──▶  rematch (Rust, static)
+   │ writes ~/.rematch/traces/<session>.jsonl           │ owns ledger.sqlite, staging/, library, improver, jobs
+   │ writes ~/.rematch/pending/<session>.json            │ spawns `omp -p --no-tools --mode json` (editor, classifier)
    │ factory: `match --cwd` → skills.customDirectories   │ writes staging/<branch>/<name>/ and ~/.omp/agent/skills/<name>/
-   └ tool_call: runs ~/.omp/agent/extensions/evolve-hooks/<id>.ts
+   └ tool_call: runs ~/.omp/agent/extensions/rematch-hooks/<id>.ts
 ```
 
-Root `EVOLVE_ROOT` = `$OMP_EVOLVE_ROOT` or `~/.omp/evolve`. Agent dir = `$PI_CODING_AGENT_DIR` or `~/.omp/agent`.
-`OMP_EVOLVE=0` or `EVOLVE_ROOT/off` file ⇒ extension registers nothing but `/evolve on` and the `omp_evolve` tool; binary refuses reflect/stage.
+Root `REMATCH_ROOT` = `$REMATCH_ROOT` or `~/.rematch`. Agent dir = `$PI_CODING_AGENT_DIR` or `~/.omp/agent`.
+`REMATCH=0` or `REMATCH_ROOT/off` file ⇒ extension registers nothing but `/rematch on` and the `rematch` tool; binary refuses reflect/stage.
 
-### Files under EVOLVE_ROOT
+### Files under REMATCH_ROOT
 
 ```
 traces/<session_id>.jsonl         extension trace (schema §3)
@@ -57,7 +57,7 @@ export/                           git-tracked work↔home export of invariant en
 off                               kill switch marker
 ```
 
-## 2. CLI (binary `omp-evolve`)
+## 2. CLI (binary `rematch`)
 
 Every subcommand prints exactly one JSON line on stdout:
 `{"ok":true,"operation":"<op>","data":{...}}` (exit 0) or `{"ok":false,"operation":"<op>","error":"..."}` (exit 1; 2 usage; 130 cancelled).
@@ -105,10 +105,10 @@ uninstall [--yes]
 | `mark` | `class ∈ correction|preference|scope` |
 | `session_shutdown` | `reasons [...], flagged (bool)` |
 
-Pre-classification (extension, no model; regex constants live in `evolve-core/src/redirect.rs` and are copied verbatim into the extension): `mark` = `/^\/evolve\s+mark\s+(correction|preference|scope)\b/i`; `interrupt` = input while `!ctx.isIdle()`; `revert` = `/\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i`; `negation` = `/^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i` (leading whitespace trimmed); `reprompt` = Jaccard(tokens(text), tokens(previous input)) ≥ 0.6 with tokens `[a-z0-9]+` on lowercased text. Precedence: mark > interrupt > revert > negation > reprompt > none.
+Pre-classification (extension, no model; regex constants live in `rematch-core/src/redirect.rs` and are copied verbatim into the extension): `mark` = `/^\/rematch\s+mark\s+(correction|preference|scope)\b/i`; `interrupt` = input while `!ctx.isIdle()`; `revert` = `/\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i`; `negation` = `/^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i` (leading whitespace trimmed); `reprompt` = Jaccard(tokens(text), tokens(previous input)) ≥ 0.6 with tokens `[a-z0-9]+` on lowercased text. Precedence: mark > interrupt > revert > negation > reprompt > none.
 Session is flagged when any of: ≥1 prelabel ≠ none; `is_error` tool results ≥ 3 in any window of 6 consecutive tool results (tool-error cluster); a `mark`. Flag = write `pending/<session_id>.json`.
 
-## 4. Core types (`evolve-core/src/types.rs`, authoritative in Rust)
+## 4. Core types (`rematch-core/src/types.rs`, authoritative in Rust)
 
 ```rust
 pub enum Kind { Skill, Rule, Script, Agent, Hook, Fact, Lesson }
@@ -137,8 +137,8 @@ pub struct Outcome { … exactly SPEC §"Session outcome records" … }
 
 Entry directory layout (`<dir>` = staging/drafts/archive/kept path):
 ```
-<dir>/SKILL.md            frontmatter: name, description, evolve: {id, status, branch, family, version, predicate_hash}
-<dir>/evolve.json         serde of Entry + manifest + predicate (the ledger row mirrors it; evolve.json is authoritative for files, ledger for counters)
+<dir>/SKILL.md            frontmatter: name, description, rematch: {id, status, branch, family, version, predicate_hash}
+<dir>/rematch.json        serde of Entry + manifest + predicate (the ledger row mirrors it; rematch.json is authoritative for files, ledger for counters)
 <dir>/units/*.md  facts/*.md (each fact has `as_of:`)  scripts/* (mode 0644 until approved; 0755 after)
 <dir>/hook.json           kind=Hook only: {tool, field, regex, message, pass_condition}
 <dir>/EXPERIENCE.md       written by the reflector after keep/retire (read-only to the system)
@@ -186,21 +186,21 @@ Classifier prompt: batched `[{id, text, after_deliverable, prelabel}]` → ```js
 
 ## 10. Extension (`extension/index.ts`, no build step)
 
-Factory (async): read env/off; resolve binary (`$OMP_EVOLVE_BIN` → `<ext>/../target/release/omp-evolve` → `<ext>/../target/debug/omp-evolve` → PATH); `await pi.exec(bin, ["match","--cwd",process.cwd()])`; override `skills.customDirectories` with `[...configured, ...skill_dirs]`; remember `entries`/`hooks`; register tool `omp_evolve {operation, arguments[]}` (approval: read for doctor/status/library/digest/match/why, exec otherwise), command `/evolve`, shortcut `alt+e` (digest), handlers §3. `session_start`: open trace, write `session_start`, spawn `reflect --pending` detached (`Bun.spawn` with `stdio ignore`, `unref`), run `digest` and present lines via `ctx.ui.notify`, and each approval via `ctx.ui.confirm(title, diff)` → `library approve|decline <id>`. `tool_call`: evaluate loaded hook modules (`default export {id, tool, test(input)=>string|null}`); block with the rule's message, record `tool_blocked`. `/evolve <sub>`: `why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|ship|transfer` map 1:1 onto the binary; long ones return a job id.
+Factory (async): read env/off; resolve binary (`$REMATCH_BIN` → `<ext>/../target/release/rematch` → `<ext>/../target/debug/rematch` → PATH); `await pi.exec(bin, ["match","--cwd",process.cwd()])`; override `skills.customDirectories` with `[...configured, ...skill_dirs]`; remember `entries`/`hooks`; register tool `rematch {operation, arguments[]}` (approval: read for doctor/status/library/digest/match/why, exec otherwise), command `/rematch`, shortcut `alt+e` (digest), handlers §3. `session_start`: open trace, write `session_start`, spawn `reflect --pending` detached (`Bun.spawn` with `stdio ignore`, `unref`), run `digest` and present lines via `ctx.ui.notify`, and each approval via `ctx.ui.confirm(title, diff)` → `library approve|decline <id>`. `tool_call`: evaluate loaded hook modules (`default export {id, tool, test(input)=>string|null}`); block with the rule's message, record `tool_blocked`. `/rematch <sub>`: `why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|ship|transfer` map 1:1 onto the binary; long ones return a job id.
 
 ## 11. Deviations from SPEC (all forced by §0)
 
 1. `resources_discover` → factory-time `skills.customDirectories` override (same semantics, per process).
 2. Batch isolation uses a `--config` overlay + fresh worktree instead of a private `PI_CODING_AGENT_DIR` (auth lives in the agent dir).
-3. `omp plugin install @<org>/omp-evolve` → `scripts/install.sh` (`cargo build --release`, `omp plugin link extension/`, PATH shim). No registry publish.
+3. `omp plugin install @<org>/rematch` → `scripts/install.sh` (`cargo build --release`, `omp plugin link extension/`, PATH shim). No registry publish.
 4. "Related thing: embeddings, exploratory only" is not implemented: the binary holds no provider credentials; exact signature + MinHash are implemented.
 5. Status `pinned` is carried as the `Entry.pinned` flag (status and location unchanged; automatic transitions refuse pinned entries; `disable`/`rollback` are user actions and proceed). `Status::Pinned` remains a valid status for imports.
-6. A kept entry replaced by a sibling becomes `dormant` (files in `predecessors/<name>/<version>/`) rather than `retired`, because `rollback` must be able to restore it and `retired` never leaves. A non-evolve skill that a kept entry replaced is saved as version `0` and restored by `rollback`/`uninstall`.
+6. A kept entry replaced by a sibling becomes `dormant` (files in `predecessors/<name>/<version>/`) rather than `retired`, because `rollback` must be able to restore it and `retired` never leaves. A non-rematch skill that a kept entry replaced is saved as version `0` and restored by `rollback`/`uninstall`.
 7. Declining an approval (`library decline`) retires the entry (SPEC: retired ← "approval declined").
 
 ## 12. lint.toml schema
 
-`improver/lint.toml` (copied to `EVOLVE_ROOT/improver/` on first run). Every key is optional; a missing key takes the built-in value (`evolve_core::lint::DEFAULT_LINT_TOML`, which the shipped file equals verbatim — a test enforces it). All `[patterns]` entries are Rust `regex` syntax; use TOML multi-line literal strings (`'''…'''`) for patterns containing `'` (inside `'…'`, `''` is **not** an escape).
+`improver/lint.toml` (copied to `REMATCH_ROOT/improver/` on first run). Every key is optional; a missing key takes the built-in value (`rematch_core::lint::DEFAULT_LINT_TOML`, which the shipped file equals verbatim — a test enforces it). All `[patterns]` entries are Rust `regex` syntax; use TOML multi-line literal strings (`'''…'''`) for patterns containing `'` (inside `'…'`, `''` is **not** an escape).
 
 ```toml
 [limits]
@@ -233,9 +233,9 @@ facts = ["facts", "workspace facts", "reference"]
 probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]  # a hook regex matching "" or every probe "matches everything"
 ```
 
-Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `evolve.json` and `EXPERIENCE.md`; markdown is linted with its `evolve:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (rule present, pass condition and message non-empty, regex compiles, does not match everything); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
+Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `rematch.json` and `EXPERIENCE.md`; markdown is linted with its `rematch:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (rule present, pass condition and message non-empty, regex compiles, does not match everything); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
 
-## 13. Ledger SQL (schema_version 1, `evolve_core::ledger`)
+## 13. Ledger SQL (schema_version 1, `rematch_core::ledger`)
 
 WAL, `synchronous=NORMAL`, `busy_timeout` 5 s. Migrations are an ordered list; `schema_version(version, created_at)` records each applied one; a ledger newer than the binary is refused. Blobs: `<ledger dir>/blobs/<sha256>` (atomic write via rename).
 
@@ -256,16 +256,16 @@ WAL, `synchronous=NORMAL`, `busy_timeout` 5 s. Migrations are an ordered list; `
 
 ## 14. Binary module map and the omp process interface
 
-`crates/omp-evolve/src/`:
+`crates/rematch/src/`:
 ```
 main.rs        clap dispatch → one JSON envelope on stdout (envelope.rs); exit codes 0/1/2/130; `--version` → {"version"}
-app.rs         AppCtx{paths, ledger, now, cwd, text}: ensure_dirs, improver files (embedded; `$OMP_EVOLVE_IMPROVER` overrides) copied on first run, ledger open; `new_entry`
+app.rs         AppCtx{paths, ledger, now, cwd, text}: ensure_dirs, improver files (embedded; `$REMATCH_IMPROVER` overrides) copied on first run, ledger open; `new_entry`
 envelope.rs    Envelope{ok, operation, data|error}; `--text` renders `data.lines` (else pretty JSON); `Cancelled` → 130, `Usage` → 2
-config.rs      omp config.yml (agent dir + <repo>/.omp/config.yml overlay) → modelRoles lookup; role fallbacks (§0) + `evolve-solver`→default
+config.rs      omp config.yml (agent dir + <repo>/.omp/config.yml overlay) → modelRoles lookup; role fallbacks (§0) + `rematch-solver`→default
 proc.rs        bounded process execution with process-group kill (shared by editor, classifier, batch rollouts, verifiers)
 omp.rs         omp invocation builders + JSON event stream parsing/verification (forge omp_runner contract)
 editor.rs      model calls (editor, classifier, reflector) through omp or `--editor <cmd>`; tolerant reply parser; per-reflection CallBudget (≤ 3)
-jobs.rs        detached jobs: `spawn_detached(ctx, kind, argv, payload) -> job_id` (setsid, stdio→jobs/<id>.log, `{job}` token + $OMP_EVOLVE_JOB_ID), `update`, `status` (kill(pid,0) liveness), `LockFile`
+jobs.rs        detached jobs: `spawn_detached(ctx, kind, argv, payload) -> job_id` (setsid, stdio→jobs/<id>.log, `{job}` token + $REMATCH_JOB_ID), `update`, `status` (kill(pid,0) liveness), `LockFile`
 library_cmd.rs library subcommands, off|on
 reflect.rs     count + reflect --pending (§loop 1–8), editor/classifier calls, lint retry, stage, EXPERIENCE.md on decisions
 create.rs      greenfield (sessions | task | description→draft), activate
@@ -300,47 +300,47 @@ pub fn child_env() -> Vec<(String, String)>;       // PI_OFFLINE=1 PI_SKIP_VERSI
 pub fn parse_events(stdout: &str) -> anyhow::Result<Vec<serde_json::Value>>;   // every non-empty line must be JSON
 pub struct Verified { pub text: String, pub events: Vec<serde_json::Value>, pub usage: Option<serde_json::Value> }
 pub fn verify_stream(events: Vec<Value>, expected: &ModelRef, no_tools: bool) -> anyhow::Result<Verified>;   // §9 rules
-pub fn run_no_tools(call: &NoToolsCall, paths: &EvolvePaths) -> anyhow::Result<Verified>;  // tmp cwd, run_bounded, verify
+pub fn run_no_tools(call: &NoToolsCall, paths: &RematchPaths) -> anyhow::Result<Verified>;  // tmp cwd, run_bounded, verify
 pub fn run_tools(call: &ToolsCall) -> anyhow::Result<Verified>;
 ```
 `--editor <cmd>` (tests): `editor::call` bypasses `run_no_tools`, pipes the prompt to the command's stdin and reads stdout (see below).
 
 ### Binary behavior notes (Phase 1 + 1.5)
 
-- Scripted model (`--editor <cmd>`): run with `sh -c`, prompt on stdin, env `OMP_EVOLVE_ROLE=<role>` and `OMP_EVOLVE_PROMPT=editor|classifier|reflector`; stdout is the reply. Without it, the role's model is resolved from config.yml and called through `run_no_tools`. The reflector uses the `evolve-editor` role with `improver/reflector.md`.
+- Scripted model (`--editor <cmd>`): run with `sh -c`, prompt on stdin, env `REMATCH_ROLE=<role>` and `REMATCH_PROMPT=editor|classifier|reflector`; stdout is the reply. Without it, the role's model is resolved from config.yml and called through `run_no_tools`. The reflector uses the `rematch-editor` role with `improver/reflector.md`.
 - Model calls: `count` makes ≤ 1 batched classifier call per pass (skipped when there are no unclassified non-mark redirects) and one reflector call per keep/retire (deterministic EXPERIENCE record when it fails). Each reflection's `CallBudget(3)` is charged for the classifier when its session was in that batch, then editor + one lint retry. A failed editor call keeps the pending file (`attempts` counter; dropped after 3).
-- Detached jobs: the child of `spawn_detached` writes its final envelope into `jobs/<id>.json` (`status: done|failed`, `result`); a live status whose pid is gone reads as `lost`. `run-worker` manages its own record. `OMP_EVOLVE_JOB_ID` is stripped from every `run_bounded` child.
-- Ownership: an entry owns its directory iff it lives under EVOLVE_ROOT or its SKILL.md carries an `evolve:` block with its id (`reflect::owns_dir`). Registered skills (`import --forge`, `improve`) and lessons are *foreign*: decisions, disable and pin are recorded in the ledger only (`reflect::record_status`), never moving or rewriting their files; their EXPERIENCE.md goes to `EVOLVE_ROOT/brownfield/<id>/`; approve/decline/rollback refuse them.
-- `import --forge`: skills register in branch `forge` with `path` = the forge skill dir; each `learnings/*.md` becomes a provisional `lesson` at `EVOLVE_ROOT/lessons/forge/lesson-<slug>/` (`LESSON.md` copy + `evolve.json` with `evidence_sha256` = blob hash of the file, `source_path`). `match` omits lessons. `import --history` keeps an existing `source: trace` session row (richer) instead of overwriting it.
+- Detached jobs: the child of `spawn_detached` writes its final envelope into `jobs/<id>.json` (`status: done|failed`, `result`); a live status whose pid is gone reads as `lost`. `run-worker` manages its own record. `REMATCH_JOB_ID` is stripped from every `run_bounded` child.
+- Ownership: an entry owns its directory iff it lives under REMATCH_ROOT or its SKILL.md carries a `rematch:` block with its id (`reflect::owns_dir`). Registered skills (`import --forge`, `improve`) and lessons are *foreign*: decisions, disable and pin are recorded in the ledger only (`reflect::record_status`), never moving or rewriting their files; their EXPERIENCE.md goes to `REMATCH_ROOT/brownfield/<id>/`; approve/decline/rollback refuse them.
+- `import --forge`: skills register in branch `forge` with `path` = the forge skill dir; each `learnings/*.md` becomes a provisional `lesson` at `REMATCH_ROOT/lessons/forge/lesson-<slug>/` (`LESSON.md` copy + `rematch.json` with `evidence_sha256` = blob hash of the file, `source_path`). `match` omits lessons. `import --history` keeps an existing `source: trace` session row (richer) instead of overwriting it.
 - `improve`: the audit counts every ledger session with the skill in `skill_reads` (traced and imported); < 5 ⇒ `{refused, traced_sessions, offer}`. Siblings share the base predicate (no pending-canary check), get `sibling_of` and stage at `staging/<branch>/<name>/` where branch = `--branch`, else the reading sessions' common repo, else `shared`.
 - `create --from sessions`: request stems (name + description) and `--files` extensions vs. session stems/exts; a session matches with overlap ≥ min(2, |request stems|); ≥ 3 needed; up to 8 references. `activate --task` runs one reference rollout and attaches its moment as evidence before draft → provisional.
-- `digest` lines: one per entry whose status changed since `EVOLVE_ROOT/digest.last` (imported registrations summarized in one line), plus Scope review/stale/transfer lines; approvals = unapproved scripts or uncompiled hooks of owned provisional/kept entries, plus `export:<id>` items.
+- `digest` lines: one per entry whose status changed since `REMATCH_ROOT/digest.last` (imported registrations summarized in one line), plus Scope review/stale/transfer lines; approvals = unapproved scripts or uncompiled hooks of owned provisional/kept entries, plus `export:<id>` items.
 - `reflect` content-triage failures are logged (stderr + envelope) and the pending file deleted; no ledger proposal row.
 
-## 15. Scope (Phase 3, `crates/omp-evolve/src/scope/`)
+## 15. Scope (Phase 3, `crates/rematch/src/scope/`)
 
 CLI additions: `stale [--dry-run] [--recanary <entry>]`, `split [--review-days 7]`, `transfer promote`; `ship` adds `--push`, `--pr` (needs `--push` and `gh`), `--remote origin`; `library export` adds `--entry <id>… --approve | --approve-all`.
 New `Entry` fields (serde default, omitted when empty): `fork_path`, `fork_repo`, `fork_commit`, `families_excluded`, `links` (`transfers_from`).
 
 | Command / fn | Behavior |
 | --- | --- |
-| `ship --scope team` | Kept/provisional entries whose predicate content (`count_hit`, ignoring the one-repo glob) hit sessions in ≥ 2 distinct repos, or listed with `--entry`. Target = `--repo` or the originating session's repo. Lint must pass. A temporary worktree from HEAD gets branch `omp-evolve/<name>-<last 8 id chars>` with `.omp/skills/<name>/` (no `evolve.json`/`EXPERIENCE.md`, mode 0644, `evolve.scope: team`), committed with an evidence body (counters, per family, matched sessions, repos, families, redirect class, predicted fix/regression, latest EXPERIENCE.md record). Receipt `activation: pr`. No network unless `--push`/`--pr`; never merges. |
+| `ship --scope team` | Kept/provisional entries whose predicate content (`count_hit`, ignoring the one-repo glob) hit sessions in ≥ 2 distinct repos, or listed with `--entry`. Target = `--repo` or the originating session's repo. Lint must pass. A temporary worktree from HEAD gets branch `rematch/<name>-<last 8 id chars>` with `.omp/skills/<name>/` (no `rematch.json`/`EXPERIENCE.md`, mode 0644, `rematch.scope: team`), committed with an evidence body (counters, per family, matched sessions, repos, families, redirect class, predicted fix/regression, latest EXPERIENCE.md record). Receipt `activation: pr`. No network unless `--push`/`--pr`; never merges. |
 | `ship --scope fork` | `--repo` required; entries with `fork_path`. Content = `fork/<basename>` in the package, else the SKILL.md body. Body adds `omp --version`, file sha256, base commit, before numbers (the predicate over sessions that started before the entry existed, `recurred`/`harmed` rules, per family) and after numbers (entry counters). Records `fork_repo` + `fork_commit` (base HEAD). |
-| `library export` | `policy.json` `{environment: work|home, export_enabled}`; missing ⇒ home; work refuses unless `export_enabled`. Candidates: kept entries with `lesson_tag: invariant` or `manifest.scope: invariant`. Each is linted with `transfer: true`, `facts/` dropped, `evolve.json` stripped (provisional, no counters/evidence/approvals/path). Without approval the result lists `pending` with `git diff --no-index` diffs and `requires_approval: true`; `--entry <id> --approve` or `--approve-all` writes `<export>/<id>/` and commits it (the export dir is `git init`ed on first use). Receipt `activation: prompted`. `export::decline` records `{id: content sha}` in `export-declined.json` so the digest stops offering it until the content changes. |
-| `library import-export` | Each `<dir>/<id>/evolve.json`: skip when already present (same id or `transfers_from` link), not invariant, or a near-duplicate (`dedup::route_duplicate`) of a live entry; branch = recorded branch when this library knows it, else `shared`; repo glob = that branch's latest session repo, else `**`; lint `transfer: true`; staged provisional with origin `Import{source: "export:<id>"}`. |
+| `library export` | `policy.json` `{environment: work|home, export_enabled}`; missing ⇒ home; work refuses unless `export_enabled`. Candidates: kept entries with `lesson_tag: invariant` or `manifest.scope: invariant`. Each is linted with `transfer: true`, `facts/` dropped, `rematch.json` stripped (provisional, no counters/evidence/approvals/path). Without approval the result lists `pending` with `git diff --no-index` diffs and `requires_approval: true`; `--entry <id> --approve` or `--approve-all` writes `<export>/<id>/` and commits it (the export dir is `git init`ed on first use). Receipt `activation: prompted`. `export::decline` records `{id: content sha}` in `export-declined.json` so the digest stops offering it until the content changes. |
+| `library import-export` | Each `<dir>/<id>/rematch.json`: skip when already present (same id or `transfers_from` link), not invariant, or a near-duplicate (`dedup::route_duplicate`) of a live entry; branch = recorded branch when this library knows it, else `shared`; repo glob = that branch's latest session repo, else `**`; lint `transfer: true`; staged provisional with origin `Import{source: "export:<id>"}`. |
 | `stale` | Kept/provisional, unpinned entries go `stale` when (a) a `facts/*.md` `source:` file's sha256 differs from its `source_sha256` frontmatter (written by `stale::snapshot_sources` after staging) or the file is gone, (b) the last 3 counted sessions in the branch (all branches for `shared`) all ran a family ≠ `family` and ∉ `verified_on`, (c) `git rev-parse HEAD` of `fork_repo` ≠ `fork_commit`. `--recanary` stages a new version (new id, version + 1, `predecessor`, family = the one now in use, fork commit cleared, sources re-snapshotted) and retires the stale one. |
 | `split` | `counters::family_divergence` ⇒ sibling `<name>--<family slug>` (provisional, same branch, `family` = harmed, `sibling_of`, version + 1, original files + `units/family-note.md`, linted); the original gets `families_excluded += harmed` (informational: entries load regardless of family). Idempotent. `capability_review(window)`: families whose recurrence or harm rose on ≥ 2 entries in the last window vs the one before; review list only. |
 | `transfer suggest / apply / promote` | Facets: `branches/<b>/domain.yml` `facets:` else distinct outcome facet keys of the branch (`docs/domain.yml.md`). Suggest kept invariant lessons for branches overlapping on ≥ 2 keys and not yet tried (same name, link, near-duplicate). Apply: provisional copy (new id, `links: transfers_from`, origin `Import{source: "transfer:<id>"}`, repo glob of the target branch, `facts/` dropped, approvals reset), lint `transfer: true`, rate limits except `NeedsMerge`. Promote: an entry kept in one branch plus kept (same name, link or near-duplicate) or a clean canary (matched ≥ 4, no recurrence/harm) in another ⇒ copy to `shared` (repo glob `**`) and keep it at once; `library` moves the branch version to predecessors (dormant). |
 
-File ownership (all scope status changes and evolve.json writes): an entry's files are omp-evolve's only when it is not `reflect::is_foreign` and its dir holds an `evolve.json` with its own id (`scope::owns_files`). User-owned entries (brownfield registrations in place, forge imports) get status changes in the ledger only (`reflect::record_status`); their dirs are never moved or written, and they are never `shared`-promotion sources. Entries with family `unknown/unknown` (imports) never go stale on the model-family rule.
+File ownership (all scope status changes and rematch.json writes): an entry's files are rematch's only when it is not `reflect::is_foreign` and its dir holds a `rematch.json` with its own id (`scope::owns_files`). User-owned entries (brownfield registrations in place, forge imports) get status changes in the ledger only (`reflect::record_status`); their dirs are never moved or written, and they are never `shared`-promotion sources. Entries with family `unknown/unknown` (imports) never go stale on the model-family rule.
 
-## 16. Batch mode (Phase 2, `crates/omp-evolve/src/batch/`)
+## 16. Batch mode (Phase 2, `crates/rematch/src/batch/`)
 
 New `Entry` field (serde default, omitted when false): `pending_next_run` — a batch winner staged by a `run` of its `Origin::Task`, decided by that task's next run.
 
-Task (`tasks/<id>.json`): `{id, repo (absolute), prompt, verifier?, max_time_secs (default 600), tools?, seeds (default [1]), created_at}`. omp has no sampling seed: the seed names the workspace and is exported to the rollout as `OMP_EVOLVE_SEED`.
+Task (`tasks/<id>.json`): `{id, repo (absolute), prompt, verifier?, max_time_secs (default 600), tools?, seeds (default [1]), created_at}`. omp has no sampling seed: the seed names the workspace and is exported to the rollout as `REMATCH_SEED`.
 
-Verifier specs (`run --verifier`, else the task's): `tests` (Cargo.toml → `cargo test`; pyproject/pytest.ini/setup.* → `python3 -m pytest -q`; package.json + bun lock → `bun test`), `parity:<produced>=<expected file | sha256>`, `receipt:<path>` (JSON `verdict: pass|fail`, optional `score`), `[script:]<cmd>` (`sh -c` in the worktree, exit 0 = pass, last stdout JSON line with `score` supplies the score). Verifiers run with env `EVOLVE_TASK`, `EVOLVE_WORKTREE`, `EVOLVE_REPO`, capped at max(task cap, 60 s).
+Verifier specs (`run --verifier`, else the task's): `tests` (Cargo.toml → `cargo test`; pyproject/pytest.ini/setup.* → `python3 -m pytest -q`; package.json + bun lock → `bun test`), `parity:<produced>=<expected file | sha256>`, `receipt:<path>` (JSON `verdict: pass|fail`, optional `score`), `[script:]<cmd>` (`sh -c` in the worktree, exit 0 = pass, last stdout JSON line with `score` supplies the score). Verifiers run with env `REMATCH_TASK`, `REMATCH_WORKTREE`, `REMATCH_REPO`, capped at max(task cap, 60 s).
 
 Rollout: `git worktree add --detach <variant>/wt HEAD` (plain `cp -R` for a non-git repo); the harness (kept/pinned entries + provisional entries `list_for_match` loads for the repo, candidates shadowing same-named entries) is written to `<variant>/skills/<name>/`; `--config <variant>/overlay.yml`:
 ```yaml
@@ -349,7 +349,7 @@ skills: {enabled: true, enableCodexUser: false, enableClaudeUser: false, enableC
 memory: {backend: "off"}
 memories: {enabled: false}
 ```
-(keys from `omp config list`, omp 18.12.6; a probe showed only the custom-dir skill to the model). argv = `omp::tools_argv` with the `evolve-solver` role (→ `default`), env `child_env()` + `OMP_EVOLVE_SEED` + `OMP_EVOLVE=0`, bound = task cap + 60 s. stdout → `events.jsonl` (+ ledger blob); the stream must pass `verify_stream` (else verdict Fail "rollout invalid" without the verifier; a time-capped rollout is still judged). `events_to_trace` maps `session` → `session_start`, `message_end` user/assistant/toolResult → `input`/`turn_end`/`tool_result` (input recovered from the toolCall block), `agent_end`; the worktree path is rewritten to the repo.
+(keys from `omp config list`, omp 18.12.6; a probe showed only the custom-dir skill to the model). argv = `omp::tools_argv` with the `rematch-solver` role (→ `default`), env `child_env()` + `REMATCH_SEED` + `REMATCH=0`, bound = task cap + 60 s. stdout → `events.jsonl` (+ ledger blob); the stream must pass `verify_stream` (else verdict Fail "rollout invalid" without the verifier; a time-capped rollout is still judged). `events_to_trace` maps `session` → `session_start`, `message_end` user/assistant/toolResult → `input`/`turn_end`/`tool_result` (input recovered from the toolCall block), `agent_end`; the worktree path is rewritten to the repo.
 
 Worker (`run-worker`): reference rollout (pending entries of the task loaded) → next-run rule: entries with `pending_next_run` and `Origin::Task{task}` go `kept` (+ `verified_on`, receipt) on a reference pass, `retired` on a fail → if the reference passes a score-less verifier the cycle stops (nothing can rank above it) → k invariant + k domain editor calls (`editor.md`; input = §9 shape with `redirect {class: correction, text: verifier detail}`, `task.prompt`, `verifier.verdict`, `prior_candidates` for i > 1; excerpt = around the longest consecutive tool-error stretch, else the trajectory tail), each linted and probed once → every (invariant, domain) pair composed: the best pair by one editor call with `scope: compose` (+ `candidates`, `behavioral_diff`) while the model-call budget lasts, the rest (and composer KEEP_BASE/failure/lint failure) by deterministic merge (union of files; domain laws that are simhash near-duplicates of an invariant law dropped; same-named entries merged) → each composed harness runs once; with ≥ 2 composed variants the best runs once more and must pass both → selection: (pass, score) desc, then tool errors, turns, lesson count, order; a winner must pass and beat the reference, else KEEP_BASE → winner lessons: a near-duplicate of a branch entry appends evidence to it; else one `rate::can_admit` per winner, staged provisional (origin Task, branch/predicate of the task repo, `lesson_tag` by scope, `pending_next_run: true`, receipt with the verdict). Budget at width k: rollouts = (k+1)² + [k>1] (4 at k=1, 10 at k=2), model calls = 2k + 1. Progress in `jobs/<id>.json` (`phase`, `rollouts_done`, `rollouts_budget`, `model_calls`, `verdicts`); receipt `runs/<task>/receipt.json` (+ blob) with every rollout summary, proposal, lint report and the decision; workspaces and worktrees are removed after the receipt (also on failure). One run per task at a time (`runs/<task>/.lock`).
 

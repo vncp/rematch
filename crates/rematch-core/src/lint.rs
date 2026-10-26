@@ -1,0 +1,810 @@
+//! Static lint (SPEC "Lint, in full"; DESIGN §12 for the `lint.toml` schema). Free,
+//! deterministic, run before anything is staged. `ok` iff no Error findings.
+//!
+//! Identifier and executable-risk patterns apply to the entry's text files (SKILL.md
+//! with the `rematch:` block stripped, `units/`, `facts/`, `scripts/`, any other file)
+//! and to the hook's message/pass condition — never to `rematch.json` or
+//! `EXPERIENCE.md`, which legitimately carry session ids as evidence.
+
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+use anyhow::{Context, Result};
+use regex::Regex;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::package::{router_bytes, SkillDoc, TRIGGER_RE};
+use crate::types::{Entry, Kind, LessonTag, LintFinding, LintReport, Severity};
+
+/// Built-in rules, used when `improver/lint.toml` is missing; every key of a present
+/// file is optional and falls back to these values per field.
+pub const DEFAULT_LINT_TOML: &str = r#"# Static lint rules for rematch proposals (docs/DESIGN.md §12).
+
+[limits]
+always_on_bytes = 8192
+max_stems = 10
+max_exts = 8
+
+[patterns]
+session_id = [
+  '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[47][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b',
+  '\b\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}[0-9a-zA-Z._-]*_[0-9a-fA-F-]{36}\b',
+]
+user_names = [
+  '''(?:^|[\s"'`(])/Users/[A-Za-z0-9._-]+''',
+  '''(?:^|[\s"'`(])/home/[A-Za-z0-9._-]+''',
+  '''(?:^|[\s"'`(])~/(?:repos|src|code|work|projects|dev|Desktop|Documents|Downloads)/''',
+]
+task_paths = [
+  '''(?:^|[\s"'`(])/(?:Users|home|var/folders|tmp|private/tmp)/[^\s)"'`>]+''',
+]
+urls = [
+  '''https?://[^\s)"'`>]+''',
+]
+network = [
+  '\b(?:curl|wget)\b',
+  '\b(?:nc|ssh|scp)\s+',
+]
+pipe_shell = [
+  '\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba|z|da|k)?sh\b',
+]
+destructive_git = [
+  '\bgit\s+push\s+(?:[^\n]*\s+)?(?:-f|--force)\b',
+  '\bgit\s+reset\s+--hard\b',
+  '\bgit\s+clean\s+-[a-zA-Z]*[fd][a-zA-Z]*\b',
+]
+string_match_user = [
+  '(?i)\bif\s+the\s+user\s+says\b',
+  '(?i)\bwhen\s+the\s+user\s+types\b',
+  '(?i)\buser\s+says\s+"',
+]
+approval = [
+  '(?i)\b(?:approval_requested|requires?\s+approval|human\s+approval|one-tap\s+approval)\b',
+]
+order_exception = [
+  '(?i)\b(?:form\s+order|section\s+order|order\s+exception)\b',
+]
+
+[form]
+order = ["trigger", "laws", "procedure", "pitfalls", "facts"]
+
+[form.headings]
+trigger = ["trigger", "when to use", "scope"]
+laws = ["laws", "rules", "invariants", "constraints"]
+procedure = ["procedure", "workflow", "steps"]
+pitfalls = ["pitfalls", "anti-patterns", "gotchas"]
+facts = ["facts", "workspace facts", "reference"]
+
+[hooks]
+probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]
+"#;
+
+static BUILTIN: LazyLock<toml::Table> =
+    LazyLock::new(|| toml::from_str(DEFAULT_LINT_TOML).expect("DEFAULT_LINT_TOML is valid TOML"));
+
+fn builtin<T: DeserializeOwned>(section: &str, key: Option<&str>) -> T {
+    let sec = &BUILTIN[section];
+    let v = match key {
+        Some(k) => sec[k].clone(),
+        None => sec.clone(),
+    };
+    v.try_into().expect("DEFAULT_LINT_TOML matches the schema")
+}
+
+/// Per-field fallbacks to the built-in file (field-level, so a partial `lint.toml`
+/// keeps every other built-in value).
+macro_rules! field_defaults {
+    ($($f:ident: $ty:ty = $sec:literal . $key:literal;)*) => {
+        $(fn $f() -> $ty { builtin($sec, Some($key)) })*
+    };
+}
+
+field_defaults! {
+    d_always_on_bytes: usize = "limits"."always_on_bytes";
+    d_max_stems: usize = "limits"."max_stems";
+    d_max_exts: usize = "limits"."max_exts";
+    d_session_id: Vec<String> = "patterns"."session_id";
+    d_user_names: Vec<String> = "patterns"."user_names";
+    d_task_paths: Vec<String> = "patterns"."task_paths";
+    d_urls: Vec<String> = "patterns"."urls";
+    d_network: Vec<String> = "patterns"."network";
+    d_pipe_shell: Vec<String> = "patterns"."pipe_shell";
+    d_destructive_git: Vec<String> = "patterns"."destructive_git";
+    d_string_match_user: Vec<String> = "patterns"."string_match_user";
+    d_approval: Vec<String> = "patterns"."approval";
+    d_order_exception: Vec<String> = "patterns"."order_exception";
+    d_order: Vec<String> = "form"."order";
+    d_headings: std::collections::BTreeMap<String, Vec<String>> = "form"."headings";
+    d_probes: Vec<String> = "hooks"."probes";
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    #[serde(default = "d_always_on_bytes")]
+    pub always_on_bytes: usize,
+    #[serde(default = "d_max_stems")]
+    pub max_stems: usize,
+    #[serde(default = "d_max_exts")]
+    pub max_exts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Patterns {
+    #[serde(default = "d_session_id")]
+    pub session_id: Vec<String>,
+    #[serde(default = "d_user_names")]
+    pub user_names: Vec<String>,
+    #[serde(default = "d_task_paths")]
+    pub task_paths: Vec<String>,
+    #[serde(default = "d_urls")]
+    pub urls: Vec<String>,
+    #[serde(default = "d_network")]
+    pub network: Vec<String>,
+    #[serde(default = "d_pipe_shell")]
+    pub pipe_shell: Vec<String>,
+    #[serde(default = "d_destructive_git")]
+    pub destructive_git: Vec<String>,
+    #[serde(default = "d_string_match_user")]
+    pub string_match_user: Vec<String>,
+    /// `manifest.rationale` matching any ⇒ executable-risk findings become Warn
+    /// (approval requested) instead of Error.
+    #[serde(default = "d_approval")]
+    pub approval: Vec<String>,
+    /// `manifest.rationale` matching any ⇒ form-order findings become Warn.
+    #[serde(default = "d_order_exception")]
+    pub order_exception: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Form {
+    #[serde(default = "d_order")]
+    pub order: Vec<String>,
+    /// Heading keywords (lowercase substrings) per form section.
+    #[serde(default = "d_headings")]
+    pub headings: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Hooks {
+    /// Benign tool inputs; a hook regex matching all of them "matches everything".
+    #[serde(default = "d_probes")]
+    pub probes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LintConfig {
+    #[serde(default)]
+    pub limits: Limits,
+    #[serde(default)]
+    pub patterns: Patterns,
+    #[serde(default)]
+    pub form: Form,
+    #[serde(default)]
+    pub hooks: Hooks,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        builtin("limits", None)
+    }
+}
+impl Default for Patterns {
+    fn default() -> Self {
+        builtin("patterns", None)
+    }
+}
+impl Default for Form {
+    fn default() -> Self {
+        builtin("form", None)
+    }
+}
+impl Default for Hooks {
+    fn default() -> Self {
+        builtin("hooks", None)
+    }
+}
+
+impl LintConfig {
+    pub fn parse(text: &str) -> Result<LintConfig> {
+        let cfg: LintConfig = toml::from_str(text).context("lint.toml")?;
+        cfg.compile()?;
+        Ok(cfg)
+    }
+
+    /// `improver/lint.toml`, or the built-in rules when the file does not exist.
+    pub fn load(path: &Path) -> Result<LintConfig> {
+        match std::fs::read_to_string(path) {
+            Ok(t) => Self::parse(&t).with_context(|| path.display().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(LintConfig::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn compile(&self) -> Result<Compiled> {
+        let c = |v: &[String]| -> Result<Vec<Regex>> {
+            v.iter().map(|p| Regex::new(p).with_context(|| format!("pattern {p:?}"))).collect()
+        };
+        let p = &self.patterns;
+        Ok(Compiled {
+            session_id: c(&p.session_id)?,
+            user_names: c(&p.user_names)?,
+            task_paths: c(&p.task_paths)?,
+            urls: c(&p.urls)?,
+            network: c(&p.network)?,
+            pipe_shell: c(&p.pipe_shell)?,
+            destructive_git: c(&p.destructive_git)?,
+            string_match_user: c(&p.string_match_user)?,
+            approval: c(&p.approval)?,
+            order_exception: c(&p.order_exception)?,
+        })
+    }
+}
+
+struct Compiled {
+    session_id: Vec<Regex>,
+    user_names: Vec<Regex>,
+    task_paths: Vec<Regex>,
+    urls: Vec<Regex>,
+    network: Vec<Regex>,
+    pipe_shell: Vec<Regex>,
+    destructive_git: Vec<Regex>,
+    string_match_user: Vec<Regex>,
+    approval: Vec<Regex>,
+    order_exception: Vec<Regex>,
+}
+
+/// Facts about the surroundings the entry dir cannot tell.
+#[derive(Debug, Clone, Default)]
+pub struct LintContext {
+    /// Always-on bytes already used in the entry's branch by other entries.
+    pub branch_other_bytes: usize,
+    /// Literal user names (login, git author) to keep out of the text.
+    pub user_names: Vec<String>,
+    /// Linting a cross-branch transfer: domain lessons and facts never transfer.
+    pub transfer: bool,
+}
+
+/// Always-on bytes of every `*/SKILL.md` directly under a branch dir, except `exclude`.
+pub fn branch_always_on_bytes(branch_dir: &Path, exclude: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(branch_dir) else { return 0 };
+    rd.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.as_path() != exclude)
+        .filter_map(|p| std::fs::read_to_string(p.join("SKILL.md")).ok())
+        .map(|t| router_bytes(&t))
+        .sum()
+}
+
+struct Report {
+    findings: Vec<LintFinding>,
+}
+
+impl Report {
+    fn add(&mut self, rule: &str, sev: Severity, msg: impl Into<String>, path: Option<&str>) {
+        self.findings.push(LintFinding {
+            rule: rule.into(),
+            severity: sev,
+            message: msg.into(),
+            path: path.map(str::to_string),
+        });
+    }
+}
+
+fn first_match<'a>(res: &[Regex], text: &'a str) -> Option<&'a str> {
+    res.iter().find_map(|r| r.find(text).map(|m| m.as_str()))
+}
+
+fn rel(dir: &Path, p: &Path) -> String {
+    p.strip_prefix(dir).unwrap_or(p).to_string_lossy().replace('\\', "/")
+}
+
+fn text_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let p = e?.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let r = rel(dir, &p);
+                if r != "rematch.json" && r != "EXPERIENCE.md" {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Text as linted: markdown loses its `rematch:` frontmatter block (entry ids are
+/// UUIDs by design).
+fn lint_text(path: &Path, raw: &str) -> String {
+    if path.extension().is_some_and(|e| e == "md") {
+        if let Ok(mut d) = SkillDoc::parse(raw) {
+            d.frontmatter.remove("rematch");
+            return d.render();
+        }
+    }
+    raw.to_string()
+}
+
+fn check_text(rep: &mut Report, c: &Compiled, ctx: &LintContext, approved_risk: bool, text: &str, path: &str) {
+    if let Some(m) = first_match(&c.session_id, text) {
+        rep.add("identifiers", Severity::Error, format!("session id in text: {m}"), Some(path));
+    }
+    if let Some(m) = first_match(&c.task_paths, text) {
+        rep.add("identifiers", Severity::Error, format!("task-specific path in text: {}", m.trim()), Some(path));
+    }
+    if let Some(m) = first_match(&c.user_names, text) {
+        rep.add("identifiers", Severity::Error, format!("user name in text: {}", m.trim()), Some(path));
+    }
+    let lower = text.to_lowercase();
+    for name in ctx.user_names.iter().filter(|n| n.len() >= 2) {
+        let n = name.to_lowercase();
+        let hit = lower.match_indices(&n).any(|(i, _)| {
+            let before = lower[..i].chars().next_back();
+            let after = lower[i + n.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric())
+        });
+        if hit {
+            rep.add("identifiers", Severity::Error, format!("user name in text: {name}"), Some(path));
+        }
+    }
+    if let Some(m) = first_match(&c.string_match_user, text) {
+        rep.add("string_match_user", Severity::Error, format!("branches on the user's literal words: {m}"), Some(path));
+    }
+    let sev = if approved_risk { Severity::Warn } else { Severity::Error };
+    let suffix = if approved_risk { " (approval requested in manifest)" } else { "" };
+    for (what, res) in [
+        ("URL", &c.urls),
+        ("network call", &c.network),
+        ("curl | sh", &c.pipe_shell),
+        ("destructive git", &c.destructive_git),
+    ] {
+        if let Some(m) = first_match(res, text) {
+            rep.add("executable_risk", sev, format!("{what}: {}{suffix}", m.trim()), Some(path));
+        }
+    }
+}
+
+fn form_index(cfg: &Form, heading: &str) -> Option<usize> {
+    let h = heading.to_lowercase();
+    cfg.order.iter().position(|sec| {
+        cfg.headings.get(sec).is_some_and(|kws| kws.iter().any(|k| h.contains(&k.to_lowercase())))
+    })
+}
+
+/// Lint an entry directory against its entry record (predicate, trigger line,
+/// manifest, hook, approved scripts).
+pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext) -> Result<LintReport> {
+    let c = cfg.compile()?;
+    let mut rep = Report { findings: Vec::new() };
+    let rationale = entry.manifest.as_ref().map(|m| m.rationale.as_str()).unwrap_or("");
+    let approved_risk = first_match(&c.approval, rationale).is_some();
+    let order_excused = first_match(&c.order_exception, rationale).is_some();
+
+    // Text rules over every text file.
+    let files = text_files(dir)?;
+    let mut md_texts: Vec<(String, String)> = Vec::new();
+    for p in &files {
+        let Ok(raw) = std::fs::read_to_string(p) else { continue };
+        let r = rel(dir, p);
+        let text = lint_text(p, &raw);
+        if r == "hook.json" {
+            // the regex legitimately names risky commands; lint the human text only
+            if let Some(h) = &entry.hook {
+                check_text(&mut rep, &c, ctx, approved_risk, &format!("{}\n{}", h.message, h.pass_condition), &r);
+            }
+            continue;
+        }
+        check_text(&mut rep, &c, ctx, approved_risk, &text, &r);
+        if r.ends_with(".md") {
+            md_texts.push((r, raw));
+        }
+    }
+
+    // Trigger predicate + trigger line.
+    let p = &entry.predicate;
+    if p.repo_glob.trim().is_empty() {
+        rep.add("trigger", Severity::Error, "entry has no trigger predicate (empty repo glob)", Some("rematch.json"));
+    }
+    if p.stems.len() > cfg.limits.max_stems {
+        rep.add("trigger", Severity::Error, format!("{} stems > {}", p.stems.len(), cfg.limits.max_stems), Some("rematch.json"));
+    }
+    if p.file_exts.len() > cfg.limits.max_exts {
+        rep.add("trigger", Severity::Error, format!("{} file extensions > {}", p.file_exts.len(), cfg.limits.max_exts), Some("rematch.json"));
+    }
+    let skill_raw = std::fs::read_to_string(dir.join("SKILL.md")).ok();
+    let skill = skill_raw.as_deref().and_then(|t| SkillDoc::parse(t).ok());
+    match &skill {
+        None => rep.add("trigger", Severity::Error, "SKILL.md missing or unparseable", Some("SKILL.md")),
+        Some(doc) => {
+            let tl = entry.trigger_line.trim();
+            if tl.is_empty() {
+                rep.add("trigger", Severity::Error, "entry has no trigger line", Some("rematch.json"));
+            } else if !doc.body.contains(tl) && !doc.body.lines().any(|l| TRIGGER_RE.is_match(l)) {
+                rep.add("trigger", Severity::Error, "SKILL.md body carries no trigger line", Some("SKILL.md"));
+            }
+            if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
+                rep.add("trigger", Severity::Error, "frontmatter description missing (omp requires it)", Some("SKILL.md"));
+            }
+        }
+    }
+
+    // Scripts: shipped and non-executable until approved.
+    let script_ref = Regex::new(r"scripts/[A-Za-z0-9._/-]*[A-Za-z0-9_-]").unwrap();
+    for (r, raw) in &md_texts {
+        for m in script_ref.find_iter(raw) {
+            if !dir.join(m.as_str()).is_file() {
+                rep.add("scripts", Severity::Error, format!("referenced script not shipped: {}", m.as_str()), Some(r));
+            }
+        }
+    }
+    for p in files.iter().filter(|p| rel(dir, p).starts_with("scripts/")) {
+        let r = rel(dir, p);
+        if is_executable(p) && !entry.approved_scripts.contains(&r) {
+            rep.add("scripts", Severity::Error, "script is executable before approval (must be 0644)", Some(&r));
+        }
+    }
+
+    // Always-on budget (router bodies of the branch).
+    if let Some(raw) = &skill_raw {
+        let mine = router_bytes(raw);
+        let total = mine + ctx.branch_other_bytes;
+        if total > cfg.limits.always_on_bytes {
+            rep.add(
+                "always_on",
+                Severity::Error,
+                format!(
+                    "always-on text {total} B > {} B in branch (this entry {mine} B); pay for new text by deletion",
+                    cfg.limits.always_on_bytes
+                ),
+                Some("SKILL.md"),
+            );
+        }
+    }
+
+    // Form order in SKILL.md: trigger line, then headings in configured order.
+    if let Some(doc) = &skill {
+        let trigger_pos = form_index(&cfg.form, "trigger").or_else(|| cfg.form.order.iter().position(|s| s == "trigger"));
+        let mut seen: Option<(usize, String)> = None;
+        let mut fence = false;
+        for line in doc.body.lines() {
+            if line.trim_start().starts_with("```") {
+                fence = !fence;
+            }
+            if fence {
+                continue;
+            }
+            let idx = if let Some(h) = line.strip_prefix('#').filter(|_| line.starts_with("##")) {
+                form_index(&cfg.form, h.trim_start_matches('#').trim())
+            } else if TRIGGER_RE.is_match(line) || (!entry.trigger_line.trim().is_empty() && line.contains(entry.trigger_line.trim())) {
+                trigger_pos
+            } else {
+                None
+            };
+            let Some(i) = idx else { continue };
+            if let Some((prev, prev_line)) = &seen {
+                if i < *prev {
+                    let (sev, why) = if order_excused {
+                        (Severity::Warn, " (manifest explains)")
+                    } else {
+                        (Severity::Error, "")
+                    };
+                    rep.add(
+                        "form_order",
+                        sev,
+                        format!(
+                            "{:?} after {:?}; order is {}{why}",
+                            line.trim(),
+                            prev_line,
+                            cfg.form.order.join(" → ")
+                        ),
+                        Some("SKILL.md"),
+                    );
+                    break;
+                }
+            }
+            if seen.as_ref().is_none_or(|(p, _)| i >= *p) {
+                seen = Some((i, line.trim().to_string()));
+            }
+        }
+    }
+
+    // Facts carry as_of.
+    let needs_as_of = |r: &str| r.starts_with("facts/") && r.ends_with(".md");
+    for (r, raw) in &md_texts {
+        let fact_skill = r == "SKILL.md" && entry.kind == Kind::Fact;
+        if !(needs_as_of(r) || fact_skill) {
+            continue;
+        }
+        let has = SkillDoc::parse(raw)
+            .ok()
+            .and_then(|d| d.frontmatter.get("as_of").cloned())
+            .is_some_and(|v| match v {
+                serde_yaml::Value::String(s) => !s.trim().is_empty(),
+                serde_yaml::Value::Null => false,
+                _ => true,
+            });
+        if !has {
+            rep.add("facts_as_of", Severity::Error, "workspace fact without `as_of:` frontmatter", Some(r));
+        }
+    }
+
+    // Hooks: documented pass condition; regex compiles and cannot match everything.
+    if entry.kind == Kind::Hook || entry.hook.is_some() {
+        match &entry.hook {
+            None => rep.add("hook", Severity::Error, "hook entry without a hook rule", Some("hook.json")),
+            Some(h) => {
+                if h.pass_condition.trim().is_empty() {
+                    rep.add("hook", Severity::Error, "hook has no documented pass condition", Some("hook.json"));
+                }
+                if h.message.trim().is_empty() {
+                    rep.add("hook", Severity::Error, "hook has no block message", Some("hook.json"));
+                }
+                match Regex::new(&h.regex) {
+                    Err(e) => rep.add("hook", Severity::Error, format!("hook regex does not compile: {e}"), Some("hook.json")),
+                    Ok(re) => {
+                        let probes = &cfg.hooks.probes;
+                        if re.is_match("") || (!probes.is_empty() && probes.iter().all(|p| re.is_match(p))) {
+                            rep.add(
+                                "hook",
+                                Severity::Error,
+                                "hook regex matches everything (empty input or every benign probe); it would block valid completions",
+                                Some("hook.json"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if ctx.transfer && (entry.lesson_tag == Some(LessonTag::Domain) || entry.kind == Kind::Fact) {
+        rep.add("transfer", Severity::Error, "domain lessons and workspace facts never transfer", None);
+    }
+
+    let ok = !rep.findings.iter().any(|f| f.severity == Severity::Error);
+    Ok(LintReport { ok, findings: rep.findings })
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_p: &Path) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::tests::entry;
+    use crate::types::{EditorScope, HookRule, Manifest, Moment, Status};
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    const GOOD: &str = "---\nname: ledger-skill\ndescription: Use when editing the ledger.\nrematch:\n  id: 01a175bd-c1f9-73d6-b367-a261c3b1734c\n---\n# Ledger\n\nUse when editing the ledger.\n\n## Laws\n\n- MUST run `scripts/check.sh` before committing.\n\n## Procedure\n\n1. Add a migration.\n\n## Pitfalls\n\n- Dropping columns in place.\n";
+
+    fn good() -> (tempfile::TempDir, Entry) {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "SKILL.md", GOOD);
+        write(t.path(), "scripts/check.sh", "cargo test -p rematch-core\n");
+        write(t.path(), "rematch.json", "{\"evidence\": \"01a175bd-c1f9-73d6-b367-a261c3b1734c\"}");
+        write(t.path(), "EXPERIENCE.md", "- `01a175bd-c1f9-73d6-b367-a261c3b1734c`#3\n");
+        let mut e = entry("e", "ledger-skill", "repo", Status::Provisional);
+        e.manifest = Some(Manifest {
+            evidence: Moment { session_id: "01a175bd-c1f9-73d6-b367-a261c3b1734c".into(), seq: 3 },
+            predicted_fix: "f".into(),
+            predicted_regression: "r".into(),
+            rationale: String::new(),
+            scope: EditorScope::Domain,
+        });
+        (t, e)
+    }
+
+    fn lint(dir: &Path, e: &Entry) -> LintReport {
+        lint_entry(dir, e, &LintConfig::default(), &LintContext::default()).unwrap()
+    }
+
+    fn rules(r: &LintReport) -> Vec<(String, Severity)> {
+        r.findings.iter().map(|f| (f.rule.clone(), f.severity)).collect()
+    }
+
+    #[test]
+    fn default_config_parses_and_partial_files_fall_back_per_field() {
+        let d = LintConfig::default();
+        assert_eq!(d.limits.always_on_bytes, 8192);
+        assert_eq!(d.form.order, vec!["trigger", "laws", "procedure", "pitfalls", "facts"]);
+        let partial = LintConfig::parse("[limits]\nalways_on_bytes = 100\n").unwrap();
+        assert_eq!(partial.limits.always_on_bytes, 100);
+        assert_eq!(partial.limits.max_stems, 10);
+        assert_eq!(partial.patterns, d.patterns);
+        assert!(LintConfig::parse("[patterns]\nurls = ['(']\n").is_err(), "bad regex rejected at load");
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(LintConfig::load(&t.path().join("missing.toml")).unwrap(), d);
+    }
+
+    #[test]
+    fn shipped_lint_toml_equals_builtin() {
+        // improver/lint.toml ships the built-in rules verbatim; drift is a bug.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../improver/lint.toml");
+        assert_eq!(LintConfig::load(&repo).unwrap(), LintConfig::default());
+    }
+
+    #[test]
+    fn clean_entry_passes_and_ignores_rematch_json_and_experience() {
+        let (t, e) = good();
+        let r = lint(t.path(), &e);
+        assert!(r.ok, "{:?}", r.findings);
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+    }
+
+    #[test]
+    fn identifiers_in_text_are_errors() {
+        let (t, e) = good();
+        write(t.path(), "units/a.md", "See session 01a175bd-c1f9-73d6-b367-a261c3b1734c.\n");
+        write(t.path(), "units/b.md", "Open /Users/alice/repos/x/main.rs first.\n");
+        let ctx = LintContext { user_names: vec!["vince".into()], ..Default::default() };
+        write(t.path(), "units/c.md", "Ask Vince before merging.\n");
+        let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
+        assert!(!r.ok);
+        let msgs: Vec<_> = r.findings.iter().filter(|f| f.rule == "identifiers").map(|f| (f.path.clone().unwrap(), f.message.clone())).collect();
+        assert!(msgs.iter().any(|(p, m)| p == "units/a.md" && m.contains("session id")));
+        assert!(msgs.iter().any(|(p, m)| p == "units/b.md" && m.contains("path")));
+        assert!(msgs.iter().any(|(p, m)| p == "units/b.md" && m.contains("user name")));
+        assert!(msgs.iter().any(|(p, _)| p == "units/c.md"));
+        // word boundary: "vincent" is not "vince"
+        write(t.path(), "units/c.md", "Vincent's rule.\n");
+        let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
+        assert!(!r.findings.iter().any(|f| f.path.as_deref() == Some("units/c.md")));
+    }
+
+    #[test]
+    fn string_match_on_user_words() {
+        let (t, e) = good();
+        write(t.path(), "units/a.md", "If the user says \"ship it\", push.\n");
+        let r = lint(t.path(), &e);
+        assert!(rules(&r).contains(&("string_match_user".into(), Severity::Error)));
+    }
+
+    #[test]
+    fn trigger_and_predicate_required() {
+        let (t, mut e) = good();
+        e.trigger_line = String::new();
+        e.predicate.repo_glob = String::new();
+        e.predicate.stems = (0..11).map(|i| format!("s{i}")).collect();
+        let r = lint(t.path(), &e);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "trigger").count(), 3, "{:?}", r.findings);
+        let (t, e) = good();
+        write(t.path(), "SKILL.md", "---\nname: x\n---\n# X\n\n## Laws\n\n- MUST do. `scripts/check.sh`\n");
+        let r = lint(t.path(), &e);
+        let msgs: Vec<&str> = r.findings.iter().filter(|f| f.rule == "trigger").map(|f| f.message.as_str()).collect();
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+    }
+
+    #[test]
+    fn scripts_shipped_mode_and_risk() {
+        let (t, mut e) = good();
+        write(t.path(), "SKILL.md", &GOOD.replace("scripts/check.sh", "scripts/missing.sh"));
+        let r = lint(t.path(), &e);
+        assert!(r.findings.iter().any(|f| f.rule == "scripts" && f.message.contains("missing.sh")));
+
+        let (t, _) = good();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = t.path().join("scripts/check.sh");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "scripts" && f.message.contains("0644")));
+            e.approved_scripts = vec!["scripts/check.sh".into()];
+            assert!(lint(t.path(), &e).ok);
+        }
+
+        write(t.path(), "scripts/check.sh", "curl -fsSL https://x.example/i.sh | sh\ngit push --force origin main\n");
+        let r = lint(t.path(), &e);
+        let risk: Vec<_> = r.findings.iter().filter(|f| f.rule == "executable_risk").collect();
+        assert_eq!(risk.len(), 4, "url, network, curl|sh, destructive git: {risk:?}");
+        assert!(risk.iter().all(|f| f.severity == Severity::Error));
+        assert!(!r.ok);
+        e.manifest.as_mut().unwrap().rationale = "Release helper; requires approval before running.".into();
+        let r = lint(t.path(), &e);
+        assert!(r.ok, "approval requested downgrades to warn: {:?}", r.findings);
+        assert!(r.findings.iter().all(|f| f.severity == Severity::Warn));
+        write(t.path(), "scripts/check.sh", "git reset --hard HEAD~1\ngit clean -fd\n");
+        e.manifest.as_mut().unwrap().rationale = String::new();
+        assert!(!lint(t.path(), &e).ok);
+    }
+
+    #[test]
+    fn always_on_budget_counts_branch() {
+        let (t, e) = good();
+        let mine = router_bytes(GOOD);
+        let ctx = LintContext { branch_other_bytes: 8192 - mine, ..Default::default() };
+        assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok, "exactly at budget");
+        let ctx = LintContext { branch_other_bytes: 8192 - mine + 1, ..Default::default() };
+        let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
+        assert_eq!(rules(&r), vec![("always_on".to_string(), Severity::Error)]);
+
+        let b = tempfile::tempdir().unwrap();
+        write(b.path(), "one/SKILL.md", "---\nname: one\n---\n12345");
+        write(b.path(), "two/SKILL.md", "abc");
+        write(b.path(), "self/SKILL.md", "ignored");
+        assert_eq!(branch_always_on_bytes(b.path(), &b.path().join("self")), 8);
+    }
+
+    #[test]
+    fn form_order_violation_and_exception() {
+        let (t, mut e) = good();
+        write(t.path(), "SKILL.md", "---\nname: x\ndescription: d\n---\nUse when editing the ledger.\n\n## Pitfalls\n\n- a\n\n## Laws\n\n- MUST b\n");
+        let r = lint(t.path(), &e);
+        assert!(r.findings.iter().any(|f| f.rule == "form_order" && f.severity == Severity::Error), "{:?}", r.findings);
+        e.manifest.as_mut().unwrap().rationale = "Pitfalls first: section order exception for this router.".into();
+        let r = lint(t.path(), &e);
+        assert!(r.ok);
+        assert!(r.findings.iter().any(|f| f.rule == "form_order" && f.severity == Severity::Warn));
+        // trigger line after laws is also out of order
+        write(t.path(), "SKILL.md", "---\nname: x\ndescription: d\n---\n## Laws\n\n- MUST b\n\nUse when editing the ledger.\n");
+        e.manifest.as_mut().unwrap().rationale = String::new();
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "form_order"));
+    }
+
+    #[test]
+    fn facts_need_as_of() {
+        let (t, mut e) = good();
+        write(t.path(), "facts/latency.md", "p50 is 12 ms\n");
+        write(t.path(), "facts/ok.md", "---\nas_of: 2026-10-25\n---\np99 is 40 ms\n");
+        let r = lint(t.path(), &e);
+        let f: Vec<_> = r.findings.iter().filter(|f| f.rule == "facts_as_of").collect();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].path.as_deref(), Some("facts/latency.md"));
+        std::fs::remove_file(t.path().join("facts/latency.md")).unwrap();
+        e.kind = Kind::Fact;
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "facts_as_of" && f.path.as_deref() == Some("SKILL.md")));
+    }
+
+    #[test]
+    fn hooks_need_pass_condition_and_selective_regex() {
+        let (t, mut e) = good();
+        e.kind = Kind::Hook;
+        let hook = |re: &str, pass: &str| HookRule {
+            tool: "bash".into(),
+            field: "command".into(),
+            regex: re.into(),
+            message: "Use --force-with-lease.".into(),
+            pass_condition: pass.into(),
+        };
+        e.hook = Some(hook(r"git\s+push\s+--force\b", "commands without bare --force pass"));
+        write(t.path(), "hook.json", &serde_json::to_string(e.hook.as_ref().unwrap()).unwrap());
+        assert!(lint(t.path(), &e).ok, "regex naming git push --force is not a text risk");
+        e.hook = Some(hook(r"git\s+push", ""));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "hook" && f.message.contains("pass condition")));
+        e.hook = Some(hook(r"(", "p"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("does not compile")));
+        e.hook = Some(hook(r".*", "p"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("matches everything")));
+        e.hook = Some(hook(r"[a-z]", "p"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("matches everything")), "matches all probes");
+        e.hook = None;
+        assert!(!lint(t.path(), &e).ok);
+    }
+
+    #[test]
+    fn transfer_blocks_domain_and_facts() {
+        let (t, mut e) = good();
+        let ctx = LintContext { transfer: true, ..Default::default() };
+        e.lesson_tag = Some(LessonTag::Invariant);
+        assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok);
+        e.lesson_tag = Some(LessonTag::Domain);
+        assert!(!lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok);
+    }
+}

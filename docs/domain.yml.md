@@ -1,9 +1,9 @@
 # `branches/<branch>/domain.yml`
 
 Each branch (a repo or project; `library::branch_for` names it) can register its facet
-vocabulary in `EVOLVE_ROOT/branches/<branch>/domain.yml`. Outcome records use these keys
+vocabulary in `REMATCH_ROOT/branches/<branch>/domain.yml`. Outcome records use these keys
 in their `facets` (SPEC §Session outcome records). Cross-domain transfer reads them
-(`omp-evolve transfer suggest`, `scope::transfer`).
+(`rematch transfer suggest`, `scope::transfer`).
 
 ```yaml
 domain: <dotted subject path>   # prefix-seekable: quant.options, repo.payments, 3d.animation

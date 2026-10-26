@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/evolve-core", "crates/omp-evolve"]
+members = ["crates/rematch-core", "crates/rematch"]
 resolver = "2"
 
 [workspace.package]

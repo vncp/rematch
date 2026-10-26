@@ -1,3 +1,5 @@
+> Historical: this spec was written under the working name omp-evolve; the shipped project is **rematch**. Names in DESIGN.md are current.
+
 # omp-evolve build spec v2
 
 Oct 25, 2026 · @Vincent Pham

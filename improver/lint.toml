@@ -1,4 +1,4 @@
-# Static lint rules for omp-evolve proposals (docs/DESIGN.md §12).
+# Static lint rules for rematch proposals (docs/DESIGN.md §12).
 
 [limits]
 always_on_bytes = 8192

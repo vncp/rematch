@@ -1,0 +1,28 @@
+[package]
+name = "rematch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rematch"
+path = "src/main.rs"
+
+[dependencies]
+rematch-core = { path = "../rematch-core" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+serde_yaml.workspace = true
+regex.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
