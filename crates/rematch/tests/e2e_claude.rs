@@ -1,8 +1,8 @@
 //! End-to-end through the Claude Code adapter's own hook relay (`adapters/claude-code/scripts/
 //! hook.sh`): synthetic Claude Code hook payloads → `traces/cc:<uuid>.jsonl` + the pending
-//! flag → `reflect --pending` stages an entry → `match --harness claude-code` links it into
-//! `REMATCH_ROOT/claude-skills/`, which the plugin's `skills/` symlink exposes. Also the
-//! approved `stuck` and `retrieve` hooks, the kill switch, and the never-fail rule.
+//! flag → `reflect --pending` stages an entry → `skills sync --harness claude-code` links it
+//! into the shared `REMATCH_ROOT/skills/`, which the plugin's `skills/` symlink exposes. Also
+//! the approved `stuck` and `retrieve` hooks, the kill switch, and the never-fail rule.
 
 mod common;
 
@@ -133,11 +133,19 @@ fn hooks_trace_flag_reflect_and_link() {
     let repo = env.repo.to_string_lossy().into_owned();
     let file = format!("{repo}/src/ledger.rs");
 
-    // SessionStart: the relay links the plugin's skills/ to claude-skills and asks for a re-scan.
+    // An older version's layout: `claude-skills/` with the plugin's skills/ pointing there.
+    let legacy = env.root.join("claude-skills");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::os::unix::fs::symlink(env.home.join("gone"), legacy.join("old")).unwrap();
+    let link = plugin_root(&env).join("skills");
+    std::os::unix::fs::symlink(&legacy, &link).unwrap();
+
+    // SessionStart: the relay re-points the plugin's skills/ to the shared dir, removes the
+    // legacy dir and asks for a re-scan.
     let o = event(&env, "SessionStart", json!({"source":"startup","model":"claude-opus-5-5"}));
     assert_eq!(o.json(), json!({"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":true}}));
-    let link = plugin_root(&env).join("skills");
-    assert_eq!(std::fs::read_link(&link).unwrap(), env.root.join("claude-skills"));
+    assert_eq!(std::fs::read_link(&link).unwrap(), env.root.join("skills"));
+    assert!(!legacy.exists());
 
     let o = event(&env, "UserPromptSubmit", json!({"prompt":"Add the ledger reconciliation command to the payments crate"}));
     assert!(o.stdout.trim().is_empty(), "no retrieve hook approved: {:?}", o.stdout);
@@ -227,16 +235,16 @@ fn hooks_trace_flag_reflect_and_link() {
     let row = env.run(&["library", "why", &sid]);
     assert!(row["lines"][0].as_str().unwrap().contains("claude-opus-5-5"), "{row}");
 
-    // match --harness claude-code links the staged skill; the plugin sees it through skills/.
-    let m = env.run(&["match", "--harness", "claude-code", "--cwd", &repo]);
+    // skills sync links the staged skill; the plugin sees it through skills/.
+    let m = env.run(&["skills", "sync", "--harness", "claude-code", "--cwd", &repo]);
     let staged = env.staged_dir();
-    assert_eq!(m["claude_skills"]["linked"], json!({"run-tests-before-commit": staged}), "{m}");
-    assert_eq!(m["claude_skills"]["changed"], true);
-    let linked = env.root.join("claude-skills/run-tests-before-commit");
+    assert_eq!((m["added"].clone(), m["links"].clone()), (json!(["run-tests-before-commit"]), json!({"run-tests-before-commit": staged})), "{m}");
+    assert_eq!(m["dirs"], json!([env.root.join("skills")]));
+    let linked = env.root.join("skills/run-tests-before-commit");
     assert_eq!(std::fs::read_link(&linked).unwrap(), staged);
     assert!(link.join("run-tests-before-commit/SKILL.md").is_file(), "readable through the plugin's skills/ link");
-    let again = env.run(&["match", "--harness", "claude-code", "--cwd", &repo]);
-    assert_eq!(again["claude_skills"]["changed"], false, "idempotent");
+    let again = env.run(&["skills", "sync", "--harness", "claude-code", "--cwd", &repo]);
+    assert_eq!((again["added"].clone(), again["pruned"].clone()), (json!([]), json!([])), "idempotent");
 
     // The next session in the repo loads it (and needs no re-scan: the links did not change).
     let next = "6e1d9b9f-2222-4d4d-9999-0123456789ab";
@@ -245,14 +253,21 @@ fn hooks_trace_flag_reflect_and_link() {
     assert_eq!((o.code, o.stdout.trim()), (0, ""));
     let s = trace_of(&env, &format!("cc:{next}"));
     assert_eq!(s[0]["loaded_entries"], json!([id]));
-    assert_eq!(s[0]["staging_dirs"], json!([env.root.join("staging/payments")]));
+    assert_eq!(s[0]["staging_dirs"], json!([env.root.join("skills")]));
 
-    // Elsewhere nothing matches: the link goes, and Claude Code is asked to re-scan.
+    // Elsewhere nothing matches: the link stays (union: a session in the repo may use it), and
+    // the session does not count it.
     let other = env.home.join("elsewhere");
     std::fs::create_dir_all(&other).unwrap();
-    let p = json!({"session_id":"7f2e0c0a-3333-4e4e-aaaa-0123456789ab","cwd":other,"hook_event_name":"SessionStart","source":"startup"});
+    let elsewhere = "7f2e0c0a-3333-4e4e-aaaa-0123456789ab";
+    let p = json!({"session_id":elsewhere,"cwd":other,"hook_event_name":"SessionStart","source":"startup"});
     let o = run_hook(&env, "trace-event", &p.to_string(), &[]);
-    assert_eq!(o.json()["hookSpecificOutput"]["reloadSkills"], true);
+    assert_eq!((o.code, o.stdout.trim()), (0, ""));
+    assert_eq!(std::fs::read_link(&linked).unwrap(), staged);
+    assert_eq!(trace_of(&env, &format!("cc:{elsewhere}"))[0]["loaded_entries"], json!([]));
+
+    // Retired: the link is pruned at once.
+    env.run(&["library", "disable", &id]);
     assert!(std::fs::symlink_metadata(&linked).is_err());
 }
 

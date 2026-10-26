@@ -1,2 +1,2 @@
-# Created at session start: a symlink to $REMATCH_ROOT/claude-skills (see README).
+# Created at session start: a symlink to $REMATCH_ROOT/skills, the shared skills dir (see README).
 /skills

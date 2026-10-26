@@ -20,6 +20,10 @@ ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
 
 `~/.claude/plugins/` is Claude Code's marketplace cache and settings only list `enabledPlugins` by `name@marketplace`; a marketplace install would copy the plugin and drop the `skills/` symlink, so use one of the two routes above. Check the load with `claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch`: 8 hooks, and under Skills the three commands plus every linked skill.
 
+Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [`docs/MANUAL.md`](../../docs/MANUAL.md#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`; nothing else is installed for skills.
+
+Upgrading from a version that used `~/.rematch/claude-skills/`: the first `SessionStart` re-points `skills/` here to `~/.rematch/skills` and deletes `~/.rematch/claude-skills/` (only links lived there).
+
 Optional: give `SessionEnd` more than its 1.5 s (plugin timeouts do not raise it): `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000`.
 
 To remove: delete the `~/.claude/skills/rematch` link (or stop passing `--plugin-dir`). `rematch uninstall` removes `~/.rematch`.
@@ -28,7 +32,7 @@ To remove: delete the `~/.claude/skills/rematch` link (or stop passing `--plugin
 
 | Claude Code hook | rematch |
 |---|---|
-| `SessionStart` | `session_start` with the entries matched for the session's cwd; links the matching provisional and kept skills into `~/.rematch/claude-skills/` and, on the first start, `skills/` here → that directory (asks Claude Code to re-scan skills when a link changed) |
+| `SessionStart` | `session_start` with the entries matched for the session's cwd; syncs the shared `~/.rematch/skills/` for that cwd (adds its matching provisional skills, keeps every other live link) and, on the first start, links `skills/` here → that directory (asks Claude Code to re-scan skills when a link changed) |
 | `UserPromptSubmit` | `input` with the redirect pre-label (negation, revert, reprompt, interrupt, mark); with an approved `retrieve` hook, the matching units as added context |
 | `PreToolUse` | approved `block` / `stuck` hooks: a refusal exits 2 with the hook's message, and is traced |
 | `PostToolUse`, `PostToolUseFailure` | `tool_result` |
@@ -39,11 +43,13 @@ Every hook goes through `scripts/hook.sh`, which never fails a hook: any error e
 
 Commands (each runs the binary before the prompt reaches the model and shows its output):
 
-- `/rematch:rematch-status` — `rematch status` and what loads here.
+- `/rematch:rematch-status` — `rematch status` and the skills linked for this directory (`rematch skills sync --harness claude-code`).
 - `/rematch:rematch-why [cc:<id>]` — `rematch library why`.
 - `/rematch:rematch-mark correction|preference|scope` — `rematch mark` for this session.
 
 Reflection never runs inside Claude Code. Run `rematch reflect --pending` in a terminal (or start omp, which spawns it); `rematch digest --text` lists what was staged and what waits for approval; `rematch library approve <id>` approves a hook. Past Claude Code sessions: `rematch import --history --harness claude-code`, then `rematch reflect --history`.
+
+Subagents: rematch's provisional agents (`~/.rematch/agents/<name>.md`) are file symlinks, and Claude Code does not read a symlinked agent file in a plugin's `agents/` (verified with `claude plugin details`, DESIGN §18.1), so the plugin has no `agents/` and agent entries stay omp-only.
 
 ## Files
 
@@ -53,5 +59,5 @@ hooks/hooks.json             the eight hooks, exec form: sh scripts/hook.sh trac
 scripts/hook.sh              stdin → rematch <op> --harness claude-code --hook-output
 scripts/rematch.sh           binary lookup ($REMATCH_BIN, target/{release,debug}, PATH)
 commands/rematch-*.md        the three commands
-skills                       (created at first SessionStart, git-ignored) → ~/.rematch/claude-skills
+skills                       (created at first SessionStart, git-ignored) → ~/.rematch/skills
 ```

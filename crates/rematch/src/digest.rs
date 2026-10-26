@@ -1,6 +1,6 @@
-//! `match --cwd` (load-time payload for the extension factory; with `--harness claude-code`
-//! also the skill links of `REMATCH_ROOT/claude-skills/`) and `digest --cwd`
-//! (session-start lines, one-tap approvals, capability-floor review, transfers).
+//! `match --cwd` (load-time payload for the extension factory: entries, predicate hits, hook
+//! modules) and `digest --cwd` (session-start lines, one-tap approvals, capability-floor
+//! review, transfers). Skill delivery is `skills sync` (`skills_cmd`).
 
 use std::path::PathBuf;
 
@@ -24,10 +24,6 @@ pub struct MatchArgs {
     /// Refines `predicate_hit` with the count-time content rule.
     #[arg(long)]
     pub inputs: Option<String>,
-    /// `claude-code`: also link the skills that load for this cwd into
-    /// `REMATCH_ROOT/claude-skills/` (the Claude Code plugin's `skills/`); result in `claude_skills`.
-    #[arg(long, value_enum)]
-    pub harness: Option<crate::trace_event::Harness>,
 }
 
 pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
@@ -62,9 +58,6 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     }
     let mut out = serde_json::to_value(&m)?;
     out["entries"] = Value::Array(entries);
-    if a.harness == Some(crate::trace_event::Harness::ClaudeCode) {
-        out["claude_skills"] = crate::trace_event::match_claude(ctx, &m)?;
-    }
     Ok(out)
 }
 

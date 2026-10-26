@@ -37,10 +37,6 @@ use crate::types::{ModelRef, SessionRecord, UnixMs};
 
 /// Session ids of imported Codex sessions are `codex:<session_meta.id>`.
 pub const ID_PREFIX: &str = "codex:";
-/// Marker in a kept entry's copy under `~/.agents/skills/<name>/` written by `library sync
-/// --harness codex`: `{id, version, updated_at, created_at}`. Directories without it are not
-/// rematch's.
-pub const CODEX_COPY_MARKER: &str = ".rematch-codex.json";
 
 /// A parsed Codex rollout: the `session_meta` header plus every other line as
 /// `(timestamp ms, type, payload)` in file order.
@@ -131,14 +127,17 @@ fn skill_list_paths(body: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The rematch entry behind an offered skill, resolved now from the filesystem: a synced
-/// provisional link leads to the staging dir holding `rematch.json`; a kept copy holds
-/// [`CODEX_COPY_MARKER`]. An entry created after `started` was not what Codex offered then
-/// (a newer version behind the same name) and is not attributed.
+/// The rematch entry behind an offered skill, resolved now from the filesystem: a link in
+/// the shared skills dir leads to the entry dir (staging or kept) holding `rematch.json`. An
+/// entry created after `started` was not what Codex offered then (a newer version behind the
+/// same name) and is not attributed. A hook entry's router `SKILL.md` is offered too, but Codex
+/// never runs the hook, so it is not a loaded entry.
 fn rematch_entry_of(skill_md: &Path, started: UnixMs) -> Option<String> {
     let dir = skill_md.parent()?;
-    let read = |name: &str| -> Option<Value> { serde_json::from_str(&std::fs::read_to_string(dir.join(name)).ok()?).ok() };
-    let v = read(crate::library::REMATCH_JSON).or_else(|| read(CODEX_COPY_MARKER))?;
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(crate::library::REMATCH_JSON)).ok()?).ok()?;
+    if matches!(v.get("kind").and_then(Value::as_str), Some("hook" | "agent" | "lesson")) {
+        return None;
+    }
     let created = v.get("created_at").and_then(Value::as_i64).unwrap_or(0);
     (created <= started).then(|| v.get("id").and_then(Value::as_str).map(str::to_string)).flatten().filter(|id| !id.is_empty())
 }
@@ -1254,32 +1253,39 @@ mod tests {
         assert!(matches!(&recs[2], TraceRecord::ToolResult { path: Some(p), .. } if p == "src/lib.rs"));
     }
 
-    /// The `## Skills` list Codex gave the model → rematch entries: a synced provisional link
-    /// (staging dir with `rematch.json`), a kept copy (marker), and neither a foreign skill nor
-    /// an entry created after the session started.
+    /// The `## Skills` list Codex gave the model → rematch entries: links in the shared
+    /// skills dir to a provisional (staging) and a kept entry dir, each with `rematch.json`, and
+    /// neither a foreign skill, a hook's router (Codex never runs it) nor an entry created after
+    /// the session started.
     #[test]
     fn loaded_entries_from_the_offered_skill_list() {
         let (_t, repo) = repo();
         let base = repo.parent().unwrap().to_path_buf();
         let staged = base.join("rematch/staging/payments/ledger-tests");
         let newer = base.join("rematch/staging/payments/too-new");
-        let links = base.join("rematch/codex-skills");
+        let kept = base.join("omp/agent/skills/kept-one");
+        let hook = base.join("rematch/staging/shared/stuck-detector");
+        let links = base.join("rematch/skills");
         let skills = base.join("home/.agents/skills");
-        for d in [&staged, &newer, &links, &skills.join("kept-one"), &skills.join("mine")] {
+        for d in [&staged, &newer, &kept, &hook, &links, &skills.join("mine")] {
             std::fs::create_dir_all(d).unwrap();
         }
         let started = iso_ms("2026-10-20T10:00:00.000Z").unwrap();
         std::fs::write(staged.join("rematch.json"), json!({"id": "e-prov", "created_at": started - 1}).to_string()).unwrap();
         std::fs::write(newer.join("rematch.json"), json!({"id": "e-new", "created_at": started + 1}).to_string()).unwrap();
+        std::fs::write(kept.join("rematch.json"), json!({"id": "e-kept", "created_at": 0}).to_string()).unwrap();
+        std::fs::write(hook.join("rematch.json"), json!({"id": "e-hook", "kind": "hook", "created_at": 0}).to_string()).unwrap();
         std::os::unix::fs::symlink(&staged, links.join("ledger-tests")).unwrap();
         std::os::unix::fs::symlink(&newer, links.join("too-new")).unwrap();
+        std::os::unix::fs::symlink(&kept, links.join("kept-one")).unwrap();
+        std::os::unix::fs::symlink(&hook, links.join("stuck-detector")).unwrap();
         std::os::unix::fs::symlink(&links, skills.join("rematch")).unwrap();
-        std::fs::write(skills.join("kept-one").join(CODEX_COPY_MARKER), json!({"id": "e-kept", "created_at": 0}).to_string()).unwrap();
         let body = format!(
             "## Skills\nA skill is …\n### Skill roots\n- `r0` = `{}`\n- `r1` = `/opt/codex/.system`\n### Available skills\n\
              - ledger-tests: Use when testing the ledger. (file: r0/rematch/ledger-tests/SKILL.md)\n\
              - too-new: Use when x. (file: r0/rematch/too-new/SKILL.md)\n\
-             - kept-one: Use when y. (file: r0/kept-one/SKILL.md)\n\
+             - kept-one: Use when y. (file: r0/rematch/kept-one/SKILL.md)\n\
+             - stuck-detector: Use when stuck. (file: r0/rematch/stuck-detector/SKILL.md)\n\
              - mine: Use when z. (file: r0/mine/SKILL.md)\n\
              - imagegen: Generate images. (file: r1/imagegen/SKILL.md)\n",
             skills.display()
@@ -1292,8 +1298,8 @@ mod tests {
         ]
         .concat();
         let s = parse_session(&text, None).unwrap();
-        assert_eq!(s.offered_skills().len(), 5, "{:?}", s.offered_skills());
-        assert_eq!(s.offered_skills()[4], PathBuf::from("/opt/codex/.system/imagegen/SKILL.md"));
+        assert_eq!(s.offered_skills().len(), 6, "{:?}", s.offered_skills());
+        assert_eq!(s.offered_skills()[5], PathBuf::from("/opt/codex/.system/imagegen/SKILL.md"));
         let TraceRecord::SessionStart { loaded_entries, staging_dirs, .. } = &trace_records_of(&s)[0] else { panic!() };
         assert_eq!(loaded_entries, &vec!["e-prov".to_string(), "e-kept".to_string()]);
         assert_eq!(staging_dirs[0], skills.join("rematch/ledger-tests").to_string_lossy());

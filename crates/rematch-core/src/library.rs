@@ -3,11 +3,15 @@
 //!
 //! Locations by status:
 //! - draft → `drafts/<name>/` (never loaded)
-//! - provisional → `staging/<branch>/<name>/` (loaded via customDirectories on match)
-//! - kept → `<agent_dir>/skills/<name>/` (loaded natively); a replaced kept dir is
-//!   saved to `predecessors/<name>/<version>/` (version 0 = a skill the plugin did not
-//!   write)
+//! - provisional → `staging/<branch>/<name>/` (loaded through the shared skills dir once a
+//!   synced cwd matched it)
+//! - kept → `<agent_dir>/skills/<name>/` (loaded natively by omp; other harnesses through the
+//!   shared skills dir); a replaced kept dir is saved to `predecessors/<name>/<version>/`
+//!   (version 0 = a skill the plugin did not write)
 //! - retired | dormant | stale → `archive/<status>/<id>/` (never loaded, never deleted)
+//! - every loadable skill entry is linked as `skills/<name> → <entry dir>` by
+//!   [`sync_shared_skills`], which every status change, stage and rollback runs (DESIGN §16
+//!   "Shared skills")
 //! - agents (kind `agent`: `AGENT.md` + `rematch.json`) take the same locations except
 //!   kept, which is `kept-agents/<name>/` with `AGENT.md` copied to
 //!   `<agent_dir>/agents/<name>.md`; a provisional agent is also linked as
@@ -18,6 +22,7 @@
 //! `pinned` is a flag (human-owned): automatic transitions refuse pinned entries; the
 //! entry keeps its status and location. `Status::Pinned` is accepted as a status too.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -445,6 +450,7 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     if agent && e.status == Status::Provisional {
         link_agent(paths, &e)?;
     }
+    sync_shared_skills(ledger, paths, None)?;
     Ok(e)
 }
 
@@ -519,6 +525,7 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
             _ => {}
         }
     }
+    sync_shared_skills(ledger, paths, None)?;
     Ok(e)
 }
 
@@ -635,6 +642,7 @@ pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rol
         }
         None => None,
     };
+    sync_shared_skills(ledger, paths, None)?;
     Ok(Rollback { retired, restored, restored_version: version })
 }
 
@@ -822,13 +830,20 @@ pub fn hook_active(paths: &RematchPaths, e: &Entry) -> bool {
     e.kind != Kind::Hook || paths.hooks_dir().join(format!("{}.ts", e.id)).is_file()
 }
 
+/// A provisional, non-agent, active entry whose repo glob matches `place` (the repo, else
+/// the cwd): what a load-time match contributes.
+fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &str) -> bool {
+    e.status == Status::Provisional && e.kind != Kind::Agent && hook_active(paths, e) && matches_repo(&e.predicate, place)
+}
+
 /// Load-time match (DESIGN §6): a branch's staging dir is contributed when ≥ 1 of its
 /// provisional non-agent, active ([`hook_active`]) entries' repo globs matches the repo
 /// (else cwd). `entries` lists what will load — provisional entries of contributed
 /// branches, every provisional agent (omp discovers them through the plugin root in
 /// every session) and every kept/pinned entry — with their glob hit (false for an
 /// unapproved hook, which must not count). `hooks` lists approved hook modules of
-/// loadable, matching entries.
+/// loadable, matching entries. `skill_dirs` stays in the payload for compatibility;
+/// harnesses load skills from the shared dir ([`sync_shared_skills`]).
 pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>, cwd: &Path) -> Result<MatchResult> {
     let mut out = MatchResult {
         branch: branch_for(repo, cwd),
@@ -844,7 +859,7 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
     let mut branches: Vec<&str> = provisional
         .iter()
-        .filter(|e| e.kind != Kind::Agent && hook_active(paths, e) && matches_repo(&e.predicate, &place))
+        .filter(|e| provisional_hit(paths, e, &place))
         .map(|e| e.branch.as_str())
         .collect();
     branches.sort();
@@ -877,10 +892,153 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
     Ok(out)
 }
 
+/// What [`sync_shared_skills`] did to `REMATCH_ROOT/skills/` (DESIGN §16 "Shared skills").
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SkillsSync {
+    /// Names this sync linked or re-pointed.
+    pub added: Vec<String>,
+    /// Names whose link this sync removed.
+    pub pruned: Vec<String>,
+    /// Links in the directory after the sync.
+    pub total: usize,
+    /// Skill directories a harness loads: the shared dir (none while rematch is off).
+    pub dirs: Vec<PathBuf>,
+    /// `name → entry dir` of every link after the sync.
+    pub links: BTreeMap<String, PathBuf>,
+    /// Names in the directory that are not symlinks: never touched.
+    pub untouched: Vec<String>,
+    pub off: bool,
+}
+
+impl SkillsSync {
+    /// A harness that discovered its skills before this sync must re-scan to see it.
+    pub fn changed(&self) -> bool {
+        !self.added.is_empty() || !self.pruned.is_empty()
+    }
+}
+
+/// An entry the shared dir may link: rematch-owned (its dir holds its own `rematch.json`, so a
+/// user skill registered in place is never linked), with a `SKILL.md`, not an agent (reached
+/// through `agents/`) or a lesson (a library record), and a hook only once approved.
+fn shareable(paths: &RematchPaths, e: &Entry) -> bool {
+    !matches!(e.kind, Kind::Agent | Kind::Lesson)
+        && hook_active(paths, e)
+        && e.path.join(SKILL_MD).is_file()
+        && load_entry(&e.path).is_ok_and(|x| x.id == e.id)
+}
+
+/// Linked whatever cwd synced: kept and pinned entries (status or human pin).
+fn always_shared(e: &Entry) -> bool {
+    matches!(e.status, Status::Kept | Status::Pinned) || e.pinned
+}
+
+#[cfg(unix)]
+pub fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
+}
+
+#[cfg(windows)]
+pub fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
+}
+
+/// Atomic per link: a hidden temporary symlink renamed over `link`, so a reader sees the old
+/// target or the new one, never a missing name.
+pub fn relink(target: &Path, link: &Path) -> Result<()> {
+    let name = link.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = link.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    symlink_dir(target, &tmp)?;
+    std::fs::rename(&tmp, link).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow!(err).context(format!("rename {} → {}", tmp.display(), link.display()))
+    })
+}
+
+/// Make `REMATCH_ROOT/skills/` hold one symlink `<name> → <entry dir>` per loadable entry
+/// ([`shareable`]): every kept/pinned entry, and every provisional entry whose predicate
+/// matched a `place` (repo, else cwd) synced so far — union semantics: a provisional link is
+/// never removed because this `place` does not match (another session elsewhere may load it),
+/// only when its entry stops being provisional/kept/pinned (retired, dormant, stale, draft,
+/// deleted, moved). With `place` = `None` (status changes) nothing provisional is added.
+/// One name has one link: a provisional entry matched by this sync takes it; a provisional
+/// candidate already linked shadows the kept entry of its name until it is kept or retired.
+/// Only symlinks are touched; hidden names (another sync's temporary links) are skipped. While
+/// rematch is off every link is removed and `dirs` is empty.
+pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&Path>) -> Result<SkillsSync> {
+    let dir = &paths.skills_shared;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let off = paths.is_off();
+    let live: Vec<Entry> = if off {
+        Vec::new()
+    } else {
+        [Status::Provisional, Status::Kept, Status::Pinned]
+            .into_iter()
+            .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
+            .collect::<Result<Vec<_>>>()?
+            .concat()
+            .into_iter()
+            .filter(|e| shareable(paths, e))
+            .collect()
+    };
+    let (mut current, mut untouched) = (BTreeMap::new(), Vec::new());
+    for ent in std::fs::read_dir(dir)? {
+        let ent = ent?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        if ent.file_type()?.is_symlink() {
+            current.insert(name, std::fs::read_link(ent.path())?);
+        } else {
+            untouched.push(name);
+        }
+    }
+    let holder = |name: &str, target: &Path| live.iter().find(|e| e.name == name && e.path == target);
+    let mut want: BTreeMap<String, PathBuf> =
+        current.iter().filter(|(n, t)| holder(n, t).is_some()).map(|(n, t)| (n.clone(), t.clone())).collect();
+    for e in live.iter().filter(|e| always_shared(e)) {
+        let shadowed = want.get(&e.name).and_then(|t| holder(&e.name, t)).is_some_and(|h| !always_shared(h));
+        if !shadowed {
+            want.insert(e.name.clone(), e.path.clone());
+        }
+    }
+    if let Some(place) = place {
+        let place = place.to_string_lossy();
+        for e in live.iter().filter(|e| provisional_hit(paths, e, &place)) {
+            want.insert(e.name.clone(), e.path.clone());
+        }
+    }
+    for n in &untouched {
+        want.remove(n);
+    }
+    let mut out = SkillsSync { off, untouched, ..Default::default() };
+    for (name, seen) in &current {
+        let link = dir.join(name);
+        // Re-read before removing: a concurrent sync may have re-pointed it to a live entry.
+        if !want.contains_key(name) && std::fs::read_link(&link).is_ok_and(|t| &t == seen) {
+            remove_link(&link)?;
+            out.pruned.push(name.clone());
+        }
+    }
+    for (name, target) in &want {
+        if current.get(name) != Some(target) {
+            relink(target, &dir.join(name))?;
+            out.added.push(name.clone());
+        }
+    }
+    out.total = want.len();
+    out.links = want;
+    if !off {
+        out.dirs.push(dir.clone());
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UninstallPlan {
     /// Paths to remove: kept skill dirs and kept agent files the plugin wrote, the
-    /// provisional-agent link dir, `rematch-hooks/`, the root.
+    /// provisional-agent link dir, the shared skills dir, `rematch-hooks/`, the root.
     pub remove: Vec<PathBuf>,
     /// `(from, to)` copies run before removal: original (non-rematch) skills and agent
     /// files that a kept entry replaced, restored from the version-0 predecessor.
@@ -905,8 +1063,8 @@ fn written_by_us(ledger: &Ledger, md: &Path) -> Result<bool> {
 
 /// Everything the plugin wrote and nothing else: kept skill dirs whose SKILL.md (and
 /// kept `<agent_dir>/agents/*.md` files whose frontmatter) has a `rematch:` block with
-/// an id known to the ledger, the provisional-agent link dir, the rematch-hooks dir,
-/// and the root.
+/// an id known to the ledger, the provisional-agent link dir, the shared skills dir (links
+/// only; removing it never follows them), the rematch-hooks dir, and the root.
 pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
     for d in sorted_children(&paths.skills_dir())? {
@@ -933,6 +1091,9 @@ pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<Uninstall
     }
     if paths.agents.exists() {
         plan.remove.push(paths.agents.clone());
+    }
+    if paths.skills_shared.exists() {
+        plan.remove.push(paths.skills_shared.clone());
     }
     let hooks = paths.hooks_dir();
     if hooks.exists() {
@@ -1305,6 +1466,8 @@ mod tests {
             set_status(&x.ledger, &x.paths, id, Status::Kept, None).unwrap();
         }
         stage(&x.ledger, &x.paths, &agent_entry("a3", "staged-agent"), &[w("AGENT.md", &agent_md("staged-agent", "p"))]).unwrap();
+        // kept skills are linked in the shared dir; removing it never follows the links
+        assert_eq!(std::fs::read_link(x.paths.skills_shared.join("fresh")).unwrap(), skills.join("fresh"));
 
         let plan = uninstall_plan(&x.paths, &x.ledger).unwrap();
         assert_eq!(
@@ -1315,6 +1478,7 @@ mod tests {
                 agents.join("fresh-agent.md"),
                 agents.join("replaced-agent.md"),
                 x.paths.agents.clone(),
+                x.paths.skills_shared.clone(),
                 x.paths.hooks_dir(),
                 x.paths.root.clone()
             ]
@@ -1335,6 +1499,52 @@ mod tests {
         assert!(!agents.join("fresh-agent.md").exists());
         assert_eq!(std::fs::read_to_string(agents.join("replaced-agent.md")).unwrap(), agent_md("replaced-agent", "user"));
         assert_eq!(std::fs::read_to_string(agents.join("mine-agent.md")).unwrap(), agent_md("mine-agent", "user"));
+    }
+
+    #[test]
+    fn shared_skills_union_shadow_prune_and_off() {
+        let x = env();
+        let dir = x.paths.skills_shared.clone();
+        let names = |s: &SkillsSync| (s.added.clone(), s.pruned.clone(), s.total);
+        let link = |n: &str| std::fs::read_link(dir.join(n)).ok();
+        stage(&x.ledger, &x.paths, &entry("a", "alpha", "repo", Status::Provisional), &[w("SKILL.md", &skill("alpha"))]).unwrap();
+        let mut b = entry("b", "beta", "other", Status::Provisional);
+        b.predicate.repo_glob = "/w/other".into();
+        stage(&x.ledger, &x.paths, &b, &[w("SKILL.md", &skill("beta"))]).unwrap();
+        assert_eq!(link("alpha"), None, "staging alone matched no cwd");
+
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        assert_eq!((names(&s), s.dirs.clone()), ((vec!["alpha".into()], vec![], 1), vec![dir.clone()]));
+        // union: another cwd adds its own and keeps alpha
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/other"))).unwrap();
+        assert_eq!(names(&s), (vec!["beta".into()], vec![], 2));
+        assert!(!sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap().changed(), "idempotent");
+        // a directory that is not a link is never touched
+        std::fs::create_dir_all(dir.join("mine")).unwrap();
+        assert_eq!(sync_shared_skills(&x.ledger, &x.paths, None).unwrap().untouched, vec!["mine".to_string()]);
+
+        // keep: the link follows the entry to its kept dir
+        set_status(&x.ledger, &x.paths, "a", Status::Kept, None).unwrap();
+        assert_eq!(link("alpha"), Some(x.paths.skills_dir().join("alpha")));
+        // a matched provisional candidate of the same name shadows it until retired
+        let mut a2 = entry("a2", "alpha", "repo2", Status::Provisional);
+        a2.predicate.repo_glob = "/w/repo".into();
+        stage(&x.ledger, &x.paths, &a2, &[w("SKILL.md", &skill("alpha"))]).unwrap();
+        sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")));
+        sync_shared_skills(&x.ledger, &x.paths, None).unwrap();
+        assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")), "a status-change sync keeps the candidate");
+        set_status(&x.ledger, &x.paths, "a2", Status::Retired, None).unwrap();
+        assert_eq!(link("alpha"), Some(x.paths.skills_dir().join("alpha")));
+        // retire: pruned
+        set_status(&x.ledger, &x.paths, "b", Status::Retired, None).unwrap();
+        assert_eq!(link("beta"), None);
+
+        // off: every link goes, the user's dir stays
+        std::fs::write(&x.paths.off_marker, "").unwrap();
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        assert_eq!((names(&s), s.off, s.dirs.is_empty()), ((vec![], vec!["alpha".into()], 0), true, true));
+        assert!(dir.join("mine").is_dir());
     }
 
     fn agent_md(name: &str, prompt: &str) -> String {

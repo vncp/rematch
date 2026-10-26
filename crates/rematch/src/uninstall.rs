@@ -17,8 +17,8 @@ pub struct UninstallArgs {
 
 pub fn cmd_uninstall(ctx: &AppCtx, a: UninstallArgs) -> Result<Value> {
     let mut plan = library::uninstall_plan(&ctx.paths, &ctx.ledger)?;
-    // Kept copies `library sync --harness codex` wrote under ~/.agents/skills (DESIGN §18.2.3).
-    plan.remove.splice(0..0, crate::library_cmd::codex_copies());
+    // Kept copies older versions wrote under ~/.agents/skills for Codex (`.rematch-codex.json`).
+    plan.remove.splice(0..0, crate::skills_cmd::legacy_codex_copies());
     let mut lines: Vec<String> = plan.restore.iter().map(|(f, t)| format!("restore {} → {}", f.display(), t.display())).collect();
     lines.extend(plan.remove.iter().map(|p| format!("remove {}", p.display())));
     let note = "the extension link and the PATH shim belong to omp/install.sh: `omp plugin uninstall @vncp/rematch` and remove ~/.local/bin/rematch; links you made for other harnesses (~/.agents/skills/rematch, ~/.claude/skills/rematch) are yours to remove";

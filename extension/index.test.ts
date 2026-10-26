@@ -1,6 +1,7 @@
 // Hook runtime of the rematch extension (DESIGN §10): the pure mode helpers, and the factory against
-// a fake host whose `pi.exec` answers for the binary. Run: `bun test extension`.
-import { afterAll, describe, expect, test } from "bun:test";
+// a fake host whose `pi.exec` answers for the binary and whose settings registry records overrides.
+// Run: `bun test extension`.
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +22,21 @@ import rematch, {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rematch-ext-test-"));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+/** Every `skills.customDirectories` override the factory made: `[settings scope, value]`. */
+const overrides: [unknown, string[]][] = [];
+mock.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({
+	lookup: (key: string) =>
+		key === "skills.customDirectories"
+			? {
+					get: (scope: { custom?: string[] }) => scope.custom ?? ["/configured/skills"],
+					override: (scope: { custom?: string[] }, value: string[]) => {
+						scope.custom = value;
+						overrides.push([scope, value]);
+					},
+				}
+			: undefined,
+}));
 
 const stuck = (repeats = 3) => hookFromModule({ id: "stuck-1", mode: "stuck", tool: "*", message: "stuck", params: { repeats } }, "x");
 const truncate = (max_age_turns: number, keep_chars: number, tool = "*") =>
@@ -221,7 +237,7 @@ function writeHook(id: string, mode: string, params: object): string {
 	return file;
 }
 
-type HostState = { entries: object[]; hooks: string[]; approvals?: object[]; onApprove?: () => void };
+type HostState = { entries: object[]; hooks: string[]; dirs?: string[]; approvals?: object[]; onApprove?: () => void };
 
 /** The `messages` a `context` handler returned (throws when it changed nothing). */
 function contextMessages(r: unknown): unknown[] {
@@ -253,14 +269,16 @@ async function host(name: string, state: HostState) {
 	const z: unknown = new Proxy(() => z, { get: () => z, apply: () => z });
 	const pi = {
 		zod: z,
-		pi: { settings: {}, VERSION: "test" },
+		pi: { settings: {} as { custom?: string[] }, VERSION: "test" },
 		logger: { warn() {}, debug() {} },
 		async exec(cmd: string, argv: string[]) {
 			if (cmd !== bin) return { stdout: "", stderr: "", code: 128, killed: false };
 			execs.push(argv);
 			switch (argv[0]) {
 				case "match":
-					return ok({ entries: state.entries, hooks: state.hooks, skill_dirs: [] });
+					return ok({ entries: state.entries, hooks: state.hooks });
+				case "skills":
+					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], off: false });
 				case "library":
 					if (argv[1] === "approve") state.onApprove?.();
 					return ok({});
@@ -323,6 +341,7 @@ async function host(name: string, state: HostState) {
 			session = id;
 		},
 		matches: () => execs.filter(a => a[0] === "match").map(a => a[2]),
+		settings: pi.pi.settings,
 	};
 }
 
@@ -406,5 +425,20 @@ describe("factory", () => {
 		expect(h.matches()).toEqual([process.cwd(), process.cwd(), tmp]);
 		await h.fire("context", { messages: [user("q")] });
 		expect(h.matches()).toHaveLength(3);
+	});
+
+	test("the factory syncs the cwd and adds the shared skills dir to skills.customDirectories", async () => {
+		const shared = path.join(tmp, "rematch", "skills");
+		const h = await host("skills", { entries: [], hooks: [], dirs: [shared] });
+		expect(h.execs.filter(a => a[0] === "skills")).toEqual([["skills", "sync", "--cwd", process.cwd(), "--harness", "omp"]]);
+		const mine = overrides.filter(([scope]) => scope === h.settings);
+		expect(mine.map(([, value]) => value)).toEqual([["/configured/skills", shared]]);
+		// A re-match elsewhere syncs that cwd; the same shared dir is never added twice.
+		h.ctx.cwd = tmp;
+		await h.fire("context", { messages: [user("q")] });
+		expect(h.execs.filter(a => a[0] === "skills").map(a => a[3])).toEqual([process.cwd(), tmp]);
+		expect(overrides.filter(([scope]) => scope === h.settings)).toHaveLength(1);
+		await h.fire("session_start");
+		expect(h.traceOf()[0].staging_dirs).toEqual([shared]);
 	});
 });

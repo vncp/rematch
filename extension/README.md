@@ -6,9 +6,10 @@ Install: `omp plugin link <repo>/extension` (see `scripts/install.sh`). Contract
 What it does:
 
 - **Factory**: resolves the binary (`$REMATCH_BIN` → `../target/release/rematch` → `../target/debug/rematch` → `PATH`),
-  runs `rematch match --cwd <cwd>` (5 s), adds the returned `skill_dirs` to `skills.customDirectories`
-  (runtime override, `[...configured, ...skill_dirs]`), and imports the returned hook modules. Any failure is logged
-  through `pi.logger` and the session continues without staging.
+  runs `rematch match --cwd <cwd>` and `rematch skills sync --cwd <cwd> --harness omp` in parallel (5 s each), adds the
+  sync's `dirs` (the shared `<root>/skills`, DESIGN §16 "Shared skills") to `skills.customDirectories` (runtime
+  override, `[...configured, ...dirs]`), and imports the hook modules `match` returns. Any failure is logged through
+  `pi.logger` and the session continues without that part.
 - **Trace**: main sessions only (`ctx.agent.kind !== "sub"`) append to `<root>/traces/<session_id>.jsonl`
   (`session_start`, `input`, `tool_result`, `tool_blocked`, `retrieval`, `turn_end`, `model_change`, `agent_end`, `mark`,
   `session_shutdown`). A flagged session (prelabel ≠ none, ≥3 errors in 6 consecutive tool results, or a mark)
@@ -19,12 +20,13 @@ What it does:
   `block` blocks a `tool_call` whose `input[field]` matches; `stuck` blocks a call identical to the `repeats`
   calls right before it (both fail closed); on `context`, `truncate` trims old tool-result text in the outgoing copy
   and `retrieve` appends one hidden `custom` message with matching package units from `rematch retrieve` (both fail open).
-  Approving (`library approve`, the digest), `activate`, `disable` and `rollback` re-run `match` and swap the live hook
-  sets, as do a session switch/branch and a changed `ctx.cwd`, so an approved hook runs at once. Tests: `bun test extension`.
+  Approving (`library approve`, the digest), `activate`, `disable` and `rollback` re-run `match` and `skills sync` and swap
+  the live hook sets, as do a session switch/branch and a changed `ctx.cwd`, so an approved hook runs at once (skill links
+  added by the re-sync reach omp's skill list at its next start). Tests: `bun test extension`.
 - **Entry points**: tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`
   (`why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|decline|ship|transfer|digest|doctor|uninstall|builtins|anchor`).
   Approving entries and uninstalling are reserved to the user (command or digest), never the tool.
 
 Root is `$REMATCH_ROOT` or `~/.rematch`. Kill switch: `REMATCH=0` (only the tool and `/rematch` register)
-or `<root>/off` (handlers stay registered but inert, so `/rematch on` resumes tracing immediately; staging dirs
-apply from the next omp start).
+or `<root>/off` (handlers stay registered but inert, so `/rematch on` resumes tracing immediately; skills apply from the
+next omp start).

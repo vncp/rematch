@@ -25,6 +25,9 @@ pub struct RematchPaths {
     pub agents: PathBuf,
     /// Entry dirs of kept agents (omp loads the copy in `<agent_dir>/agents/<name>.md`).
     pub kept_agents: PathBuf,
+    /// The one skill delivery directory every harness loads (DESIGN §16 "Shared skills"):
+    /// symlinks `<name> → <entry dir>` written by `library::sync_shared_skills`.
+    pub skills_shared: PathBuf,
     pub improver: PathBuf,
     pub jobs: PathBuf,
     pub runs: PathBuf,
@@ -86,6 +89,7 @@ impl RematchPaths {
             predecessors: root.join("predecessors"),
             agents: root.join("agents"),
             kept_agents: root.join("kept-agents"),
+            skills_shared: root.join("skills"),
             improver: root.join("improver"),
             jobs: root.join("jobs"),
             runs: root.join("runs"),
@@ -147,6 +151,7 @@ impl RematchPaths {
             &self.predecessors,
             &self.agents,
             &self.kept_agents,
+            &self.skills_shared,
             &self.improver,
             &self.jobs,
             &self.runs,
@@ -369,7 +374,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = RematchPaths::with_roots(t.path().join("root"), t.path().join("agent"));
         p.ensure_dirs().unwrap();
-        assert!(p.staging.is_dir() && p.blobs.is_dir() && p.agents.is_dir() && p.kept_agents.is_dir());
+        assert!(p.staging.is_dir() && p.blobs.is_dir() && p.agents.is_dir() && p.kept_agents.is_dir() && p.skills_shared.is_dir());
         assert!(!RematchPaths::off_by(None, &p.off_marker));
         assert!(!RematchPaths::off_by(Some("1"), &p.off_marker));
         assert!(RematchPaths::off_by(Some("0"), &p.off_marker));

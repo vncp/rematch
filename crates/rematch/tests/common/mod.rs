@@ -58,6 +58,7 @@ impl Env {
             .env_remove("OMP_BIN")
             .env_remove("REMATCH_IMPROVER")
             .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLAUDE_PLUGIN_ROOT")
             .env_remove("CODEX_HOME")
             .env_remove("REMATCH_BIN")
             .current_dir(&self.repo);

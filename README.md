@@ -54,10 +54,11 @@ The binary, the ledger, lint, the counters and the entries are the same for ever
 
 | | omp | Claude Code ([`adapters/claude-code`](adapters/claude-code/README.md)) | Codex ([`adapters/codex`](adapters/codex/README.md)) |
 |---|---|---|---|
-| Install | `scripts/install.sh` (omp plugin link) | `claude --plugin-dir adapters/claude-code` for one session; `ln -s $PWD/adapters/claude-code ~/.claude/skills/rematch` for every session | symlink + optional `$rematch-status` skill (adapter README) |
+| Install | `scripts/install.sh` (omp plugin link) | `claude --plugin-dir adapters/claude-code` for one session; `ln -s $PWD/adapters/claude-code ~/.claude/skills/rematch` for every session | `ln -s ~/.rematch/skills ~/.agents/skills/rematch` + optional `$rematch-status` skill (adapter README) |
 | Live trace | extension, every event | plugin hooks → `rematch trace-event`; turns recovered at `Stop` from the transcript | none: post-hoc from `~/.codex/sessions` rollouts |
-| Provisional entries load | `skills.customDirectories`, per process, on match | `~/.rematch/claude-skills/` links synced at `SessionStart` (shared by all sessions); the plugin's `skills/` links there | `rematch library sync --harness codex --cwd <repo>` → `~/.rematch/codex-skills/` (one link `~/.agents/skills/rematch`); no per-session gating |
-| Kept entries | `~/.omp/agent/skills/<name>/` | linked into the same `claude-skills/` | copied to `~/.agents/skills/<name>/` |
+| Skills load from | the shared `~/.rematch/skills/`, added to `skills.customDirectories` per process | the shared `~/.rematch/skills/`, through the plugin's `skills/` link | the shared `~/.rematch/skills/`, through `~/.agents/skills/rematch`; no per-session gating |
+| Shared dir synced for a cwd by | the extension at omp start (`skills sync`) | the `SessionStart` hook (`reloadSkills` when a link changed) | `rematch skills sync --harness codex --cwd <repo>` before Codex starts |
+| Kept entries | `~/.omp/agent/skills/<name>/`, also linked in the shared dir (one skill by realpath) | linked in the shared dir | linked in the shared dir |
 | `block` / `stuck` hooks | yes | yes: `PreToolUse` → `rematch hook-check`, exit 2 | no |
 | `retrieve` hook | before every request | once per prompt, when the unit set changes (`additionalContext`) | no |
 | `truncate` hook | yes | no (no hook rewrites earlier tool results) | no |
@@ -67,7 +68,7 @@ The binary, the ledger, lint, the counters and the entries are the same for ever
 | Commands | `/rematch …`, the `rematch` tool | `/rematch:rematch-status`, `/rematch:rematch-why`, `/rematch:rematch-mark` | `$rematch-status` skill |
 | Batch mode | yes | not wired | not wired (plan in DESIGN §18.2.4) |
 
-No model call ever runs inside a Claude Code or Codex session; what Claude Code cannot do that omp can is listed in DESIGN §18.1.
+One directory, `~/.rematch/skills/`, delivers skills to all three harnesses: it links every kept entry and every provisional entry whose predicate matched a directory that was synced, so loading is the union of the repos you work in while counting stays with each session's own predicate ([`docs/MANUAL.md`](docs/MANUAL.md#where-skills-load-from), DESIGN §16 "Shared skills"). No model call ever runs inside a Claude Code or Codex session; what Claude Code cannot do that omp can is listed in DESIGN §18.1.
 
 ## How it works
 
@@ -158,7 +159,7 @@ The loop design, the scoped editors, the preference for skills and scripts over 
 | **Propose** | One editor session through `omp -p --no-tools`, inputs in the prompt: the trace excerpt, the deliverable, the redirect, the current entry if any, matching `EXPERIENCE.md` lessons. The prompt treats the trace as data. The editor returns edits plus a manifest (evidence moment, predicted fix, predicted regression). `KEEP_BASE` is valid. There is no composer: with no probes, choosing between two untested texts would be blind selection. | `improver/editor.md`; `omp.rs` verifies provider and model on every event |
 | **Lint** | Static, free, every rule in `improver/lint.toml`. On an error the editor gets one retry with the findings. | `lint::lint_entry` |
 | **Stage** | Written to `staging/<branch>/<name>/` as `provisional` with the predicate, model family, originating session and manifest. Near-duplicates (simhash) route evidence to the existing entry instead. | `library::stage`, `dedup` |
-| **Load** | At the next session start the extension asks the binary which staging directories match the working directory and adds them to omp's skill paths before discovery. Every session is an on-session; there is no withheld arm. | extension factory; `library::list_for_match` |
+| **Load** | At the next session start the extension has the binary link the entries matching the working directory into the shared skills directory, which it adds to omp's skill paths before discovery; `match` gives the entries and hooks the session counts. Every session is an on-session; there is no withheld arm. | extension factory; `library::sync_shared_skills`, `library::list_for_match` |
 | **Count · decide** | For every finished trace: did the motivating redirect class recur while the entry was loaded; did a tool-error cluster, a takeover or a disable happen. Then the decision rule. After a keep or retire the reflector writes `EXPERIENCE.md` beside the entry; later proposals read matching ones. The editor prompt itself is never amended. | `counters::fold_session`, `counters::decide` |
 
 ## What it counts
@@ -243,17 +244,17 @@ Every entry records the model family it was created under and keeps a per-family
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/architecture-dark.svg">
-    <img alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and asks the binary which staging directories match before discovery. The Rust binary owns rematch-core, reflect and count, create and improve, batch and scope, and calls omp -p non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent/skills." src="docs/assets/readme/architecture-light.svg" width="100%">
+    <img alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and has the binary sync the shared skills directory before discovery. The Rust binary owns rematch-core, reflect and count, create and improve, batch and scope, and calls omp -p non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent/skills." src="docs/assets/readme/architecture-light.svg" width="100%">
   </picture>
 </p>
 
 | Unit | What it holds | Rule |
 |---|---|---|
 | `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, approved hook modules (`block` and `stuck` on `tool_call`, `truncate` and `retrieve` on `context`; the modules are data, the modes live here), the `rematch` tool and `/rematch` command, the digest; `agents/` (made by `install.sh`, gitignored): a link to `~/.rematch/agents/`, through which omp discovers provisional subagents | forwards raw events; parses nothing beyond the hook-module contract; no model calls; every handler fails open except `block`/`stuck` hooks |
-| `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 119 unit tests + 1 golden import test |
-| `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `retrieve`, built-in entries, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 54 unit + 50 end-to-end tests (236 cargo tests in all, plus 23 extension tests under `bun test`) |
+| `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 135 unit tests + 1 golden import test |
+| `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, `skills sync` (the shared skills dir), doctor, uninstall, `retrieve`, built-in entries, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 60 unit + 43 end-to-end tests (239 cargo tests in all, plus 24 extension tests under `bun test`) |
 | `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
-| `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
+| `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `skills/` (the shared skill links every harness loads), `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
 

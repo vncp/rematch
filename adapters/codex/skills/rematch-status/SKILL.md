@@ -8,8 +8,8 @@ below writes under `~/.rematch/`, outside the workspace, so each one needs the u
 in Codex; run them from the session's working directory and pass it as `--cwd`.
 
 1. Refresh the skills Codex sees for this repo:
-   `rematch library sync --harness codex --cwd "$PWD" --text`
-   Show the printed lines as they are. Synced skills reach Codex in the next session, not this one.
+   `rematch skills sync --harness codex --cwd "$PWD" --text`
+   Show the printed lines as they are. Newly linked skills reach Codex in the next session, not this one.
 2. Read the digest: `rematch digest --cwd "$PWD"` prints one JSON line. Show every string in
    `data.lines` as it is, one per line.
 3. For each item in `data.approvals` (`id`, `name`, `kind`, `reason`, `diff`): show the name,

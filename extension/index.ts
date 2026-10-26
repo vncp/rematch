@@ -1,7 +1,7 @@
 // rematch extension: traces main sessions into <root>/traces/<session_id>.jsonl (DESIGN §3),
-// loads matching staging dirs via `skills.customDirectories`, runs approved hooks (`block`/`stuck` on
-// `tool_call`, `truncate`/`retrieve` on `context`), and exposes the `rematch` tool, the `/rematch`
-// command and the `alt+e` digest shortcut (DESIGN §10).
+// loads the shared skills dir (`skills sync` → `skills.customDirectories`), runs approved hooks
+// (`block`/`stuck` on `tool_call`, `truncate`/`retrieve` on `context`), and exposes the `rematch`
+// tool, the `/rematch` command and the `alt+e` digest shortcut (DESIGN §10).
 // It parses nothing the binary owns: every decision beyond the cheap prelabels lives in Rust.
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -607,11 +607,13 @@ export function loadedEntryIds(data: unknown, hooks: readonly Hook[]): string[] 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Module-level cache of `match` results (factories are rebound per subagent; per-session state stays
-// in the closure). Keyed by binary + cwd and cleared when the main session rotates or the user
-// changes what loads, so a cached result never outlives the session it was matched for.
+// Module-level cache of `match` + `skills sync` results (factories are rebound per subagent;
+// per-session state stays in the closure). Keyed by binary + cwd and cleared when the main
+// session rotates or the user changes what loads, so a cached result never outlives the session
+// it was matched for.
 
-const matchCache = new Map<string, Promise<Envelope>>();
+type Matched = { match: Envelope; sync: Envelope };
+const matchCache = new Map<string, Promise<Matched>>();
 
 type RegistryHandle = { get(scope: unknown): unknown; override(scope: unknown, value: unknown): void };
 
@@ -669,37 +671,39 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 	}
 
-	// --- loaded state: staging dirs + hooks matched for `loadedCwd` ------------------------------
+	// --- loaded state: skill dirs + hooks matched for `loadedCwd` --------------------------------
 	// Matched at load time for process.cwd(); re-matched when a main session's cwd changes, when the
 	// main session switches or branches, and after the user approves, activates, disables or rolls
-	// back an entry, so approved hooks run at once (staging dirs only ever add, §0).
+	// back an entry, so approved hooks run at once (skill dirs only ever add, §0). Skills load from
+	// the one shared dir `skills sync` maintains (`dirs`); `match` supplies entries and hooks.
 	let loadedCwd: string | null = null;
 	let loadedEntries: string[] = [];
-	let stagingDirs: string[] = [];
+	let skillDirs: string[] = [];
 	let hooks: Hook[] = [];
 	let callHooks: Hook[] = [];
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
 	let tracksCalls = false;
 
-	/** Match `cwd` and adopt its entries and hooks; `fresh` drops every cached match first. Never throws. */
+	/** Match and sync `cwd`, adopt its entries, hooks and skill dirs; `fresh` drops every cached result first. Never throws. */
 	async function loadMatch(cwd: string, fresh: boolean): Promise<void> {
 		if (!fresh && cwd === loadedCwd) return;
 		loadedCwd = cwd;
 		if (!enabled || !bin) return;
 		if (fresh) matchCache.clear();
 		const key = `${bin}\0${cwd}`;
+		let pending = matchCache.get(key);
+		if (!pending) {
+			pending = Promise.all([
+				call(["match", "--cwd", cwd], { timeout: 5000 }),
+				call(["skills", "sync", "--cwd", cwd, "--harness", "omp"], { timeout: 5000 }),
+			]).then(([match, sync]) => ({ match, sync }));
+			matchCache.set(key, pending);
+		}
+		const { match, sync } = await pending;
+		if (!match.ok || !sync.ok) matchCache.delete(key);
 		try {
-			let pending = matchCache.get(key);
-			if (!pending) {
-				pending = call(["match", "--cwd", cwd], { timeout: 5000 });
-				matchCache.set(key, pending);
-			}
-			const match = await pending;
-			if (!match.ok) {
-				matchCache.delete(key);
-				throw new Error(match.error ?? "match failed");
-			}
+			if (!match.ok) throw new Error(match.error ?? "match failed");
 			const data = match.data ?? {};
 			if (data.off === true) {
 				enabled = false;
@@ -713,11 +717,6 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 					log("warn", `hook ${file} skipped: ${errorText(error)}`);
 				}
 			}
-			const dirs = stringsOf(data.skill_dirs).filter(d => !stagingDirs.includes(d));
-			if (dirs.length > 0) {
-				await addSkillDirs(pi, dirs);
-				stagingDirs = [...stagingDirs, ...dirs];
-			}
 			loadedEntries = loadedEntryIds(data, next);
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
@@ -725,7 +724,17 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
 			tracksCalls = next.some(h => h.mode === "stuck");
 		} catch (error) {
-			log("warn", `match/staging skipped for ${cwd}: ${errorText(error)}`);
+			log("warn", `match skipped for ${cwd}: ${errorText(error)}`);
+		}
+		try {
+			if (!sync.ok) throw new Error(sync.error ?? "skills sync failed");
+			const dirs = stringsOf(sync.data?.dirs).filter(d => !skillDirs.includes(d));
+			if (dirs.length > 0) {
+				await addSkillDirs(pi, dirs);
+				skillDirs = [...skillDirs, ...dirs];
+			}
+		} catch (error) {
+			log("warn", `skills skipped for ${cwd}: ${errorText(error)}`);
 		}
 	}
 
@@ -826,7 +835,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			omp_version: pi.pi.VERSION ?? null,
 			loaded_entries: loadedEntries,
 			hooks_loaded: hooks.map(h => h.id),
-			staging_dirs: stagingDirs,
+			staging_dirs: skillDirs,
 		});
 		if (!loadedAnnotated) {
 			loadedAnnotated = true;
@@ -875,7 +884,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (yes && r.ok) approved = true;
 			ctx.ui.notify(`rematch: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
 		}
-		// What the user just approved (hook modules, staging dirs) loads now, not at the next omp start.
+		// Hook modules the user just approved run now; skill links the sync adds load at the next omp start.
 		if (approved) await reload(ctx.cwd, true);
 	}
 
@@ -941,7 +950,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		if (env.ok) {
 			enabled = on;
 			if (on) {
-				env.data = { ...env.data, note: "tracing resumes now; staging dirs apply from the next omp start" };
+				env.data = { ...env.data, note: "tracing resumes now; skills apply from the next omp start" };
 				if (!trace && ctx && isMain(ctx)) await startSession(ctx, false);
 			}
 		}

@@ -3,8 +3,9 @@
 //!
 //! * `trace-event --harness claude-code` — `SessionStart`, `UserPromptSubmit`, `PostToolUse`,
 //!   `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd` → DESIGN §3 records appended to
-//!   `traces/cc:<session_id>.jsonl`; `SessionStart` also matches the cwd and links the
-//!   matching staging entries into `REMATCH_ROOT/claude-skills/` ([`sync_claude_skills`]);
+//!   `traces/cc:<session_id>.jsonl`; `SessionStart` also matches the cwd and syncs the
+//!   shared skills dir `REMATCH_ROOT/skills/` (`skills_cmd::sync_cwd`), which the plugin's
+//!   `skills/` links to;
 //!   `UserPromptSubmit` runs an approved `retrieve` hook and returns its units as
 //!   `additionalContext`; `SessionEnd` writes `session_shutdown` and, when flagged,
 //!   `pending/<sid>.json`.
@@ -18,7 +19,6 @@
 //! Code's hook protocol instead of printing the envelope; with it every error exits 0, so
 //! rematch never fails a hook except by an intentional block.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,16 +27,14 @@ use clap::Args;
 use rematch_core::features::head;
 use rematch_core::import::{args_hash, is_injected_frame, repo_of, TRACE_DELIVERABLE_CHARS, TRACE_INPUT_TEXT_CHARS};
 use rematch_core::import_claude;
-use rematch_core::library::{self, MatchResult, SKILL_MD};
+use rematch_core::library::{self, MatchResult};
 use rematch_core::trace::{self, flag_reasons, AgentInfo, RetrievedUnit, TraceRecord};
-use rematch_core::types::{HookMode, Kind, ModelRef, Status, DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS};
+use rematch_core::types::{HookMode, Kind, ModelRef, DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
 use crate::envelope::Envelope;
 
-/// Directory under `REMATCH_ROOT` that the plugin's `skills/` symlink points at.
-pub const CLAUDE_SKILLS_DIR: &str = "claude-skills";
 /// Bytes of the transcript tail read to recover a run's turns.
 const TRANSCRIPT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 /// Tool results whose paths join the retrieval query (the extension's `retrievalQuery`).
@@ -59,10 +57,6 @@ pub struct TraceEventArgs {
     /// exit 2; any error exits 0. Without it the result is the usual envelope.
     #[arg(long)]
     pub hook_output: bool,
-}
-
-pub fn claude_skills_dir(ctx: &AppCtx) -> PathBuf {
-    ctx.paths.root.join(CLAUDE_SKILLS_DIR)
 }
 
 fn read_payload() -> Result<Value> {
@@ -293,104 +287,6 @@ pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
     Ok(Loaded { m, hooks, loaded_entries })
 }
 
-/// The skill links of `REMATCH_ROOT/claude-skills/` after a sync.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SkillSync {
-    pub dir: PathBuf,
-    /// `name → target`.
-    pub linked: BTreeMap<String, PathBuf>,
-    pub changed: bool,
-}
-
-/// Makes `REMATCH_ROOT/claude-skills/` hold exactly one symlink per skill this cwd loads:
-/// every `<name>/SKILL.md` of the contributed staging branch dirs (what omp loads through
-/// `skills.customDirectories`) and every kept/pinned entry's package. Staging stays where it
-/// is; Claude Code sees it through the plugin's `skills/` symlink to this dir. Only
-/// symlinks are removed. With the kill switch on, every link goes.
-pub fn sync_claude_skills(ctx: &AppCtx, m: &MatchResult) -> Result<SkillSync> {
-    let dir = claude_skills_dir(ctx);
-    let mut want: BTreeMap<String, PathBuf> = BTreeMap::new();
-    if !m.off {
-        for d in &m.skill_dirs {
-            let mut kids: Vec<PathBuf> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect();
-            kids.sort();
-            for k in kids {
-                let Some(name) = k.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue };
-                if k.join(SKILL_MD).is_file() {
-                    want.entry(name).or_insert(k);
-                }
-            }
-        }
-        for me in m.entries.iter().filter(|e| matches!(e.status, Status::Kept | Status::Pinned)) {
-            let Some(e) = ctx.ledger.get_entry(&me.id)? else { continue };
-            if matches!(e.kind, Kind::Lesson | Kind::Agent) {
-                continue;
-            }
-            let path = if e.path.join(SKILL_MD).is_file() { e.path.clone() } else { ctx.paths.skills_dir().join(&e.name) };
-            if path.join(SKILL_MD).is_file() {
-                want.entry(e.name.clone()).or_insert(path);
-            }
-        }
-    }
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let mut changed = false;
-    for ent in std::fs::read_dir(&dir)?.flatten() {
-        let p = ent.path();
-        if !std::fs::symlink_metadata(&p).is_ok_and(|md| md.file_type().is_symlink()) {
-            continue;
-        }
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if want.get(&name).is_some_and(|t| std::fs::read_link(&p).is_ok_and(|cur| &cur == t)) {
-            continue;
-        }
-        std::fs::remove_file(&p).with_context(|| format!("unlink {}", p.display()))?;
-        changed = true;
-    }
-    for (name, target) in &want {
-        let link = dir.join(name);
-        if std::fs::symlink_metadata(&link).is_ok() {
-            continue;
-        }
-        symlink_dir(target, &link)?;
-        changed = true;
-    }
-    Ok(SkillSync { dir, linked: want, changed })
-}
-
-#[cfg(unix)]
-fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
-}
-
-#[cfg(windows)]
-fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_dir(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
-}
-
-/// `<plugin root>/skills` → `REMATCH_ROOT/claude-skills`, created when absent (the repo
-/// cannot ship an absolute link). `true` when created or repointed.
-fn ensure_plugin_link(ctx: &AppCtx, plugin_root: &Path) -> Result<bool> {
-    if !plugin_root.join(".claude-plugin").is_dir() {
-        return Ok(false);
-    }
-    let link = plugin_root.join("skills");
-    let target = claude_skills_dir(ctx);
-    match std::fs::symlink_metadata(&link) {
-        Ok(md) if md.file_type().is_symlink() => {
-            if std::fs::read_link(&link).is_ok_and(|cur| cur == target) {
-                return Ok(false);
-            }
-            std::fs::remove_file(&link)?;
-        }
-        // A real directory is the user's: leave it.
-        Ok(_) => return Ok(false),
-        Err(_) => {}
-    }
-    std::fs::create_dir_all(&target)?;
-    symlink_dir(&target, &link)?;
-    Ok(true)
-}
-
 // ---- trace-event ----
 
 pub fn cmd_trace_event(ctx: &AppCtx, a: TraceEventArgs) -> Result<Value> {
@@ -404,9 +300,9 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
         return hook_check(ctx, a, payload);
     }
     if ctx.paths.is_off() {
-        // Staging must not load while off: drop the links, write nothing.
+        // Staging must not load while off: the sync empties the shared dir; write nothing.
         if event == "SessionStart" {
-            sync_claude_skills(ctx, &MatchResult { off: true, ..Default::default() })?;
+            crate::skills_cmd::sync_cwd(ctx, &cwd_of(ctx, payload))?;
         }
         return Ok(json!({"event": event, "off": true, "records": [], "hook": HookReply::default().json()}));
     }
@@ -422,13 +318,13 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
             let source = str_of(payload, "source");
             let mut reload = false;
             if let Some(root) = std::env::var_os("CLAUDE_PLUGIN_ROOT").filter(|r| !r.is_empty()) {
-                reload |= ensure_plugin_link(ctx, Path::new(&root))?;
+                reload |= crate::skills_cmd::ensure_plugin_link(ctx, Path::new(&root))?;
             }
             // Compaction continues the session: its skills refresh, its trace does not restart.
             if source != "compact" || !tf.started() {
                 reload |= start(ctx, &mut tf, &sid, &cwd, payload, &mut extra)?;
             } else {
-                reload |= sync_claude_skills(ctx, &load(ctx, &cwd)?.m)?.changed;
+                reload |= crate::skills_cmd::sync_cwd(ctx, &cwd)?.0.changed();
             }
             if reload {
                 reply.stdout = Some(json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "reloadSkills": true}}));
@@ -484,11 +380,11 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
     Ok(out)
 }
 
-/// `session_start` after matching `cwd` and syncing the skill links; `true` when the links
-/// changed (the hook asks Claude Code to re-scan skills).
+/// `session_start` after matching `cwd` and syncing the shared skills dir; `true` when the
+/// links changed (the hook asks Claude Code to re-scan skills).
 fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Value, extra: &mut Value) -> Result<bool> {
     let loaded = load(ctx, cwd)?;
-    let sync = sync_claude_skills(ctx, &loaded.m)?;
+    let (sync, _) = crate::skills_cmd::sync_cwd(ctx, cwd)?;
     let repo = repo_of(cwd).map(|p| p.to_string_lossy().into_owned());
     let cwd_s = cwd.to_string_lossy().into_owned();
     let seq = tf.seq();
@@ -511,11 +407,11 @@ fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Valu
         omp_version: "claude-code".into(),
         loaded_entries: loaded.loaded_entries.clone(),
         hooks_loaded: loaded.hooks.iter().map(|h| h.id.clone()).collect(),
-        staging_dirs: loaded.m.skill_dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect(),
+        staging_dirs: sync.dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect(),
     })?;
-    extra["skills"] = json!(sync.linked.keys().collect::<Vec<_>>());
+    extra["skills"] = json!(sync.links.keys().collect::<Vec<_>>());
     extra["loaded_entries"] = json!(loaded.loaded_entries);
-    Ok(sync.changed)
+    Ok(sync.changed())
 }
 
 /// A trace whose `SessionStart` hook never ran (plugin enabled mid-session, hook timeout)
@@ -767,12 +663,6 @@ pub fn hook_check(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<V
     Ok(json!({"event": "PreToolUse", "block": true, "hook_id": hook.id, "reason": reason, "hook": reply.json()}))
 }
 
-/// `match --harness claude-code`: the link sync for the command's cwd.
-pub fn match_claude(ctx: &AppCtx, m: &MatchResult) -> Result<Value> {
-    let s = sync_claude_skills(ctx, m)?;
-    Ok(json!({"dir": s.dir, "linked": s.linked, "changed": s.changed}))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +687,7 @@ mod tests {
 
     #[test]
     fn library_module_round_trips() {
-        use rematch_core::types::{Family, HookRule, Origin, Predicate};
+        use rematch_core::types::{Family, HookRule, Origin, Predicate, Status};
         let mut e = crate::app::new_entry(
             crate::app::NewEntry {
                 kind: Kind::Hook,

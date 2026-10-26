@@ -1,7 +1,7 @@
 //! End-to-end for the Codex adapter (DESIGN §18): a handwritten Codex rollout with a
 //! negation redirect → `import --history --harness codex` → `reflect --history` with a
-//! scripted editor stages an entry → `library sync --harness codex --cwd <repo>` links it
-//! into `REMATCH_ROOT/codex-skills/`.
+//! scripted editor stages an entry → `skills sync --harness codex --cwd <repo>` links it
+//! into the shared `REMATCH_ROOT/skills/`, which Codex reads through `~/.agents/skills/rematch`.
 
 mod common;
 
@@ -75,19 +75,27 @@ fn codex_history_reflects_and_syncs() {
     assert_eq!(input["text"], "No, that's wrong: run the tests before you commit; the reconcile tests fail", "ambient block stripped");
     assert_eq!(input["after_deliverable"], "Added the reconcile command and committed it.");
 
-    // Delivery: the provisional entry matches this repo → linked for Codex.
-    let d = env.run(&["library", "sync", "--harness", "codex", "--cwd", env.repo.to_str().unwrap()]);
-    let link = env.root.join("codex-skills/run-tests-before-commit");
+    // Delivery: the provisional entry matches this repo → linked in the shared dir. An older
+    // version's layout is migrated: its `~/.agents/skills/rematch → codex-skills` link is
+    // re-pointed and its marked kept copy removed.
+    let skills_root = env.home.join(".agents/skills");
+    std::fs::create_dir_all(skills_root.join("old-kept")).unwrap();
+    std::fs::write(skills_root.join("old-kept/.rematch-codex.json"), "{}").unwrap();
+    std::fs::create_dir_all(skills_root.join("mine")).unwrap();
+    std::fs::create_dir_all(env.root.join("codex-skills")).unwrap();
+    std::os::unix::fs::symlink(env.root.join("codex-skills"), skills_root.join("rematch")).unwrap();
+    let d = env.run(&["skills", "sync", "--harness", "codex", "--cwd", env.repo.to_str().unwrap()]);
+    let link = env.root.join("skills/run-tests-before-commit");
     assert_eq!(std::fs::read_link(&link).unwrap(), skill_dir, "{d}");
-    assert!(link.join("SKILL.md").is_file());
-    assert_eq!(d["linked"][0]["name"], "run-tests-before-commit", "{d}");
+    assert_eq!(d["added"], json!(["run-tests-before-commit"]), "{d}");
+    assert_eq!(std::fs::read_link(skills_root.join("rematch")).unwrap(), env.root.join("skills"));
+    assert_eq!(d["reached_from"], json!([skills_root.join("rematch")]), "{d}");
+    assert!(skills_root.join("rematch/run-tests-before-commit/SKILL.md").is_file());
+    assert!(!skills_root.join("old-kept").exists() && skills_root.join("mine").is_dir() && !env.root.join("codex-skills").exists());
 
     // Counting: a later, clean Codex session in the repo listed the synced skill to the
     // model (`## Skills`, through ~/.agents/skills/rematch); its import writes the trace and
     // `count` folds it into the entry's counters.
-    let skills_root = env.home.join(".agents/skills");
-    std::fs::create_dir_all(&skills_root).unwrap();
-    std::os::unix::fs::symlink(env.root.join("codex-skills"), skills_root.join("rematch")).unwrap();
     let id2 = "01a15c11-0000-7000-8000-000000000003";
     let clean = clean_rollout(&env.repo, &skills_root, id2);
     let day = codex_home.join("sessions/2026/10/21");
@@ -109,12 +117,15 @@ fn codex_history_reflects_and_syncs() {
         "{e}"
     );
 
-    // Another directory: no predicate hit, the link goes.
+    // Another directory: no predicate hit, the link stays (union); Codex is told how to see
+    // the dir when no link reaches it.
     let elsewhere = env.home.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let d2 = env.run(&["library", "sync", "--harness", "codex", "--cwd", elsewhere.to_str().unwrap()]);
-    assert_eq!(d2["unlinked"], json!(["run-tests-before-commit"]), "{d2}");
-    assert!(std::fs::symlink_metadata(&link).is_err());
+    std::fs::remove_file(skills_root.join("rematch")).unwrap();
+    let d2 = env.run(&["skills", "sync", "--harness", "codex", "--cwd", elsewhere.to_str().unwrap()]);
+    assert_eq!((d2["added"].clone(), d2["pruned"].clone(), d2["reached_from"].clone()), (json!([]), json!([]), json!([])), "{d2}");
+    assert!(d2["lines"].to_string().contains("ln -s"), "{d2}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), skill_dir);
 }
 
 /// A clean Codex session started a minute from now (after the entry exists) whose skill list

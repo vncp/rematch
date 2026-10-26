@@ -19,6 +19,7 @@ pub mod proc;
 pub mod reflect;
 pub mod retrieve;
 pub mod scope;
+pub mod skills_cmd;
 pub mod trace_event;
 pub mod uninstall;
 
@@ -53,6 +54,11 @@ enum Cmd {
     Reflect(reflect::ReflectArgs),
     /// Staging dirs, entries and hooks that load for a directory.
     Match(digest::MatchArgs),
+    /// The shared skill directory every harness loads (REMATCH_ROOT/skills): sync.
+    Skills {
+        #[command(subcommand)]
+        cmd: skills_cmd::SkillsCmd,
+    },
     /// Units of the loaded skill packages that match a query (the `retrieve` context hook).
     Retrieve(retrieve::RetrieveArgs),
     /// Session-start digest: new statuses, approvals, review list, transfers.
@@ -76,7 +82,7 @@ enum Cmd {
     RunWorker(batch::worker::RunWorkerArgs),
     /// Job status (or all jobs + entry counts).
     Status { job: Option<String> },
-    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export, sync.
+    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export.
     Library {
         #[command(subcommand)]
         cmd: library_cmd::LibraryCmd,
@@ -117,6 +123,7 @@ impl Cmd {
             Cmd::Import(_) => "import",
             Cmd::Reflect(_) => "reflect",
             Cmd::Match(_) => "match",
+            Cmd::Skills { .. } => "skills",
             Cmd::Digest => "digest",
             Cmd::Retrieve(_) => "retrieve",
             Cmd::Record(_) => "record",
@@ -151,6 +158,7 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Import(a) => import_cmd::cmd_import(ctx, a),
         Cmd::Reflect(a) => reflect::cmd_reflect(ctx, a),
         Cmd::Match(a) => digest::cmd_match(ctx, a),
+        Cmd::Skills { cmd } => skills_cmd::cmd_skills(ctx, cmd),
         Cmd::Digest => digest::cmd_digest(ctx),
         Cmd::Retrieve(a) => retrieve::cmd_retrieve(ctx, a),
         Cmd::Record(a) => reflect::cmd_record(ctx, a),

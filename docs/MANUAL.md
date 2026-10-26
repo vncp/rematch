@@ -220,11 +220,11 @@ Then work as usual. Each session is traced to `~/.rematch/traces/cc:<session id>
 
 | In Claude Code | Same as |
 |---|---|
-| `/rematch:rematch-status` | `rematch status` + what loads in this directory (`rematch match --harness claude-code`) |
+| `/rematch:rematch-status` | `rematch status` + the skills linked for this directory (`rematch skills sync --harness claude-code`) |
 | `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
 | `/rematch:rematch-mark correction` | `/rematch mark correction` in omp: overrides the classifier for the last turn of this session |
 
-Provisional and kept skills that match the directory appear as `rematch:<name>` skills: at session start the plugin links them into `~/.rematch/claude-skills/`, which the plugin's `skills/` points at (created on first start; `rematch match --harness claude-code --cwd <dir>` refreshes it by hand). Approved `block` and `stuck` hooks refuse tool calls; an approved `retrieve` hook adds matching units to your prompt. `rematch off` stops tracing and unlinks the skills at the next session start. To remove the plugin, delete the `~/.claude/skills/rematch` link; `rematch uninstall` removes `~/.rematch`.
+Provisional and kept skills appear as `rematch:<name>` skills through the shared skills directory (see [Where skills load from](#where-skills-load-from)): at session start the plugin syncs `~/.rematch/skills/` for the session's directory and points its own `skills/` there (created on first start; `rematch skills sync --harness claude-code --cwd <dir>` refreshes it by hand). Approved `block` and `stuck` hooks refuse tool calls; an approved `retrieve` hook adds matching units to your prompt. `rematch off` stops tracing and empties the shared skills directory at once. Upgrading from a version that linked skills into `~/.rematch/claude-skills/`: the first session start re-points the plugin's `skills/` and deletes that directory. To remove the plugin, delete the `~/.claude/skills/rematch` link; `rematch uninstall` removes `~/.rematch`.
 
 Raise `SessionEnd`'s 1.5 s budget if large sessions end unflagged: `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000 claude`.
 
@@ -235,15 +235,32 @@ Codex (CLI, IDE extension, Codex in the ChatGPT desktop app) gets the same entri
 ```sh
 rematch import --history --harness codex       # ~/.codex/sessions (or $CODEX_HOME/sessions) → the ledger, read-only
 rematch reflect --history                      # flagged Codex sessions are reflected like omp ones
-ln -s ~/.rematch/codex-skills ~/.agents/skills/rematch   # once: Codex sees rematch's provisional skills
-rematch library sync --harness codex --cwd "$PWD"        # before starting Codex in a repo
+ln -s ~/.rematch/skills ~/.agents/skills/rematch          # once: Codex sees rematch's skills (the shared directory)
+rematch skills sync --harness codex --cwd "$PWD"          # before starting Codex in a repo: adds the skills that match it
 ```
 
 - **Ids.** Imported Codex sessions are `codex:<rollout id>`: `rematch library why codex:<id>`, `rematch mark --session codex:<id> --class correction`.
-- **What loads.** `library sync` links the provisional skills whose predicate matches the repo into `~/.rematch/codex-skills/` and copies kept skills to `~/.agents/skills/<name>/` (marked with `.rematch-codex.json`; a directory of yours with the same name is left alone and reported). Codex loads every skill under its skill roots in every session, so the links stay visible everywhere until the next sync; they are counted only where the predicate hits.
+- **What loads.** Codex reads the shared skills directory `~/.rematch/skills/` through the one link above (it scans `~/.agents/skills` recursively and follows directory links): every kept skill, and every provisional skill whose predicate matched a directory you synced, from any harness. Codex loads every skill under its skill roots in every session, so a linked skill is visible everywhere until it is retired; it is counted only where its predicate hits. Upgrading from a version that used `~/.rematch/codex-skills/` and copies marked `.rematch-codex.json`: the first `skills sync --harness codex` re-points your `~/.agents/skills/rematch` link and removes those copies.
 - **Counting.** A rollout records the skill list Codex gave the model; the import turns the rematch skills in it into the session's loaded entries. Clean sessions are counted by the next `rematch count` (or `reflect`), flagged ones when `reflect --history` handles them. Import after you worked: a session that was never imported never counts.
 - **Reviewer threads** (Codex's auto-review subagents) are imported but never reflected.
 - **Optional:** `$rematch-status` (`adapters/codex/skills/rematch-status`, symlinked into `~/.agents/skills/`) runs the sync, the digest and approvals from inside Codex, each command after your approval.
+
+## Where skills load from
+
+One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for every skill entry that loads: every kept or pinned entry (its directory under `~/.omp/agent/skills/`), and every provisional entry whose predicate matched a directory that was synced (its `staging/<branch>/<name>/`). All three harnesses read it:
+
+| Harness | Reads `~/.rematch/skills/` through | Synced for a directory by | You install |
+|---|---|---|---|
+| omp | `skills.customDirectories`, added by the extension for the process | the extension, at omp start (`skills sync --cwd`) | `scripts/install.sh` |
+| Claude Code | the plugin's `skills/` link (made at the first session start) | the plugin's `SessionStart` hook | `ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch` |
+| Codex | `~/.agents/skills/rematch` | `rematch skills sync --harness codex --cwd "$PWD"` | `ln -s ~/.rematch/skills ~/.agents/skills/rematch` |
+
+- **Loading is the union of what you work on.** A sync adds the provisional skills matching its directory and never removes one because this directory does not match it: a session in another repo may be using it. Each extra skill costs one description line in the system prompt.
+- **Counting is not.** A session counts only the entries whose predicate matches its own directory, so a skill loaded from the shared directory in an unrelated repo never moves a counter.
+- **Status changes apply at once.** Keeping an entry re-points its link to the kept directory; retiring, archiving or disabling one removes its link; `rematch off` removes every link and `rematch on` restores the kept ones. A session sees the directory as it was at its own start; a link removed while it runs dangles there.
+- `rematch skills sync --cwd <dir>` runs the sync by hand and prints what it added and pruned. Directories in `~/.rematch/skills/` that are not links are never touched.
+- `~/.rematch` is shared by every omp profile, and so is the directory: a skill kept under one profile's `skills/` is linked for sessions of every profile and harness.
+- Subagents (`kind: agent`) are not skills: omp loads them (provisional ones through the extension's `agents/` link, kept ones from `~/.omp/agent/agents/`); Claude Code and Codex do not.
 
 ## Where things are
 
@@ -252,9 +269,8 @@ rematch library sync --harness codex --cwd "$PWD"        # before starting Codex
   traces/            one JSONL per session (the only input to reflection)
   pending/           sessions flagged for the next reflection
   ledger.sqlite      sessions, entries, counters, proposals, receipts
-  staging/<branch>/  provisional entries, loaded on match (staging/shared/ holds the built-in hook entries)
-  claude-skills/     links to the skills that load for the last Claude Code session start (the Claude Code plugin's skills/)
-  codex-skills/      links to the provisional skills that match the repo of the last `library sync --harness codex` (~/.agents/skills/rematch points here)
+  staging/<branch>/  provisional entries, loaded through skills/ once a synced directory matched them (staging/shared/ holds the built-in hook entries)
+  skills/            links to every skill entry that loads, read by omp, Claude Code and Codex (see Where skills load from)
   agents/            links to provisional agents (extension/agents points here)
   kept-agents/       entry dirs of kept agents
   drafts/ archive/   never loaded (archive is never deleted)
@@ -265,7 +281,6 @@ rematch library sync --harness codex --cwd "$PWD"        # before starting Codex
 ~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/)
 ~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/)
 ~/.omp/agent/extensions/rematch-hooks/   approved hooks (data-only modules: block, stuck, truncate, retrieve)
-~/.agents/skills/<name>/                  kept entries copied for Codex by `library sync --harness codex` (marker .rematch-codex.json)
 ```
 
 Roles, in `~/.omp/agent/config.yml`:

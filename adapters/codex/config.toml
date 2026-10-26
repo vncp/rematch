@@ -4,8 +4,8 @@
 # Restart Codex after changing this file.
 
 # Switch one rematch skill off in Codex only (it keeps loading in omp / Claude Code and keeps
-# its counters). `path` is the SKILL.md as Codex sees it: the provisional link, or the kept
-# copy under ~/.agents/skills/<name>/. To stop it everywhere: `rematch library disable <id>`.
+# its counters). `path` is the SKILL.md as Codex sees it: the entry's link in the shared dir,
+# ~/.agents/skills/rematch/<name>/SKILL.md. To stop it everywhere: `rematch library disable <id>`.
 # [[skills.config]]
 # path = "/Users/<you>/.agents/skills/rematch/<name>/SKILL.md"
 # enabled = false
