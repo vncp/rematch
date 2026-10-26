@@ -15,7 +15,7 @@
   <a href="#how-a-reflection-works">How a reflection works</a> ·
   <a href="#what-it-counts">Counters</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="docs/DESIGN.md">Design</a>
+  <a href="docs/MANUAL.md">Manual</a>
 </p>
 
 <p align="center">
@@ -260,7 +260,7 @@ Open questions from the spec that the build did not settle are at the end of [`d
 
 ## Docs
 
-[Design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
+[Manual](docs/MANUAL.md) · [design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
 
 ## License
 
