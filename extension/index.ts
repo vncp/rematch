@@ -192,7 +192,7 @@ export function skillsInvoked(text: string): string[] {
 
 // Prelabel regexes: verbatim with evolve-core `redirect.rs`.
 export const REVERT = /\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i;
-export const NEGATION = /^(?:no|nope|don't|do not|stop|not that|wrong|that's not|i said|actually|instead)\b/i;
+export const NEGATION = /^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i;
 export const MARK = /^\/evolve\s+mark\s+(correction|preference|scope)\b/i;
 export const REPROMPT_JACCARD = 0.6;
 

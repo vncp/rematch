@@ -628,38 +628,45 @@ pub struct Triage {
 /// Words that make a redirect about how the agent worked (tooling, verification, steps).
 pub const PROCESS_TEXT_PATTERN: &str = r"(?i)\b(?:tests?|testing|cargo|build|builds|compile[sd]?|lint|linter|clippy|fmt|format(?:ter)?|verify|verified|verification|check(?:ed)?|run|ran|running|command|commands|tool|tools|script|scripts|step|steps|first|before|after|skip(?:ped)?|forgot|workflow|process|procedure|commit|push|git|branch|ci|debug|logs?|retry|loop|stuck|read|grep|search|plan|order|install|worktree|diff|edit|patch)\b";
 
+/// Words that make a procedural failure about the agent's general way of working rather
+/// than this workload's conventions: the invariant editor's territory (SPEC §loop step 3).
+pub const INVARIANT_TEXT_PATTERN: &str = r"(?i)\b(?:verify|verified|verification|didn't run|did not run|never ran|forgot|skip(?:ped)?|before (?:you|claiming|saying|yielding)|stuck|loop|looping|retry|retrying|decompose|one at a time|too many|assum(?:ed|ing)|guess(?:ed|ing)|hallucinat\w*|read the|check the|plan first)\b";
+
 static PROCESS_TEXT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(PROCESS_TEXT_PATTERN).expect("static pattern"));
+static INVARIANT_TEXT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(INVARIANT_TEXT_PATTERN).expect("static pattern"));
 
-/// Triage of the first failure (SPEC loop step 2). Process when the moment is a tool-error
-/// cluster, a takeover (`interrupt`), a `revert`, or a redirect whose text references
-/// tooling/verification/steps ([`PROCESS_TEXT_PATTERN`]); otherwise content.
+/// Triage of the first failure (SPEC loop step 2). Two independent axes:
+///
+/// * kind — `Process` when the moment is a tool-error cluster, a takeover (`interrupt`), a
+///   `revert`, a redirect whose text references tooling/verification/steps
+///   ([`PROCESS_TEXT_PATTERN`]), or a redirect of a deliverable the agent produced with tools
+///   (any `tool_result` between the previous user turn and the moment: the complaint is about
+///   how the work was done). `Content` only for a corrected prose answer: no tool activity and
+///   no process words.
+/// * scope — `Domain` by default; `Invariant` when the failure is procedural in the agent's
+///   general way of working: error clusters, takeovers, reverts, or [`INVARIANT_TEXT_PATTERN`].
 pub fn triage(session: &SessionRecord, records: &[TraceRecord]) -> Triage {
-    let process = |moment, reason: &str| Triage {
-        kind: TriageKind::Process,
-        scope: EditorScope::Invariant,
-        moment,
-        reason: reason.to_string(),
-    };
-    let content = |moment, reason: &str| Triage {
-        kind: TriageKind::Content,
-        scope: EditorScope::Domain,
+    let make = |kind, scope, moment, reason: &str| Triage {
+        kind,
+        scope,
         moment,
         reason: reason.to_string(),
     };
     let Some(moment) = find_moment(session) else {
-        return content(None, "no_moment");
+        return make(TriageKind::Content, EditorScope::Domain, None, "no_moment");
     };
     if session.error_cluster_seqs.contains(&moment.seq) {
-        return process(Some(moment), "error_cluster");
+        return make(TriageKind::Process, EditorScope::Invariant, Some(moment), "error_cluster");
     }
     let redirect = session.redirects.iter().find(|r| r.seq == moment.seq);
     let prelabel = redirect.map(|r| r.prelabel.as_str()).unwrap_or("");
     if prelabel == PRELABEL_INTERRUPT {
-        return process(Some(moment), "interrupt");
+        return make(TriageKind::Process, EditorScope::Invariant, Some(moment), "interrupt");
     }
     if prelabel == PRELABEL_REVERT {
-        return process(Some(moment), "revert");
+        return make(TriageKind::Process, EditorScope::Invariant, Some(moment), "revert");
     }
     // Text of the redirect; a bare `mark` record falls back to the input it labels.
     let mut text = redirect.map(|r| r.text_head.clone()).unwrap_or_default();
@@ -672,10 +679,28 @@ pub fn triage(session: &SessionRecord, records: &[TraceRecord]) -> Triage {
             text = t.clone();
         }
     }
-    if PROCESS_TEXT_RE.is_match(&text) {
-        process(Some(moment), "procedural_text")
+    let scope = if INVARIANT_TEXT_RE.is_match(&text) {
+        EditorScope::Invariant
     } else {
-        content(Some(moment), "content_text")
+        EditorScope::Domain
+    };
+    if PROCESS_TEXT_RE.is_match(&text) {
+        return make(TriageKind::Process, scope, Some(moment), "procedural_text");
+    }
+    // Was the corrected deliverable produced with tools? Then the redirect is about the work.
+    let prev_input_seq = records
+        .iter()
+        .filter(|r| matches!(r, TraceRecord::Input { .. }) && r.seq() < moment.seq)
+        .map(|r| r.seq())
+        .max()
+        .unwrap_or(0);
+    let worked_with_tools = records.iter().any(|r| {
+        matches!(r, TraceRecord::ToolResult { .. }) && r.seq() > prev_input_seq && r.seq() < moment.seq
+    });
+    if worked_with_tools {
+        make(TriageKind::Process, scope, Some(moment), "tool_deliverable")
+    } else {
+        make(TriageKind::Content, EditorScope::Domain, Some(moment), "content_text")
     }
 }
 
@@ -946,7 +971,12 @@ not json at all
             Some(RedirectClass::Correction),
             "No, you didn't run the tests before saying done",
         )];
-        assert_eq!(triage(&s, &[]).reason, "procedural_text");
+        let t = triage(&s, &[]);
+        assert_eq!((t.kind, t.scope, t.reason.as_str()), (TriageKind::Process, EditorScope::Invariant, "procedural_text"));
+        // Procedural, but about this workload's conventions → domain editor.
+        s.redirects = vec![redirect(5, "negation", Some(RedirectClass::Correction), "No, commit messages here must reference the ticket")];
+        let t = triage(&s, &[]);
+        assert_eq!((t.kind, t.scope, t.reason.as_str()), (TriageKind::Process, EditorScope::Domain, "procedural_text"));
         s.redirects = vec![redirect(
             5,
             "negation",
@@ -972,5 +1002,27 @@ not json at all
 {"seq":9,"t":2,"ev":"mark","class":"correction"}"#,
         );
         assert_eq!(triage(&s, &recs).reason, "procedural_text");
+        // A corrected deliverable the agent produced with tools is about the work, not a fact.
+        s.redirects = vec![redirect(
+            4,
+            "negation",
+            Some(RedirectClass::Correction),
+            "That's wrong. Every public function must have a docstring and be exported in __all__",
+        )];
+        let recs = parse_trace(
+            r#"{"seq":1,"t":1,"ev":"input","text":"add mul","prelabel":"none"}
+{"seq":2,"t":2,"ev":"tool_result","tool":"edit","call_id":"c","input":{"path":"src/lib.py"},"args_hash":"h","result_bytes":1,"is_error":false,"error_class":null,"content_head":"","skill_read":null,"path":"src/lib.py"}
+{"seq":3,"t":3,"ev":"turn_end","usage":{},"stop_reason":"stop","text_head":"Done."}
+{"seq":4,"t":4,"ev":"input","text":"That's wrong. Every public function must have a docstring and be exported in __all__","prelabel":"negation"}"#,
+        );
+        let t = triage(&s, &recs);
+        assert_eq!((t.kind, t.scope, t.reason.as_str()), (TriageKind::Process, EditorScope::Domain, "tool_deliverable"));
+        // The same complaint about a prose answer stays content.
+        let recs = parse_trace(
+            r#"{"seq":1,"t":1,"ev":"input","text":"what does mul do","prelabel":"none"}
+{"seq":3,"t":3,"ev":"turn_end","usage":{},"stop_reason":"stop","text_head":"It adds."}
+{"seq":4,"t":4,"ev":"input","text":"That's wrong. Every public function must have a docstring and be exported in __all__","prelabel":"negation"}"#,
+        );
+        assert_eq!(triage(&s, &recs).kind, TriageKind::Content);
     }
 }

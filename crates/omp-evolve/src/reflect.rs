@@ -11,7 +11,7 @@ use clap::Args;
 use evolve_core::counters;
 use evolve_core::dedup;
 use evolve_core::experience::{self, ExperienceQuery};
-use evolve_core::features::{exts_of, rank_stems, stems_of_session, stems_of_text, MAX_PREDICATE_STEMS};
+use evolve_core::features::{exts_of, head, rank_stems, stems_of_session, stems_of_text, MAX_PREDICATE_STEMS};
 use evolve_core::ledger::{enum_str, EntryFilter};
 use evolve_core::library::{self, EVOLVE_JSON};
 use evolve_core::lint::{self, LintConfig, LintContext};
@@ -898,6 +898,19 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
         eprintln!("omp-evolve reflect {sid}: content failure at seq {} ({}); logged, no proposal", moment.seq, tri.reason);
         return done(ctx, sid, json!({"outcome": "skipped", "reason": "content", "triage": tri}));
     }
+    // SPEC §loop step 1: the signal is a redirect classified correction|preference, a tool-error
+    // cluster, a takeover, or an explicit mark. A session whose only redirects the classifier
+    // labelled scope|none carries no signal once classified; spend no editor call on it.
+    let has_signal = session.error_clusters > 0
+        || session.takeovers > 0
+        || session.redirects.iter().any(|r| {
+            r.prelabel.starts_with("mark:")
+                || matches!(r.class, None | Some(RedirectClass::Correction) | Some(RedirectClass::Preference))
+        });
+    if !has_signal {
+        eprintln!("omp-evolve reflect {sid}: redirects classified scope/none and no other signal; no proposal");
+        return done(ctx, sid, json!({"outcome": "skipped", "reason": "no_signal"}));
+    }
 
     // Predicate (DESIGN §6).
     let excerpt = trace::excerpt_around(&records, moment.seq, EXCERPT_RADIUS, EXCERPT_RADIUS);
@@ -919,14 +932,45 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
     if exts.is_empty() {
         exts = session.exts.clone();
     }
-    let inputs: Vec<String> = records
+    // SPEC §Trigger predicates: stems come from the originating turn and the files it touched.
+    // The originating turn is the task request whose deliverable was redirected (the last
+    // input before the moment); the redirect text contributes at lower weight so its wording
+    // ("that's wrong", "every") does not crowd out the task's domain terms.
+    let redirect_text: Option<String> = records.iter().find_map(|r| match r {
+        TraceRecord::Input { seq, text, .. } if *seq == moment.seq => Some(text.clone()),
+        _ => None,
+    });
+    let task_input: Option<String> = records
         .iter()
         .filter_map(|r| match r {
-            TraceRecord::Input { text, prelabel, .. } if redirect::mark_class(prelabel).is_none() => Some(text.clone()),
+            TraceRecord::Input { seq, text, prelabel, .. }
+                if *seq < moment.seq && redirect::mark_class(prelabel).is_none() =>
+            {
+                Some(text.clone())
+            }
             _ => None,
         })
-        .collect();
-    let doc_terms = stems_of_session(&inputs, &session.files_touched);
+        .last();
+    let files_for_stems: &[String] = if window_files.is_empty() { &session.files_touched } else { &window_files };
+    let mut doc_terms: Vec<String> = Vec::new();
+    if let Some(t) = &task_input {
+        for _ in 0..2 {
+            doc_terms.extend(stems_of_session(std::slice::from_ref(t), files_for_stems));
+        }
+    }
+    if let Some(t) = &redirect_text {
+        doc_terms.extend(stems_of_session(std::slice::from_ref(t), &[]));
+    }
+    if doc_terms.is_empty() {
+        let inputs: Vec<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                TraceRecord::Input { text, prelabel, .. } if redirect::mark_class(prelabel).is_none() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        doc_terms = stems_of_session(&inputs, &session.files_touched);
+    }
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
     let mut ranked = rank_stems(&doc_terms, &corpus);
     ranked.truncate(MAX_PREDICATE_STEMS);
@@ -1063,24 +1107,55 @@ pub fn cmd_mark(ctx: &AppCtx, a: MarkArgs) -> Result<Value> {
     let label = format!("mark:{}", redirect::class_name(class));
     let mut ledger_updated = false;
     let mut overrode = None;
-    if let Some(mut s) = ctx.ledger.get_session(&a.session)? {
+    // A session marked after it ended may not be in the ledger yet: fold its trace first so
+    // the mark lands on a real session record and `find_moment` can see it.
+    let existing = match ctx.ledger.get_session(&a.session)? {
+        Some(s) => Some(s),
+        None => {
+            let trace_path = ctx.paths.traces.join(format!("{}.jsonl", a.session));
+            if trace_path.is_file() {
+                let s = trace::fold_trace(&trace::read_trace(&trace_path)?, &a.session);
+                ctx.ledger.upsert_session(&s)?;
+                Some(s)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(mut s) = existing {
         // Override the classifier for the last turn …
         if let Some(last) = s.redirects.iter().filter(|r| redirect::mark_class(&r.prelabel).is_none()).max_by_key(|r| r.seq) {
             ctx.ledger.set_redirect_class(&s.id, last.seq, class, Some(1.0))?;
             overrode = Some(last.seq);
         }
-        // … and record the mark itself.
-        let seq = s.redirects.iter().map(|r| r.seq).max().map_or(0, |m| m + 1);
+        // … and record the mark itself, anchored to the last user turn in the trace (the
+        // turn being overridden) so the moment and the redirect text are real.
+        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", a.session));
+        let last_input = if trace_path.is_file() {
+            trace::read_trace(&trace_path)?.into_iter().rev().find_map(|r| match r {
+                TraceRecord::Input { seq, text, after_deliverable, t, .. } => {
+                    Some((seq, text, after_deliverable.unwrap_or_default(), t))
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let (seq, text_head, deliverable_head, t) = match last_input {
+            Some((seq, text, deliverable, t)) => (seq, head(&text, 512), head(&deliverable, 512), t),
+            None => (s.redirects.iter().map(|r| r.seq).max().map_or(0, |m| m + 1), String::new(), String::new(), ctx.now),
+        };
         if !s.redirects.iter().any(|r| r.prelabel == label && Some(r.seq) > overrode) {
+            s.redirects.retain(|r| r.seq != seq || redirect::mark_class(&r.prelabel).is_some());
             s.redirects.push(Redirect {
                 session_id: s.id.clone(),
                 seq,
                 prelabel: label.clone(),
                 class: Some(class),
                 confidence: Some(1.0),
-                text_head: String::new(),
-                deliverable_head: String::new(),
-                t: ctx.now,
+                text_head,
+                deliverable_head,
+                t,
             });
         }
         s.flagged = true;

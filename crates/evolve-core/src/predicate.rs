@@ -1,7 +1,7 @@
 //! Trigger predicates (DESIGN §6): derivation on stage, load-time match against
 //! repo/cwd, count-time match against a finished session's exts and stems.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use glob::{MatchOptions, Pattern};
 use sha2::{Digest, Sha256};
@@ -93,8 +93,17 @@ pub fn matches_repo(p: &Predicate, repo_or_cwd: &str) -> bool {
     };
     let target = repo_or_cwd.trim_end_matches('/');
     let target = if target.is_empty() { "/" } else { target };
-    Path::new(target)
-        .ancestors()
+    // Symlinked roots (`/tmp` → `/private/tmp` on macOS): a glob derived from the git toplevel
+    // (realpath) must still match a cwd given in its symlinked spelling, and vice versa.
+    let mut candidates = vec![PathBuf::from(target)];
+    if let Ok(real) = std::fs::canonicalize(target) {
+        if real != candidates[0] {
+            candidates.push(real);
+        }
+    }
+    candidates
+        .iter()
+        .flat_map(|c| c.ancestors())
         .any(|a| pat.matches_with(&a.to_string_lossy(), opts))
 }
 

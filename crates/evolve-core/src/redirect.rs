@@ -18,8 +18,7 @@ pub const REVERT_PATTERN: &str =
     r"(?i)\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)";
 
 /// User opens with a negation; applied to the left-trimmed text.
-pub const NEGATION_PATTERN: &str =
-    r"(?i)^(?:no|nope|don't|do not|stop|not that|wrong|that's not|i said|actually|instead)\b";
+pub const NEGATION_PATTERN: &str = r"(?i)^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b";
 
 /// Explicit `/evolve mark <class>` typed as input → prelabel `mark:<class>`.
 pub const MARK_PATTERN: &str = r"(?i)^/evolve\s+mark\s+(correction|preference|scope)\b";
@@ -309,6 +308,8 @@ mod tests {
         );
         assert_eq!(prelabel("  Actually use tabs", None, true), "negation");
         assert_eq!(prelabel("that's not what I asked", None, true), "negation");
+        assert_eq!(prelabel("That's wrong. In this repo every", None, true), "negation");
+        assert_eq!(prelabel("You didn't run the tests", None, true), "negation");
         assert_eq!(
             prelabel("nothing else to do", None, true),
             "none",
