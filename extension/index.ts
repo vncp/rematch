@@ -827,6 +827,10 @@ export default async function ompEvolve(pi: ExtensionAPI): Promise<void> {
 			const text = typeof event.text === "string" ? event.text : "";
 			const idle = ctx.isIdle();
 			const label = prelabel(text, idle, trace.lastInput);
+			// Slash commands and `!`/`%` local executions are not user turns; only `/evolve mark`
+			// (prelabel `mark:<class>`) and `/skill:<name>` invocations carry signal for the trace.
+			const trimmed = text.trimStart();
+			if (/^[/!%]/.test(trimmed) && !label.startsWith("mark:") && !/^\/skill:/i.test(trimmed)) return;
 			const seq = write("input", {
 				text: head(text, LIMITS.inputText),
 				source: event.source ?? null,
