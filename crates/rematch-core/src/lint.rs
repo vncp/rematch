@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::library::{primary_doc, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
 use crate::package::{router_bytes, SkillDoc, TRIGGER_RE};
-use crate::types::{Entry, Kind, LessonTag, LintFinding, LintReport, Severity};
+use crate::types::{Entry, HookMode, HookParams, HookRule, Kind, LessonTag, LintFinding, LintReport, Severity};
 
 /// Built-in rules, used when `improver/lint.toml` is missing; every key of a present
 /// file is optional and falls back to these values per field.
@@ -603,30 +603,13 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
         }
     }
 
-    // Hooks: documented pass condition; regex compiles and cannot match everything.
+    // Hooks: documented pass condition plus the mode's own checks (`hook_problems`).
     if entry.kind == Kind::Hook || entry.hook.is_some() {
         match &entry.hook {
             None => rep.add("hook", Severity::Error, "hook entry without a hook rule", Some("hook.json")),
             Some(h) => {
-                if h.pass_condition.trim().is_empty() {
-                    rep.add("hook", Severity::Error, "hook has no documented pass condition", Some("hook.json"));
-                }
-                if h.message.trim().is_empty() {
-                    rep.add("hook", Severity::Error, "hook has no block message", Some("hook.json"));
-                }
-                match Regex::new(&h.regex) {
-                    Err(e) => rep.add("hook", Severity::Error, format!("hook regex does not compile: {e}"), Some("hook.json")),
-                    Ok(re) => {
-                        let probes = &cfg.hooks.probes;
-                        if re.is_match("") || (!probes.is_empty() && probes.iter().all(|p| re.is_match(p))) {
-                            rep.add(
-                                "hook",
-                                Severity::Error,
-                                "hook regex matches everything (empty input or every benign probe); it would block valid completions",
-                                Some("hook.json"),
-                            );
-                        }
-                    }
+                for p in hook_problems(h, &cfg.hooks.probes) {
+                    rep.add("hook", Severity::Error, p, Some("hook.json"));
                 }
             }
         }
@@ -638,6 +621,80 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
 
     let ok = !rep.findings.iter().any(|f| f.severity == Severity::Error);
     Ok(LintReport { ok, findings: rep.findings })
+}
+
+/// Bounds a context/stuck hook's parameters must respect (`hook` lint rule).
+pub const TRUNCATE_MAX_AGE_TURNS: std::ops::RangeInclusive<u32> = 1..=100;
+pub const TRUNCATE_KEEP_CHARS: std::ops::RangeInclusive<u32> = 200..=100_000;
+pub const STUCK_REPEATS: std::ops::RangeInclusive<u32> = 2..=20;
+pub const RETRIEVE_BUDGET_BYTES: std::ops::RangeInclusive<u32> = 500..=65_536;
+pub const RETRIEVE_MIN_OVERLAP: std::ops::RangeInclusive<u32> = 1..=20;
+
+/// Problems of a hook rule, per mode (empty = valid). Every mode needs a documented pass
+/// condition and a tool (`*` = any). `block`: field, message, a regex that compiles and
+/// matches neither the empty input nor every benign `probe`. `stuck`: message and
+/// `repeats` ≥ 2. `truncate`/`retrieve`: parameters within bounds. A parameter of another
+/// mode is a problem (the rule would not do what it says).
+pub fn hook_problems(h: &HookRule, probes: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mode = crate::ledger::enum_str(&h.mode);
+    if h.pass_condition.trim().is_empty() {
+        out.push("hook has no documented pass condition".to_string());
+    }
+    if h.tool.trim().is_empty() {
+        out.push(format!("{mode} hook names no tool (use `*` for every tool)"));
+    }
+    let given = [
+        ("max_age_turns", h.max_age_turns, HookMode::Truncate),
+        ("keep_chars", h.keep_chars, HookMode::Truncate),
+        ("repeats", h.repeats, HookMode::Stuck),
+        ("budget_bytes", h.budget_bytes, HookMode::Retrieve),
+        ("min_overlap", h.min_overlap, HookMode::Retrieve),
+    ];
+    for (name, v, owner) in given {
+        if v.is_some() && owner != h.mode {
+            out.push(format!("`{name}` belongs to {} hooks, not {mode}", crate::ledger::enum_str(&owner)));
+        }
+    }
+    let mut bound = |name: &str, v: u32, r: std::ops::RangeInclusive<u32>| {
+        if !r.contains(&v) {
+            out.push(format!("{mode} hook `{name}` = {v} is outside {}..={}", r.start(), r.end()));
+        }
+    };
+    match h.params() {
+        HookParams::Block {} => {}
+        HookParams::Truncate { max_age_turns, keep_chars } => {
+            bound("max_age_turns", max_age_turns, TRUNCATE_MAX_AGE_TURNS);
+            bound("keep_chars", keep_chars, TRUNCATE_KEEP_CHARS);
+        }
+        HookParams::Stuck { repeats } => bound("repeats", repeats, STUCK_REPEATS),
+        HookParams::Retrieve { budget_bytes, min_overlap } => {
+            bound("budget_bytes", budget_bytes, RETRIEVE_BUDGET_BYTES);
+            bound("min_overlap", min_overlap, RETRIEVE_MIN_OVERLAP);
+        }
+    }
+    if matches!(h.mode, HookMode::Block | HookMode::Stuck) && h.message.trim().is_empty() {
+        out.push(format!("{mode} hook has no block message"));
+    }
+    if h.mode == HookMode::Block {
+        if h.field.trim().is_empty() {
+            out.push("block hook names no input field".to_string());
+        }
+        match Regex::new(&h.regex) {
+            Err(e) => out.push(format!("hook regex does not compile: {e}")),
+            Ok(re) => {
+                if re.is_match("") || (!probes.is_empty() && probes.iter().all(|p| re.is_match(p))) {
+                    out.push(
+                        "hook regex matches everything (empty input or every benign probe); it would block valid completions"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    } else if !h.regex.is_empty() || !h.field.is_empty() {
+        out.push(format!("{mode} hook takes no regex/field (block hooks only)"));
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -846,13 +903,7 @@ mod tests {
     fn hooks_need_pass_condition_and_selective_regex() {
         let (t, mut e) = good();
         e.kind = Kind::Hook;
-        let hook = |re: &str, pass: &str| HookRule {
-            tool: "bash".into(),
-            field: "command".into(),
-            regex: re.into(),
-            message: "Use --force-with-lease.".into(),
-            pass_condition: pass.into(),
-        };
+        let hook = |re: &str, pass: &str| HookRule::block("bash", "command", re, "Use --force-with-lease.", pass);
         e.hook = Some(hook(r"git\s+push\s+--force\b", "commands without bare --force pass"));
         write(t.path(), "hook.json", &serde_json::to_string(e.hook.as_ref().unwrap()).unwrap());
         assert!(lint(t.path(), &e).ok, "regex naming git push --force is not a text risk");
@@ -866,6 +917,81 @@ mod tests {
         assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("matches everything")), "matches all probes");
         e.hook = None;
         assert!(!lint(t.path(), &e).ok);
+    }
+
+    #[test]
+    fn hook_modes_validate_their_own_parameters() {
+        let (t, mut e) = good();
+        e.kind = Kind::Hook;
+        let probes = LintConfig::default().hooks.probes;
+        let rule = |mode: HookMode| HookRule {
+            mode,
+            tool: "*".into(),
+            message: "Same call again; change the approach.".into(),
+            pass_condition: "every call that differs from the previous ones passes".into(),
+            ..HookRule::block("", "", "", "", "")
+        };
+        let problems = |h: &HookRule| hook_problems(h, &probes);
+
+        // defaults of every non-block mode are valid, regex/field not needed
+        for mode in [HookMode::Truncate, HookMode::Stuck, HookMode::Retrieve] {
+            assert_eq!(problems(&rule(mode)), Vec::<String>::new(), "{mode:?}");
+            e.hook = Some(rule(mode));
+            write(t.path(), "hook.json", &serde_json::to_string(e.hook.as_ref().unwrap()).unwrap());
+            assert!(lint(t.path(), &e).ok, "{mode:?}: {:?}", lint(t.path(), &e).findings);
+        }
+        // block still needs a selective regex and a field
+        assert!(problems(&rule(HookMode::Block)).iter().any(|p| p.contains("matches everything")));
+        assert!(problems(&rule(HookMode::Block)).iter().any(|p| p.contains("no input field")));
+
+        // truncate bounds
+        let mut tr = rule(HookMode::Truncate);
+        tr.max_age_turns = Some(0);
+        tr.keep_chars = Some(50);
+        let p = problems(&tr);
+        assert!(p.iter().any(|p| p.contains("max_age_turns") && p.contains("outside")), "{p:?}");
+        assert!(p.iter().any(|p| p.contains("keep_chars") && p.contains("outside")), "{p:?}");
+        tr.max_age_turns = Some(6);
+        tr.keep_chars = Some(1200);
+        assert!(problems(&tr).is_empty());
+
+        // stuck: repeats ≥ 2 and a message
+        let mut st = rule(HookMode::Stuck);
+        st.repeats = Some(1);
+        assert!(problems(&st).iter().any(|p| p.contains("repeats")));
+        st.repeats = Some(3);
+        st.message = " ".into();
+        assert!(problems(&st).iter().any(|p| p.contains("no block message")));
+
+        // retrieve bounds; message optional
+        let mut rt = rule(HookMode::Retrieve);
+        rt.message.clear();
+        rt.budget_bytes = Some(100);
+        rt.min_overlap = Some(0);
+        let p = problems(&rt);
+        assert!(p.iter().any(|p| p.contains("budget_bytes")) && p.iter().any(|p| p.contains("min_overlap")), "{p:?}");
+        rt.budget_bytes = Some(6000);
+        rt.min_overlap = Some(2);
+        assert!(problems(&rt).is_empty());
+
+        // every mode: pass condition documented; foreign parameters and a regex refused
+        let mut x = rule(HookMode::Retrieve);
+        x.pass_condition.clear();
+        x.keep_chars = Some(1200);
+        x.regex = "rm".into();
+        let p = problems(&x);
+        assert!(p.iter().any(|p| p.contains("pass condition")), "{p:?}");
+        assert!(p.iter().any(|p| p.contains("`keep_chars` belongs to truncate")), "{p:?}");
+        assert!(p.iter().any(|p| p.contains("takes no regex")), "{p:?}");
+        e.hook = Some(x);
+        assert!(!lint(t.path(), &e).ok);
+
+        // serde: `mode` defaults to block, mode parameters are optional
+        let old: HookRule =
+            serde_json::from_str(r#"{"tool":"bash","field":"command","regex":"x","message":"m","pass_condition":"p"}"#).unwrap();
+        assert_eq!(old.mode, HookMode::Block);
+        let tr: HookRule = serde_json::from_str(r#"{"mode":"truncate","tool":"*","pass_condition":"p"}"#).unwrap();
+        assert_eq!(tr.params(), HookParams::Truncate { max_age_turns: 6, keep_chars: 1200 });
     }
 
     #[test]

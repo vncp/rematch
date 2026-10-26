@@ -1,12 +1,13 @@
 // rematch extension: traces main sessions into <root>/traces/<session_id>.jsonl (DESIGN §3),
-// loads matching staging dirs via `skills.customDirectories`, runs approved hooks on `tool_call`,
-// and exposes the `rematch` tool, the `/rematch` command and the `alt+e` digest shortcut (DESIGN §10).
+// loads matching staging dirs via `skills.customDirectories`, runs approved hooks (`block`/`stuck` on
+// `tool_call`, `truncate`/`retrieve` on `context`), and exposes the `rematch` tool, the `/rematch`
+// command and the `alt+e` digest shortcut (DESIGN §10).
 // It parses nothing the binary owns: every decision beyond the cheap prelabels lives in Rust.
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import type { ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
 // ---------------------------------------------------------------------------------------------
@@ -296,18 +297,19 @@ export function shellWords(input: string): string[] {
 
 export const OPERATIONS = [
 	"doctor", "import", "reflect", "match", "digest", "record", "create", "improve", "activate", "run",
-	"status", "library", "why", "task", "transfer", "ship", "count", "mark", "off", "on", "uninstall",
+	"status", "library", "why", "task", "transfer", "ship", "count", "mark", "off", "on", "uninstall", "builtins", "anchor",
 ] as const;
 export type Operation = (typeof OPERATIONS)[number];
 
-const LONG_OPS: Record<string, true> = { reflect: true, create: true, improve: true, run: true, ship: true, import: true };
+const LONG_OPS: Record<string, true> = { reflect: true, create: true, improve: true, run: true, ship: true, import: true, anchor: true };
 const READ_OPS: Record<string, true> = { doctor: true, status: true, digest: true, match: true, why: true };
 
 /** `read` only for operations that cannot mutate state; everything else asks for `exec`. */
 export function approvalFor(operation: string, args: readonly string[] = []): "read" | "exec" {
 	if (READ_OPS[operation]) return "read";
 	if (operation === "library") return args.length === 0 || args[0] === "ls" || args[0] === "why" ? "read" : "exec";
-	if (operation === "transfer") return args[0] === "apply" ? "exec" : "read";
+	if (operation === "transfer") return args.length === 0 || args[0] === "suggest" ? "read" : "exec";
+	if (operation === "builtins") return args[0] === "reinstall" ? "exec" : "read";
 	return "exec";
 }
 
@@ -339,6 +341,8 @@ export function buildArgv(operation: string, rawArgs: readonly string[], session
 			return ["library", "why", ...(args.length === 0 && sessionId ? [sessionId] : args)];
 		case "library":
 			return ["library", ...(args.length === 0 ? ["ls"] : args)];
+		case "builtins":
+			return ["builtins", ...(args.length === 0 ? ["ls"] : args)];
 		case "mark": {
 			const rest = [...args];
 			if (rest.length > 0 && !rest[0].startsWith("-")) rest.splice(0, 1, "--class", rest[0]);
@@ -367,9 +371,15 @@ export function markClass(args: readonly string[]): string | null {
 	return m ? m[1].toLowerCase() : null;
 }
 
+/** Binary argv after whose success the loaded set changed (hook modules written or removed): re-match. */
+export function changesLoaded(argv: readonly string[]): boolean {
+	if (argv[0] === "activate") return true;
+	return argv[0] === "library" && ["approve", "disable", "rollback"].includes(argv[1] ?? "");
+}
+
 export const COMMANDS = [
 	"why", "status", "library", "create", "improve", "run", "activate", "mark", "off", "on", "disable",
-	"rollback", "approve", "decline", "ship", "transfer", "digest", "doctor", "uninstall",
+	"rollback", "approve", "decline", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor",
 ] as const;
 
 /** `/rematch <sub> …` → (operation, arguments). `disable|rollback|approve|decline` live under `library`. */
@@ -386,21 +396,222 @@ export function commandToOperation(words: readonly string[]): { operation: Opera
 }
 
 // ---------------------------------------------------------------------------------------------
-// Module-level, read-only caches (factories are rebound per subagent; per-session state stays in the closure)
+// Hook modes (DESIGN §10). A compiled module is data only:
+// `export default { id, mode, tool, field, regex, message, pass_condition, params }`; the modes live here.
+// `block`/`stuck` run on `tool_call` and fail closed; `truncate`/`retrieve` run on `context` and fail open.
+
+export const HOOK_MODES = ["block", "truncate", "stuck", "retrieve"] as const;
+export type HookMode = (typeof HOOK_MODES)[number];
+export type Hook = {
+	id: string;
+	mode: HookMode;
+	tool: string;
+	field: string;
+	message: string;
+	/** `block` only: `params.{source,flags}` as a RegExp. */
+	pattern: RegExp | null;
+	params: Record<string, number>;
+};
+
+const MODE_PARAMS: Record<HookMode, readonly string[]> = {
+	block: [],
+	truncate: ["max_age_turns", "keep_chars"],
+	stuck: ["repeats"],
+	retrieve: ["budget_bytes", "min_overlap"],
+};
+
+/** Validate a module's default export; throws on anything the binary would not have written. */
+export function hookFromModule(def: unknown, fallbackId: string): Hook {
+	if (!isRecord(def)) throw new Error("no default export object");
+	const mode = def.mode;
+	if (typeof mode !== "string" || !(HOOK_MODES as readonly string[]).includes(mode)) throw new Error(`unknown hook mode ${String(mode)}`);
+	if (typeof def.tool !== "string" || !def.tool) throw new Error("hook names no tool");
+	const params = isRecord(def.params) ? def.params : {};
+	const nums: Record<string, number> = {};
+	for (const key of MODE_PARAMS[mode as HookMode]) {
+		const v = params[key];
+		if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new Error(`${mode} hook needs a numeric params.${key}`);
+		nums[key] = v;
+	}
+	let pattern: RegExp | null = null;
+	if (mode === "block") {
+		if (typeof def.field !== "string" || !def.field) throw new Error("block hook names no field");
+		if (typeof params.source !== "string" || typeof params.flags !== "string") throw new Error("block hook needs params.source and params.flags");
+		pattern = new RegExp(params.source, params.flags);
+	}
+	return {
+		id: typeof def.id === "string" && def.id ? def.id : fallbackId,
+		mode: mode as HookMode,
+		tool: def.tool,
+		field: typeof def.field === "string" ? def.field : "",
+		message: typeof def.message === "string" ? def.message : "",
+		pattern,
+		params: nums,
+	};
+}
+
+/**
+ * Import an approved hook module. The `?v=<mtime>` suffix makes a rewritten module (re-approval,
+ * rollback) a new module record; Bun keys its ESM cache by the specifier and ignores the query of
+ * a `file:` URL, so the suffix goes on the plain path.
+ */
+export async function loadHook(file: string): Promise<Hook> {
+	// Runtime-selected module: hook paths come from the binary's `match` result.
+	const mod: unknown = await import(`${file}?v=${fs.statSync(file).mtimeMs}`);
+	return hookFromModule(isRecord(mod) ? mod.default : undefined, path.basename(file).replace(/\.[cm]?[jt]s$/, ""));
+}
+
+function toolMatches(hook: Hook, toolName: string): boolean {
+	return hook.tool === "*" || hook.tool === toolName;
+}
+
+/** `block`: the rule's message when `input[field]` matches its pattern, else null. */
+export function blockReason(hook: Hook, toolName: string, input: unknown): string | null {
+	if (hook.mode !== "block" || !hook.pattern || !toolMatches(hook, toolName)) return null;
+	const value = isRecord(input) ? input[hook.field] : undefined;
+	if (typeof value !== "string") return null;
+	hook.pattern.lastIndex = 0;
+	return hook.pattern.test(value) ? hook.message : null;
+}
+
+export function callKey(toolName: string, input: unknown): string {
+	return `${toolName}\0${argsHash(input)}`;
+}
+
+/** The session's recent tool calls (tool + args hash), most recent last. */
+export class CallHistory {
+	#keys: string[] = [];
+	/** Calls immediately before now that were identical to `key`. */
+	run(key: string): number {
+		let n = 0;
+		for (let i = this.#keys.length - 1; i >= 0 && this.#keys[i] === key; i--) n++;
+		return n;
+	}
+	push(key: string): void {
+		this.#keys.push(key);
+		if (this.#keys.length > 32) this.#keys.shift();
+	}
+	clear(): void {
+		this.#keys = [];
+	}
+}
+
+/** `stuck`: the message once `repeats` identical calls ran right before this identical one. */
+export function stuckReason(hook: Hook, toolName: string, run: number): string | null {
+	if (hook.mode !== "stuck" || !toolMatches(hook, toolName)) return null;
+	return run >= hook.params.repeats ? hook.message : null;
+}
+
+export function truncationMarker(removed: number, age: number): string {
+	return `…[rematch: truncated ${removed} chars, age ${age} turns]`;
+}
+
+/**
+ * `truncate`: a tool result older than `max_age_turns` user turns (more user messages after it)
+ * keeps the first `keep_chars` of its text plus a marker; the strictest matching rule wins and
+ * non-text blocks are kept. Returns a new array (untouched messages reused) or null when nothing
+ * changed. Only the outgoing request is affected: `context` receives a copy (DESIGN §0).
+ */
+export function truncateToolResults(messages: readonly unknown[], hooks: readonly Hook[]): unknown[] | null {
+	const rules = hooks.filter(h => h.mode === "truncate");
+	if (rules.length === 0) return null;
+	const out = [...messages];
+	let changed = false;
+	let age = 0;
+	for (let i = out.length - 1; i >= 0; i--) {
+		const m = out[i];
+		if (!isRecord(m)) continue;
+		if (m.role === "user" && m.synthetic !== true) {
+			age++;
+			continue;
+		}
+		if (m.role !== "toolResult" || !Array.isArray(m.content)) continue;
+		const toolName = typeof m.toolName === "string" ? m.toolName : "";
+		let keep = Number.POSITIVE_INFINITY;
+		for (const r of rules) {
+			if (toolMatches(r, toolName) && age > r.params.max_age_turns) keep = Math.min(keep, r.params.keep_chars);
+		}
+		if (!Number.isFinite(keep)) continue;
+		const text = textOf(m.content);
+		if (text.length <= keep) continue;
+		// Never split a surrogate pair: a lone surrogate is invalid in the outgoing request.
+		const last = text.charCodeAt(keep - 1);
+		const cut = last >= 0xd800 && last <= 0xdbff ? keep - 1 : keep;
+		const others = (m.content as unknown[]).filter(b => !(isRecord(b) && b.type === "text"));
+		out[i] = { ...m, content: [{ type: "text", text: `${text.slice(0, cut)}\n${truncationMarker(text.length - cut, age)}` }, ...others] };
+		changed = true;
+	}
+	return changed ? out : null;
+}
+
+/** `retrieve` query: the last user message text + the paths of the last `maxPaths` tool results. */
+export function retrievalQuery(messages: readonly unknown[], maxPaths = 10): string {
+	const recs = messages.filter(isRecord);
+	const lastUser = recs.findLast(m => m.role === "user" && m.synthetic !== true);
+	const callPaths = new Map<string, string>();
+	for (const m of recs) {
+		if (m.role !== "assistant") continue;
+		for (const b of recordsOf(m.content)) {
+			if (b.type !== "toolCall" || typeof b.id !== "string" || !isRecord(b.arguments)) continue;
+			const p = b.arguments.path ?? b.arguments.file_path;
+			if (typeof p === "string" && p) callPaths.set(b.id, stripSelectors(p));
+		}
+	}
+	const paths: string[] = [];
+	for (const r of recs.filter(m => m.role === "toolResult").slice(-maxPaths)) {
+		const p = typeof r.toolCallId === "string" ? callPaths.get(r.toolCallId) : undefined;
+		if (p && !paths.includes(p)) paths.push(p);
+	}
+	return head([lastUser ? textOf(lastUser.content) : "", ...paths].filter(s => s.trim()).join("\n"), LIMITS.inputText);
+}
+
+export type RetrievedUnit = { entry_id: string; name: string; path: string; title: string; text: string };
+
+/** Units of a `retrieve` envelope's data (the binary owns ranking and the budget). */
+export function retrievedUnits(data: unknown): RetrievedUnit[] {
+	const units = isRecord(data) ? recordsOf(data.units) : [];
+	return units
+		.filter(u => ["entry_id", "name", "path", "title", "text"].every(k => typeof u[k] === "string"))
+		.map(u => ({ entry_id: u.entry_id as string, name: u.name as string, path: u.path as string, title: u.title as string, text: u.text as string }));
+}
+
+export const RETRIEVAL_TYPE = "com.vncp.rematch.retrieval";
+
+/**
+ * The one message `retrieve` appends: an omp `CustomMessage` (`role: "custom"`, hidden), which the
+ * provider conversion sends as a `developer` message (pi-agent-core `compaction/messages.ts`
+ * `CustomMessage` + `convertMessageToLlm`).
+ */
+export function retrievalMessage(units: readonly RetrievedUnit[], timestamp = Date.now()): Json {
+	const body = units.map(u => `<unit skill="${u.name}" path="${u.path}">\n${u.text.trimEnd()}\n</unit>`).join("\n\n");
+	return {
+		role: "custom",
+		customType: RETRIEVAL_TYPE,
+		display: false,
+		timestamp,
+		content: `[rematch] Units of skills loaded in this session that match the current request, retrieved by the harness (the whole skill: skill://<name>).\n\n${body}`,
+		details: { units: units.map(u => ({ entry_id: u.entry_id, path: u.path })) },
+	};
+}
+
+/**
+ * `session_start.loaded_entries` of a `match` result: entries with a predicate hit, minus the
+ * `retrieve` hooks, which a session credits through its `retrieval` record only where they injected
+ * units (DESIGN §7).
+ */
+export function loadedEntryIds(data: unknown, hooks: readonly Hook[]): string[] {
+	const retrieveIds = new Set(hooks.filter(h => h.mode === "retrieve").map(h => h.id));
+	return (isRecord(data) ? recordsOf(data.entries) : [])
+		.filter(e => typeof e.id === "string" && e.predicate_hit !== false && !retrieveIds.has(e.id))
+		.map(e => e.id as string);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Module-level cache of `match` results (factories are rebound per subagent; per-session state stays
+// in the closure). Keyed by binary + cwd and cleared when the main session rotates or the user
+// changes what loads, so a cached result never outlives the session it was matched for.
 
 const matchCache = new Map<string, Promise<Envelope>>();
-
-type Hook = { id: string; tool: string; test: (input: unknown) => unknown };
-
-async function loadHook(file: string): Promise<Hook | null> {
-	// Runtime-selected module: hook paths come from the binary's `match` result.
-	const mod: unknown = await import(pathToFileURL(file).href);
-	const h = isRecord(mod) ? mod.default : undefined;
-	if (!isRecord(h) || typeof h.tool !== "string" || typeof h.test !== "function") return null;
-	const id = typeof h.id === "string" && h.id ? h.id : path.basename(file).replace(/\.[cm]?[jt]s$/, "");
-	const test = h.test as (input: unknown) => unknown;
-	return { id, tool: h.tool, test: input => test.call(h, input) };
-}
 
 type RegistryHandle = { get(scope: unknown): unknown; override(scope: unknown, value: unknown): void };
 
@@ -458,56 +669,84 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 	}
 
-	// --- load time: staging dirs + hooks ---------------------------------------------------------
+	// --- loaded state: staging dirs + hooks matched for `loadedCwd` ------------------------------
+	// Matched at load time for process.cwd(); re-matched when a main session's cwd changes, when the
+	// main session switches or branches, and after the user approves, activates, disables or rolls
+	// back an entry, so approved hooks run at once (staging dirs only ever add, §0).
+	let loadedCwd: string | null = null;
 	let loadedEntries: string[] = [];
 	let stagingDirs: string[] = [];
 	let hooks: Hook[] = [];
-	if (enabled && bin) {
+	let callHooks: Hook[] = [];
+	let contextHooks: Hook[] = [];
+	let retrieveHooks: Hook[] = [];
+	let tracksCalls = false;
+
+	/** Match `cwd` and adopt its entries and hooks; `fresh` drops every cached match first. Never throws. */
+	async function loadMatch(cwd: string, fresh: boolean): Promise<void> {
+		if (!fresh && cwd === loadedCwd) return;
+		loadedCwd = cwd;
+		if (!enabled || !bin) return;
+		if (fresh) matchCache.clear();
+		const key = `${bin}\0${cwd}`;
 		try {
-			const cwd = process.cwd();
-			const key = `${bin}\0${cwd}`;
 			let pending = matchCache.get(key);
 			if (!pending) {
 				pending = call(["match", "--cwd", cwd], { timeout: 5000 });
 				matchCache.set(key, pending);
 			}
 			const match = await pending;
-			if (!match.ok) throw new Error(match.error ?? "match failed");
+			if (!match.ok) {
+				matchCache.delete(key);
+				throw new Error(match.error ?? "match failed");
+			}
 			const data = match.data ?? {};
 			if (data.off === true) {
 				enabled = false;
-			} else {
-				loadedEntries = recordsOf(data.entries)
-					.filter(e => typeof e.id === "string" && e.predicate_hit !== false)
-					.map(e => e.id as string);
-				const dirs = stringsOf(data.skill_dirs);
-				if (dirs.length > 0) {
-					await addSkillDirs(pi, dirs);
-					stagingDirs = dirs;
-				}
-				for (const file of stringsOf(data.hooks)) {
-					try {
-						const hook = await loadHook(file);
-						if (hook) hooks.push(hook);
-						else log("warn", `hook ${file} has no {tool, test} default export; skipped`);
-					} catch (error) {
-						log("warn", `hook ${file} failed to import: ${errorText(error)}`);
-					}
+				return;
+			}
+			const next: Hook[] = [];
+			for (const file of stringsOf(data.hooks)) {
+				try {
+					next.push(await loadHook(file));
+				} catch (error) {
+					log("warn", `hook ${file} skipped: ${errorText(error)}`);
 				}
 			}
+			const dirs = stringsOf(data.skill_dirs).filter(d => !stagingDirs.includes(d));
+			if (dirs.length > 0) {
+				await addSkillDirs(pi, dirs);
+				stagingDirs = [...stagingDirs, ...dirs];
+			}
+			loadedEntries = loadedEntryIds(data, next);
+			hooks = next;
+			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
+			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
+			retrieveHooks = next.filter(h => h.mode === "retrieve");
+			tracksCalls = next.some(h => h.mode === "stuck");
 		} catch (error) {
-			loadedEntries = [];
-			stagingDirs = [];
-			hooks = [];
-			log("warn", `match/staging skipped: ${errorText(error)}`);
+			log("warn", `match/staging skipped for ${cwd}: ${errorText(error)}`);
 		}
-	} else if (enabled) {
-		log("warn", "binary not found; tracing without staging");
 	}
+
+	let loading: Promise<void> = Promise.resolve();
+	/** Serialized `loadMatch`: a context event never sees a half-adopted state. */
+	function reload(cwd: string, fresh: boolean): Promise<void> {
+		loading = loading.then(() => loadMatch(cwd, fresh));
+		return loading;
+	}
+
+	if (enabled && !bin) log("warn", "binary not found; tracing without staging");
+	await reload(process.cwd(), false);
 
 	// --- per-session trace state (closure: one binding = one session) ----------------------------
 	let trace: SessionTrace | null = null;
 	let loadedAnnotated = false;
+	const calls = new CallHistory();
+	let lastRetrieval: { key: string; units: RetrievedUnit[] } | null = null;
+	let lastTracedUnits = "";
+	/** The appended retrieval message, reused while the unit contents are unchanged. */
+	let lastInjected: { content: string; message: Json } | null = null;
 
 	// `agent` is absent on hosts older than the identity API: treat those as main.
 	const isMain = (ctx: ExtensionContext) => ctx.agent?.kind !== "sub";
@@ -625,6 +864,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		const lines = stringsOf(env.data?.lines);
 		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
 		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
+		let approved = false;
 		for (const a of recordsOf(env.data?.approvals)) {
 			if (typeof a.id !== "string") continue;
 			const name = typeof a.name === "string" ? a.name : a.id;
@@ -632,8 +872,11 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			const body = [a.reason, a.diff].filter((x): x is string => typeof x === "string" && x.length > 0).join("\n\n");
 			const yes = await ctx.ui.confirm(`rematch: approve ${kind} ${name}?`, body);
 			const r = await call(["library", yes ? "approve" : "decline", a.id]);
+			if (yes && r.ok) approved = true;
 			ctx.ui.notify(`rematch: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
 		}
+		// What the user just approved (hook modules, staging dirs) loads now, not at the next omp start.
+		if (approved) await reload(ctx.cwd, true);
 	}
 
 	async function showDigest(ctx: ExtensionContext, quietWhenEmpty: boolean): Promise<void> {
@@ -649,6 +892,10 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	}
 
 	async function startSession(ctx: ExtensionContext, withDigest: boolean): Promise<void> {
+		calls.clear();
+		lastRetrieval = null;
+		lastTracedUnits = "";
+		lastInjected = null;
 		await openTrace(ctx);
 		spawnReflect();
 		// Dialogs may outlive the handler budget: present detached, never throwing.
@@ -706,7 +953,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		const argv = buildArgv(operation, args, sid, ctx?.cwd ?? process.cwd());
 		if (operation === "off" || operation === "on") return toggle(operation === "on", ctx);
 		if (operation === "mark") recordMark(markClass(argv));
-		return call(argv, { signal, timeout: timeoutFor(operation) });
+		const env = await call(argv, { signal, timeout: timeoutFor(operation) });
+		if (env.ok && changesLoaded(argv)) await reload(ctx?.cwd ?? loadedCwd ?? process.cwd(), true);
+		return env;
 	}
 
 	const z = pi.zod;
@@ -784,30 +1033,102 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		},
 	});
 
-	// --- hooks: fail closed ----------------------------------------------------------------------
+	// --- tool_call hooks (block, stuck): fail closed ---------------------------------------------
 	pi.on("tool_call", (event, ctx) => {
-		if (!enabled || hooks.length === 0) return undefined;
-		for (const hook of hooks) {
-			if (event.toolName !== hook.tool) continue;
+		if (!enabled || callHooks.length === 0) return undefined;
+		let key: string | null = null;
+		let blocked: { hook: Hook; reason: string } | null = null;
+		for (const hook of callHooks) {
 			let reason: string | null;
 			try {
-				const r = hook.test(event.input);
-				reason = typeof r === "string" && r ? r : null;
+				if (hook.mode === "block") reason = blockReason(hook, event.toolName, event.input);
+				else {
+					key ??= callKey(event.toolName, event.input);
+					reason = stuckReason(hook, event.toolName, calls.run(key));
+				}
 			} catch (error) {
 				reason = `rematch hook ${hook.id} failed: ${errorText(error)}`;
 			}
-			if (!reason) continue;
-			if (isMain(ctx)) write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: hook.id, reason });
-			return { block: true, reason };
+			if (reason) {
+				blocked = { hook, reason };
+				break;
+			}
 		}
-		return undefined;
+		// A call a `block` rule rejected never ran, so it is no repetition; a call `stuck` rejected stays
+		// in the run, so the next identical call is rejected too.
+		if (tracksCalls && (!blocked || blocked.hook.mode === "stuck")) {
+			try {
+				calls.push(key ?? callKey(event.toolName, event.input));
+			} catch {
+				// an unhashable input has nothing to repeat
+			}
+		}
+		if (!blocked) return undefined;
+		if (isMain(ctx)) write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: blocked.hook.id, reason: blocked.reason });
+		return { block: true, reason: blocked.reason };
+	});
+
+	/** `retrieve` (main sessions only, so the trace can attribute it): one message or null. */
+	async function retrieveMessage(messages: readonly unknown[], ctx: ExtensionContext): Promise<Json | null> {
+		const hook = retrieveHooks[0];
+		if (!hook || !trace || !isMain(ctx)) return null;
+		const query = retrievalQuery(messages);
+		if (!query) return null;
+		// The binary bounds candidates to the entries loaded for --cwd (`retrieve::candidates`).
+		const argv = [
+			"retrieve", "--cwd", ctx.cwd, "--budget", String(hook.params.budget_bytes), "--min-overlap", String(hook.params.min_overlap),
+			"--query", query,
+		];
+		const key = argv.join("\0");
+		let units: RetrievedUnit[];
+		if (lastRetrieval?.key === key) units = lastRetrieval.units;
+		else {
+			const env = await call(argv, { timeout: 3000 });
+			if (!env.ok) return null;
+			units = retrievedUnits(env.data);
+			lastRetrieval = { key, units };
+		}
+		if (units.length === 0) return null;
+		const signature = units.map(u => `${u.entry_id}:${u.path}`).join("|");
+		if (signature !== lastTracedUnits) {
+			lastTracedUnits = signature;
+			const traced = units.map(u => ({ entry_id: u.entry_id, path: u.path, bytes: Buffer.byteLength(u.text, "utf8") }));
+			write("retrieval", { entry_ids: retrieveHooks.map(h => h.id), units: traced, bytes: traced.reduce((n, u) => n + u.bytes, 0) });
+		}
+		// One message object per unit content: a cache hit or an identical answer re-sends it unchanged.
+		const content = JSON.stringify(units);
+		if (lastInjected?.content !== content) lastInjected = { content, message: retrievalMessage(units) };
+		return lastInjected.message;
+	}
+
+	// --- context hooks (truncate, retrieve): fail open, outgoing request only ---------------------
+	pi.on("context", async (event, ctx) => {
+		if (!enabled) return undefined;
+		// A main session that moved to another cwd loads that cwd's entries and hooks first.
+		if (isMain(ctx) && ctx.cwd !== loadedCwd) await reload(ctx.cwd, false);
+		if (contextHooks.length === 0) return undefined;
+		let messages: unknown[] | null = null;
+		try {
+			messages = truncateToolResults(event.messages, contextHooks);
+		} catch (error) {
+			log("warn", `truncate hook failed: ${errorText(error)}`);
+		}
+		try {
+			const extra = await retrieveMessage(messages ?? event.messages, ctx);
+			if (extra) messages = [...(messages ?? event.messages), extra];
+		} catch (error) {
+			log("warn", `retrieve hook failed: ${errorText(error)}`);
+		}
+		return messages ? { messages: messages as typeof event.messages } : undefined;
 	});
 
 	// --- trace events: fail open -----------------------------------------------------------------
 	pi.on(
 		"session_start",
 		guard("session_start", async (_event, ctx) => {
-			if (enabled && isMain(ctx)) await startSession(ctx, true);
+			if (!enabled || !isMain(ctx)) return;
+			await reload(ctx.cwd, false);
+			await startSession(ctx, true);
 		}),
 	);
 
@@ -815,6 +1136,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		if (!enabled || !isMain(ctx)) return;
 		if (trace && trace.id === sessionIdOf(ctx)) return;
 		closeTrace();
+		// Another session: what loads is matched afresh (the library may have changed since).
+		await reload(ctx.cwd, true);
 		await startSession(ctx, false);
 	});
 	pi.on("session_switch", rotate);

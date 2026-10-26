@@ -41,7 +41,12 @@ impl AppCtx {
             Some(c) => absolute(&c)?,
             None => std::env::current_dir().context("current dir")?,
         };
-        Ok(AppCtx { paths, ledger, now: now_ms(), cwd, text })
+        let ctx = AppCtx { paths, ledger, now: now_ms(), cwd, text };
+        // Built-in entries arrive unapproved; a failure must not take every command down.
+        if let Err(e) = crate::builtins::ensure(&ctx) {
+            eprintln!("rematch: built-in entries not installed: {e:#}");
+        }
+        Ok(ctx)
     }
 
     pub fn improver_file(&self, name: &str) -> PathBuf {

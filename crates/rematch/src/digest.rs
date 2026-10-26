@@ -1,4 +1,5 @@
-//! `match --cwd` (load-time payload for the extension factory) and `digest --cwd`
+//! `match --cwd` (load-time payload for the extension factory; with `--harness claude-code`
+//! also the skill links of `REMATCH_ROOT/claude-skills/`) and `digest --cwd`
 //! (session-start lines, one-tap approvals, capability-floor review, transfers).
 
 use std::path::PathBuf;
@@ -23,6 +24,10 @@ pub struct MatchArgs {
     /// Refines `predicate_hit` with the count-time content rule.
     #[arg(long)]
     pub inputs: Option<String>,
+    /// `claude-code`: also link the skills that load for this cwd into
+    /// `REMATCH_ROOT/claude-skills/` (the Claude Code plugin's `skills/`); result in `claude_skills`.
+    #[arg(long, value_enum)]
+    pub harness: Option<crate::trace_event::Harness>,
 }
 
 pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
@@ -57,6 +62,9 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     }
     let mut out = serde_json::to_value(&m)?;
     out["entries"] = Value::Array(entries);
+    if a.harness == Some(crate::trace_event::Harness::ClaudeCode) {
+        out["claude_skills"] = crate::trace_event::match_claude(ctx, &m)?;
+    }
     Ok(out)
 }
 
@@ -100,10 +108,14 @@ pub fn pending_approvals(ctx: &AppCtx) -> Result<Vec<Value>> {
                 .map(|m| format!("{} Predicted fix: {}", m.rationale, m.predicted_fix).trim().to_string())
                 .unwrap_or_else(|| e.trigger_line.clone());
             if e.kind == Kind::Hook {
-                if !ctx.paths.hooks_dir().join(format!("{}.ts", e.id)).is_file() {
+                if !library::hook_active(&ctx.paths, &e) {
                     let diff = match library::hook_module(&e) {
                         Ok(m) => m,
                         Err(err) => format!("(hook does not compile: {err:#})"),
+                    };
+                    let reason = match &e.hook {
+                        Some(h) => format!("{reason}\n\nPass condition: {}", h.pass_condition.trim()),
+                        None => reason,
                     };
                     out.push(json!({"id": e.id, "name": e.name, "kind": "hook", "diff": truncate(&diff, APPROVAL_DIFF_BYTES), "reason": reason}));
                 }

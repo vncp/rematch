@@ -60,6 +60,17 @@ impl Usage {
     }
 }
 
+/// One unit a `retrieval` record put into the context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievedUnit {
+    #[serde(default)]
+    pub entry_id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub bytes: u64,
+}
+
 /// One trace line. Field names match DESIGN §3 exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
@@ -145,6 +156,10 @@ pub enum TraceRecord {
         hook_id: String,
         #[serde(default)]
         reason: String,
+        /// `args_hash` of the blocked input (written by the Claude Code adapter, whose `stuck`
+        /// window is read back from the trace: a call `stuck` rejected stays in the run).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        args_hash: String,
     },
     TurnEnd {
         seq: u32,
@@ -196,6 +211,20 @@ pub enum TraceRecord {
         #[serde(default)]
         flagged: bool,
     },
+    /// A `retrieve` hook appended package units to the outgoing context (DESIGN §3, §10).
+    /// `entry_ids` = the retrieve hooks; `units[].entry_id` = the packages the units came
+    /// from. Both join the session's loaded entries, so counting attributes to them.
+    Retrieval {
+        seq: u32,
+        #[serde(default)]
+        t: UnixMs,
+        #[serde(default)]
+        entry_ids: Vec<String>,
+        #[serde(default)]
+        units: Vec<RetrievedUnit>,
+        #[serde(default)]
+        bytes: u64,
+    },
     /// Unknown `ev`, or a known `ev` whose fields did not parse. Kept verbatim.
     #[serde(untagged)]
     Other(Value),
@@ -219,6 +248,7 @@ impl TraceRecord {
             | Self::AgentEnd { seq, .. }
             | Self::ModelChange { seq, .. }
             | Self::Mark { seq, .. }
+            | Self::Retrieval { seq, .. }
             | Self::SessionShutdown { seq, .. } => *seq,
             Self::Other(v) => v.get("seq").and_then(Value::as_u64).unwrap_or(0) as u32,
         }
@@ -234,6 +264,7 @@ impl TraceRecord {
             | Self::AgentEnd { t, .. }
             | Self::ModelChange { t, .. }
             | Self::Mark { t, .. }
+            | Self::Retrieval { t, .. }
             | Self::SessionShutdown { t, .. } => *t,
             Self::Other(v) => v.get("t").and_then(Value::as_i64).unwrap_or(0),
         }
@@ -249,6 +280,7 @@ impl TraceRecord {
             Self::AgentEnd { .. } => "agent_end",
             Self::ModelChange { .. } => "model_change",
             Self::Mark { .. } => "mark",
+            Self::Retrieval { .. } => "retrieval",
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::Other(v) => v.get("ev").and_then(Value::as_str).unwrap_or(""),
         }
@@ -386,6 +418,40 @@ pub fn error_cluster_seqs(results: &[(u32, bool)]) -> Vec<u32> {
             }
         } else {
             active = false;
+        }
+    }
+    out
+}
+
+/// The extension's `session_shutdown` reasons for a trace, in first-seen order: every
+/// non-`none` input prelabel (`mark:<class>` verbatim, else `redirect:<label>`), a `mark`
+/// record (`mark:<class>`), and `tool_error_cluster` once ≥ [`ERROR_CLUSTER_MIN`] of the last
+/// [`ERROR_CLUSTER_WINDOW`] tool results were errors. Harness adapters that cannot keep this
+/// state in-process (Claude Code hooks, history importers) derive the flag from it.
+pub fn flag_reasons(records: &[TraceRecord]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |r: String| {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    };
+    let mut window: std::collections::VecDeque<bool> = std::collections::VecDeque::with_capacity(ERROR_CLUSTER_WINDOW);
+    for rec in records {
+        match rec {
+            TraceRecord::Input { prelabel, .. } if prelabel != PRELABEL_NONE && !prelabel.is_empty() => {
+                push(if prelabel.starts_with("mark:") { prelabel.clone() } else { format!("redirect:{prelabel}") });
+            }
+            TraceRecord::Mark { class, .. } => push(format!("mark:{}", class_name(*class))),
+            TraceRecord::ToolResult { is_error, .. } => {
+                if window.len() == ERROR_CLUSTER_WINDOW {
+                    window.pop_front();
+                }
+                window.push_back(*is_error);
+                if window.iter().filter(|e| **e).count() >= ERROR_CLUSTER_MIN {
+                    push("tool_error_cluster".into());
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -546,6 +612,13 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 }
             }
             TraceRecord::SessionShutdown { flagged, .. } => shutdown_flagged |= *flagged,
+            TraceRecord::Retrieval { entry_ids, units, .. } => {
+                for e in entry_ids.iter().chain(units.iter().map(|u| &u.entry_id)) {
+                    if !e.is_empty() && !s.loaded_entries.contains(e) {
+                        s.loaded_entries.push(e.clone());
+                    }
+                }
+            }
             TraceRecord::ToolBlocked { .. }
             | TraceRecord::AgentEnd { .. }
             | TraceRecord::ModelChange { .. } => {}
@@ -836,6 +909,17 @@ not json at all
         assert!(!s.flagged && s.redirects.is_empty() && s.error_clusters == 0);
         assert_eq!(s.branch, "", "no session_start: no cwd to name a branch");
         assert_eq!(fold_trace(&[], "E").started_at, 0);
+    }
+
+    #[test]
+    fn retrieval_joins_the_loaded_entries() {
+        let t = r#"{"seq":0,"t":1,"ev":"session_start","session_id":"S","cwd":"/w","loaded_entries":["e1","hook-r"]}
+{"seq":1,"t":2,"ev":"retrieval","entry_ids":["hook-r"],"units":[{"entry_id":"e1","path":"units/a.md","bytes":10},{"entry_id":"kept-x","path":"facts/b.md","bytes":20}],"bytes":30}"#;
+        let recs = parse_trace(t);
+        assert_eq!(recs[1].ev(), "retrieval");
+        assert!(matches!(&recs[1], TraceRecord::Retrieval { units, bytes: 30, .. } if units.len() == 2 && units[1].path == "facts/b.md"));
+        let s = fold_trace(&recs, "S");
+        assert_eq!(s.loaded_entries, vec!["e1", "hook-r", "kept-x"]);
     }
 
     #[test]

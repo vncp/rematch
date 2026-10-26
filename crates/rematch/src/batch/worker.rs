@@ -3,6 +3,9 @@
 //! 1. Reference rollout with the current harness (base library for the task repo).
 //!    Entries a previous run staged for this task (`pending_next_run`) are loaded in it
 //!    and decided by its verdict: pass ⇒ `kept`, fail ⇒ `retired` (the next-run rule).
+//!    A keep that replaces a kept entry first replays the kept entry's originating task
+//!    once with the pending entry in its place (`scope::anchor`); a failing replay retires
+//!    the pending entry. Anchor replays are outside the cycle's rollout budget.
 //! 2. Invariant and domain candidates: one editor call each (`improver/editor.md`, input =
 //!    the reference trajectory around the longest tool-error stretch, else its tail where
 //!    the verifier failed), lint, then one probe rollout each on the same task and seed.
@@ -53,6 +56,7 @@ use crate::app::{new_id, AppCtx};
 use crate::config::{resolve_role, ROLE_SOLVER};
 use crate::editor::{call_editor, parse_editor_reply, CallBudget, EditorDecision, EditorEntry, EditorReply};
 use crate::envelope::Cancelled;
+use crate::scope::anchor::{certify, failure_note, replaced_kept, replay_in_run, AnchorOutcome};
 use crate::jobs;
 use crate::omp;
 
@@ -479,33 +483,65 @@ impl Cycle<'_> {
         }))
     }
 
-    /// Pending entries of this task: reference pass ⇒ kept, fail ⇒ retired.
+    /// Pending entries of this task: reference pass ⇒ kept, fail ⇒ retired. A keep that
+    /// replaces a kept entry first runs its anchor replay (`scope::anchor`); a failing
+    /// replay retires the pending entry and the kept one stays.
     fn resolve_pending(&self, pending: &[Entry], reference: &Rollout) -> Result<(Vec<Value>, Vec<String>)> {
         let ctx = self.ctx;
         let pass = reference.verdict.as_ref().is_some_and(is_pass);
         let mut out = Vec::new();
         let mut retired = Vec::new();
         for e in pending {
-            let mut e2 = e.clone();
-            e2.pending_next_run = false;
-            if pass && !e2.verified_on.contains(&self.family) {
-                e2.verified_on.push(self.family.clone());
-            }
-            ctx.ledger.upsert_entry(&e2)?;
+            let mut anchor_json = Value::Null;
+            let mut anchor_pass = None;
             let (to, note) = if pass {
-                (Status::Kept, format!("batch next run of task {} passed ({})", self.task.id, reference.session.id))
+                let note = format!("batch next run of task {} passed ({})", self.task.id, reference.session.id);
+                match replaced_kept(ctx, e)? {
+                    None => (Status::Kept, note),
+                    Some(kept) => match replay_in_run(ctx, e, &kept, &self.omp_bin, &self.task.id) {
+                        Ok(outcome) => {
+                            anchor_json = json!({"kept": kept.id, "replay": outcome});
+                            match outcome {
+                                AnchorOutcome::Replayed { pass: false, receipt } => (Status::Retired, failure_note(&receipt)),
+                                AnchorOutcome::Replayed { pass: true, receipt } => {
+                                    anchor_pass = Some(receipt);
+                                    (Status::Kept, note)
+                                }
+                                AnchorOutcome::NoVerifier => (Status::Kept, note),
+                            }
+                        }
+                        Err(err) => {
+                            // Keep the flag so the next run decides again.
+                            out.push(json!({"id": e.id, "name": e.name, "status": e.status, "error": format!("anchor replay: {err:#}")}));
+                            continue;
+                        }
+                    },
+                }
             } else {
                 (Status::Retired, format!("batch next run of task {} failed ({})", self.task.id, reference.session.id))
             };
+            let mut e2 = e.clone();
+            e2.pending_next_run = false;
+            if to == Status::Kept && !e2.verified_on.contains(&self.family) {
+                e2.verified_on.push(self.family.clone());
+            }
+            ctx.ledger.upsert_entry(&e2)?;
             match set_status(&ctx.ledger, &ctx.paths, &e.id, to, Some(&note)) {
                 Ok(moved) => {
-                    if pass {
+                    let mut row = json!({"id": e.id, "name": e.name, "status": to});
+                    if to == Status::Kept {
                         let lint = lint_entry(&moved.path, &moved, &self.lint_cfg, &LintContext::default())?;
                         self.insert_receipt(&moved.id, lint, reference.verdict.clone())?;
+                        if let Some(r) = &anchor_pass {
+                            anchor_json["certificate"] = json!(certify(ctx, &moved, r, None)?);
+                        }
                     } else {
                         retired.push(e.id.clone());
                     }
-                    out.push(json!({"id": e.id, "name": e.name, "status": to}));
+                    if !anchor_json.is_null() {
+                        row["anchor"] = anchor_json;
+                    }
+                    out.push(row);
                 }
                 Err(err) => {
                     // Keep the flag so the next run decides again.

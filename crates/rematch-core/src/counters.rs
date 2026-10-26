@@ -36,12 +36,15 @@ pub fn redirect_class_of(class: Option<RedirectClass>, prelabel: &str) -> Option
 }
 
 /// Did the entry's motivating redirect class recur in this session? An entry without
-/// a class (motivated by an error cluster or takeover) recurs on any classed redirect.
+/// a class (motivated by an error cluster or takeover, and the built-ins) recurs on a
+/// correction or preference redirect only: a scope redirect (the user widened or
+/// changed the task) carries no failure signal (DESIGN §7).
 pub fn recurred(entry: &Entry, s: &SessionRecord) -> bool {
     let want = entry.redirect_class.filter(|c| *c != RedirectClass::None);
-    s.redirects.iter().any(|r| match redirect_class_of(r.class, &r.prelabel) {
-        Some(c) => want.is_none_or(|w| w == c),
-        None => false,
+    s.redirects.iter().any(|r| match (redirect_class_of(r.class, &r.prelabel), want) {
+        (Some(c), Some(w)) => c == w,
+        (Some(c), None) => matches!(c, RedirectClass::Correction | RedirectClass::Preference),
+        (None, _) => false,
     })
 }
 
@@ -207,6 +210,30 @@ mod tests {
         // classifier wins over prelabel, including an explicit None
         assert_eq!(redirect_class_of(Some(Preference), "revert"), Some(Preference));
         assert_eq!(redirect_class_of(Some(RedirectClass::None), "revert"), None);
+    }
+
+    #[test]
+    fn unclassed_entries_recur_on_correction_or_preference_never_scope() {
+        use RedirectClass::{Correction, Preference, Scope};
+        let mut e = entry("e", "n", "b", Status::Provisional);
+        e.redirect_class = None;
+        let mut s = session("s", "b", 0);
+        for (redirect, want) in [
+            (red("none", Some(Scope)), false),
+            (red("mark:scope", None), false),
+            (red("interrupt", None), false),
+            (red("none", Some(Correction)), true),
+            (red("mark:preference", None), true),
+        ] {
+            s.redirects = vec![redirect];
+            assert_eq!(recurred(&e, &s), want, "{:?}", s.redirects[0]);
+        }
+        // an explicit class still matches only itself, scope included
+        e.redirect_class = Some(Scope);
+        s.redirects = vec![red("mark:scope", None)];
+        assert!(recurred(&e, &s));
+        s.redirects = vec![red("none", Some(Preference))];
+        assert!(!recurred(&e, &s));
     }
 
     #[test]

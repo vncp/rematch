@@ -7,6 +7,8 @@ pub mod types;
 // Owned by the Trace slice (DESIGN §3, §6 derivation, importer, outcomes):
 pub mod trace; // own trace JSONL → TraceRecord stream + SessionRecord fold
 pub mod import; // omp session JSONL → SessionRecord (+ skill reads, outcomes from receipts)
+pub mod import_claude; // Claude Code ~/.claude/projects/<slug>/<uuid>.jsonl → TraceRecord stream
+pub mod import_codex; // Codex ~/.codex/sessions/**/rollout-*.jsonl → TraceRecord stream
 pub mod redirect; // heuristics + classifier batch prompt building/parsing
 pub mod features; // tokenization, stop words, Porter stemming, tf-idf stems, Jaccard
 pub mod outcome; // Outcome signature/normalization, MinHash

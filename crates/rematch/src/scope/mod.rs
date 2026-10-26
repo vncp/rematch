@@ -1,8 +1,10 @@
 //! Phase 3 scope (DESIGN §14 `scope/`, SPEC §Scope and who merges, §Branches,
 //! §Cross-domain transfer, §Models): team/fork PRs (`ship`), the work↔home export
 //! (`export`), evidence drift (`stale`), per-family splits and the capability floor
-//! (`split`), cross-branch transfer and `shared` promotion (`transfer`).
+//! (`split`), cross-branch transfer and `shared` promotion (`transfer`), and the anchor
+//! replay that gates a replacement of a kept entry (`anchor`, SPEC §Rollback and anchors).
 
+pub mod anchor;
 pub mod export;
 pub mod ship;
 pub mod split;

@@ -15,6 +15,8 @@ The short version: **use omp as usual.** rematch watches, proposes when you corr
 - [Prompt and tool text for an omp fork](#prompt-and-tool-text-for-an-omp-fork)
 - [Managing the library](#managing-the-library)
 - [Turning it off, rolling back, uninstalling](#turning-it-off-rolling-back-uninstalling)
+- [Claude Code](#claude-code)
+- [Codex](#codex)
 - [Where things are](#where-things-are)
 - [Troubleshooting](#troubleshooting)
 
@@ -61,11 +63,30 @@ This overrides the classifier for the last turn, flags the session, and the next
 
 Skill *text* activates on its own. Anything executable does not:
 
-- A proposed **script** is staged mode 0644 (not runnable). A proposed **hook** (a rule that blocks a tool call) is not installed.
-- At session start the digest asks, once per item, with the diff: approve or decline. Decline retires it.
+- A proposed **script** is staged mode 0644 (not runnable). A proposed **hook** is not installed, and until you approve it nothing of it loads or counts.
+- At session start the digest asks, once per item, with the diff and the hook's pass condition: approve or decline. Decline retires it.
 - From the terminal: `rematch library approve <id>` / `rematch library decline <id>`.
 
-Approved scripts become 0755 in place; approved hooks are compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` and run on `tool_call`.
+Approved scripts become 0755 in place; approved hooks are compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` (data only; the extension runs them). A hook has one of four modes:
+
+| Mode | What it does |
+|---|---|
+| `block` | blocks a tool call whose input field matches a pattern, with the rule's message |
+| `stuck` | blocks a call identical (same tool, same arguments) to the N calls right before it; any other call in between resets it |
+| `truncate` | in the request sent to the model (never in the session file), tool outputs older than N user turns keep their first K characters and end with `…[rematch: truncated N chars, age K turns]` |
+| `retrieve` | before each request, appends one hidden message with the units of your loaded skill packages that match what you just asked and the files just touched, within a byte budget |
+
+### Built-in entries
+
+Three hook entries ship with rematch and show up as approvals the first time the digest runs (branch `shared`, they match every session):
+
+| Entry | Mode | Setting |
+|---|---|---|
+| `context-unit-retrieval` | `retrieve` | ≤ 6000 bytes, units sharing ≥ 2 stems with the request |
+| `tool-output-truncation` | `truncate` | outputs older than 6 user turns keep 1200 characters |
+| `stuck-detector` | `stuck` | the 4th identical call in a row is blocked |
+
+They are ordinary entries: nothing runs until you approve one; once approved, it is counted in every session, retired after two sessions in which you redirected the agent (any classed correction, preference or scope redirect) or two with harm (error cluster, takeover, disable), and kept after four clean ones. Declining retires it for good. `rematch builtins ls` shows their status; `rematch builtins reinstall [name]` stages a retired one again.
 
 ## Creating a skill on purpose
 
@@ -100,10 +121,9 @@ A pinned skill is refused.
 ## Learning from sessions before rematch was installed
 
 ```
-rematch import --history                              # omp's session history → the ledger (no model)
+rematch import --history [--harness omp|claude-code|codex|all] [--skip-profile <name>…]   # omp (default + profiles), Claude Code (~/.claude/projects) and Codex (~/.codex/sessions) history → the ledger (no model)
 rematch reflect --history [--since 2026-10-01] [--limit 10]
 ```
-
 `reflect --history` treats every imported session that the extension would have flagged (a redirect, or a tool-error cluster) like a fresh one: it rebuilds the session's trace from omp's file, then runs the normal reflection (same rate limits, ≤ 3 model calls each). Newest first, at most `--limit` sessions per run (default 10); run it again for the next batch. A session is reflected once; the envelope lists each session's outcome.
 
 ## Batch mode with a verifier
@@ -117,6 +137,12 @@ rematch status <job-id>
 ```
 
 The worker runs the task in a fresh git worktree with the current harness, proposes an invariant and a domain candidate, probes each, composes, re-runs, and lets the verifier pick. Four rollouts at the default width, ten at `--width 2`. The winner's lessons are staged **provisional**; they become kept only when the *next* run of that task passes with them loaded. The receipt is at `~/.rematch/runs/<task>/receipt.json`.
+
+**Replacing a kept skill.** When a new version would replace a kept one (a sibling of it from `improve` or a per-family split, or a batch winner with the same name), rematch first re-runs the kept skill's own task once in a fresh worktree, with the new version loaded instead of the old. That task is the one the kept skill came from (or whose last run staged or loaded it), and it must have a verifier. If the verifier passes, the replacement goes ahead and the verdict is recorded in the new version's receipt. If it fails, the new version is retired with the note `anchor replay failed: …` and the kept skill stays. If there is no such task with a verifier, the new version's own clean sessions are the only check, as for any other entry. It is one run, not a test suite. To see what would happen without changing anything:
+
+```
+rematch anchor replay <id>     # runs the replay once and reports pass/fail; stages, keeps and retires nothing
+```
 
 ## Subagents
 
@@ -179,6 +205,46 @@ rematch transfer suggest | apply <id> --branch <b>         # invariant lessons a
 | `/rematch rollback <skill>` | previous version back, immediately |
 | `rematch uninstall` | prints what it would remove; `--yes` removes every file rematch wrote (root, hooks, kept entries, restoring predecessors) and nothing else |
 
+## Claude Code
+
+The same binary, ledger and entries work in Claude Code through the plugin in `adapters/claude-code` (details and what it cannot do: [`DESIGN.md`](DESIGN.md) §18.1).
+
+**Install** (nothing is installed for you; Claude Code 2.1.285 or later, `rematch` built with `cargo build --release` or on `PATH`, or `REMATCH_BIN` set):
+
+```sh
+claude --plugin-dir /path/to/rematch/adapters/claude-code          # this session only
+ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch # every session (loads as rematch@skills-dir)
+```
+
+Then work as usual. Each session is traced to `~/.rematch/traces/cc:<session id>.jsonl` by the plugin's hooks; a session with a redirect, a tool-error cluster or a mark is flagged when it ends. Claude Code never runs a reflection itself: run `rematch reflect --pending` in a terminal (or open omp, which spawns it), then `rematch digest --text` for what was staged and what waits for approval, and `rematch library approve <id>` to approve a hook.
+
+| In Claude Code | Same as |
+|---|---|
+| `/rematch:rematch-status` | `rematch status` + what loads in this directory (`rematch match --harness claude-code`) |
+| `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
+| `/rematch:rematch-mark correction` | `/rematch mark correction` in omp: overrides the classifier for the last turn of this session |
+
+Provisional and kept skills that match the directory appear as `rematch:<name>` skills: at session start the plugin links them into `~/.rematch/claude-skills/`, which the plugin's `skills/` points at (created on first start; `rematch match --harness claude-code --cwd <dir>` refreshes it by hand). Approved `block` and `stuck` hooks refuse tool calls; an approved `retrieve` hook adds matching units to your prompt. `rematch off` stops tracing and unlinks the skills at the next session start. To remove the plugin, delete the `~/.claude/skills/rematch` link; `rematch uninstall` removes `~/.rematch`.
+
+Raise `SessionEnd`'s 1.5 s budget if large sessions end unflagged: `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000 claude`.
+
+## Codex
+
+Codex (CLI, IDE extension, Codex in the ChatGPT desktop app) gets the same entries and counters through its own files: rematch reads its session rollouts afterwards and puts skills where Codex looks for them. Nothing runs inside a Codex session; there are no hooks, no retrieval or truncation, and no live trace. Install steps and the full limitation list: [`adapters/codex/README.md`](../adapters/codex/README.md); format facts and the record mapping: [`DESIGN.md`](DESIGN.md) §18.2.
+
+```sh
+rematch import --history --harness codex       # ~/.codex/sessions (or $CODEX_HOME/sessions) → the ledger, read-only
+rematch reflect --history                      # flagged Codex sessions are reflected like omp ones
+ln -s ~/.rematch/codex-skills ~/.agents/skills/rematch   # once: Codex sees rematch's provisional skills
+rematch library sync --harness codex --cwd "$PWD"        # before starting Codex in a repo
+```
+
+- **Ids.** Imported Codex sessions are `codex:<rollout id>`: `rematch library why codex:<id>`, `rematch mark --session codex:<id> --class correction`.
+- **What loads.** `library sync` links the provisional skills whose predicate matches the repo into `~/.rematch/codex-skills/` and copies kept skills to `~/.agents/skills/<name>/` (marked with `.rematch-codex.json`; a directory of yours with the same name is left alone and reported). Codex loads every skill under its skill roots in every session, so the links stay visible everywhere until the next sync; they are counted only where the predicate hits.
+- **Counting.** A rollout records the skill list Codex gave the model; the import turns the rematch skills in it into the session's loaded entries. Clean sessions are counted by the next `rematch count` (or `reflect`), flagged ones when `reflect --history` handles them. Import after you worked: a session that was never imported never counts.
+- **Reviewer threads** (Codex's auto-review subagents) are imported but never reflected.
+- **Optional:** `$rematch-status` (`adapters/codex/skills/rematch-status`, symlinked into `~/.agents/skills/`) runs the sync, the digest and approvals from inside Codex, each command after your approval.
+
 ## Where things are
 
 ```
@@ -186,16 +252,20 @@ rematch transfer suggest | apply <id> --branch <b>         # invariant lessons a
   traces/            one JSONL per session (the only input to reflection)
   pending/           sessions flagged for the next reflection
   ledger.sqlite      sessions, entries, counters, proposals, receipts
-  staging/<branch>/  provisional entries, loaded on match
+  staging/<branch>/  provisional entries, loaded on match (staging/shared/ holds the built-in hook entries)
+  claude-skills/     links to the skills that load for the last Claude Code session start (the Claude Code plugin's skills/)
+  codex-skills/      links to the provisional skills that match the repo of the last `library sync --harness codex` (~/.agents/skills/rematch points here)
   agents/            links to provisional agents (extension/agents points here)
   kept-agents/       entry dirs of kept agents
   drafts/ archive/   never loaded (archive is never deleted)
   improver/          editor.md, classifier.md, reflector.md, lint.toml
   jobs/ runs/ tasks/ batch mode
+  builtins.version   hash of the shipped built-in entries (installed once; retired ones stay retired)
   off                kill-switch marker
 ~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/)
 ~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/)
-~/.omp/agent/extensions/rematch-hooks/   approved hooks
+~/.omp/agent/extensions/rematch-hooks/   approved hooks (data-only modules: block, stuck, truncate, retrieve)
+~/.agents/skills/<name>/                  kept entries copied for Codex by `library sync --harness codex` (marker .rematch-codex.json)
 ```
 
 Roles, in `~/.omp/agent/config.yml`:
@@ -213,3 +283,4 @@ modelRoles:
 - **The reflection chose KEEP_BASE.** The editor decided no rule would prevent that redirect (usually a scope change). `library why` shows the class; mark it `correction` if you disagree.
 - **A session ran reflection with the wrong model.** The editor refuses to proceed if the provider/model of any reply differs from the configured role; the pending file is kept and retried next start (3 attempts). `doctor --text` shows the resolved roles.
 - **omp is not on PATH for the binary** (ssh, cron): set `OMP_BIN=/path/to/omp`.
+- **Profiles (`omp --profile <name>` / `OMP_PROFILE`).** The agent directory follows omp's profile resolution (`~/.omp/profiles/<name>/agent` when `OMP_PROFILE` or `PI_PROFILE` is set, else `$PI_CODING_AGENT_DIR`, else `~/.omp/agent`; `PI_CONFIG_DIR` replaces `~/.omp`), while `~/.rematch` stays shared unless `REMATCH_ROOT` is set. `import --history` imports the default agent dir and every profile's sessions except profiles listed in `--skip-profile <name>` or `~/.rematch/policy.json` (`{"skip_profiles":["…"]}`). `rematch doctor --text` shows the resolved `agent_dir` and which profiles exist or are skipped.

@@ -16,9 +16,10 @@ use crate::proc::run_bounded;
 
 pub const PLUGIN_NAME: &str = "@vncp/rematch";
 
-fn plugins_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
-    std::env::var_os("OMP_PLUGINS_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".omp").join("plugins"))
+fn plugins_dir(ctx: &AppCtx) -> PathBuf {
+    std::env::var_os("OMP_PLUGINS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.paths.config_root.join("plugins"))
 }
 
 pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
@@ -56,7 +57,7 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         }
     }
 
-    let plugins = plugins_dir();
+    let plugins = plugins_dir(ctx);
     let lock = plugins.join("omp-plugins.lock.json");
     let in_lock = std::fs::read_to_string(&lock).map(|t| t.contains(&format!("\"{PLUGIN_NAME}\""))).unwrap_or(false);
     let module = plugins.join("node_modules").join(PLUGIN_NAME);
@@ -99,6 +100,31 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         .map(|r| r.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
         .unwrap_or(0);
     let off = ctx.paths.is_off();
+    let existing_profiles = ctx.paths.list_profiles();
+    let policy = crate::scope::export::Policy::load(&ctx.paths.root).unwrap_or_default();
+    let mut skipped_profiles: Vec<String> = policy
+        .skip_profiles
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    skipped_profiles.sort();
+    skipped_profiles.dedup();
+    let active_profile = ctx.paths.profile.as_deref().unwrap_or("default");
+    let profiles_note = if existing_profiles.is_empty() {
+        "none".to_string()
+    } else {
+        existing_profiles.join(", ")
+    };
+    let skip_note = if skipped_profiles.is_empty() {
+        String::new()
+    } else {
+        format!(" (skipped: {})", skipped_profiles.join(", "))
+    };
+    lines.push(format!(
+        "agent_dir: {} (profile: {active_profile} · profiles: {profiles_note}{skip_note})",
+        ctx.paths.agent_dir.display()
+    ));
     lines.push(format!(
         "root: {} · {} sessions ({} traced) · {} pending · off: {off}",
         ctx.paths.root.display(),
@@ -119,9 +145,11 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         "ledger": {"path": ctx.paths.ledger_file, "schema_version": schema, "binary_schema_version": SCHEMA_VERSION,
                    "sessions": sessions.len(), "traced_sessions": traced, "entries": by_status},
         "improver": {"dir": ctx.paths.improver, "files": improver},
-        "paths": {"root": ctx.paths.root, "agent_dir": ctx.paths.agent_dir, "traces": ctx.paths.traces, "pending": ctx.paths.pending,
+        "paths": {"root": ctx.paths.root, "config_root": ctx.paths.config_root, "profile": ctx.paths.profile,
+                  "agent_dir": ctx.paths.agent_dir, "traces": ctx.paths.traces, "pending": ctx.paths.pending,
                   "staging": ctx.paths.staging, "drafts": ctx.paths.drafts, "archive": ctx.paths.archive, "jobs": ctx.paths.jobs,
                   "skills": ctx.paths.skills_dir(), "hooks": ctx.paths.hooks_dir()},
+        "profiles": {"active": ctx.paths.profile, "existing": existing_profiles, "skipped": skipped_profiles},
         "pending": pending,
         "off": off,
         "version": env!("CARGO_PKG_VERSION"),

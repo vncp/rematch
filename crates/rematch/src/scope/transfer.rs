@@ -9,6 +9,10 @@
 //!   domain lessons and facts are blocked; workspace `facts/` never travel.
 //! - `promote_shared`: an entry kept in ≥ 2 branches (or kept in one plus a clean
 //!   canary with matched ≥ 4 in another) is copied to `shared` as kept, no new canary.
+//!   When the copy takes a kept entry's slot, the anchor replay (`scope::anchor`) runs
+//!   first: fail ⇒ the copy is retired with the note and that entry's promotion is not
+//!   retried; replay error (task busy, omp missing) ⇒ the copy is retired as deferred and
+//!   the next promotion pass tries again; no verifier ⇒ the keep proceeds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +28,7 @@ use rematch_core::{Edit, Entry, LessonTag, Link, LinkRel, Origin, Predicate, Sta
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::anchor::{self, AnchorOutcome};
 use super::{branch_anchor, lint_edits, lint_errors, owns_files, package_edits, resolve_entry};
 use crate::app::{new_id, AppCtx};
 
@@ -77,6 +82,10 @@ pub struct Promotion {
     pub branches: Vec<String>,
     pub shared_id: Option<String>,
     pub blocked: Option<String>,
+    /// Anchor replay before the shared copy replaced a kept entry: `{kept, replay,
+    /// certificate?}`, plus `retired` (the copy's id) when it did not pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Value>,
 }
 
 pub fn read_domain(ctx: &AppCtx, branch: &str) -> Result<Option<DomainFile>> {
@@ -302,10 +311,12 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
         if done.contains(&e.name) {
             continue;
         }
+        // A live shared copy, or one whose anchor replay failed, settles this entry; a
+        // copy retired otherwise (counters, a deferred replay) is tried again.
         let in_shared = all.iter().any(|x| {
             x.branch == SHARED_BRANCH
-                && x.status != Status::Retired
                 && (x.name == e.name || x.links.iter().any(|l| l.rel == LinkRel::TransfersFrom && l.id == e.id))
+                && (x.status != Status::Retired || anchor_failed_for(x, &e.id))
         });
         if in_shared {
             continue;
@@ -324,7 +335,14 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             continue;
         }
         done.insert(e.name.clone());
-        let mut p = Promotion { entry: e.id.clone(), name: e.name.clone(), branches: branches.iter().cloned().collect(), shared_id: None, blocked: None };
+        let mut p = Promotion {
+            entry: e.id.clone(),
+            name: e.name.clone(),
+            branches: branches.iter().cloned().collect(),
+            shared_id: None,
+            blocked: None,
+            anchor: None,
+        };
         let glob = derive(None, &[], &[]).repo_glob;
         debug_assert_eq!(glob, ANY_REPO);
         let origin = Origin::Import { source: format!("shared:{}", e.id) };
@@ -344,12 +362,49 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             continue;
         }
         let staged = stage(&ctx.ledger, &ctx.paths, &copy, &files)?;
+        let mut anchor_pass = None;
+        if let Some(kept) = anchor::replaced_kept(ctx, &staged)? {
+            let (retire, json) = match anchor::replay_before_replace(ctx, &staged, &kept) {
+                Ok(outcome) => {
+                    let json = json!({"kept": kept.id, "replay": outcome});
+                    match outcome {
+                        AnchorOutcome::Replayed { pass: false, receipt } => (Some(anchor::failure_note(&receipt)), json),
+                        AnchorOutcome::Replayed { pass: true, receipt } => {
+                            anchor_pass = Some(receipt);
+                            (None, json)
+                        }
+                        AnchorOutcome::NoVerifier => (None, json),
+                    }
+                }
+                Err(err) => (Some(format!("anchor replay deferred: {err:#}")), json!({"kept": kept.id, "error": format!("{err:#}")})),
+            };
+            p.anchor = Some(json);
+            if let Some(why) = retire {
+                set_status(&ctx.ledger, &ctx.paths, &staged.id, Status::Retired, Some(&why))?;
+                if let Some(a) = p.anchor.as_mut() {
+                    a["retired"] = json!(staged.id);
+                }
+                p.blocked = Some(why);
+                out.push(p);
+                continue;
+            }
+        }
         let note = format!("promoted to shared: kept in {}", p.branches.join(", "));
         let kept = set_status(&ctx.ledger, &ctx.paths, &staged.id, Status::Kept, Some(&note))?;
+        if let (Some(r), Some(a)) = (&anchor_pass, p.anchor.as_mut()) {
+            a["certificate"] = json!(anchor::certify(ctx, &kept, r, None)?);
+        }
         p.shared_id = Some(kept.id);
         out.push(p);
     }
     Ok(out)
+}
+
+/// A shared copy of `src` retired by a failed anchor replay (not a deferred one).
+fn anchor_failed_for(x: &Entry, src: &str) -> bool {
+    x.status == Status::Retired
+        && x.links.iter().any(|l| l.rel == LinkRel::TransfersFrom && l.id == src)
+        && x.status_note.as_deref().is_some_and(|n| n.starts_with(anchor::FAILED_NOTE))
 }
 
 pub fn cmd_transfer(ctx: &AppCtx, args: TransferArgs) -> Result<Value> {

@@ -1,6 +1,7 @@
 //! Admission rate limits and caps (DESIGN §8; SPEC "Caps and rates").
 
 use crate::ledger::{EntryFilter, Ledger};
+use crate::library::is_builtin;
 use crate::types::{Status, UnixMs};
 
 pub const MAX_ADMISSIONS_PER_DAY: u32 = 1;
@@ -47,22 +48,26 @@ pub fn utc_day(now: UnixMs) -> String {
         .to_string()
 }
 
+/// Entries of `status` in `branch` that the caps ration: built-ins are not proposals.
 fn count(ledger: &Ledger, status: Status, branch: &str) -> Result<usize, RateLimit> {
     Ok(ledger
         .list_entries(&EntryFilter { status: Some(status), branch: Some(branch.into()), ..Default::default() })?
-        .len())
+        .iter()
+        .filter(|e| !is_builtin(e))
+        .count())
 }
 
 /// Checks, in order: pending canary on the predicate; ≤ 1 admission per predicate per
 /// UTC day; ≤ 10 provisional in the branch; kept caps (5 general in `shared` + 5 per
-/// branch) ⇒ `NeedsMerge`.
+/// branch) ⇒ `NeedsMerge`. Built-in entries (`library::is_builtin`) are no canaries and
+/// take no cap slot.
 pub fn can_admit(ledger: &Ledger, predicate_hash: &str, branch: &str, now: UnixMs) -> Result<(), RateLimit> {
     let pending = ledger.list_entries(&EntryFilter {
         status: Some(Status::Provisional),
         predicate_hash: Some(predicate_hash.into()),
         ..Default::default()
     })?;
-    if let Some(e) = pending.first() {
+    if let Some(e) = pending.iter().find(|e| !is_builtin(e)) {
         return Err(RateLimit::PendingCanary { entry_id: e.id.clone() });
     }
     let day = utc_day(now);

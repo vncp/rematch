@@ -203,7 +203,8 @@ fn select(ctx: &AppCtx, args: &ShipArgs) -> Result<(Vec<Entry>, Vec<Skipped>)> {
         }
         return Ok((out, skipped));
     }
-    for e in ctx.ledger.list_entries(&EntryFilter::default())?.into_iter().filter(|e| live(e)) {
+    // Built-ins ship with the binary, not to a repo: never selected automatically.
+    for e in ctx.ledger.list_entries(&EntryFilter::default())?.into_iter().filter(|e| live(e) && !rematch_core::library::is_builtin(e)) {
         let e = adopt_fork_path(ctx, e)?;
         match args.scope {
             ShipScope::Team => {

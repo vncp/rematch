@@ -1,0 +1,18 @@
+# rematch for Codex: optional keys for ~/.codex/config.toml (or a trusted project's
+# .codex/config.toml). rematch needs none of them: Codex finds rematch's skills through the
+# ~/.agents/skills/rematch symlink (adapters/codex/README.md, step 2) without any config.
+# Restart Codex after changing this file.
+
+# Switch one rematch skill off in Codex only (it keeps loading in omp / Claude Code and keeps
+# its counters). `path` is the SKILL.md as Codex sees it: the provisional link, or the kept
+# copy under ~/.agents/skills/<name>/. To stop it everywhere: `rematch library disable <id>`.
+# [[skills.config]]
+# path = "/Users/<you>/.agents/skills/rematch/<name>/SKILL.md"
+# enabled = false
+
+# The initial skill list Codex gives the model is capped at 2% of the context window (8,000
+# characters when unknown); with many skills installed Codex shortens descriptions first, then
+# omits skills. Provisional rematch skills compete for that budget like any other; raise it
+# (≤ 10000 tokens) if rematch's entries are being cut from the list.
+# [skills]
+# max_context_tokens = 6000

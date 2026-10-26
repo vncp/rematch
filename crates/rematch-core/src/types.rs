@@ -115,15 +115,102 @@ pub struct Manifest {
     pub scope: EditorScope,
 }
 
-/// Declarative verifier compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` on approval.
+/// What a compiled hook does in the extension (DESIGN §10). `block` is the original
+/// `tool_call` verifier; the other modes are the context policies of D22/D23, which
+/// enter as entries under the same counters instead of always-on behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookMode {
+    /// `tool_call`: block when `input[field]` matches `regex`.
+    #[default]
+    Block,
+    /// `context`: tool results older than `max_age_turns` user turns keep `keep_chars`.
+    Truncate,
+    /// `tool_call`: the `repeats`-th consecutive identical call (same tool + args hash) is blocked.
+    Stuck,
+    /// `context`: append the loaded packages' units that overlap the current request.
+    Retrieve,
+}
+
+/// Declarative rule compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` on
+/// approval. Mode parameters are flat optional fields; [`HookRule::params`] resolves
+/// them with the mode defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookRule {
+    #[serde(default)]
+    pub mode: HookMode,
+    /// Tool the rule applies to (`*` = every tool; ignored by `retrieve`).
     pub tool: String,
-    /// Input field inspected (e.g. `command`, `path`).
+    /// Input field inspected by `block` (e.g. `command`, `path`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub field: String,
+    /// `block` only: Rust regex (a leading `(?i)` becomes the JS `i` flag).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub regex: String,
+    /// Block reason (`block`, `stuck`); optional description otherwise.
+    #[serde(default)]
     pub message: String,
     pub pass_condition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_chars: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_overlap: Option<u32>,
+}
+
+/// Resolved mode parameters of a [`HookRule`] (the `params` of the compiled module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum HookParams {
+    Block {},
+    Truncate { max_age_turns: u32, keep_chars: u32 },
+    Stuck { repeats: u32 },
+    Retrieve { budget_bytes: u32, min_overlap: u32 },
+}
+
+pub const DEFAULT_TRUNCATE_MAX_AGE_TURNS: u32 = 6;
+pub const DEFAULT_TRUNCATE_KEEP_CHARS: u32 = 1200;
+pub const DEFAULT_STUCK_REPEATS: u32 = 3;
+pub const DEFAULT_RETRIEVE_BUDGET_BYTES: u32 = 6000;
+pub const DEFAULT_RETRIEVE_MIN_OVERLAP: u32 = 2;
+
+impl HookRule {
+    /// `block` rule (the shape the editor proposes).
+    pub fn block(tool: &str, field: &str, regex: &str, message: &str, pass_condition: &str) -> HookRule {
+        HookRule {
+            mode: HookMode::Block,
+            tool: tool.into(),
+            field: field.into(),
+            regex: regex.into(),
+            message: message.into(),
+            pass_condition: pass_condition.into(),
+            max_age_turns: None,
+            keep_chars: None,
+            repeats: None,
+            budget_bytes: None,
+            min_overlap: None,
+        }
+    }
+
+    pub fn params(&self) -> HookParams {
+        match self.mode {
+            HookMode::Block => HookParams::Block {},
+            HookMode::Truncate => HookParams::Truncate {
+                max_age_turns: self.max_age_turns.unwrap_or(DEFAULT_TRUNCATE_MAX_AGE_TURNS),
+                keep_chars: self.keep_chars.unwrap_or(DEFAULT_TRUNCATE_KEEP_CHARS),
+            },
+            HookMode::Stuck => HookParams::Stuck { repeats: self.repeats.unwrap_or(DEFAULT_STUCK_REPEATS) },
+            HookMode::Retrieve => HookParams::Retrieve {
+                budget_bytes: self.budget_bytes.unwrap_or(DEFAULT_RETRIEVE_BUDGET_BYTES),
+                min_overlap: self.min_overlap.unwrap_or(DEFAULT_RETRIEVE_MIN_OVERLAP),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,14 +10,19 @@ What it does:
   (runtime override, `[...configured, ...skill_dirs]`), and imports the returned hook modules. Any failure is logged
   through `pi.logger` and the session continues without staging.
 - **Trace**: main sessions only (`ctx.agent.kind !== "sub"`) append to `<root>/traces/<session_id>.jsonl`
-  (`session_start`, `input`, `tool_result`, `tool_blocked`, `turn_end`, `model_change`, `agent_end`, `mark`,
+  (`session_start`, `input`, `tool_result`, `tool_blocked`, `retrieval`, `turn_end`, `model_change`, `agent_end`, `mark`,
   `session_shutdown`). A flagged session (prelabel ≠ none, ≥3 errors in 6 consecutive tool results, or a mark)
   gets `<root>/pending/<session_id>.json` at shutdown. `session_switch`/`session_branch` rotate the trace.
 - **Session start**: spawns `rematch reflect --pending` detached, then shows the digest (≤5 lines, then
   `+N more`) and one confirm per approval → `library approve|decline <id>`. `alt+e` shows the digest on demand.
-- **Hooks**: `tool_call` runs each loaded hook's `test(input)`; a message blocks the call (a throwing hook blocks too).
+- **Hooks** (modules are data: `{id, mode, tool, field, regex, message, pass_condition, params}`; DESIGN §10):
+  `block` blocks a `tool_call` whose `input[field]` matches; `stuck` blocks a call identical to the `repeats`
+  calls right before it (both fail closed); on `context`, `truncate` trims old tool-result text in the outgoing copy
+  and `retrieve` appends one hidden `custom` message with matching package units from `rematch retrieve` (both fail open).
+  Approving (`library approve`, the digest), `activate`, `disable` and `rollback` re-run `match` and swap the live hook
+  sets, as do a session switch/branch and a changed `ctx.cwd`, so an approved hook runs at once. Tests: `bun test extension`.
 - **Entry points**: tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`
-  (`why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|decline|ship|transfer|digest|doctor|uninstall`).
+  (`why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|decline|ship|transfer|digest|doctor|uninstall|builtins|anchor`).
   Approving entries and uninstalling are reserved to the user (command or digest), never the tool.
 
 Root is `$REMATCH_ROOT` or `~/.rematch`. Kill switch: `REMATCH=0` (only the tool and `/rematch` register)

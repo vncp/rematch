@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod batch;
+pub mod builtins;
 pub mod config;
 pub mod create;
 pub mod digest;
@@ -16,7 +17,9 @@ pub mod library_cmd;
 pub mod omp;
 pub mod proc;
 pub mod reflect;
+pub mod retrieve;
 pub mod scope;
+pub mod trace_event;
 pub mod uninstall;
 
 use std::path::PathBuf;
@@ -28,7 +31,7 @@ use app::AppCtx;
 use envelope::{Envelope, EXIT_OK, EXIT_USAGE};
 
 #[derive(Parser, Debug)]
-#[command(name = "rematch", version, about = "rematch: trace-grounded harness evolution for omp")]
+#[command(name = "rematch", version, about = "rematch: trace-grounded harness evolution for omp, Claude Code and Codex")]
 struct Cli {
     /// Human-readable output instead of the JSON envelope.
     #[arg(long, global = true)]
@@ -50,10 +53,16 @@ enum Cmd {
     Reflect(reflect::ReflectArgs),
     /// Staging dirs, entries and hooks that load for a directory.
     Match(digest::MatchArgs),
+    /// Units of the loaded skill packages that match a query (the `retrieve` context hook).
+    Retrieve(retrieve::RetrieveArgs),
     /// Session-start digest: new statuses, approvals, review list, transfers.
     Digest,
     /// Append an event for a session (marks); the trace file stays the primary input.
     Record(reflect::RecordArgs),
+    /// Harness hook payload on stdin → DESIGN §3 trace records (Claude Code adapter).
+    TraceEvent(trace_event::TraceEventArgs),
+    /// Harness `PreToolUse` payload on stdin → approved block/stuck hooks verdict (Claude Code adapter).
+    HookCheck(trace_event::TraceEventArgs),
     /// Greenfield: create an entry from sessions, a task, or a description (draft).
     Create(create::CreateArgs),
     /// Brownfield: register, audit, split or propose a sibling for an existing skill.
@@ -67,7 +76,7 @@ enum Cmd {
     RunWorker(batch::worker::RunWorkerArgs),
     /// Job status (or all jobs + entry counts).
     Status { job: Option<String> },
-    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export.
+    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export, sync.
     Library {
         #[command(subcommand)]
         cmd: library_cmd::LibraryCmd,
@@ -82,6 +91,13 @@ enum Cmd {
     Stale(scope::stale::StaleArgs),
     /// Per-family split of entries whose counters diverge.
     Split(scope::split::SplitArgs),
+    /// Anchor replay of a kept entry's originating task with its sibling in place (manual: reports, stages nothing).
+    Anchor(scope::anchor::AnchorArgs),
+    /// Built-in entries (context unit retrieval, tool-output truncation, stuck detection).
+    Builtins {
+        #[command(subcommand)]
+        cmd: builtins::BuiltinsCmd,
+    },
     /// Fold finished traces into counters and decide.
     Count(reflect::CountArgs),
     /// Override the redirect class of a session's last turn.
@@ -102,7 +118,10 @@ impl Cmd {
             Cmd::Reflect(_) => "reflect",
             Cmd::Match(_) => "match",
             Cmd::Digest => "digest",
+            Cmd::Retrieve(_) => "retrieve",
             Cmd::Record(_) => "record",
+            Cmd::TraceEvent(_) => "trace-event",
+            Cmd::HookCheck(_) => "hook-check",
             Cmd::Create(_) => "create",
             Cmd::Improve(_) => "improve",
             Cmd::Activate(_) => "activate",
@@ -115,6 +134,8 @@ impl Cmd {
             Cmd::Ship(_) => "ship",
             Cmd::Stale(_) => "stale",
             Cmd::Split(_) => "split",
+            Cmd::Anchor(_) => "anchor",
+            Cmd::Builtins { .. } => "builtins",
             Cmd::Count(_) => "count",
             Cmd::Mark(_) => "mark",
             Cmd::Off => "off",
@@ -131,7 +152,10 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Reflect(a) => reflect::cmd_reflect(ctx, a),
         Cmd::Match(a) => digest::cmd_match(ctx, a),
         Cmd::Digest => digest::cmd_digest(ctx),
+        Cmd::Retrieve(a) => retrieve::cmd_retrieve(ctx, a),
         Cmd::Record(a) => reflect::cmd_record(ctx, a),
+        Cmd::TraceEvent(a) => trace_event::cmd_trace_event(ctx, a),
+        Cmd::HookCheck(a) => trace_event::cmd_hook_check(ctx, a),
         Cmd::Create(a) => create::cmd_create(ctx, a),
         Cmd::Improve(a) => improve::cmd_improve(ctx, a),
         Cmd::Activate(a) => create::cmd_activate(ctx, a),
@@ -144,6 +168,8 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Ship(a) => scope::ship::cmd_ship(ctx, a),
         Cmd::Stale(a) => scope::stale::cmd_stale(ctx, a),
         Cmd::Split(a) => scope::split::cmd_split(ctx, a),
+        Cmd::Anchor(a) => scope::anchor::cmd_anchor(ctx, a),
+        Cmd::Builtins { cmd } => builtins::cmd_builtins(ctx, cmd),
         Cmd::Count(a) => reflect::cmd_count(ctx, a),
         Cmd::Mark(a) => reflect::cmd_mark(ctx, a),
         Cmd::Off => library_cmd::cmd_off(ctx),
@@ -172,12 +198,18 @@ fn main() {
                 }
                 std::process::exit(if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand { EXIT_USAGE } else { EXIT_OK });
             }
-            Envelope::err(&op_from_argv(), e.render().to_string().trim().to_string()).print(text_flag);
+            let env = Envelope::err(&op_from_argv(), e.render().to_string().trim().to_string());
+            // A hook must never block by accident (exit 2 is Claude Code's block code).
+            if std::env::args().any(|a| a == "--hook-output") {
+                std::process::exit(trace_event::emit_hook(&env));
+            }
+            env.print(text_flag);
             std::process::exit(EXIT_USAGE);
         }
     };
     let op = cli.cmd.name();
     let text = cli.text;
+    let hook_output = matches!(&cli.cmd, Cmd::TraceEvent(a) | Cmd::HookCheck(a) if a.hook_output);
     let (env, code) = match AppCtx::open_with(cli.cwd.clone(), text) {
         Ok(ctx) => {
             let (env, code) = Envelope::from_result(op, dispatch(&ctx, cli.cmd));
@@ -186,6 +218,9 @@ fn main() {
         }
         Err(e) => Envelope::from_result(op, Err(e)),
     };
+    if hook_output {
+        std::process::exit(trace_event::emit_hook(&env));
+    }
     env.print(text);
     std::process::exit(code);
 }

@@ -48,6 +48,27 @@ Then use omp. The first proposal arrives after the first session that ends with 
 
 Optional, in `~/.omp/agent/config.yml`: `modelRoles.rematch-editor` for the strongest model you have and `modelRoles.rematch-classifier` for a fast one. Without them the editor falls back to `slow` → `default`, the classifier to `smol` → `tiny` → `default`.
 
+## One binary, any harness
+
+The binary, the ledger, lint, the counters and the entries are the same for every harness; an adapter only forwards what its harness exposes ([`docs/DESIGN.md`](docs/DESIGN.md) §18). Session ids carry the harness (`cc:<uuid>`, `codex:<id>`; omp's are bare), so one ledger holds all of them.
+
+| | omp | Claude Code ([`adapters/claude-code`](adapters/claude-code/README.md)) | Codex ([`adapters/codex`](adapters/codex/README.md)) |
+|---|---|---|---|
+| Install | `scripts/install.sh` (omp plugin link) | `claude --plugin-dir adapters/claude-code` for one session; `ln -s $PWD/adapters/claude-code ~/.claude/skills/rematch` for every session | symlink + optional `$rematch-status` skill (adapter README) |
+| Live trace | extension, every event | plugin hooks → `rematch trace-event`; turns recovered at `Stop` from the transcript | none: post-hoc from `~/.codex/sessions` rollouts |
+| Provisional entries load | `skills.customDirectories`, per process, on match | `~/.rematch/claude-skills/` links synced at `SessionStart` (shared by all sessions); the plugin's `skills/` links there | `rematch library sync --harness codex --cwd <repo>` → `~/.rematch/codex-skills/` (one link `~/.agents/skills/rematch`); no per-session gating |
+| Kept entries | `~/.omp/agent/skills/<name>/` | linked into the same `claude-skills/` | copied to `~/.agents/skills/<name>/` |
+| `block` / `stuck` hooks | yes | yes: `PreToolUse` → `rematch hook-check`, exit 2 | no |
+| `retrieve` hook | before every request | once per prompt, when the unit set changes (`additionalContext`) | no |
+| `truncate` hook | yes | no (no hook rewrites earlier tool results) | no |
+| Loaded entries for counting | live | live (`session_start`) | reconstructed at import from the skill list in the rollout; clean sessions' traces written at import |
+| History import | `import --history --harness omp` | `--harness claude-code` (`~/.claude/projects`) | `--harness codex`; reviewer/subagent threads imported, never reflected |
+| Reflection | spawned at session start | `rematch reflect --pending` from a shell | `rematch reflect --history` from a shell |
+| Commands | `/rematch …`, the `rematch` tool | `/rematch:rematch-status`, `/rematch:rematch-why`, `/rematch:rematch-mark` | `$rematch-status` skill |
+| Batch mode | yes | not wired | not wired (plan in DESIGN §18.2.4) |
+
+No model call ever runs inside a Claude Code or Codex session; what Claude Code cannot do that omp can is listed in DESIGN §18.1.
+
 ## How it works
 
 Every claim below carries the id of the decision it rests on; the evidence and the paper behind each id are in [`docs/research.md`](docs/research.md) §2.
@@ -73,6 +94,7 @@ The loop design, the scoped editors, the preference for skills and scripts over 
 
 - [What you can do with it](#what-you-can-do-with-it)
 - [Thirty-second start](#thirty-second-start)
+- [One binary, any harness](#one-binary-any-harness)
 - [How it works](#how-it-works)
 - [In one minute](#in-one-minute)
 - [Highlights](#highlights)
@@ -198,7 +220,7 @@ Budget: `rollouts = (k+1)² + [k>1]`, four at `k=1`, ten at `--width 2`; model c
 | Fork | `ship --scope fork [--repo <fork>]`: the entry's `fork_path` (set with `library set-fork-path`), the built fingerprint and before/after counters in the PR body | per-model prompt text, tool descriptions, compaction defaults |
 | Work → home | `library export`, per-entry approval with the diff; off by default at work (`policy.json`) | invariant entries only; lint with `transfer: true` blocks domain and workspace facts |
 
-A branch is a repo or project. `shared` holds entries kept in two or more branches; promotion needs a second branch's canary and costs nothing. `transfer suggest` lists kept invariant lessons not yet tried in a branch whose facet structure overlaps on two or more keys (`branches/<branch>/domain.yml`); a transfer is applied as `provisional` and earns its place through that branch's counters.
+A branch is a repo or project. `shared` holds entries kept in two or more branches; promotion needs a second branch's canary and no new canary of its own. When the shared copy replaces a kept entry whose originating task has a verifier, that task is replayed once with the copy in place first; a failing replay retires the copy and the kept entry stays. `transfer suggest` lists kept invariant lessons not yet tried in a branch whose facet structure overlaps on two or more keys (`branches/<branch>/domain.yml`); a transfer is applied as `provisional` and earns its place through that branch's counters.
 
 ## Models
 
@@ -227,9 +249,9 @@ Every entry records the model family it was created under and keeps a per-family
 
 | Unit | What it holds | Rule |
 |---|---|---|
-| `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, approved hook modules, the `rematch` tool and `/rematch` command, the digest; `agents/` (made by `install.sh`, gitignored): a link to `~/.rematch/agents/`, through which omp discovers provisional subagents | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
-| `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 106 unit tests |
-| `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 47 unit + 17 end-to-end tests |
+| `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, approved hook modules (`block` and `stuck` on `tool_call`, `truncate` and `retrieve` on `context`; the modules are data, the modes live here), the `rematch` tool and `/rematch` command, the digest; `agents/` (made by `install.sh`, gitignored): a link to `~/.rematch/agents/`, through which omp discovers provisional subagents | forwards raw events; parses nothing beyond the hook-module contract; no model calls; every handler fails open except `block`/`stuck` hooks |
+| `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 119 unit tests + 1 golden import test |
+| `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `retrieve`, built-in entries, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 54 unit + 32 end-to-end tests |
 | `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
 | `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
 
@@ -240,9 +262,10 @@ The two-language split is kept on one rule: the schema lives in Rust and the ext
 The checks every change goes through:
 
 ```sh
-cargo test --workspace                        # 106 core · 47 binary · 17 end-to-end (scripted editors, fake omp)
+cargo test --workspace                        # 119 core · 54 binary · 32 end-to-end (scripted editors, fake omp)
 cargo clippy --workspace --all-targets -- -D warnings
 bun build extension/index.ts --no-bundle --outdir /tmp/rematch-ext-check
+bun test extension                            # hook runtime: mode helpers + the factory against a fake host
 ```
 
 The end-to-end tests run the built binary against a temporary root: a synthetic trace with a redirect is reflected through a scripted editor, staged, matched, counted through four clean sessions and kept into the agent skills dir; the lint-fail script exercises exactly one retry; a wrong-model reply fails closed; `import --history` runs against anonymized goldens; `improve` refuses, splits, stages a sibling and refuses a pinned skill; the batch worker completes a `k=1` cycle with a fake omp and keeps the winner on the next run; `ship` creates the branch and commit; `export` refuses at work by default.
@@ -251,14 +274,14 @@ What was run live against omp 18.12.6 before this README was written: the full i
 
 ## Status
 
-Built: the interactive loop (Phase 1), create and improve with the mechanical split and the forge import (Phase 1.5), batch mode with worktree isolation and the next-run keep rule (Phase 2), team and fork shipping, work-to-home export, stale on drift, split per family, transfer suggestions and `shared` promotion (Phase 3).
+Built: the interactive loop (Phase 1), create and improve with the mechanical split and the forge import (Phase 1.5), batch mode with worktree isolation and the next-run keep rule, context-hook unit retrieval, and tool-output truncation and stuck detection as entries under the same counters (three built-in hook entries that wait for your approval; Phase 2), team and fork shipping, work-to-home export, stale on drift, split per family, transfer suggestions and `shared` promotion (Phase 3), and omp profile resolution (`OMP_PROFILE` / `PI_PROFILE` / `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, multi-profile history import with `--skip-profile` and `policy.json` `skip_profiles`).
 
 Not yet earned:
 
 - **A `kept` entry from daily use.** The kill criterion in the spec is six weeks of daily use: if no entry reaches `kept` over at least four matched sessions and recurrence has not fallen on any trigger, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
+- **The built-in context entries in a live session.** Retrieval, truncation and stuck detection are exercised by unit and end-to-end tests and by a fake-`pi` drive of the extension's `context` and `tool_call` handlers; none has been approved and counted in real use yet.
 - **A batch cycle where a candidate beats the reference.** The one live cycle had a reference that already passed, so both editors chose `KEEP_BASE`; the fake-omp tests cover the other branches.
 - **A merged team PR and a `shared` promotion from real branches.** Both are exercised on scratch repositories only.
-- **Profiles.** `omp --profile <name>` agent directories and `PI_CONFIG_DIR` are not resolved; `PI_CODING_AGENT_DIR` and the default root are.
 - **Linux.** The code is POSIX-portable (`setsid`, process groups, `sh` scripts) and every run above was macOS arm64. No Windows.
 - **Embeddings for the "related thing" lookup.** Exact signature and MinHash are implemented; embeddings would need credentials the binary does not hold.
 

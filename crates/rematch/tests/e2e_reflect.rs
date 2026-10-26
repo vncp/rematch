@@ -110,8 +110,10 @@ fn keep_base_records_a_proposal_and_stages_nothing() {
     assert!(r["proposal"].is_string());
     assert!(!env.staged_dir().exists());
     assert!(!env.root.join("pending").join(format!("{s1}.json")).exists());
+    // only the shipped built-ins (unapproved hooks, `origin.source == "builtin"`) are in the library
     let ls = env.run(&["library", "ls"]);
-    assert_eq!(ls["entries"], json!([]));
+    let staged: Vec<&Value> = ls["entries"].as_array().unwrap().iter().filter(|e| e["origin"]["source"] != "builtin").collect();
+    assert!(staged.is_empty(), "{ls}");
 }
 
 #[test]

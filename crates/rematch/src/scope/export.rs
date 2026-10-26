@@ -47,6 +47,8 @@ pub struct Policy {
     pub environment: Environment,
     #[serde(default)]
     pub export_enabled: Option<bool>,
+    #[serde(default)]
+    pub skip_profiles: Vec<String>,
 }
 
 impl Policy {

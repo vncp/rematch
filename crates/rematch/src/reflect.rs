@@ -13,7 +13,7 @@ use rematch_core::counters;
 use rematch_core::dedup;
 use rematch_core::experience::{self, ExperienceQuery};
 use rematch_core::features::{exts_of, head, rank_stems, stems_of_session, stems_of_text, MAX_PREDICATE_STEMS};
-use rematch_core::import::{apply_trace_signals, read_session, trace_records_of};
+use rematch_core::import::apply_trace_signals;
 use rematch_core::ledger::{enum_str, EntryFilter, SessionFilter};
 use rematch_core::library::{self, REMATCH_JSON};
 use rematch_core::lint::{self, LintConfig, LintContext};
@@ -23,13 +23,14 @@ use rematch_core::redirect;
 use rematch_core::trace::{self, TraceRecord, TriageKind};
 use rematch_core::types::{
     Counters, Decision, Edit, EditorScope, Entry, Family, Kind, LessonTag, LintReport, Manifest, Moment, Origin,
-    Predicate, Proposal, Redirect, RedirectClass, SessionRecord, Severity, Status,
+    Paired, Predicate, Proposal, Redirect, RedirectClass, SessionRecord, Severity, Status,
 };
 use serde_json::{json, Value};
 
 use crate::app::{new_entry, AppCtx, NewEntry};
 use crate::config::{ROLE_CLASSIFIER, ROLE_EDITOR};
 use crate::editor::{self, CallBudget, EditorDecision, EditorReply};
+use crate::scope::anchor::{self, AnchorOutcome, AnchorReceipt};
 
 /// Hard rule: at most three model calls per reflection (classifier batch, editor, one lint retry).
 pub const MAX_MODEL_CALLS: u32 = 3;
@@ -451,22 +452,49 @@ fn experience_dir(ctx: &AppCtx, e: &Entry) -> PathBuf {
 }
 
 /// Apply a Keep/Retire/Dormant decision and write EXPERIENCE.md for keep/retire.
+/// A Keep that replaces a kept entry first runs its anchor replay (`scope::anchor`): a
+/// failing replay turns it into a Retire with an `anchor replay failed: …` note.
 pub fn apply_decision(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_cmd: Option<&str>) -> Result<Value> {
+    if d == Decision::Continue {
+        return Ok(json!({"entry": e.id, "decision": d}));
+    }
+    let mut d = d;
+    let mut note = format!("counters: {}", experience::counters_line(c).lines().next().unwrap_or(""));
+    let mut anchor = None;
+    if d == Decision::Keep {
+        if let Some(kept) = anchor::replaced_kept(ctx, e)? {
+            let outcome = anchor::replay_before_replace(ctx, e, &kept)?;
+            if let AnchorOutcome::Replayed { pass: false, receipt } = &outcome {
+                d = Decision::Retire;
+                note = anchor::failure_note(receipt);
+            }
+            anchor = Some((kept, outcome));
+        }
+    }
     let to = match d {
         Decision::Keep => Status::Kept,
         Decision::Retire => Status::Retired,
-        Decision::Dormant => Status::Dormant,
-        Decision::Continue => return Ok(json!({"entry": e.id, "decision": d})),
+        _ => Status::Dormant,
     };
-    let note = format!("counters: {}", experience::counters_line(c).lines().next().unwrap_or(""));
     let moved = if is_foreign(ctx, e) {
         record_status(ctx, e, to, &format!("{note} (files left in place)"))?
     } else {
         library::set_status(&ctx.ledger, &ctx.paths, &e.id, to, Some(&note))?
     };
     let mut out = json!({"entry": e.id, "name": e.name, "decision": d, "status": moved.status, "path": moved.path});
+    if let Some((kept, outcome)) = &anchor {
+        out["anchor"] = json!({"kept": kept.id, "replay": outcome});
+        if let AnchorOutcome::Replayed { pass: true, receipt } = outcome {
+            let canary = Paired { matched: c.matched, recurrence: c.recurrence, harm: c.harm, family: e.family.clone() };
+            out["anchor"]["certificate"] = json!(anchor::certify(ctx, &moved, receipt, Some(canary))?);
+        }
+    }
     if matches!(d, Decision::Keep | Decision::Retire) {
-        let (situation, lesson, tag, source) = reflector_lesson(ctx, &moved, d, c, editor_cmd);
+        let replay = match anchor.as_ref().map(|(_, o)| o) {
+            Some(AnchorOutcome::Replayed { receipt, .. }) => Some(&**receipt),
+            _ => None,
+        };
+        let (situation, lesson, tag, source) = reflector_lesson(ctx, &moved, d, c, replay, editor_cmd);
         let dir = experience_dir(ctx, &moved);
         if dir.starts_with(ctx.paths.root.join("brownfield")) {
             std::fs::create_dir_all(&dir)?;
@@ -510,9 +538,17 @@ fn entry_files(dir: &Path, cap: usize) -> BTreeMap<String, String> {
     out
 }
 
-/// Reflector call (`improver/reflector.md`); deterministic record when it fails.
-fn reflector_lesson(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_cmd: Option<&str>) -> (String, String, LessonTag, &'static str) {
-    let input = json!({
+/// Reflector call (`improver/reflector.md`); deterministic record when it fails. `replay`
+/// is the anchor replay that preceded a keep (or turned it into a retire).
+fn reflector_lesson(
+    ctx: &AppCtx,
+    e: &Entry,
+    d: Decision,
+    c: &Counters,
+    replay: Option<&AnchorReceipt>,
+    editor_cmd: Option<&str>,
+) -> (String, String, LessonTag, &'static str) {
+    let mut input = json!({
         "entry": {"id": e.id, "name": e.name, "kind": e.kind, "trigger_line": e.trigger_line,
                   "redirect_class": e.redirect_class, "family": e.family, "branch": e.branch, "origin": e.origin},
         "manifest": e.manifest,
@@ -520,6 +556,14 @@ fn reflector_lesson(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_c
         "counters": c,
         "decision": d,
     });
+    if let Some(r) = replay {
+        input["anchor_replay"] = json!({
+            "task": r.task,
+            "verifier": r.verifier,
+            "pass": crate::batch::verifier::is_pass(&r.verdict),
+            "detail": head(crate::batch::verifier::detail_of(&r.verdict), 1024),
+        });
+    }
     let reply = editor::call(ctx, editor_cmd, ROLE_EDITOR, &ctx.improver_file("reflector.md"), &editor::wrap_input("reflector", &input));
     if let Ok(text) = reply {
         if let Some(v) = redirect::extract_json(&text) {
@@ -553,10 +597,16 @@ fn reflector_lesson(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_c
             "Kept: {} matched sessions with no recurrence of the {class} redirect and no harm event.",
             c.matched
         ),
-        _ => format!(
-            "Retired: recurrence {} and harm {} over {} matched sessions; the entry did not prevent the {class} redirect.",
-            c.recurrence, c.harm, c.matched
-        ),
+        _ => match replay {
+            Some(r) => format!(
+                "Retired before replacing a kept entry: {} matched clean sessions, but one replay of task {} with it in place failed the verifier.",
+                c.matched, r.task
+            ),
+            None => format!(
+                "Retired: recurrence {} and harm {} over {} matched sessions; the entry did not prevent the {class} redirect.",
+                c.recurrence, c.harm, c.matched
+            ),
+        },
     };
     let tag = e.lesson_tag.unwrap_or(match e.manifest.as_ref().map(|m| m.scope) {
         Some(EditorScope::Invariant) => LessonTag::Invariant,
@@ -1210,7 +1260,8 @@ impl HistoryStage {
 
 /// `reflect --history`: every imported session that is flagged, has no trace file and no
 /// `history_reflected_at` marker, newest first, gets `traces/<sid>.jsonl` synthesized from its
-/// omp session file (`trace_records_of`, `mode: "import"`) and `pending/<sid>.json`, so the
+/// harness transcript (`import_cmd::read_transcript`: omp, Claude Code or Codex by id prefix,
+/// `mode: "import"`) and `pending/<sid>.json`, so the
 /// normal loop (count + reflect, rate limits, ≤ 3 model calls) handles it. At most `limit`
 /// pending files per run. Sessions ruled out for good (subagent files, or not flagged by the
 /// extension's rule) are marked too; a missing session file is left for a later run.
@@ -1230,24 +1281,24 @@ fn stage_history(ctx: &AppCtx, only: Option<&str>, since: Option<i64>, limit: us
             continue;
         }
         let mut skip = |reason: String| st.skipped.push(json!({"session": s.id, "outcome": "skipped", "reason": reason}));
-        let Some(path) = crate::import_cmd::locate_session_file(ctx, s)? else {
-            skip("no_session_file".into());
-            continue;
-        };
-        let omp = match read_session(&path) {
-            Ok(o) => o,
+        let transcript = match crate::import_cmd::read_transcript(ctx, s) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                skip("no_session_file".into());
+                continue;
+            }
             Err(e) => {
                 skip(format!("unreadable: {e:#}"));
                 continue;
             }
         };
-        if omp.header.parent_session.is_some() {
-            // The extension traces main sessions only.
+        if transcript.subagent {
+            // The adapters trace main sessions only.
             ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
             skip("subagent".into());
             continue;
         }
-        let records = trace_records_of(&omp);
+        let records = transcript.records;
         let Some(TraceRecord::SessionShutdown { reasons, flagged: true, .. }) = records.last() else {
             ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
             skip("not_flagged".into());

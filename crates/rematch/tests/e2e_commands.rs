@@ -388,12 +388,12 @@ fn omp_result(id: &str, name: &str, text: &str, is_error: bool) -> Value {
 
 /// omp v3 session file under `<agent>/sessions/-work-payments/` (cwd = the env repo) whose
 /// entries chain `parentId`s, one second apart from `<day>T10:00:00Z`.
-fn write_omp_session(env: &Env, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
-    let dir = env.agent.join("sessions").join("-work-payments");
+fn write_omp_session_in(agent_dir: &Path, repo: &Path, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
+    let dir = agent_dir.join("sessions").join("-work-payments");
     std::fs::create_dir_all(&dir).unwrap();
     let mut lines = vec![
         json!({"type": "title", "v": 1, "title": "x", "pad": "  "}),
-        json!({"type": "session", "version": 3, "id": sid, "timestamp": format!("{day}T10:00:00.000Z"), "cwd": env.repo}),
+        json!({"type": "session", "version": 3, "id": sid, "timestamp": format!("{day}T10:00:00.000Z"), "cwd": repo}),
     ];
     let mut parent: Option<String> = None;
     for (i, m) in messages.iter().enumerate() {
@@ -405,6 +405,10 @@ fn write_omp_session(env: &Env, sid: &str, day: &str, messages: &[Value]) -> Pat
     let path = dir.join(format!("{day}T10-00-00-000Z_{sid}.jsonl"));
     std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
     path
+}
+
+fn write_omp_session(env: &Env, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
+    write_omp_session_in(&env.agent, &env.repo, sid, day, messages)
 }
 
 /// user → assistant(edit) → toolResult → assistant → user "No, that's wrong …" → assistant.
@@ -530,4 +534,75 @@ fn improve_builds_its_excerpt_from_imported_history() {
     let clusters = input["clusters"].as_array().unwrap();
     assert!(clusters.iter().any(|c| c["class"] == "error_cluster" && c["stems"] == "bash" && c["count"] == 1), "{input}");
     assert_eq!(input["redirect"]["class"], "error_cluster", "{input}");
+}
+
+#[test]
+fn import_history_and_doctor_across_profiles_with_skip() {
+    let env = Env::new();
+    let omp_root = env.home.join(".omp");
+    let default_agent = omp_root.join("agent");
+    let work_agent = omp_root.join("profiles/work/agent");
+    let skip_agent = omp_root.join("profiles/sandbox/agent");
+    for dir in [&default_agent, &work_agent, &skip_agent] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.yml"),
+            "modelRoles:\n  smol: fakeprov/small-model\n  default: anthropic/claude-opus-5-5:high\n",
+        )
+        .unwrap();
+    }
+    let msg = &[omp_user("Fix the payments rounding"), omp_assistant("Fixed.", vec![], "stop")];
+    write_omp_session_in(&default_agent, &env.repo, "sess-default", "2026-10-10", msg);
+    write_omp_session_in(&work_agent, &env.repo, "sess-work-1", "2026-10-11", msg);
+    write_omp_session_in(&work_agent, &env.repo, "sess-work-2", "2026-10-12", msg);
+    write_omp_session_in(&skip_agent, &env.repo, "sess-sandbox", "2026-10-13", msg);
+
+    // 1. CLI --skip-profile skips `sandbox` while importing `default` and `work`.
+    let mut c = env.cmd(&["import", "--history", "--skip-profile", "sandbox"]);
+    c.env_remove("PI_CODING_AGENT_DIR");
+    let (v, code) = env.run_cmd(c);
+    assert_eq!(code, 0, "{v}");
+    let h = &v["data"]["history"];
+    assert_eq!(h["files"], 3, "{h}");
+    assert_eq!(h["new"], 3, "{h}");
+    assert_eq!(h["profiles"]["default"]["files"], 1, "{h}");
+    assert_eq!(h["profiles"]["default"]["new"], 1, "{h}");
+    assert_eq!(h["profiles"]["work"]["files"], 2, "{h}");
+    assert_eq!(h["profiles"]["work"]["new"], 2, "{h}");
+    assert!(h["profiles"].get("sandbox").is_none(), "{h}");
+    assert_eq!(h["skipped_profiles"], json!(["sandbox"]), "{h}");
+
+    // 2. policy.json `skip_profiles` also skips `sandbox` without the CLI flag, and doctor reports it.
+    std::fs::write(env.root.join("policy.json"), r#"{"skip_profiles":["sandbox"]}"#).unwrap();
+    let mut c2 = env.cmd(&["import", "--history"]);
+    c2.env_remove("PI_CODING_AGENT_DIR").env("OMP_PROFILE", "work");
+    let (v2, code2) = env.run_cmd(c2);
+    assert_eq!(code2, 0, "{v2}");
+    let h2 = &v2["data"]["history"];
+    assert_eq!(h2["files"], 3, "{h2}");
+    assert_eq!(h2["new"], 0, "{h2}");
+    assert_eq!(h2["updated"], 3, "{h2}");
+    assert_eq!(h2["skipped_profiles"], json!(["sandbox"]), "{h2}");
+
+    // 3. Doctor under OMP_PROFILE=work resolves work's agent_dir, lists existing and skipped profiles.
+    let mut doc = env.cmd(&["doctor"]);
+    doc.env("OMP_BIN", script("fake-omp.sh"))
+        .env("OMP_PROFILE", "work")
+        .env("PI_CODING_AGENT_DIR", "/ignored/under/named/profile");
+    let (dv, dcode) = env.run_cmd(doc);
+    assert_eq!(dcode, 0, "{dv}");
+    let dd = &dv["data"];
+    assert_eq!(dd["paths"]["agent_dir"], json!(work_agent), "{dd}");
+    assert_eq!(dd["paths"]["root"], json!(env.root), "{dd}");
+    assert_eq!(dd["profiles"]["active"], "work", "{dd}");
+    assert_eq!(dd["profiles"]["existing"], json!(["sandbox", "work"]), "{dd}");
+    assert_eq!(dd["profiles"]["skipped"], json!(["sandbox"]), "{dd}");
+    assert!(
+        dd["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("profile: work") && l.as_str().unwrap().contains("skipped: sandbox")),
+        "{dd}"
+    );
 }

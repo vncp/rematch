@@ -1,7 +1,8 @@
-//! `import --history [--sessions <dir>]` (omp session JSONL → ledger) and
+//! `import --history [--harness omp|claude-code|codex|all] [--sessions <dir>]` (session
+//! history → ledger: omp session JSONL, Claude Code and Codex transcripts) and
 //! `import --forge <path>` (compound-forge skills → provisional brownfield entries,
 //! learnings → provisional lessons). Both are idempotent. Also the lookup of a ledger
-//! session's trace records (live trace, else synthesized from its omp session file) shared
+//! session's trace records (live trace, else synthesized from its harness transcript) shared
 //! by `improve` and `reflect --history`.
 
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use rematch_core::import::{
     trace_records_of,
 };
 use rematch_core::ledger::{EntryFilter, SessionFilter};
+use rematch_core::{import_claude, import_codex};
 use rematch_core::library::{self, validate_name, REMATCH_JSON};
 use rematch_core::outcome::{minhash, outcome_tokens, MINHASH_K};
 use rematch_core::package::{slug, SkillDoc};
@@ -26,14 +28,34 @@ use crate::app::{new_entry, AppCtx, NewEntry};
 
 pub const FORGE_BRANCH: &str = "forge";
 
+/// Whose session history `import --history` reads.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryHarness {
+    /// omp: `<agent dir>/sessions` plus every profile's sessions dir.
+    Omp,
+    /// Claude Code: `~/.claude/projects` (`$CLAUDE_CONFIG_DIR/projects`).
+    ClaudeCode,
+    /// Codex: `~/.codex/sessions` (`$CODEX_HOME/sessions`).
+    Codex,
+    /// Every harness whose default history dir exists.
+    All,
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct ImportArgs {
-    /// Import omp session history into the ledger.
+    /// Import session history into the ledger.
     #[arg(long)]
     pub history: bool,
-    /// Sessions directory (default: `<agent dir>/sessions`).
+    /// Which harness's history: omp, claude-code, codex, or all (default: each harness's
+    /// default dir that exists).
+    #[arg(long, value_enum, default_value_t = HistoryHarness::All)]
+    pub harness: HistoryHarness,
+    /// Sessions directory of the selected harness (with `--harness all`: an omp sessions dir).
     #[arg(long, value_name = "DIR")]
     pub sessions: Option<PathBuf>,
+    /// Skip a named profile during `--history` import (repeatable; merged with `policy.json` `skip_profiles`).
+    #[arg(long = "skip-profile", value_name = "NAME")]
+    pub skip_profiles: Vec<String>,
     /// compound-forge checkout: skills/* → provisional brownfield entries, learnings/*.md → lessons.
     #[arg(long, value_name = "PATH")]
     pub forge: Option<PathBuf>,
@@ -50,13 +72,72 @@ pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
     let mut out = json!({});
     let mut lines = Vec::new();
     if a.history {
-        let dir = a.sessions.clone().unwrap_or_else(|| ctx.paths.agent_dir.join("sessions"));
-        let h = import_history(ctx, &dir)?;
-        lines.push(format!(
-            "history: {} files, {} new, {} updated, {} kept from traces, {} failed; {} sessions with skill reads, {} redirects, {} outcomes",
-            h["files"], h["new"], h["updated"], h["skipped_traced"], h["failed"], h["with_skill_reads"], h["redirects"], h["outcomes"]
-        ));
-        out["history"] = h;
+        let (omp, claude, codex) = match a.harness {
+            HistoryHarness::Omp => (true, false, false),
+            HistoryHarness::ClaudeCode => (false, true, false),
+            HistoryHarness::Codex => (false, false, true),
+            HistoryHarness::All => (true, a.sessions.is_none(), a.sessions.is_none()),
+        };
+        let all = a.harness == HistoryHarness::All;
+        let mut imported = 0;
+        if omp && (!all || a.sessions.is_some() || omp_history_present(ctx)) {
+            let h = match &a.sessions {
+                Some(dir) => import_history(ctx, dir)?,
+                None => import_history_all_profiles(ctx, &a.skip_profiles)?,
+            };
+            lines.push(format!(
+                "history: {} files, {} new, {} updated, {} kept from traces, {} failed; {} sessions with skill reads, {} redirects, {} outcomes",
+                h["files"], h["new"], h["updated"], h["skipped_traced"], h["failed"], h["with_skill_reads"], h["redirects"], h["outcomes"]
+            ));
+            if let Some(profiles) = h.get("profiles").and_then(Value::as_object) {
+                let summary: Vec<String> = profiles
+                    .iter()
+                    .map(|(name, p)| format!("{name}: {} ({} new)", p["files"], p["new"]))
+                    .collect();
+                let skipped: Vec<&str> = h
+                    .get("skipped_profiles")
+                    .and_then(Value::as_array)
+                    .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !summary.is_empty() || !skipped.is_empty() {
+                    let skip_note = if skipped.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (skipped: {})", skipped.join(", "))
+                    };
+                    lines.push(format!("profiles: {}{skip_note}", summary.join(", ")));
+                }
+            }
+            out["history"] = h;
+            imported += 1;
+        }
+        let harnesses: [(bool, &str, &str, Option<PathBuf>); 2] = [
+            (claude, "claude-code", "history_claude_code", rematch_core::import_claude::default_sessions_dir()),
+            (codex, "codex", "history_codex", rematch_core::import_codex::default_sessions_dir()),
+        ];
+        for (selected, name, key, default_dir) in harnesses {
+            if !selected {
+                continue;
+            }
+            let dir = match (a.sessions.clone().or(default_dir), all) {
+                (Some(d), _) if d.is_dir() => d,
+                (_, true) => continue,
+                (d, false) => bail!(
+                    "{name} sessions dir {} does not exist",
+                    d.map(|d| d.display().to_string()).unwrap_or_else(|| "(no home directory)".into())
+                ),
+            };
+            let h = import_harness_history(ctx, name, &dir)?;
+            lines.push(format!(
+                "{name} history: {} files ({} subagent), {} new, {} updated, {} kept from traces, {} failed; {} sessions with skill reads, {} redirects",
+                h["files"], h["subagent_files"], h["new"], h["updated"], h["skipped_traced"], h["failed"], h["with_skill_reads"], h["redirects"]
+            ));
+            out[key] = h;
+            imported += 1;
+        }
+        if imported == 0 {
+            bail!("no session history found (omp sessions, ~/.claude/projects, ~/.codex/sessions)");
+        }
     }
     if let Some(forge) = &a.forge {
         let f = import_forge(ctx, forge, a.migrate)?;
@@ -70,97 +151,338 @@ pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
     Ok(out)
 }
 
-pub fn import_history(ctx: &AppCtx, dir: &Path) -> Result<Value> {
-    if !dir.is_dir() {
-        bail!("sessions dir {} does not exist", dir.display());
+#[derive(Default)]
+struct HistoryStats {
+    files: usize,
+    new: u32,
+    updated: u32,
+    skipped: u32,
+    failed: u32,
+    subagents: u32,
+    skill_sessions: u32,
+    skills: std::collections::BTreeMap<String, u32>,
+    redirects: u32,
+    outcomes: u32,
+    /// Clean sessions that loaded entries, whose synthesized trace was written for `count`.
+    traces: u32,
+    errors: Vec<String>,
+}
+
+impl HistoryStats {
+    fn merge(&mut self, other: &HistoryStats) {
+        self.files += other.files;
+        self.new += other.new;
+        self.updated += other.updated;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        self.subagents += other.subagents;
+        self.skill_sessions += other.skill_sessions;
+        for (k, v) in &other.skills {
+            *self.skills.entry(k.clone()).or_default() += v;
+        }
+        self.redirects += other.redirects;
+        self.outcomes += other.outcomes;
+        self.traces += other.traces;
+        for e in &other.errors {
+            if self.errors.len() < 10 {
+                self.errors.push(e.clone());
+            }
+        }
     }
+
+    fn to_json(&self, dir: &Path) -> Value {
+        json!({
+            "dir": dir,
+            "files": self.files,
+            "new": self.new,
+            "updated": self.updated,
+            "skipped_traced": self.skipped,
+            "failed": self.failed,
+            "subagent_files": self.subagents,
+            "with_skill_reads": self.skill_sessions,
+            "skills_read": self.skills,
+            "redirects": self.redirects,
+            "outcomes": self.outcomes,
+            "traces_written": self.traces,
+            "errors": self.errors,
+        })
+    }
+}
+
+fn import_dir_stats(ctx: &AppCtx, dir: &Path) -> Result<HistoryStats> {
     let files = scan_sessions_dir(dir)?;
-    let (mut new, mut updated, mut skipped, mut failed) = (0u32, 0u32, 0u32, 0u32);
-    let (mut skill_sessions, mut redirects, mut outcomes, mut subagents) = (0u32, 0u32, 0u32, 0u32);
-    let mut errors = Vec::new();
-    let mut skills: std::collections::BTreeMap<String, u32> = Default::default();
+    let mut st = HistoryStats { files: files.len(), ..Default::default() };
     for f in &files {
         let session = match read_session(&f.path) {
             Ok(s) => s,
             Err(e) => {
-                failed += 1;
-                if errors.len() < 10 {
-                    errors.push(format!("{}: {e:#}", f.path.display()));
+                st.failed += 1;
+                if st.errors.len() < 10 {
+                    st.errors.push(format!("{}: {e:#}", f.path.display()));
                 }
                 continue;
             }
         };
         let rec = session_record(&session);
         if rec.id.is_empty() {
-            failed += 1;
+            st.failed += 1;
             continue;
         }
         if f.parent_id.is_some() {
-            subagents += 1;
+            st.subagents += 1;
         }
         match ctx.ledger.get_session(&rec.id)? {
             // Our own trace of the session is richer (loaded entries, prelabels): keep it.
             Some(existing) if existing.source == "trace" => {
-                skipped += 1;
+                st.skipped += 1;
                 continue;
             }
-            Some(_) => updated += 1,
-            None => new += 1,
+            Some(_) => st.updated += 1,
+            None => st.new += 1,
         }
         if !rec.skill_reads.is_empty() {
-            skill_sessions += 1;
+            st.skill_sessions += 1;
             for s in &rec.skill_reads {
-                *skills.entry(s.clone()).or_default() += 1;
+                *st.skills.entry(s.clone()).or_default() += 1;
             }
         }
-        redirects += rec.redirects.len() as u32;
+        st.redirects += rec.redirects.len() as u32;
         ctx.ledger.upsert_session(&rec)?;
         for o in extract_outcomes(&session, &rec) {
             ctx.ledger.insert_outcome(&o)?;
             ctx.ledger.put_minhash(&o.id, &minhash(&outcome_tokens(&o), MINHASH_K))?;
-            outcomes += 1;
+            st.outcomes += 1;
         }
     }
     eprintln!("rematch import: {} session files from {}", files.len(), dir.display());
-    Ok(json!({
-        "dir": dir,
-        "files": files.len(),
-        "new": new,
-        "updated": updated,
-        "skipped_traced": skipped,
-        "failed": failed,
-        "subagent_files": subagents,
-        "with_skill_reads": skill_sessions,
-        "skills_read": skills,
-        "redirects": redirects,
-        "outcomes": outcomes,
-        "errors": errors,
-    }))
+    Ok(st)
 }
 
+pub fn import_history(ctx: &AppCtx, dir: &Path) -> Result<Value> {
+    if !dir.is_dir() {
+        bail!("sessions dir {} does not exist", dir.display());
+    }
+    Ok(import_dir_stats(ctx, dir)?.to_json(dir))
+}
+
+/// Import the default agent dir (`ctx.paths.agent_dir` when default, plus `default_agent_dir()`)
+/// and every `<config_root>/profiles/<name>/agent/sessions` except profiles in `skip_profiles`
+/// or `REMATCH_ROOT/policy.json` `skip_profiles`.
+pub fn import_history_all_profiles(ctx: &AppCtx, cli_skip: &[String]) -> Result<Value> {
+    let policy = crate::scope::export::Policy::load(&ctx.paths.root).unwrap_or_default();
+    let mut skip_set: std::collections::BTreeSet<String> = policy
+        .skip_profiles
+        .iter()
+        .chain(cli_skip.iter())
+        .filter_map(|s| rematch_core::paths::normalize_profile_name(s).or_else(|| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }))
+        .collect();
+
+    let default_agent = if ctx.paths.profile.is_none() {
+        ctx.paths.agent_dir.clone()
+    } else {
+        ctx.paths.default_agent_dir()
+    };
+    let default_sessions = default_agent.join("sessions");
+
+    let all_profiles = ctx.paths.list_profiles();
+    let mut skipped_profiles = Vec::new();
+    let mut targets: Vec<(String, PathBuf)> = Vec::new();
+
+    if skip_set.remove("default") {
+        skipped_profiles.push("default".to_string());
+    } else if default_sessions.is_dir() {
+        targets.push(("default".to_string(), default_sessions.clone()));
+    }
+
+    for prof in &all_profiles {
+        if skip_set.contains(prof) {
+            skipped_profiles.push(prof.clone());
+            continue;
+        }
+        let sdir = rematch_core::paths::RematchPaths::profile_agent_dir(&ctx.paths.config_root, prof).join("sessions");
+        if sdir.is_dir() {
+            targets.push((prof.clone(), sdir));
+        }
+    }
+    for s in skip_set {
+        if !skipped_profiles.contains(&s) {
+            skipped_profiles.push(s);
+        }
+    }
+
+    let active_sessions = ctx.paths.agent_dir.join("sessions");
+    if targets.is_empty() && !active_sessions.is_dir() && all_profiles.is_empty() {
+        bail!("sessions dir {} does not exist", active_sessions.display());
+    }
+
+    let mut total = HistoryStats::default();
+    let mut per_profile = serde_json::Map::new();
+    for (name, sdir) in &targets {
+        let st = import_dir_stats(ctx, sdir)?;
+        total.merge(&st);
+        per_profile.insert(name.clone(), st.to_json(sdir));
+    }
+
+    let mut out = total.to_json(&active_sessions);
+    out["profiles"] = Value::Object(per_profile);
+    out["skipped_profiles"] = json!(skipped_profiles);
+    Ok(out)
+}
+
+/// Whether any omp sessions dir exists (active, default, or a profile's).
+fn omp_history_present(ctx: &AppCtx) -> bool {
+    ctx.paths.agent_dir.join("sessions").is_dir()
+        || ctx.paths.default_agent_dir().join("sessions").is_dir()
+        || ctx
+            .paths
+            .list_profiles()
+            .iter()
+            .any(|p| rematch_core::paths::RematchPaths::profile_agent_dir(&ctx.paths.config_root, p).join("sessions").is_dir())
+}
+
+/// `import --history` of a Claude Code (`name` = `claude-code`) or Codex sessions dir: each
+/// transcript's trace is synthesized and folded into its ledger row. Outcomes are derived
+/// from omp tool receipts only, so none are extracted here. A clean main session that loaded
+/// rematch entries (Codex: skills it listed, DESIGN §18.2.2) gets its synthesized trace
+/// written to `traces/<sid>.jsonl`, so `count` folds it into those entries' counters;
+/// flagged ones reach the counters through `reflect --history`, which skips sessions that
+/// already have a trace.
+fn import_harness_history(ctx: &AppCtx, name: &str, dir: &Path) -> Result<Value> {
+    let st = if name == Transcripts::ClaudeCode.name() {
+        import_harness_stats(
+            ctx,
+            import_claude::scan_sessions_dir(dir)?,
+            import_claude::read_session,
+            import_claude::session_record,
+            import_claude::ClaudeSession::is_subagent,
+            import_claude::trace_records_of,
+        )?
+    } else {
+        import_harness_stats(
+            ctx,
+            import_codex::scan_sessions_dir(dir)?,
+            import_codex::read_session,
+            import_codex::session_record,
+            import_codex::CodexSession::is_subagent,
+            import_codex::trace_records_of,
+        )?
+    };
+    eprintln!("rematch import: {} {name} session files from {}", st.files, dir.display());
+    Ok(st.to_json(dir))
+}
+
+fn import_harness_stats<S>(
+    ctx: &AppCtx,
+    files: Vec<PathBuf>,
+    read: impl Fn(&Path) -> Result<S>,
+    record: impl Fn(&S) -> SessionRecord,
+    is_subagent: impl Fn(&S) -> bool,
+    trace: impl Fn(&S) -> Vec<TraceRecord>,
+) -> Result<HistoryStats> {
+    let mut st = HistoryStats { files: files.len(), ..Default::default() };
+    for f in &files {
+        let session = match read(f) {
+            Ok(s) => s,
+            Err(e) => {
+                st.failed += 1;
+                if st.errors.len() < 10 {
+                    st.errors.push(format!("{}: {e:#}", f.display()));
+                }
+                continue;
+            }
+        };
+        let rec = record(&session);
+        if rec.id.is_empty() {
+            st.failed += 1;
+            continue;
+        }
+        let subagent = is_subagent(&session);
+        if subagent {
+            st.subagents += 1;
+        }
+        let existing = ctx.ledger.get_session(&rec.id)?;
+        let counted = existing.as_ref().is_some_and(|s| s.counted);
+        match existing {
+            // The adapter's own trace of the session is richer (loaded entries): keep it.
+            Some(existing) if existing.source == "trace" => {
+                st.skipped += 1;
+                continue;
+            }
+            Some(_) => st.updated += 1,
+            None => st.new += 1,
+        }
+        if !rec.skill_reads.is_empty() {
+            st.skill_sessions += 1;
+            for s in &rec.skill_reads {
+                *st.skills.entry(s.clone()).or_default() += 1;
+            }
+        }
+        st.redirects += rec.redirects.len() as u32;
+        ctx.ledger.upsert_session(&rec)?;
+        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", rec.id));
+        if !subagent && !rec.flagged && !counted && !rec.loaded_entries.is_empty() && !trace_path.exists() {
+            let mut body = String::new();
+            for r in &trace(&session) {
+                body.push_str(&serde_json::to_string(r)?);
+                body.push('\n');
+            }
+            std::fs::create_dir_all(&ctx.paths.traces)?;
+            let tmp = trace_path.with_extension("jsonl.tmp");
+            std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+            std::fs::rename(&tmp, &trace_path).with_context(|| format!("rename to {}", trace_path.display()))?;
+            st.traces += 1;
+        }
+    }
+    Ok(st)
+}
 /// The omp session file of a ledger session: the path recorded at import, else
-/// `<agent dir>/sessions/<slug of its cwd>/*_<id>.jsonl`, else any `*_<id>.jsonl` under the
-/// sessions dir. Subagent files (`<Name>.jsonl`) are found only through the recorded path.
+/// `<agent dir>/sessions/<slug of its cwd>/*_<id>.jsonl` (across the active, default, and
+/// profile agent dirs), else any `*_<id>.jsonl` under those sessions dirs. Subagent files
+/// (`<Name>.jsonl`) are found only through the recorded path.
 pub fn locate_session_file(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<PathBuf>> {
     if let Some(p) = s.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
         return Ok(Some(p));
     }
-    let dir = ctx.paths.agent_dir.join("sessions");
-    if !dir.is_dir() {
-        return Ok(None);
-    }
     let is_it = |p: &Path| {
         p.extension().is_some_and(|e| e == "jsonl") && session_id_from_filename(p).as_deref() == Some(s.id.as_str())
     };
-    for slug in cwd_slugs(&s.cwd) {
-        for ent in std::fs::read_dir(dir.join(slug)).into_iter().flatten().flatten() {
-            let p = ent.path();
-            if is_it(&p) {
-                return Ok(Some(p));
+    let mut session_dirs = vec![ctx.paths.agent_dir.join("sessions")];
+    let default_sessions = ctx.paths.default_agent_dir().join("sessions");
+    if !session_dirs.contains(&default_sessions) {
+        session_dirs.push(default_sessions);
+    }
+    for prof in ctx.paths.list_profiles() {
+        let pdir = rematch_core::paths::RematchPaths::profile_agent_dir(&ctx.paths.config_root, &prof).join("sessions");
+        if !session_dirs.contains(&pdir) {
+            session_dirs.push(pdir);
+        }
+    }
+    let slugs = cwd_slugs(&s.cwd);
+    for dir in &session_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        for slug in &slugs {
+            for ent in std::fs::read_dir(dir.join(slug)).into_iter().flatten().flatten() {
+                let p = ent.path();
+                if is_it(&p) {
+                    return Ok(Some(p));
+                }
             }
         }
     }
-    Ok(scan_sessions_dir(&dir)?.into_iter().map(|f| f.path).find(|p| is_it(p)))
+    for dir in &session_dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(found) = scan_sessions_dir(dir)?.into_iter().map(|f| f.path).find(|p| is_it(p)) {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// omp's session directory names for a cwd: `-<path under $HOME, / → ->` inside the home
@@ -177,17 +499,89 @@ fn cwd_slugs(cwd: &str) -> Vec<String> {
     out
 }
 
+/// Harnesses whose sessions carry an id prefix (`cc:`, `codex:`); unprefixed ids are omp's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transcripts {
+    ClaudeCode,
+    Codex,
+}
+
+impl Transcripts {
+    pub fn of_id(id: &str) -> Option<Transcripts> {
+        if id.starts_with(import_claude::ID_PREFIX) {
+            Some(Transcripts::ClaudeCode)
+        } else if id.starts_with(import_codex::ID_PREFIX) {
+            Some(Transcripts::Codex)
+        } else {
+            None
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Transcripts::ClaudeCode => "claude-code",
+            Transcripts::Codex => "codex",
+        }
+    }
+
+    fn default_dir(self) -> Option<PathBuf> {
+        match self {
+            Transcripts::ClaudeCode => import_claude::default_sessions_dir(),
+            Transcripts::Codex => import_codex::default_sessions_dir(),
+        }
+    }
+
+    /// The transcript of a ledger session: the path recorded at import, else the harness's
+    /// lookup under its default sessions dir.
+    fn locate(self, s: &SessionRecord) -> Option<PathBuf> {
+        if let Some(p) = s.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
+            return Some(p);
+        }
+        let dir = self.default_dir().filter(|d| d.is_dir())?;
+        match self {
+            Transcripts::ClaudeCode => import_claude::find_session_file(&dir, &s.id),
+            Transcripts::Codex => import_codex::find_session_file(&dir, &s.id),
+        }
+    }
+}
+
+/// A ledger session's harness transcript, read back: the trace synthesized from it and
+/// whether it is a subagent's (the adapters trace main sessions only).
+pub struct Transcript {
+    pub path: PathBuf,
+    pub records: Vec<TraceRecord>,
+    pub subagent: bool,
+}
+
+/// The transcript of a ledger session from the harness its id names (omp, Claude Code,
+/// Codex). `Ok(None)` when no file is found; `Err` when it is unreadable.
+pub fn read_transcript(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Transcript>> {
+    let Some(h) = Transcripts::of_id(&s.id) else {
+        let Some(path) = locate_session_file(ctx, s)? else { return Ok(None) };
+        let omp = read_session(&path)?;
+        return Ok(Some(Transcript { subagent: omp.header.parent_session.is_some(), records: trace_records_of(&omp), path }));
+    };
+    let Some(path) = h.locate(s) else { return Ok(None) };
+    Ok(Some(match h {
+        Transcripts::ClaudeCode => {
+            let c = import_claude::read_session(&path)?;
+            Transcript { subagent: c.is_subagent(), records: import_claude::trace_records_of(&c), path }
+        }
+        Transcripts::Codex => {
+            let c = import_codex::read_session(&path)?;
+            Transcript { subagent: c.is_subagent(), records: import_codex::trace_records_of(&c), path }
+        }
+    }))
+}
+
 /// Trace records of a ledger session: its live trace when present, else the trace
-/// synthesized from its omp session file ([`trace_records_of`]). `None` when neither exists.
+/// synthesized from its harness transcript ([`read_transcript`]). `None` when neither exists.
 pub fn records_for_session(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Vec<TraceRecord>>> {
     let tp = ctx.paths.traces.join(format!("{}.jsonl", s.id));
     if tp.is_file() {
         return Ok(Some(trace::read_trace(&tp)?));
     }
-    match locate_session_file(ctx, s)? {
-        Some(p) => Ok(Some(trace_records_of(&read_session(&p)?))),
-        None => Ok(None),
-    }
+    Ok(read_transcript(ctx, s)?.map(|t| t.records))
 }
 
 /// [`records_for_session`] plus the session row whose redirect and error-cluster seqs address
