@@ -185,6 +185,70 @@ export function skillFromReadPath(p: unknown): string | null {
 	return m ? m[1] : null;
 }
 
+// Changed files (ADR 001 `session_shutdown.files_changed`): verbatim with rematch-core `trace.rs`.
+export const MUTATING_TOOLS = ["edit", "write", "multiedit", "notebookedit", "apply_patch", "ast_edit"];
+export const PATCH_FILE = /^\["?([^\]\n"]+?)"?#[0-9A-Za-z]{4}\]\s*$|^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$|^\*\*\* Move to: (.+?)\s*$|^MV\s+"?([^"\n]+?)"?\s*$/gm;
+export const FILES_CHANGED_MAX = 50;
+export const FILES_CHANGED_MAX_BYTES = 1024 * 1024;
+/** Share of the 2 s `session_shutdown` budget spent hashing changed files. */
+export const FILES_CHANGED_BUDGET_MS = 1000;
+
+/** Files a successful mutating tool call names: `path`/`file_path`/`paths[]`, plus the paths inside an `edit`/`apply_patch` payload. */
+export function changedPaths(tool: string, input: unknown): string[] {
+	const name = tool.toLowerCase();
+	if (!MUTATING_TOOLS.includes(name) || !isRecord(input)) return [];
+	const out: string[] = [];
+	const push = (p: unknown) => {
+		if (typeof p !== "string") return;
+		const clean = stripSelectors(p.trim());
+		if (clean && !clean.includes("://") && !out.includes(clean)) out.push(clean);
+	};
+	push(input.path);
+	push(input.file_path);
+	if (Array.isArray(input.paths)) for (const p of input.paths) push(p);
+	if (name === "edit" || name === "apply_patch") {
+		for (const key of ["input", "patch"]) {
+			const text = input[key];
+			if (typeof text !== "string") continue;
+			for (const m of text.matchAll(PATCH_FILE)) push(m[1] ?? m[2] ?? m[3] ?? m[4]);
+		}
+	}
+	return out;
+}
+
+/**
+ * `[path, sha256]` of the first `FILES_CHANGED_MAX` readable regular files of `paths` (relative ones
+ * resolve against `cwd`) no larger than `FILES_CHANGED_MAX_BYTES`, repo-relative inside `repo`;
+ * `null` when `deadline` (ms epoch) passes first, so the record omits the field.
+ */
+export function filesChanged(paths: readonly string[], cwd: string, repo: string | null, deadline: number): [string, string][] | null {
+	const out: [string, string][] = [];
+	for (const p of paths) {
+		if (out.length >= FILES_CHANGED_MAX) break;
+		if (Date.now() > deadline) return null;
+		const abs = path.resolve(cwd, p);
+		try {
+			const st = fs.statSync(abs);
+			if (!st.isFile() || st.size > FILES_CHANGED_MAX_BYTES) continue;
+			const sha = createHash("sha256").update(fs.readFileSync(abs)).digest("hex");
+			const rel = repo ? path.relative(repo, abs) : "";
+			out.push([repo && rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel.split(path.sep).join("/") : abs, sha]);
+		} catch {
+			// unreadable or gone: not recorded
+		}
+	}
+	return out;
+}
+
+/** `cwd` relative to the repo toplevel (`""` at the top), trying the cwd's real path for symlinked roots; null outside. */
+export function subpathOf(top: string, cwd: string): string | null {
+	for (const c of [cwd, (() => { try { return fs.realpathSync(cwd); } catch { return cwd; } })()]) {
+		const rel = path.relative(top, c);
+		if (!rel.startsWith("..") && !path.isAbsolute(rel)) return rel.split(path.sep).join("/");
+	}
+	return null;
+}
+
 export function skillsInvoked(text: string): string[] {
 	const names = new Set<string>();
 	for (const m of text.matchAll(/(?:^|\s)\/skill:([A-Za-z0-9][A-Za-z0-9._-]*)/g)) names.add(m[1]);
@@ -598,16 +662,24 @@ export function retrievalMessage(units: readonly RetrievedUnit[], timestamp = Da
 	};
 }
 
+/** One versioned `session_start.loaded_entries` item (ADR 001). */
+export type LoadedEntry = { id: string; version?: number; sha?: string };
+
 /**
  * `session_start.loaded_entries` of a `match` result: entries with a predicate hit, minus the
  * `retrieve` hooks, which a session credits through its `retrieval` record only where they injected
- * units (DESIGN §7).
+ * units (DESIGN §7); each `{id, version, sha}` as `match` reported it.
  */
-export function loadedEntryIds(data: unknown, hooks: readonly Hook[]): string[] {
+export function loadedEntriesOf(data: unknown, hooks: readonly Hook[]): LoadedEntry[] {
 	const retrieveIds = new Set(hooks.filter(h => h.mode === "retrieve").map(h => h.id));
 	return (isRecord(data) ? recordsOf(data.entries) : [])
 		.filter(e => typeof e.id === "string" && e.predicate_hit !== false && !retrieveIds.has(e.id))
-		.map(e => e.id as string);
+		.map(e => {
+			const out: LoadedEntry = { id: e.id as string };
+			if (typeof e.version === "number") out.version = e.version;
+			if (typeof e.sha === "string" && e.sha) out.sha = e.sha;
+			return out;
+		});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -648,6 +720,10 @@ type SessionTrace = {
 	turnsSinceAgentEnd: number;
 	lastModel: ModelRef | null;
 	dirReady: boolean;
+	cwd: string;
+	repo: string | null;
+	/** Files successful mutating tool calls named, hashed into `session_shutdown.files_changed`. */
+	changed: Set<string>;
 };
 
 export default async function rematch(pi: ExtensionAPI): Promise<void> {
@@ -683,7 +759,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	// back an entry, so approved hooks run at once (skill dirs only ever add, §0). Skills load from
 	// the one shared dir `skills sync` maintains (`dirs`); `match` supplies entries and hooks.
 	let loadedCwd: string | null = null;
-	let loadedEntries: string[] = [];
+	let loadedEntries: LoadedEntry[] = [];
+	let visibleEntries: string[] = [];
 	let skillDirs: string[] = [];
 	let hooks: Hook[] = [];
 	let callHooks: Hook[] = [];
@@ -723,7 +800,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 					log("warn", `hook ${file} skipped: ${errorText(error)}`);
 				}
 			}
-			loadedEntries = loadedEntryIds(data, next);
+			loadedEntries = loadedEntriesOf(data, next);
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
 			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
@@ -734,6 +811,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 		try {
 			if (!sync.ok) throw new Error(sync.error ?? "skills sync failed");
+			visibleEntries = stringsOf(sync.data?.visible);
 			const dirs = stringsOf(sync.data?.dirs).filter(d => !skillDirs.includes(d));
 			if (dirs.length > 0) {
 				await addSkillDirs(pi, dirs);
@@ -801,9 +879,22 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 	}
 
-	async function gitTop(cwd: string): Promise<string | null> {
+	/** Toplevel and HEAD in one call; an unborn HEAD still yields the toplevel (exit 1). */
+	async function gitTop(cwd: string): Promise<{ top: string | null; head: string | null }> {
 		try {
-			const r = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 3000 });
+			const r = await pi.exec("git", ["rev-parse", "--show-toplevel", "--verify", "-q", "HEAD"], { cwd, timeout: 3000 });
+			const [top, head] = r.stdout.trim().split("\n").map(s => s.trim());
+			if (r.killed || (r.code !== 0 && r.code !== 1) || !top) return { top: null, head: null };
+			return { top, head: r.code === 0 && /^[0-9a-f]{40,64}$/.test(head ?? "") ? head : null };
+		} catch {
+			return { top: null, head: null };
+		}
+	}
+
+	/** The origin URL as git prints it (the binary normalizes it); null without origin, on timeout or error. */
+	async function gitRemote(cwd: string): Promise<string | null> {
+		try {
+			const r = await pi.exec("git", ["remote", "get-url", "origin"], { cwd, timeout: 3000 });
 			const out = r.stdout.trim();
 			return r.code === 0 && !r.killed && out ? out : null;
 		} catch {
@@ -829,8 +920,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			turnsSinceAgentEnd: 0,
 			lastModel: modelOf(ctx),
 			dirReady: false,
+			cwd: ctx.cwd,
+			repo: null,
+			changed: new Set(),
 		};
-		const repo = await gitTop(ctx.cwd);
+		const t = trace;
+		const { top: repo, head } = await gitTop(ctx.cwd);
+		const remote = repo ? await gitRemote(ctx.cwd) : null;
+		t.repo = repo;
 		write("session_start", {
 			session_id: id,
 			cwd: ctx.cwd,
@@ -843,11 +940,15 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			loaded_entries: loadedEntries,
 			hooks_loaded: hooks.map(h => h.id),
 			staging_dirs: skillDirs,
+			repo_remote: remote,
+			subpath: repo ? subpathOf(repo, ctx.cwd) : null,
+			head_sha: head,
+			visible_entries: visibleEntries,
 		});
 		if (!loadedAnnotated) {
 			loadedAnnotated = true;
 			try {
-				pi.appendEntry("com.vncp.rematch.loaded", { entries: loadedEntries, hooks: hooks.map(h => h.id) });
+				pi.appendEntry("com.vncp.rematch.loaded", { entries: loadedEntries.map(e => e.id), hooks: hooks.map(h => h.id) });
 			} catch (error) {
 				log("debug", `appendEntry loaded failed: ${errorText(error)}`);
 			}
@@ -860,7 +961,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		if (!t) return;
 		const reasons = [...t.reasons];
 		const flagged = reasons.length > 0;
-		write("session_shutdown", { reasons, flagged });
+		const files = filesChanged([...t.changed], t.cwd, t.repo, Date.now() + FILES_CHANGED_BUDGET_MS);
+		write("session_shutdown", files && files.length > 0 ? { reasons, flagged, files_changed: files } : { reasons, flagged });
 		if (flagged) {
 			try {
 				const dir = path.join(root, "pending");
@@ -1211,6 +1313,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				path: typeof rawPath === "string" ? stripSelectors(rawPath) : null,
 			});
 			if (trace.errors.push(isError)) trace.reasons.add("tool_error_cluster");
+			if (!isError) for (const p of changedPaths(event.toolName, input)) trace.changed.add(p);
 		}),
 	);
 

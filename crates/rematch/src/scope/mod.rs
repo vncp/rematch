@@ -16,6 +16,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rematch_core::library::{primary_doc, AGENT_MD, REMATCH_JSON, SKILL_MD};
+use rematch_core::predicate::literal_path;
 use rematch_core::lint::{lint_entry, LintConfig, LintContext};
 use rematch_core::package::SkillDoc;
 use rematch_core::{Edit, Entry, LintReport, Origin};
@@ -242,23 +243,6 @@ pub(crate) fn lint_errors(rep: &LintReport) -> String {
         .join("; ")
 }
 
-/// Undo `glob::Pattern::escape` (`[?]` → `?`) to recover an exact repo path.
-pub(crate) fn unescape_glob(g: &str) -> String {
-    let b = g.as_bytes();
-    let mut out = String::with_capacity(g.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'[' && i + 2 < b.len() && b[i + 2] == b']' {
-            out.push(b[i + 1] as char);
-            i += 3;
-        } else {
-            let ch = g[i..].chars().next().unwrap_or_default();
-            out.push(ch);
-            i += ch.len_utf8().max(1);
-        }
-    }
-    out
-}
 
 /// The repo an entry came from: its originating session's repo, else an evidence
 /// session's repo, else the exact path its repo glob names (when it exists).
@@ -273,14 +257,7 @@ pub(crate) fn origin_repo(ctx: &AppCtx, e: &Entry) -> Result<Option<PathBuf>> {
             return Ok(Some(PathBuf::from(repo)));
         }
     }
-    let glob = e.predicate.repo_glob.trim();
-    if !glob.is_empty() && glob != rematch_core::predicate::ANY_REPO {
-        let p = PathBuf::from(unescape_glob(glob));
-        if p.is_dir() {
-            return Ok(Some(p));
-        }
-    }
-    Ok(None)
+    Ok(literal_path(&e.predicate.repo_glob).filter(|p| p.is_dir()))
 }
 
 /// Repo (else cwd) of the most recent ledger session in a branch.
@@ -357,6 +334,7 @@ pub(crate) mod testutil {
                 repo_glob: "**".into(),
                 file_exts: vec!["rs".into()],
                 stems: vec!["ledger".into(), "migrat".into()],
+                ..Default::default()
             },
             trigger_line: "Use when editing the ledger migrations.".into(),
             redirect_class: Some(rematch_core::RedirectClass::Correction),
@@ -385,6 +363,7 @@ pub(crate) mod testutil {
             fork_commit: None,
             families_excluded: vec![],
             links: vec![],
+            content_sha256: None,
         }
     }
 

@@ -3,12 +3,13 @@
 //!
 //! * `trace-event --harness claude-code` — `SessionStart`, `UserPromptSubmit`, `PostToolUse`,
 //!   `PostToolUseFailure`, `Stop`, `StopFailure`, `SessionEnd` → DESIGN §3 records appended to
-//!   `traces/cc:<session_id>.jsonl`; `SessionStart` also matches the cwd and syncs the
+//!   `traces/cc:<session_id>.jsonl`; `SessionStart` also matches the cwd, syncs the
 //!   shared skills dir `REMATCH_ROOT/skills/` (`skills_cmd::sync_cwd`), which the plugin's
-//!   `skills/` links to;
-//!   `UserPromptSubmit` runs an approved `retrieve` hook and returns its units as
-//!   `additionalContext`; `SessionEnd` writes `session_shutdown` and, when flagged,
-//!   `pending/<sid>.json`.
+//!   `skills/` links to, copies the agent entries into the plugin's `agents/`
+//!   (`skills_cmd::sync_plugin_agents`) and returns the digest (`systemMessage` +
+//!   `additionalContext`); `UserPromptSubmit` runs an approved `retrieve` hook and returns
+//!   its units as `additionalContext`; `SessionEnd` writes `session_shutdown` and, when
+//!   flagged, `pending/<sid>.json`.
 //! * `hook-check --harness claude-code` — `PreToolUse`: the approved `block`/`stuck` hooks
 //!   matched for the cwd, evaluated against the tool input (the `stuck` run read back from
 //!   the trace). A rejection is traced as `tool_blocked` and returned as exit 2 + reason.
@@ -28,7 +29,7 @@ use rematch_core::features::head;
 use rematch_core::import::{args_hash, is_injected_frame, repo_of, TRACE_DELIVERABLE_CHARS, TRACE_INPUT_TEXT_CHARS};
 use rematch_core::import_claude;
 use rematch_core::library::{self, MatchResult};
-use rematch_core::trace::{self, flag_reasons, AgentInfo, RetrievedUnit, TraceRecord};
+use rematch_core::trace::{self, flag_reasons, AgentInfo, LoadedEntry, RetrievedUnit, TraceRecord};
 use rematch_core::types::{HookMode, Kind, ModelRef, DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS};
 use serde_json::{json, Value};
 
@@ -255,8 +256,9 @@ pub struct Loaded {
     /// `truncate` cannot run in Claude Code (no hook rewrites past tool results).
     pub hooks: Vec<HookModule>,
     /// `session_start.loaded_entries`: predicate hits, minus lessons, agents (not loaded by
-    /// this adapter), and hooks that are not run or that credit through `retrieval` records.
-    pub loaded_entries: Vec<String>,
+    /// this adapter), and hooks that are not run or that credit through `retrieval` records;
+    /// versioned (`{id, version, sha}`, ADR 001).
+    pub loaded_entries: Vec<LoadedEntry>,
 }
 
 pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
@@ -282,7 +284,7 @@ pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
         .filter(|e| !skipped.contains(&e.id))
         .filter(|e| !hooks.iter().any(|h| h.id == e.id && h.mode == HookMode::Retrieve))
         .filter(|e| e.kind != Kind::Hook || hooks.iter().any(|h| h.id == e.id))
-        .map(|e| e.id.clone())
+        .map(|e| LoadedEntry { id: e.id.clone(), version: Some(e.version), sha: e.sha.clone() })
         .collect();
     Ok(Loaded { m, hooks, loaded_entries })
 }
@@ -317,17 +319,36 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
         "SessionStart" => {
             let source = str_of(payload, "source");
             let mut reload = false;
-            if let Some(root) = std::env::var_os("CLAUDE_PLUGIN_ROOT").filter(|r| !r.is_empty()) {
-                reload |= crate::skills_cmd::ensure_plugin_link(ctx, Path::new(&root))?;
+            let mut agents: Vec<String> = Vec::new();
+            if let Some(root) = plugin_root_env() {
+                reload |= crate::skills_cmd::ensure_plugin_link(ctx, &root)?;
+                match crate::skills_cmd::sync_plugin_agents(ctx, &root) {
+                    Ok(Some(a)) => {
+                        agents = a.present.clone();
+                        extra["agents"] = serde_json::to_value(&a)?;
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("rematch: agent copies not synced: {e:#}"),
+                }
             }
             // Compaction continues the session: its skills refresh, its trace does not restart.
             if source != "compact" || !tf.started() {
-                reload |= start(ctx, &mut tf, &sid, &cwd, payload, &mut extra)?;
+                reload |= start(ctx, &mut tf, &sid, &cwd, payload, &agents, &mut extra)?;
             } else {
                 reload |= crate::skills_cmd::sync_cwd(ctx, &cwd)?.0.changed();
             }
+            let mut out = json!({"hookSpecificOutput": {"hookEventName": "SessionStart"}});
             if reload {
-                reply.stdout = Some(json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "reloadSkills": true}}));
+                out["hookSpecificOutput"]["reloadSkills"] = json!(true);
+            }
+            if source != "compact" {
+                if let Some((user, model)) = session_digest(ctx) {
+                    out["systemMessage"] = json!(user);
+                    out["hookSpecificOutput"]["additionalContext"] = json!(model);
+                }
+            }
+            if out.as_object().is_some_and(|o| o.len() > 1) || out["hookSpecificOutput"].as_object().is_some_and(|o| o.len() > 1) {
+                reply.stdout = Some(out);
             }
         }
         "UserPromptSubmit" if !subagent => {
@@ -360,8 +381,9 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
             }
             let reasons = flag_reasons(&tf.records);
             let flagged = !reasons.is_empty();
+            let files_changed = files_changed(&tf.records);
             let seq = tf.seq();
-            tf.push(TraceRecord::SessionShutdown { seq, t: tf.now, reasons: reasons.clone(), flagged })?;
+            tf.push(TraceRecord::SessionShutdown { seq, t: tf.now, reasons: reasons.clone(), flagged, files_changed })?;
             if flagged {
                 std::fs::create_dir_all(&ctx.paths.pending)?;
                 let p = ctx.paths.pending.join(format!("{sid}.json"));
@@ -380,12 +402,42 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
     Ok(out)
 }
 
+/// Budget for hashing `session_shutdown.files_changed` inside the `SessionEnd` hook.
+const FILES_CHANGED_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `session_shutdown.files_changed` of a trace: the files its successful mutating tool calls
+/// named, hashed now relative to the repo of its `session_start` (empty when over budget).
+fn files_changed(records: &[TraceRecord]) -> Vec<(String, String)> {
+    let deadline = std::time::Instant::now() + FILES_CHANGED_BUDGET;
+    let (cwd, repo) = records
+        .iter()
+        .find_map(|r| match r {
+            TraceRecord::SessionStart { cwd, repo, .. } => Some((cwd.clone(), repo.clone())),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let paths = trace::changed_paths(records);
+    trace::hash_changed_files(&paths, Path::new(&cwd), repo.as_deref().map(Path::new), deadline).unwrap_or_default()
+}
+
 /// `session_start` after matching `cwd` and syncing the shared skills dir; `true` when the
-/// links changed (the hook asks Claude Code to re-scan skills).
-fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Value, extra: &mut Value) -> Result<bool> {
-    let loaded = load(ctx, cwd)?;
+/// links changed (the hook asks Claude Code to re-scan skills). `agents`: the agent entries
+/// whose copy was in the plugin's `agents/` when the session started; those with a predicate
+/// hit join `loaded_entries`, as omp's matched agents do.
+fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Value, agents: &[String], extra: &mut Value) -> Result<bool> {
+    let mut loaded = load(ctx, cwd)?;
+    let agent_hits: Vec<LoadedEntry> = loaded
+        .m
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::Agent && e.predicate_hit && agents.contains(&e.id))
+        .map(|e| LoadedEntry { id: e.id.clone(), version: Some(e.version), sha: e.sha.clone() })
+        .collect();
+    loaded.loaded_entries.extend(agent_hits);
     let (sync, _) = crate::skills_cmd::sync_cwd(ctx, cwd)?;
-    let repo = repo_of(cwd).map(|p| p.to_string_lossy().into_owned());
+    let repo_dir = repo_of(cwd);
+    let id = repo_dir.as_deref().map(|r| rematch_core::identity::identify(r, cwd)).unwrap_or_default();
+    let repo = repo_dir.map(|p| p.to_string_lossy().into_owned());
     let cwd_s = cwd.to_string_lossy().into_owned();
     let seq = tf.seq();
     tf.push(TraceRecord::SessionStart {
@@ -408,6 +460,10 @@ fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Valu
         loaded_entries: loaded.loaded_entries.clone(),
         hooks_loaded: loaded.hooks.iter().map(|h| h.id.clone()).collect(),
         staging_dirs: sync.dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect(),
+        repo_remote: id.remote,
+        subpath: id.subpath,
+        head_sha: id.head_sha,
+        visible_entries: sync.visible.clone(),
     })?;
     extra["skills"] = json!(sync.links.keys().collect::<Vec<_>>());
     extra["loaded_entries"] = json!(loaded.loaded_entries);
@@ -415,27 +471,108 @@ fn start(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Valu
 }
 
 /// A trace whose `SessionStart` hook never ran (plugin enabled mid-session, hook timeout)
-/// starts at its first traced event.
+/// starts at its first traced event; the agent copies then on disk count as loaded.
 fn ensure_started(ctx: &AppCtx, tf: &mut TraceFile, sid: &str, cwd: &Path, payload: &Value) -> Result<()> {
     if !tf.started() {
-        start(ctx, tf, sid, cwd, payload, &mut json!({}))?;
+        let agents: Vec<String> =
+            plugin_root_env().map(|r| crate::skills_cmd::plugin_agent_copies(&r).into_iter().map(|(_, id)| id).collect()).unwrap_or_default();
+        start(ctx, tf, sid, cwd, payload, &agents, &mut json!({}))?;
     }
     Ok(())
 }
 
-/// `UserPromptSubmit`: closes an aborted run, writes `input` (prelabel from the trace's
-/// previous input and run state), then runs an approved `retrieve` hook.
+/// `$CLAUDE_PLUGIN_ROOT`, which Claude Code sets for the plugin's hooks.
+fn plugin_root_env() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_PLUGIN_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from)
+}
+
+/// Characters of the digest shown to the user (`systemMessage`) and given to Claude
+/// (`additionalContext`); Claude Code caps each at 10,000.
+const DIGEST_MESSAGE_CHARS: usize = 4_000;
+const DIGEST_CONTEXT_CHARS: usize = 9_000;
+
+/// The session-start digest (`rematch digest`, which advances `digest.last`, as at omp's
+/// session start): new statuses, reviews, stale entries, transfer suggestions, and the
+/// approvals waiting — as a `systemMessage` for the user and `additionalContext` for Claude.
+/// Claude Code has no dialog, so each approval names the command that grants it; the context
+/// carries each approval's reason and diff, so Claude can show them when asked. `None` when
+/// there is nothing to say; a failed digest is logged and skipped.
+fn session_digest(ctx: &AppCtx) -> Option<(String, String)> {
+    let d = match crate::digest::cmd_digest(ctx) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("rematch: digest failed: {e:#}");
+            return None;
+        }
+    };
+    let lines: Vec<&str> = d["lines"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let approvals: Vec<&Value> = d["approvals"].as_array().into_iter().flatten().filter(|a| a["id"].is_string()).collect();
+    if lines.is_empty() && approvals.is_empty() {
+        return None;
+    }
+    let mut user = String::from("rematch digest");
+    for (i, line) in lines.iter().enumerate() {
+        if user.len() + line.len() > DIGEST_MESSAGE_CHARS {
+            user.push_str(&format!("\n- +{} more (`rematch library ls --text` lists every entry)", lines.len() - i));
+            break;
+        }
+        user.push_str(&format!("\n- {line}"));
+    }
+    if !approvals.is_empty() {
+        user.push_str("\nWaiting for your approval (Claude Code has no approval dialog; run one of these yourself, or `rematch library approve|decline <id>` in a shell):");
+        for a in &approvals {
+            let id = a["id"].as_str().unwrap_or_default();
+            let what = format!("{} {}", a["kind"].as_str().unwrap_or("entry"), a["name"].as_str().unwrap_or(id));
+            user.push_str(&format!("\n- {what}: /rematch:rematch-approve {id} · /rematch:rematch-decline {id}"));
+        }
+    }
+    let mut model = format!(
+        "[rematch] Session-start digest; the user was shown it too:\n{user}\n\nApproving or declining is the user's decision: never run `rematch library approve` or `rematch library decline` yourself. If the user asks what an approval does, show its reason and diff below."
+    );
+    for a in &approvals {
+        let block = format!(
+            "\n\n<approval id=\"{}\" kind=\"{}\" name=\"{}\">\n{}\n\n{}\n</approval>",
+            a["id"].as_str().unwrap_or_default(),
+            a["kind"].as_str().unwrap_or_default(),
+            a["name"].as_str().unwrap_or_default(),
+            a["reason"].as_str().unwrap_or_default().trim(),
+            a["diff"].as_str().unwrap_or_default().trim_end(),
+        );
+        if model.len() + block.len() > DIGEST_CONTEXT_CHARS {
+            model.push_str("\n\n(further approvals' diffs omitted: `rematch digest` prints them)");
+            break;
+        }
+        model.push_str(&block);
+    }
+    if user.len() > DIGEST_MESSAGE_CHARS + 2_000 {
+        user = head(&user, DIGEST_MESSAGE_CHARS + 2_000);
+    }
+    Some((user, model))
+}
+
+/// `UserPromptSubmit`: closes the run the prompt ends, writes `input` (prelabel from the
+/// trace's previous input and run state), then runs an approved `retrieve` hook.
+///
+/// Takeover (`interrupt`) is input while the agent loop runs (DESIGN §3, the omp extension's
+/// `agentRunning`). A run that got no `Stop` since its `input` either was aborted (Esc fires
+/// no hook, but Claude Code writes `[Request interrupted by user…]` to the transcript: the loop
+/// had ended, so the prompt is idle) or is still running (a prompt queued while Claude worked
+/// and delivered into the run: `interrupt`). An unreadable transcript counts as running.
 fn prompt(ctx: &AppCtx, tf: &mut TraceFile, cwd: &Path, payload: &Value, reply: &mut HookReply) -> Result<()> {
     let text = str_of(payload, "prompt").to_string();
     // Background-task reports, scheduled tasks and cross-session messages also arrive here.
     if text.trim().is_empty() || is_injected_frame(&text) {
         return Ok(());
     }
-    // A prompt while the previous run never stopped (Esc, or typed while Claude worked) is an
-    // interrupt, as an omp input while the agent is busy.
-    let idle = !tf.open_run().iter().any(|r| matches!(r, TraceRecord::Input { .. }));
-    if !idle {
-        close_run(tf, payload, false)?;
+    let open_since = tf.open_run().iter().rev().find_map(|r| match r {
+        TraceRecord::Input { t, .. } => Some(*t),
+        _ => None,
+    });
+    let mut idle = true;
+    if let Some(since) = open_since {
+        let tail = transcript_tail(payload);
+        idle = tail.as_ref().is_some_and(|s| import_claude::aborted_after(s, since));
+        close_run_with(tf, payload, tail.as_ref(), false)?;
     }
     let prev = tf.records.iter().rev().find_map(|r| match r {
         TraceRecord::Input { text, .. } => Some(text.clone()),
@@ -502,10 +639,29 @@ fn retrieve(ctx: &AppCtx, tf: &mut TraceFile, cwd: &Path, text: &str, reply: &mu
     Ok(())
 }
 
+/// The parsed tail of the payload's transcript (`None` without one, or unreadable).
+fn transcript_tail(payload: &Value) -> Option<import_claude::ClaudeSession> {
+    match str_of(payload, "transcript_path") {
+        "" => None,
+        p => import_claude::read_session_tail(Path::new(p), TRANSCRIPT_TAIL_BYTES)
+            .map_err(|e| eprintln!("rematch: transcript {p} unreadable: {e:#}"))
+            .ok(),
+    }
+}
+
 /// Ends the open run: one `turn_end` per API response the transcript holds after the last
 /// recorded turn or input (with `model_change` when the model changed), else one
 /// `turn_end` carrying `last_assistant_message`; then `agent_end`. `yielded` for a `Stop`.
 fn close_run(tf: &mut TraceFile, payload: &Value, yielded: bool) -> Result<()> {
+    if !tf.run_active() {
+        return Ok(());
+    }
+    let tail = transcript_tail(payload);
+    close_run_with(tf, payload, tail.as_ref(), yielded)
+}
+
+/// [`close_run`] over a transcript tail already read.
+fn close_run_with(tf: &mut TraceFile, payload: &Value, tail: Option<&import_claude::ClaudeSession>, yielded: bool) -> Result<()> {
     if !tf.run_active() {
         return Ok(());
     }
@@ -518,17 +674,7 @@ fn close_run(tf: &mut TraceFile, payload: &Value, yielded: bool) -> Result<()> {
         })
         .max()
         .unwrap_or(0);
-    let transcript = str_of(payload, "transcript_path");
-    let responses = match transcript {
-        "" => Vec::new(),
-        p => match import_claude::read_session_tail(Path::new(p), TRANSCRIPT_TAIL_BYTES) {
-            Ok(s) => import_claude::responses_after(&s, cutoff),
-            Err(e) => {
-                eprintln!("rematch: transcript {p} unreadable: {e:#}");
-                Vec::new()
-            }
-        },
-    };
+    let responses = tail.map(|s| import_claude::responses_after(s, cutoff)).unwrap_or_default();
     let mut turns = 0u32;
     let mut last_model = tf.last_model();
     for r in responses {

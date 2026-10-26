@@ -25,5 +25,6 @@ pub mod package; // SKILL.md frontmatter, package layout, mechanical split (>8 K
 pub mod dedup; // simhash near-duplicate routing
 pub mod experience; // EXPERIENCE.md writer/reader
 pub mod rate; // admissions / caps
+pub mod identity; // repo_remote normalization, subpath, HEAD (ADR 001)
 
 pub use types::*;

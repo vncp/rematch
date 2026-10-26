@@ -390,6 +390,10 @@ pub fn events_to_trace(events: &[Value], repo: &Path) -> Vec<TraceRecord> {
                     loaded_entries: Vec::new(),
                     hooks_loaded: Vec::new(),
                     staging_dirs: Vec::new(),
+                    repo_remote: None,
+                    subpath: None,
+                    head_sha: None,
+                    visible_entries: Vec::new(),
                 });
             }
             "tool_execution_start" => {

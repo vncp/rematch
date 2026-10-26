@@ -16,12 +16,12 @@ use clap::Args;
 use rematch_core::ledger::{sha256_hex, EntryFilter, SessionFilter};
 use rematch_core::library::{load_entry, stage, SHARED_BRANCH};
 use rematch_core::package::SkillDoc;
-use rematch_core::predicate::ANY_REPO;
+use rematch_core::predicate::literal_path;
 use rematch_core::{Entry, Status};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::{change_status, git, package_edits, unescape_glob};
+use super::{change_status, git, package_edits};
 use crate::app::{new_id, AppCtx};
 
 /// Frontmatter key holding the source snapshot hash of a fact.
@@ -58,8 +58,7 @@ pub struct StaleArgs {
 /// Directory a relative `source:` resolves against: the entry's exact repo glob.
 fn source_base(entry_dir: &Path) -> Option<PathBuf> {
     let e = load_entry(entry_dir).ok()?;
-    let g = e.predicate.repo_glob.trim();
-    (!g.is_empty() && g != ANY_REPO).then(|| PathBuf::from(unescape_glob(g)))
+    literal_path(&e.predicate.repo_glob)
 }
 
 fn resolve_source(src: &str, base: Option<&Path>) -> Option<PathBuf> {

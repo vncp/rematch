@@ -1,11 +1,12 @@
 //! `library ls|why|disable|rollback|pin|unpin|approve|decline|set-fork-path|export|import-export`
 //! and the `off|on` kill switch.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
-use rematch_core::ledger::{enum_str, EntryFilter, SessionFilter};
+use rematch_core::ledger::{enum_str, redirect_key, EntryFilter, JournalRow, SessionFilter};
 use rematch_core::library::{self, Approval};
 use rematch_core::predicate;
 use rematch_core::redirect;
@@ -13,6 +14,7 @@ use rematch_core::types::{Entry, Kind, SessionRecord, Status};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
+use crate::lake_read::{self, Lookup, Source};
 use crate::reflect::{is_foreign, record_status};
 
 #[derive(Subcommand, Debug, Clone)]
@@ -20,7 +22,14 @@ pub enum LibraryCmd {
     /// Every entry with raw counters.
     Ls,
     /// Loaded entries, predicate hits, redirects and counters of a session (default: latest for --cwd).
-    Why { session: Option<String> },
+    Why {
+        session: Option<String>,
+        /// Also the status each loaded entry and the class each redirect had at this time
+        /// (ms, RFC 3339, `YYYY-MM-DDTHH:MM[:SS]` UTC, or `YYYY-MM-DD` = 00:00 UTC), from the
+        /// lake's `entries`/`redirects` or this ledger's journal.
+        #[arg(long, value_name = "TS")]
+        asof: Option<String>,
+    },
     /// Retire an entry now (user disable; counts as harm for that session).
     Disable {
         id: String,
@@ -52,7 +61,7 @@ pub enum LibraryCmd {
 pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
     match cmd {
         LibraryCmd::Ls => ls(ctx),
-        LibraryCmd::Why { session } => why(ctx, session.as_deref()),
+        LibraryCmd::Why { session, asof } => why(ctx, session.as_deref(), asof.as_deref()),
         LibraryCmd::Disable { id, reason } => {
             let e = get(ctx, &id)?;
             let e = if is_foreign(ctx, &e) {
@@ -211,12 +220,92 @@ fn latest_session(ctx: &AppCtx) -> Result<Option<SessionRecord>> {
         .cloned())
 }
 
-fn why(ctx: &AppCtx, session: Option<&str>) -> Result<Value> {
+/// `--asof` → ms UTC: an integer ms, RFC 3339, `YYYY-MM-DDTHH:MM[:SS]` (UTC) or a bare
+/// `YYYY-MM-DD` (00:00 UTC).
+pub fn parse_asof(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if let Ok(ms) = s.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.timestamp_millis());
+    }
+    for f in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, f) {
+            return Ok(t.and_utc().timestamp_millis());
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d.and_hms_opt(0, 0, 0).expect("midnight").and_utc().timestamp_millis());
+    }
+    Err(crate::envelope::Usage(format!("--asof {s:?}: expected ms, RFC 3339, YYYY-MM-DDTHH:MM[:SS] or YYYY-MM-DD")).into())
+}
+
+/// What this ledger held at `ts` for a session's loaded entries and redirects (ADR 001
+/// §"Bitemporal semantics": the row with the greatest `known ≤ ts`). From the lake's
+/// `entries` (`temporal2:entry_id`) and `redirects` (`temporal:session_id,redirect_seq`)
+/// when it holds this ledger's whole journal, else from the ledger's journal: the same
+/// rows either way.
+struct AsOf {
+    ts: i64,
+    source: Source,
+    entries: BTreeMap<String, Entry>,
+    redirects: BTreeMap<u32, rematch_core::types::Redirect>,
+}
+
+impl AsOf {
+    fn load(ctx: &AppCtx, s: &SessionRecord, ts: i64) -> Result<AsOf> {
+        let ids: Vec<String> = s.loaded_entries.clone();
+        let keys: Vec<String> = s.redirects.iter().map(|r| redirect_key(&s.id, r.seq)).collect();
+        let lake_lookups = (
+            Lookup { key: "temporal2:entry_id", values: ids.clone(), window: None },
+            Lookup {
+                key: "temporal:session_id,redirect_seq",
+                values: s.redirects.iter().map(|r| format!("{}\t{}", s.id, r.seq)).collect(),
+                window: None,
+            },
+        );
+        let read = |src: Source| -> Result<(Vec<JournalRow>, Vec<JournalRow>)> {
+            let e = if ids.is_empty() { Vec::new() } else { lake_read::rows(ctx, src, "entries", Some(&lake_lookups.0), Some(&ids))? };
+            let r = if keys.is_empty() { Vec::new() } else { lake_read::rows(ctx, src, "redirects", Some(&lake_lookups.1), Some(&keys))? };
+            Ok((e, r))
+        };
+        let (source, (e, r)) = match lake_read::current_lake(ctx).map(|_| read(Source::Lake)) {
+            Some(Ok(rows)) => (Source::Lake, rows),
+            Some(Err(err)) => {
+                eprintln!("rematch library why: lake unreadable, reading the ledger's journal: {err:#}");
+                (Source::Ledger, read(Source::Ledger)?)
+            }
+            None => (Source::Ledger, read(Source::Ledger)?),
+        };
+        let me = ctx.ledger.machine_id();
+        let mine = |rows: Vec<JournalRow>, wanted: &[String]| -> Vec<JournalRow> {
+            lake_read::as_of(rows.into_iter().filter(|r| r.machine == me && wanted.contains(&r.row_key)).collect(), ts)
+        };
+        let entries = mine(e, &ids)
+            .into_iter()
+            .filter_map(|r| serde_json::from_value::<Entry>(r.json).ok().map(|e| (e.id.clone(), e)))
+            .collect();
+        let redirects = mine(r, &keys)
+            .into_iter()
+            .filter_map(|r| serde_json::from_value::<rematch_core::types::Redirect>(r.json).ok().map(|x| (x.seq, x)))
+            .collect();
+        Ok(AsOf { ts, source, entries, redirects })
+    }
+}
+
+fn utc(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or_default()
+}
+
+fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value> {
+    let asof_ts = asof.map(parse_asof).transpose()?;
     let s = match session {
         Some(id) => ctx.ledger.get_session(id)?.ok_or_else(|| anyhow!("no session {id} in the ledger (run `rematch count` after it ends)"))?,
         None => latest_session(ctx)?.ok_or_else(|| anyhow!("no session recorded for {}", ctx.cwd.display()))?,
     };
-    let place = s.repo.clone().unwrap_or_else(|| s.cwd.clone());
+    let past = asof_ts.map(|ts| AsOf::load(ctx, &s, ts)).transpose()?;
+    let place = predicate::Place::of_session(&s);
     let rows: Vec<_> = ctx.ledger.list_counters()?;
     let mut loaded = Vec::new();
     let mut lines = vec![format!(
@@ -229,19 +318,38 @@ fn why(ctx: &AppCtx, session: Option<&str>) -> Result<Value> {
         s.error_clusters,
         s.takeovers
     )];
+    lines.push(format!(
+        "repo {} · remote {} · subpath {} · head {}",
+        s.repo.as_deref().unwrap_or("none"),
+        s.repo_remote.as_deref().unwrap_or("unknown"),
+        s.subpath.as_deref().map(|p| if p.is_empty() { "." } else { p }).unwrap_or("unknown"),
+        s.head_sha.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("unknown"),
+    ));
+    if let Some(p) = &past {
+        lines.push(format!("as of {} (source {})", utc(p.ts), p.source.name()));
+    }
     for id in &s.loaded_entries {
         let Some(e) = ctx.ledger.get_entry(id)? else {
             loaded.push(json!({"id": id, "missing": true}));
             continue;
         };
-        let glob = predicate::matches_repo(&e.predicate, &place);
+        let glob = predicate::matches_place(&e.predicate, &place);
         let hit = predicate::count_match(&e.predicate, &place, &s.exts, &s.stems);
+        let loaded_version = s.loaded_versions.get(&e.id).copied();
         let this = ctx.ledger.counter_rows(&e.id)?.into_iter().find(|r| r.session_id == s.id);
         let agg = rows.iter().find(|(eid, _)| eid == &e.id).map(|(_, c)| c.clone()).unwrap_or_default();
+        let then = past.as_ref().map(|p| p.entries.get(&e.id));
+        let status = match then {
+            None => enum_str(&e.status),
+            Some(Some(t)) => format!("{}; {} as of {}", enum_str(&e.status), enum_str(&t.status), utc(past.as_ref().map_or(0, |p| p.ts))),
+            Some(None) => format!("{}; not in the ledger as of {}", enum_str(&e.status), utc(past.as_ref().map_or(0, |p| p.ts))),
+        };
         lines.push(format!(
-            "loaded {} ({}): glob {} · predicate {} · this session {} · total matched {} recurrence {} harm {}",
+            "loaded {} v{} ({}) sha {}: place {} · predicate {} · this session {} · total matched {} recurrence {} harm {}",
             e.name,
-            enum_str(&e.status),
+            loaded_version.unwrap_or(e.version),
+            status,
+            e.content_sha256.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("none"),
             if glob { "hit" } else { "miss" },
             if hit { "hit" } else { "miss" },
             this.as_ref().map(|r| format!("recurrence {} harm {}", r.recurrence, r.harm)).unwrap_or_else(|| "not counted".into()),
@@ -249,11 +357,17 @@ fn why(ctx: &AppCtx, session: Option<&str>) -> Result<Value> {
             agg.recurrence,
             agg.harm
         ));
-        loaded.push(json!({
+        let mut row = json!({
             "id": e.id, "name": e.name, "status": e.status, "predicate": e.predicate, "glob_hit": glob,
+            "version": e.version, "loaded_version": loaded_version, "content_sha256": e.content_sha256,
             "predicate_hit": hit, "session_counters": this, "counters": agg,
             "stems_overlap": e.predicate.stems.iter().filter(|x| s.stems.contains(x)).collect::<Vec<_>>(),
-        }));
+        });
+        if let Some(t) = then {
+            row["asof"] = json!({"status": t.map(|t| t.status), "version": t.map(|t| t.version),
+                                 "content_sha256": t.and_then(|t| t.content_sha256.clone())});
+        }
+        loaded.push(row);
     }
     if s.loaded_entries.is_empty() {
         lines.push("no rematch entries were loaded".into());
@@ -263,23 +377,38 @@ fn why(ctx: &AppCtx, session: Option<&str>) -> Result<Value> {
         .iter()
         .map(|r| {
             let class = redirect::effective_class(r);
+            let then = past.as_ref().map(|p| p.redirects.get(&r.seq).map(redirect::effective_class));
             lines.push(format!(
-                "redirect #{} {} → {}: {}",
+                "redirect #{} {} → {}{}: {}",
                 r.seq,
                 r.prelabel,
                 class.map(redirect::class_name).unwrap_or("unclassified"),
+                match then {
+                    None => String::new(),
+                    Some(Some(c)) => format!(" ({} as of then)", c.map(redirect::class_name).unwrap_or("unclassified")),
+                    Some(None) => " (not yet recorded then)".into(),
+                },
                 rematch_core::features::head(&r.text_head, 120)
             ));
-            json!({"seq": r.seq, "prelabel": r.prelabel, "class": class, "confidence": r.confidence, "text_head": r.text_head})
+            let mut row = json!({"seq": r.seq, "prelabel": r.prelabel, "class": class, "confidence": r.confidence, "text_head": r.text_head});
+            if let Some(t) = then {
+                row["asof"] = json!({"recorded": t.is_some(), "class": t.flatten()});
+            }
+            row
         })
         .collect();
+    let source = past.as_ref().map_or(Source::Ledger, |p| p.source);
     Ok(json!({
-        "session": {"id": s.id, "cwd": s.cwd, "repo": s.repo, "family": s.family, "model": s.model, "started_at": s.started_at,
+        "session": {"id": s.id, "cwd": s.cwd, "repo": s.repo, "repo_remote": s.repo_remote, "subpath": s.subpath,
+                     "head_sha": s.head_sha, "files_changed": s.files_changed, "loaded_entry_shas": s.loaded_entry_shas,
+                     "visible_entries": s.visible_entries, "family": s.family, "model": s.model, "started_at": s.started_at,
                      "ended_at": s.ended_at, "turns": s.turns, "tokens_in": s.tokens_in, "tokens_out": s.tokens_out,
                      "tool_calls": s.tool_calls, "tool_errors": s.tool_errors, "error_clusters": s.error_clusters,
                      "takeovers": s.takeovers, "skill_reads": s.skill_reads, "source": s.source, "counted": s.counted},
         "loaded": loaded,
         "redirects": redirects,
+        "source": source,
+        "asof": past.as_ref().map(|p| json!({"ts": p.ts, "utc": utc(p.ts)})),
         "lines": lines,
     }))
 }
@@ -304,4 +433,75 @@ pub fn cmd_on(ctx: &AppCtx) -> Result<Value> {
     }
     library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
     Ok(json!({"off": ctx.paths.is_off(), "marker": ctx.paths.off_marker, "env_off": env_off, "lines": lines}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::testutil::{entry, env, keep, session, stage};
+    use rematch_core::ledger::now_ms;
+    use rematch_core::types::{Redirect, RedirectClass};
+
+    fn tick() -> i64 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t = now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        t
+    }
+
+    fn asof_view(out: &Value) -> Value {
+        json!({"entry": out["loaded"][0]["asof"], "status": out["loaded"][0]["status"],
+               "redirect": out["redirects"][0]["asof"], "class": out["redirects"][0]["class"]})
+    }
+
+    /// A provisional entry loaded by a session whose redirect was unclassified; then the
+    /// entry is kept and the redirect labelled a correction. `--asof` between the two
+    /// writes shows the earlier status and class, from the ledger's journal and from the
+    /// lake alike; after them, the current ones.
+    #[test]
+    fn why_asof_shows_the_status_and_class_before_a_transition() {
+        let t = env();
+        let ctx = &t.ctx;
+        let e = stage(ctx, &entry("e-why", "run-tests-before-commit", "payments"), &[]);
+        let mut s = session("s-why", "payments", Some("/w/payments"), "anthropic/claude-opus", 1_000);
+        s.loaded_entries = vec![e.id.clone()];
+        s.redirects = vec![Redirect {
+            session_id: s.id.clone(),
+            seq: 3,
+            prelabel: "reprompt".into(),
+            class: None,
+            confidence: None,
+            text_head: "try again".into(),
+            deliverable_head: String::new(),
+            t: 1_500,
+        }];
+        ctx.ledger.upsert_session(&s).unwrap();
+        let before = tick();
+        keep(ctx, &e.id);
+        ctx.ledger.set_redirect_class(&s.id, 3, RedirectClass::Correction, Some(0.9)).unwrap();
+        let after = tick();
+
+        let then = json!({"entry": {"status": "provisional", "version": 1, "content_sha256": e.content_sha256},
+                          "status": "kept", "redirect": {"recorded": true, "class": null}, "class": "correction"});
+        let w = why(ctx, Some("s-why"), Some(&before.to_string())).unwrap();
+        assert_eq!((asof_view(&w), w["source"].as_str()), (then.clone(), Some("ledger")), "{w}");
+        assert!(w["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("(kept; provisional as of ")), "{w}");
+        let now = why(ctx, Some("s-why"), Some(&after.to_string())).unwrap();
+        assert_eq!((now["loaded"][0]["asof"]["status"].as_str(), now["redirects"][0]["asof"]["class"].as_str()), (Some("kept"), Some("correction")));
+        let first = why(ctx, Some("s-why"), Some("1970-01-01")).unwrap();
+        assert_eq!((first["loaded"][0]["asof"]["status"].clone(), first["redirects"][0]["asof"]["recorded"].clone()), (Value::Null, json!(false)), "nothing written yet: {first}");
+        let plain = why(ctx, Some("s-why"), None).unwrap();
+        assert_eq!((plain["asof"].clone(), plain["loaded"][0].get("asof")), (Value::Null, None));
+        assert!(parse_asof("yesterday").is_err());
+        assert_eq!(parse_asof("2026-10-26T12:00:00Z").unwrap(), parse_asof("2026-10-26T12:00").unwrap());
+
+        #[cfg(feature = "lake")]
+        {
+            crate::lake_read::export_all(ctx);
+            let w = why(ctx, Some("s-why"), Some(&before.to_string())).unwrap();
+            assert_eq!((asof_view(&w), w["source"].as_str()), (then, Some("lake")), "{w}");
+            let now = why(ctx, Some("s-why"), Some(&after.to_string())).unwrap();
+            assert_eq!((now["loaded"][0]["asof"]["status"].as_str(), now["source"].as_str()), (Some("kept"), Some("lake")));
+        }
+    }
 }

@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use super::anchor::{self, AnchorOutcome};
 use super::{branch_anchor, lint_edits, lint_errors, owns_files, package_edits, resolve_entry};
 use crate::app::{new_id, AppCtx};
+use crate::lake_read::{self, Source};
 
 /// Minimum shared structural facet keys for a transfer suggestion.
 pub const MIN_OVERLAP: usize = 2;
@@ -97,27 +98,57 @@ pub fn read_domain(ctx: &AppCtx, branch: &str) -> Result<Option<DomainFile>> {
     }
 }
 
-/// Facet keys of a branch: `domain.yml` `facets:` when present, else the distinct keys
-/// of the branch's outcome facets in the ledger.
-pub fn branch_facets(ctx: &AppCtx, branch: &str) -> Result<BTreeSet<String>> {
+/// Facet keys of a branch: `domain.yml` `facets:` when present, else the distinct keys of
+/// the branch's outcome facets ([`outcome_keys`]).
+pub fn branch_facets(ctx: &AppCtx, branch: &str, outcome_keys: &OutcomeKeys) -> Result<BTreeSet<String>> {
     if let Some(d) = read_domain(ctx, branch)? {
         if !d.facets.is_empty() {
             return Ok(d.facets.into_iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
         }
     }
-    let mut st = ctx.ledger.conn().prepare(
-        "SELECT DISTINCT f.key FROM outcome_facets f JOIN outcomes o ON o.id = f.outcome_id WHERE o.branch = ?1",
-    )?;
-    let mut keys = BTreeSet::new();
-    for k in st.query_map([branch], |r| r.get::<_, String>(0))? {
-        keys.insert(k?);
+    Ok(outcome_keys.get(branch).cloned().unwrap_or_default())
+}
+
+/// Outcome branch → the bare facet keys of its outcomes.
+pub type OutcomeKeys = BTreeMap<String, BTreeSet<String>>;
+
+/// [`OutcomeKeys`] for `transfer suggest`, and where they came from: the lake's `outcomes`
+/// (`list:facets` holds each facet's bare key; every machine's outcomes, latest row per
+/// outcome) when the lake holds this ledger's whole journal, else [`ledger_outcome_keys`].
+pub fn outcome_keys(ctx: &AppCtx) -> Result<(OutcomeKeys, Source)> {
+    if lake_read::current_lake(ctx).is_some() {
+        match lake_read::lake_rows(ctx, "outcomes", None) {
+            Ok(rows) => {
+                let mut out = OutcomeKeys::new();
+                for r in lake_read::as_of(rows, i64::MAX) {
+                    let Ok(o) = serde_json::from_value::<rematch_core::Outcome>(r.json) else { continue };
+                    out.entry(o.branch).or_default().extend(o.facets.into_iter().map(|f| f.key));
+                }
+                return Ok((out, Source::Lake));
+            }
+            Err(e) => eprintln!("rematch transfer: lake outcomes unreadable, reading the ledger: {e:#}"),
+        }
     }
-    Ok(keys)
+    Ok((ledger_outcome_keys(ctx)?, Source::Ledger))
+}
+
+/// [`OutcomeKeys`] from this ledger's outcome facet rows (the session-start digest reads
+/// these: it never touches the lake).
+pub fn ledger_outcome_keys(ctx: &AppCtx) -> Result<OutcomeKeys> {
+    let mut st = ctx.ledger.conn().prepare(
+        "SELECT o.branch, f.key FROM outcomes o LEFT JOIN outcome_facets f ON f.outcome_id = o.id",
+    )?;
+    let mut out = OutcomeKeys::new();
+    for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
+        let (branch, key) = row?;
+        out.entry(branch).or_default().extend(key);
+    }
+    Ok(out)
 }
 
 /// Every branch the library knows: `branches/` dirs, staging dirs, entry, session and
 /// outcome branches.
-fn known_branches(ctx: &AppCtx) -> Result<BTreeSet<String>> {
+fn known_branches(ctx: &AppCtx, outcome_keys: &OutcomeKeys) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for dir in [&ctx.paths.branches, &ctx.paths.staging] {
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -126,10 +157,7 @@ fn known_branches(ctx: &AppCtx) -> Result<BTreeSet<String>> {
     }
     out.extend(ctx.ledger.list_entries(&EntryFilter::default())?.into_iter().map(|e| e.branch));
     out.extend(ctx.ledger.list_sessions(&SessionFilter::default())?.into_iter().map(|s| s.branch));
-    let mut st = ctx.ledger.conn().prepare("SELECT DISTINCT branch FROM outcomes")?;
-    for b in st.query_map([], |r| r.get::<_, String>(0))? {
-        out.insert(b?);
-    }
+    out.extend(outcome_keys.keys().cloned());
     out.remove(SHARED_BRANCH);
     out.remove("");
     Ok(out)
@@ -149,12 +177,14 @@ fn tried_in(all: &[Entry], lesson: &Entry, lesson_text: &str, branch: &str) -> b
     })
 }
 
-pub fn suggest(ctx: &AppCtx) -> Result<Vec<Suggestion>> {
+/// Kept invariant lessons not yet tried in a branch whose facet keys overlap theirs on
+/// ≥ [`MIN_OVERLAP`] (outcome facet keys from [`outcome_keys`] or [`ledger_outcome_keys`]).
+pub fn suggest(ctx: &AppCtx, keys: &OutcomeKeys) -> Result<Vec<Suggestion>> {
     let all = ctx.ledger.list_entries(&EntryFilter::default())?;
-    let branches = known_branches(ctx)?;
+    let branches = known_branches(ctx, keys)?;
     let mut facets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for b in &branches {
-        facets.insert(b.clone(), branch_facets(ctx, b)?);
+        facets.insert(b.clone(), branch_facets(ctx, b, keys)?);
     }
     let mut out = Vec::new();
     for lesson in all.iter().filter(|e| e.status == Status::Kept && e.lesson_tag == Some(LessonTag::Invariant)) {
@@ -180,24 +210,25 @@ pub fn suggest(ctx: &AppCtx) -> Result<Vec<Suggestion>> {
     Ok(out)
 }
 
-/// Repo glob for a copy in `branch`: the branch's latest session repo, else the repo
-/// glob of a live entry already there.
-fn branch_glob(ctx: &AppCtx, branch: &str) -> Result<Option<String>> {
+/// Where a copy in `branch` loads (repo glob, remote, subpath; no content rules): derived
+/// from the branch's latest session repo, else the place of a live entry already there.
+fn branch_place(ctx: &AppCtx, branch: &str) -> Result<Option<Predicate>> {
     if let Some(anchor) = branch_anchor(ctx, branch)? {
-        return Ok(Some(derive(Some(&anchor), &[], &[]).repo_glob));
+        return Ok(Some(derive(Some(&anchor), &[], &[])));
     }
     Ok(ctx
         .ledger
         .list_entries(&EntryFilter { branch: Some(branch.to_string()), ..Default::default() })?
         .into_iter()
         .rev()
-        .map(|e| e.predicate.repo_glob)
-        .find(|g| !g.trim().is_empty()))
+        .map(|e| Predicate { repo_glob: e.predicate.repo_glob, repo_remote: e.predicate.repo_remote, subpath: e.predicate.subpath, ..Default::default() })
+        .find(|p| !p.repo_glob.trim().is_empty()))
 }
 
 /// A copy of `src` for another branch: new id, zeroed counters, re-approval required,
-/// workspace facts dropped. Returns the entry, its files and the dropped fact paths.
-pub(crate) fn copy_for(src: &Entry, branch: &str, repo_glob: String, origin: Origin) -> Result<(Entry, Vec<Edit>, Vec<String>)> {
+/// workspace facts dropped, loading where `place` says (its repo glob, remote and subpath; the
+/// content rules stay `src`'s). Returns the entry, its files and the dropped fact paths.
+pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Origin) -> Result<(Entry, Vec<Edit>, Vec<String>)> {
     let mut files = package_edits(&src.path)?;
     let mut dropped = Vec::new();
     files.retain(|e| match e {
@@ -219,7 +250,12 @@ pub(crate) fn copy_for(src: &Entry, branch: &str, repo_glob: String, origin: Ori
         helpful: 0,
         harmful: 0,
         origin,
-        predicate: Predicate { repo_glob, ..src.predicate.clone() },
+        predicate: Predicate {
+            repo_glob: place.repo_glob,
+            repo_remote: place.repo_remote,
+            subpath: place.subpath,
+            ..src.predicate.clone()
+        },
         predecessor: None,
         version: 1,
         created_at: 0,
@@ -265,10 +301,10 @@ pub fn apply(ctx: &AppCtx, lesson_id: &str, branch: &str) -> Result<Value> {
     if tried_in(&all, &src, &content_text(&src), branch) {
         bail!("{} was already tried in branch {branch} (same name, link or near-duplicate text)", src.name);
     }
-    let glob = branch_glob(ctx, branch)?
+    let place = branch_place(ctx, branch)?
         .ok_or_else(|| anyhow!("branch {branch} has no sessions or entries to anchor the copy's repo glob"))?;
     let origin = Origin::Import { source: format!("transfer:{}", src.id) };
-    let (e, files, dropped) = copy_for(&src, branch, glob, origin)?;
+    let (e, files, dropped) = copy_for(&src, branch, place, origin)?;
     let rep = transfer_lint(ctx, &e, &files)?;
     if !rep.ok {
         bail!("transfer blocked by lint: {}", lint_errors(&rep));
@@ -343,10 +379,10 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             blocked: None,
             anchor: None,
         };
-        let glob = derive(None, &[], &[]).repo_glob;
-        debug_assert_eq!(glob, ANY_REPO);
+        let place = derive(None, &[], &[]);
+        debug_assert_eq!(place.repo_glob, ANY_REPO);
         let origin = Origin::Import { source: format!("shared:{}", e.id) };
-        let (mut copy, files, dropped) = copy_for(e, SHARED_BRANCH, glob, origin)?;
+        let (mut copy, files, dropped) = copy_for(e, SHARED_BRANCH, place, origin)?;
         copy.verified_on = e.verified_on.clone();
         copy.version = e.version + 1;
         copy.approved_scripts = e.approved_scripts.clone();
@@ -409,7 +445,11 @@ fn anchor_failed_for(x: &Entry, src: &str) -> bool {
 
 pub fn cmd_transfer(ctx: &AppCtx, args: TransferArgs) -> Result<Value> {
     match args.cmd {
-        TransferCmd::Suggest => Ok(json!({ "suggestions": suggest(ctx)? })),
+        TransferCmd::Suggest => {
+            let (keys, source) = outcome_keys(ctx)?;
+            let suggestions = suggest(ctx, &keys)?;
+            Ok(json!({ "suggestions": suggestions, "source": source }))
+        }
         TransferCmd::Apply { lesson_id, branch } => apply(ctx, &lesson_id, &branch),
         TransferCmd::Promote => Ok(json!({ "promotions": promote_shared(ctx)? })),
     }
@@ -437,7 +477,7 @@ mod tests {
         ctx.ledger.upsert_session(&session("s-opt", "options", Some("/w/options"), "anthropic/claude-opus", 1_000)).unwrap();
         let e = stage_t(ctx, &entry("e-inv-1", "verify-before-claim", "quant"), &[("facts/rows.md", "---\nas_of: 2026-10-01\n---\n\nRows: 3\n")]);
         keep(ctx, &e.id);
-        let s = suggest(ctx).unwrap();
+        let s = suggest(ctx, &ledger_outcome_keys(ctx).unwrap()).unwrap();
         assert_eq!(s.len(), 1, "{s:?}");
         assert_eq!(s[0].to_branch, "options");
         assert_eq!(s[0].overlapping_keys, vec!["horizon".to_string(), "mechanism".to_string()]);
@@ -451,7 +491,7 @@ mod tests {
         assert_eq!(copy.predicate.repo_glob, "/w/options");
         assert!(!copy.path.join("facts").exists(), "workspace facts never transfer");
         assert_eq!(out["dropped_facts"], json!(["facts/rows.md"]));
-        assert!(suggest(ctx).unwrap().is_empty(), "already tried in options");
+        assert!(suggest(ctx, &ledger_outcome_keys(ctx).unwrap()).unwrap().is_empty(), "already tried in options");
         assert!(apply(ctx, &e.id, "options").is_err());
     }
 
@@ -484,11 +524,27 @@ mod tests {
             "m".into(),
         );
         ctx.ledger.insert_outcome(&o).unwrap();
-        assert_eq!(branch_facets(ctx, "bee").unwrap(), BTreeSet::from(["mechanism".to_string(), "universe".to_string()]));
+        let keys = ledger_outcome_keys(ctx).unwrap();
+        assert_eq!(branch_facets(ctx, "bee", &keys).unwrap(), BTreeSet::from(["mechanism".to_string(), "universe".to_string()]));
         let e = stage_t(ctx, &entry("e-inv-2", "check-receipts", "quant"), &[]);
         keep(ctx, &e.id);
-        let s = suggest(ctx).unwrap();
+        let s = suggest(ctx, &keys).unwrap();
         assert_eq!(s.iter().map(|s| s.to_branch.as_str()).collect::<Vec<_>>(), vec!["bee"]);
+        assert_eq!(outcome_keys(ctx).unwrap(), (keys.clone(), Source::Ledger), "no lake: the ledger");
+
+        // The same seed through the lake: the same keys and suggestions, from the lake.
+        #[cfg(feature = "lake")]
+        {
+            crate::lake_read::export_all(ctx);
+            let (lake_keys, source) = outcome_keys(ctx).unwrap();
+            assert_eq!((&lake_keys, source), (&keys, Source::Lake));
+            assert_eq!(suggest(ctx, &lake_keys).unwrap(), s);
+            let out = cmd_transfer(ctx, TransferArgs { cmd: TransferCmd::Suggest }).unwrap();
+            assert_eq!(out["source"], "lake", "{out}");
+            // A ledger write the lake has not seen yet: back to the ledger.
+            ctx.ledger.insert_outcome(&rematch_core::Outcome { id: "o2".into(), ..o.clone() }).unwrap();
+            assert_eq!(outcome_keys(ctx).unwrap().1, Source::Ledger);
+        }
     }
 
     #[test]

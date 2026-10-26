@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use crate::ledger::{CounterRow, Ledger};
-use crate::predicate::count_match;
+use crate::predicate::{count_match, Place};
 use crate::types::{
     Counters, Decision, Entry, EntryId, Family, RedirectClass, SessionRecord, Status, UnixMs,
 };
@@ -35,17 +35,22 @@ pub fn redirect_class_of(class: Option<RedirectClass>, prelabel: &str) -> Option
     }
 }
 
-/// Did the entry's motivating redirect class recur in this session? An entry without
-/// a class (motivated by an error cluster or takeover, and the built-ins) recurs on a
-/// correction or preference redirect only: a scope redirect (the user widened or
-/// changed the task) carries no failure signal (DESIGN §7).
-pub fn recurred(entry: &Entry, s: &SessionRecord) -> bool {
-    let want = entry.redirect_class.filter(|c| *c != RedirectClass::None);
-    s.redirects.iter().any(|r| match (redirect_class_of(r.class, &r.prelabel), want) {
+/// Whether a redirect of class `got` ([`redirect_class_of`]) is a recurrence for an entry
+/// motivated by `want`. An entry without a class (motivated by an error cluster or
+/// takeover, and the built-ins) recurs on a correction or preference redirect only: a
+/// scope redirect (the user widened or changed the task) carries no failure signal
+/// (DESIGN §7).
+pub fn class_recurs(want: Option<RedirectClass>, got: Option<RedirectClass>) -> bool {
+    match (got, want.filter(|c| *c != RedirectClass::None)) {
         (Some(c), Some(w)) => c == w,
         (Some(c), None) => matches!(c, RedirectClass::Correction | RedirectClass::Preference),
         (None, _) => false,
-    })
+    }
+}
+
+/// Did the entry's motivating redirect class recur in this session ([`class_recurs`])?
+pub fn recurred(entry: &Entry, s: &SessionRecord) -> bool {
+    s.redirects.iter().any(|r| class_recurs(entry.redirect_class, redirect_class_of(r.class, &r.prelabel)))
 }
 
 /// Harm: a tool-error cluster, a takeover (interrupt), or the user disabling the entry.
@@ -55,7 +60,9 @@ pub fn harmed(s: &SessionRecord, disabled: bool) -> bool {
 
 /// Fold one finished session into the counters of the entries that were loaded in it
 /// (the caller resolves `s.loaded_entries` to entries). An entry counts only on a
-/// count-time predicate hit. `disabled` lists entries the user disabled during the
+/// count-time predicate hit ([`Place`]: the session's remote and subpath when both sides
+/// have a remote, else its repo or cwd against the glob), and only at the version it was
+/// loaded with when `session_start` recorded one. `disabled` lists entries the user disabled during the
 /// session. Marks the session counted and refreshes each touched entry's
 /// helpful/harmful tallies. Returns the rows written.
 pub fn fold_session(
@@ -64,14 +71,17 @@ pub fn fold_session(
     entries_loaded: &[Entry],
     disabled: &[EntryId],
 ) -> Result<Vec<CounterRow>> {
-    let place = s.repo.as_deref().unwrap_or(&s.cwd);
+    let place = Place::of_session(s);
     let family = s.family.clone().unwrap_or_else(|| Family(UNKNOWN_FAMILY.into()));
     let mut rows = Vec::new();
     for e in entries_loaded {
         if !s.loaded_entries.is_empty() && !s.loaded_entries.contains(&e.id) {
             continue;
         }
-        if !count_match(&e.predicate, place, &s.exts, &s.stems) {
+        if s.loaded_versions.get(&e.id).is_some_and(|v| *v != e.version) {
+            continue;
+        }
+        if !count_match(&e.predicate, &place, &s.exts, &s.stems) {
             continue;
         }
         let row = CounterRow {

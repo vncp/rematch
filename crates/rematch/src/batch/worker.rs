@@ -814,6 +814,7 @@ impl Cycle<'_> {
             fork_commit: None,
             families_excluded: Vec::new(),
             links: Vec::new(),
+            content_sha256: None,
         })
     }
 

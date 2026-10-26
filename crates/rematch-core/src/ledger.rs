@@ -17,7 +17,11 @@ use crate::types::{
     RedirectClass, SessionRecord, Sha256Hex, Status, Subject, UnixMs,
 };
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Ledger tables whose every write is journaled (ADR 001), in backfill order.
+pub const JOURNAL_TABLES: &[&str] =
+    &["sessions", "redirects", "entries", "counters", "proposals", "receipts", "outcomes"];
 
 /// Ordered migrations; migration `i` brings the schema to version `i + 1`.
 const MIGRATIONS: &[&str] = &[r#"
@@ -90,6 +94,12 @@ CREATE INDEX outcome_facets_composite ON outcome_facets(domain, key, value);
 CREATE INDEX outcome_facets_outcome ON outcome_facets(outcome_id);
 CREATE TABLE minhash(outcome_id TEXT NOT NULL, band INTEGER NOT NULL, hash INTEGER NOT NULL, PRIMARY KEY(outcome_id, band));
 CREATE INDEX minhash_band ON minhash(band, hash);
+"#, r#"
+CREATE TABLE journal(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, known INTEGER NOT NULL, machine TEXT NOT NULL,
+  table_name TEXT NOT NULL, row_key TEXT NOT NULL, op TEXT NOT NULL, json TEXT NOT NULL);
+CREATE INDEX journal_row ON journal(table_name, row_key, seq);
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#];
 
 pub fn now_ms() -> UnixMs {
@@ -186,9 +196,55 @@ pub struct JobRecord {
     pub updated_at: UnixMs,
 }
 
+/// One journal row (ADR 001): a write the ledger performed, with the full record as
+/// written. `known` is the ledger clock at that write (ms UTC); `op` is `insert`,
+/// `update` or `snapshot` (the migration-2 backfill of rows that predate the journal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JournalRow {
+    pub seq: i64,
+    pub known: UnixMs,
+    pub machine: String,
+    /// One of [`JOURNAL_TABLES`].
+    pub table: String,
+    /// sessions/entries/proposals/receipts/outcomes: id; redirects: [`redirect_key`];
+    /// counters: [`counter_key`].
+    pub row_key: String,
+    pub op: String,
+    /// sessions: the hydrated `SessionRecord` (flags and redirects as stored); redirects:
+    /// `Redirect`; entries: `Entry`; counters: `CounterRow` plus the entry's
+    /// `content_sha256` and `predicate_hash` at fold time; proposals: `ProposalRow`;
+    /// receipts: `ReceiptRow`; outcomes: `Outcome`.
+    pub json: serde_json::Value,
+}
+
+/// Journal row key of a redirect: `<session_id>#<seq>`.
+pub fn redirect_key(session_id: &str, seq: u32) -> String {
+    format!("{session_id}#{seq}")
+}
+
+/// Journal row key of a counter row: `<entry_id>#<session_id>`.
+pub fn counter_key(entry_id: &str, session_id: &str) -> String {
+    format!("{entry_id}#{session_id}")
+}
+
+/// The ledger's machine id, written once into `meta` (`$REMATCH_MACHINE` or the host name
+/// at the time) and read back ever after.
+fn ensure_machine(conn: &Connection) -> Result<String> {
+    let got: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='machine'", [], |r| r.get(0))
+        .optional()?;
+    if let Some(m) = got {
+        return Ok(m);
+    }
+    let m = crate::outcome::machine_name();
+    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('machine', ?1)", [&m])?;
+    Ok(conn.query_row("SELECT value FROM meta WHERE key='machine'", [], |r| r.get(0))?)
+}
+
 pub struct Ledger {
     conn: Connection,
     blobs: PathBuf,
+    machine: String,
 }
 
 fn json<T: Serialize>(v: &T) -> Result<String> {
@@ -210,8 +266,9 @@ impl Ledger {
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         let blobs = path.parent().unwrap_or(Path::new(".")).join("blobs");
-        let mut l = Ledger { conn, blobs };
+        let mut l = Ledger { conn, blobs, machine: String::new() };
         l.migrate()?;
+        l.machine = ensure_machine(&l.conn)?;
         Ok(l)
     }
 
@@ -230,11 +287,174 @@ impl Ledger {
             if v <= current {
                 continue;
             }
-            let tx = self.conn.transaction()?;
+            let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(sql).with_context(|| format!("migration {v}"))?;
+            if v == 2 {
+                self.backfill_journal().context("migration 2: journal backfill")?;
+            }
             tx.execute("INSERT INTO schema_version(version, created_at) VALUES (?1, ?2)", params![v, now_ms()])?;
             tx.commit()?;
         }
+        Ok(())
+    }
+
+    /// Migration 2: one `snapshot` journal row per existing row of every journaled table,
+    /// `known` = the row's `updated_at`, else its `created_at`; tables in
+    /// [`JOURNAL_TABLES`] order, rows by `(known, key)`.
+    fn backfill_journal(&self) -> Result<()> {
+        let machine = ensure_machine(&self.conn)?;
+        let keyed = |sql: &str| -> Result<Vec<(String, i64)>> {
+            let mut st = self.conn.prepare(sql)?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
+        };
+        let mut rows: Vec<(&str, String, i64, serde_json::Value)> = Vec::new();
+        for (id, known) in keyed("SELECT id, created_at FROM sessions ORDER BY created_at, id")? {
+            if let Some(s) = self.get_session(&id)? {
+                rows.push(("sessions", id, known, serde_json::to_value(&s)?));
+            }
+        }
+        for (sid, seq, known) in {
+            let mut st = self
+                .conn
+                .prepare("SELECT session_id, seq, created_at FROM redirects ORDER BY created_at, session_id, seq")?;
+            let v = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, i64>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        } {
+            if let Some(r) = self.get_redirect(&sid, seq)? {
+                rows.push(("redirects", redirect_key(&sid, seq), known, serde_json::to_value(&r)?));
+            }
+        }
+        for (id, known) in keyed("SELECT id, updated_at FROM entries ORDER BY updated_at, id")? {
+            if let Some(e) = self.get_entry(&id)? {
+                rows.push(("entries", id, known, serde_json::to_value(&e)?));
+            }
+        }
+        let counters = {
+            let mut st = self.conn.prepare(
+                "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at FROM counters
+                 ORDER BY created_at, entry_id, session_id",
+            )?;
+            let v = st
+                .query_map([], |r| Ok((counter_row(r)?, r.get::<_, i64>(9)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        };
+        for (c, known) in counters {
+            rows.push(("counters", counter_key(&c.entry_id, &c.session_id), known, self.counter_json(&c)?));
+        }
+        for p in self.list_proposals(None, None)? {
+            rows.push(("proposals", p.id.clone(), p.created_at, serde_json::to_value(&p)?));
+        }
+        for r in self.list_receipts(None)? {
+            rows.push(("receipts", r.id.clone(), r.created_at, serde_json::to_value(&r)?));
+        }
+        for (id, known) in keyed("SELECT id, created_at FROM outcomes ORDER BY created_at, id")? {
+            if let Some(o) = self.get_outcome(&id)? {
+                rows.push(("outcomes", id, known, serde_json::to_value(&o)?));
+            }
+        }
+        let mut st = self.conn.prepare(
+            "INSERT INTO journal(known,machine,table_name,row_key,op,json) VALUES (?1,?2,?3,?4,'snapshot',?5)",
+        )?;
+        for (table, key, known, j) in rows {
+            st.execute(params![known, machine, table, key, j.to_string()])?;
+        }
+        Ok(())
+    }
+
+    // ---------------- journal ----------------
+
+    /// This ledger's machine id (`$REMATCH_MACHINE` or the host name when the ledger got its
+    /// journal; stored once in `meta`).
+    pub fn machine_id(&self) -> &str {
+        &self.machine
+    }
+
+    /// Append one journal row, unless the row's latest journaled json is identical (a
+    /// re-fold that changed nothing is not a write). Callers hold the write transaction.
+    fn journal(&self, table: &str, row_key: &str, op: &str, j: &serde_json::Value) -> Result<()> {
+        let text = j.to_string();
+        let last: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT json FROM journal WHERE table_name=?1 AND row_key=?2 ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row(params![table, row_key], |r| r.get(0))
+            .optional()?;
+        if last.as_deref() == Some(text.as_str()) {
+            return Ok(());
+        }
+        self.conn
+            .prepare_cached(
+                "INSERT INTO journal(known,machine,table_name,row_key,op,json) VALUES (?1,?2,?3,?4,?5,?6)",
+            )?
+            .execute(params![now_ms(), self.machine, table, row_key, op, text])?;
+        Ok(())
+    }
+
+    fn exists(&self, sql: &str, args: impl rusqlite::Params) -> Result<bool> {
+        Ok(self.conn.prepare_cached(sql)?.query_row(args, |_| Ok(())).optional()?.is_some())
+    }
+
+    /// Journal rows with `seq > after`, in `seq` order.
+    pub fn journal_since(&self, after: i64) -> Result<Vec<JournalRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT seq,known,machine,table_name,row_key,op,json FROM journal WHERE seq>?1 ORDER BY seq",
+        )?;
+        let raw = st
+            .query_map([after], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        raw.into_iter()
+            .map(|(seq, known, machine, table, row_key, op, j)| {
+                Ok(JournalRow { seq, known, machine, table, row_key, op, json: from_json(&j)? })
+            })
+            .collect()
+    }
+
+    /// Highest journal `seq` (0 when empty).
+    pub fn journal_max_seq(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM journal", [], |r| r.get(0))?)
+    }
+
+    /// Replay one journal row (`lake rebuild`): the record becomes the current state of its
+    /// row and the journal row is copied verbatim (same `seq`, ignored when that `seq` is
+    /// present); no new journal row is written. Idempotent: the json is the state as
+    /// written, so replaying rows in `seq` order converges on the origin ledger's state.
+    pub fn apply_journal_row(&self, row: &JournalRow) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let j = row.json.clone();
+        match row.table.as_str() {
+            "sessions" => {
+                let s: SessionRecord = serde_json::from_value(j)?;
+                self.write_session_row(&s, row.known, true)?;
+                self.write_redirects(&s, row.known, true)?;
+            }
+            "redirects" => self.write_redirect(&serde_json::from_value(j)?, row.known, true)?,
+            "entries" => self.write_entry(&serde_json::from_value(j)?)?,
+            "counters" => self.write_counter(&serde_json::from_value(j)?, row.known)?,
+            "proposals" => self.write_proposal(&serde_json::from_value(j)?)?,
+            "receipts" => self.write_receipt(&serde_json::from_value(j)?)?,
+            "outcomes" => self.write_outcome(&serde_json::from_value(j)?, row.known)?,
+            other => return Err(anyhow!("journal row {}: unknown table {other:?}", row.seq)),
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO journal(seq,known,machine,table_name,row_key,op,json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![row.seq, row.known, row.machine, row.table, row.row_key, row.op, row.json.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -254,7 +474,35 @@ impl Ledger {
     pub fn upsert_session(&self, s: &SessionRecord) -> Result<()> {
         let now = now_ms();
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        let existed = self.exists("SELECT 1 FROM sessions WHERE id=?1", [&s.id])?;
+        let old_seqs = self.redirect_seqs(&s.id)?;
+        self.write_session_row(s, now, false)?;
+        // A classifier label already in the ledger survives a re-import without one.
+        self.write_redirects(s, now, false)?;
+        let stored = self.get_session(&s.id)?.ok_or_else(|| anyhow!("session {} vanished", s.id))?;
+        let op = if existed { "update" } else { "insert" };
+        self.journal("sessions", &s.id, op, &serde_json::to_value(&stored)?)?;
+        for r in &stored.redirects {
+            let op = if old_seqs.contains(&r.seq) { "update" } else { "insert" };
+            self.journal("redirects", &redirect_key(&r.session_id, r.seq), op, &serde_json::to_value(r)?)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The session row. `exact` (journal replay) writes the record as is; otherwise
+    /// `counted` never goes back to false and `source_path` / `history_reflected_at`
+    /// survive a record that lacks them.
+    fn write_session_row(&self, s: &SessionRecord, created_at: UnixMs, exact: bool) -> Result<()> {
+        let merge = if exact {
+            "counted=excluded.counted, source=excluded.source, json=excluded.json"
+        } else {
+            "counted=MAX(sessions.counted, excluded.counted), source=excluded.source,
+               json=json_set(excluded.json,
+                 '$.source_path', COALESCE(json_extract(excluded.json, '$.source_path'), json_extract(sessions.json, '$.source_path')),
+                 '$.history_reflected_at', COALESCE(json_extract(excluded.json, '$.history_reflected_at'), json_extract(sessions.json, '$.history_reflected_at')))"
+        };
+        let sql = format!(
             "INSERT INTO sessions(id,cwd,repo,branch,started_at,ended_at,family,provider,model,turns,tokens_in,tokens_out,
                tool_calls,tool_errors,skill_reads,files_touched,exts,stems,redirects,flagged,counted,source,json,created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
@@ -264,72 +512,95 @@ impl Ledger {
                tokens_in=excluded.tokens_in, tokens_out=excluded.tokens_out, tool_calls=excluded.tool_calls,
                tool_errors=excluded.tool_errors, skill_reads=excluded.skill_reads,
                files_touched=excluded.files_touched, exts=excluded.exts, stems=excluded.stems,
-               redirects=excluded.redirects, flagged=excluded.flagged,
-               counted=MAX(sessions.counted, excluded.counted), source=excluded.source,
-               json=json_set(excluded.json,
-                 '$.source_path', COALESCE(json_extract(excluded.json, '$.source_path'), json_extract(sessions.json, '$.source_path')),
-                 '$.history_reflected_at', COALESCE(json_extract(excluded.json, '$.history_reflected_at'), json_extract(sessions.json, '$.history_reflected_at')))",
-            params![
-                s.id,
-                s.cwd,
-                s.repo,
-                s.branch,
-                s.started_at,
-                s.ended_at,
-                s.family.as_ref().map(|f| f.0.clone()),
-                s.model.as_ref().map(|m| m.provider.clone()),
-                s.model.as_ref().map(|m| m.id.clone()),
-                s.turns,
-                s.tokens_in as i64,
-                s.tokens_out as i64,
-                s.tool_calls,
-                s.tool_errors,
-                json(&s.skill_reads)?,
-                json(&s.files_touched)?,
-                json(&s.exts)?,
-                json(&s.stems)?,
-                json(&s.redirects)?,
-                s.flagged,
-                s.counted,
-                s.source,
-                json(s)?,
-                now,
-            ],
-        )?;
-        let seqs: Vec<u32> = s.redirects.iter().map(|r| r.seq).collect();
-        {
-            let mut existing = tx.prepare("SELECT seq FROM redirects WHERE session_id=?1")?;
-            let old: Vec<u32> = existing
-                .query_map([&s.id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for seq in old.into_iter().filter(|q| !seqs.contains(q)) {
-                tx.execute("DELETE FROM redirects WHERE session_id=?1 AND seq=?2", params![s.id, seq])?;
+               redirects=excluded.redirects, flagged=excluded.flagged, {merge}"
+        );
+        self.conn.prepare_cached(&sql)?.execute(params![
+            s.id,
+            s.cwd,
+            s.repo,
+            s.branch,
+            s.started_at,
+            s.ended_at,
+            s.family.as_ref().map(|f| f.0.clone()),
+            s.model.as_ref().map(|m| m.provider.clone()),
+            s.model.as_ref().map(|m| m.id.clone()),
+            s.turns,
+            s.tokens_in as i64,
+            s.tokens_out as i64,
+            s.tool_calls,
+            s.tool_errors,
+            json(&s.skill_reads)?,
+            json(&s.files_touched)?,
+            json(&s.exts)?,
+            json(&s.stems)?,
+            json(&s.redirects)?,
+            s.flagged,
+            s.counted,
+            s.source,
+            json(s)?,
+            created_at,
+        ])?;
+        Ok(())
+    }
+
+    fn redirect_seqs(&self, session_id: &str) -> Result<Vec<u32>> {
+        let mut st = self.conn.prepare_cached("SELECT seq FROM redirects WHERE session_id=?1")?;
+        let v = st.query_map([session_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v)
+    }
+
+    /// The session's redirect rows become `s.redirects`: seqs not in it are deleted.
+    fn write_redirects(&self, s: &SessionRecord, created_at: UnixMs, exact: bool) -> Result<()> {
+        for seq in self.redirect_seqs(&s.id)? {
+            if !s.redirects.iter().any(|r| r.seq == seq) {
+                self.conn.execute("DELETE FROM redirects WHERE session_id=?1 AND seq=?2", params![s.id, seq])?;
             }
         }
         for r in &s.redirects {
-            // A classifier label already in the ledger survives a re-import without one.
-            tx.execute(
-                "INSERT INTO redirects(session_id,seq,prelabel,class,confidence,text_head,deliverable_head,t,created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-                 ON CONFLICT(session_id,seq) DO UPDATE SET prelabel=excluded.prelabel,
-                   class=COALESCE(excluded.class, redirects.class),
-                   confidence=COALESCE(excluded.confidence, redirects.confidence),
-                   text_head=excluded.text_head, deliverable_head=excluded.deliverable_head, t=excluded.t",
-                params![
-                    s.id,
-                    r.seq,
-                    r.prelabel,
-                    r.class.map(|c| enum_str(&c)),
-                    r.confidence,
-                    r.text_head,
-                    r.deliverable_head,
-                    r.t,
-                    now
-                ],
-            )?;
+            self.write_redirect(r, created_at, exact)?;
         }
-        tx.commit()?;
         Ok(())
+    }
+
+    /// One redirect row. `exact` (journal replay) writes the label as is; otherwise a stored
+    /// label survives a redirect that carries none.
+    fn write_redirect(&self, r: &crate::types::Redirect, created_at: UnixMs, exact: bool) -> Result<()> {
+        let labels = if exact {
+            "class=excluded.class, confidence=excluded.confidence"
+        } else {
+            "class=COALESCE(excluded.class, redirects.class), confidence=COALESCE(excluded.confidence, redirects.confidence)"
+        };
+        let sql = format!(
+            "INSERT INTO redirects(session_id,seq,prelabel,class,confidence,text_head,deliverable_head,t,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(session_id,seq) DO UPDATE SET prelabel=excluded.prelabel, {labels},
+               text_head=excluded.text_head, deliverable_head=excluded.deliverable_head, t=excluded.t"
+        );
+        self.conn.prepare_cached(&sql)?.execute(params![
+            r.session_id,
+            r.seq,
+            r.prelabel,
+            r.class.map(|c| enum_str(&c)),
+            r.confidence,
+            r.text_head,
+            r.deliverable_head,
+            r.t,
+            created_at
+        ])?;
+        Ok(())
+    }
+
+    /// One stored redirect, labels included.
+    pub fn get_redirect(&self, session_id: &str, seq: u32) -> Result<Option<crate::types::Redirect>> {
+        let raw = self
+            .conn
+            .prepare_cached(
+                "SELECT seq,prelabel,class,confidence,text_head,deliverable_head,t FROM redirects
+                 WHERE session_id=?1 AND seq=?2",
+            )?
+            .query_row(params![session_id, seq], redirect_raw)
+            .optional()?;
+        raw.map(|r| redirect_from_raw(session_id, r)).transpose()
     }
 
     fn session_from_row(&self, row: &Row<'_>) -> rusqlite::Result<(String, bool, bool)> {
@@ -344,32 +615,8 @@ impl Ledger {
             "SELECT seq,prelabel,class,confidence,text_head,deliverable_head,t FROM redirects
              WHERE session_id=?1 ORDER BY seq",
         )?;
-        let rows = st.query_map([&s.id], |r| {
-            Ok((
-                r.get::<_, u32>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<f64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut redirects = Vec::new();
-        for row in rows {
-            let (seq, prelabel, class, confidence, text_head, deliverable_head, t) = row?;
-            redirects.push(crate::types::Redirect {
-                session_id: s.id.clone(),
-                seq,
-                prelabel,
-                class: class.map(|c| parse_enum(&c)).transpose()?,
-                confidence,
-                text_head,
-                deliverable_head,
-                t,
-            });
-        }
-        s.redirects = redirects;
+        let raws = st.query_map([&s.id], redirect_raw)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        s.redirects = raws.into_iter().map(|r| redirect_from_raw(&s.id, r)).collect::<Result<_>>()?;
         Ok(s)
     }
 
@@ -419,17 +666,27 @@ impl Ledger {
     }
 
     pub fn set_session_counted(&self, id: &str, counted: bool) -> Result<()> {
-        self.conn
-            .execute("UPDATE sessions SET counted=?2 WHERE id=?1", params![id, counted])?;
-        Ok(())
+        self.update_session(id, "UPDATE sessions SET counted=?2 WHERE id=?1", params![id, counted])
     }
 
     /// Marks an imported session as dealt with by `reflect --history` (kept across upserts).
     pub fn set_history_reflected(&self, id: &str, at: UnixMs) -> Result<()> {
-        self.conn.execute(
+        self.update_session(
+            id,
             "UPDATE sessions SET json=json_set(json, '$.history_reflected_at', ?2) WHERE id=?1",
             params![id, at],
-        )?;
+        )
+    }
+
+    /// One in-place update of a session row, journaled with the hydrated result.
+    fn update_session(&self, id: &str, sql: &str, args: impl rusqlite::Params) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if self.conn.execute(sql, args)? > 0 {
+            if let Some(s) = self.get_session(id)? {
+                self.journal("sessions", id, "update", &serde_json::to_value(&s)?)?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -441,10 +698,15 @@ impl Ledger {
         class: RedirectClass,
         confidence: Option<f64>,
     ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
         let n = self.conn.execute(
             "UPDATE redirects SET class=?3, confidence=?4 WHERE session_id=?1 AND seq=?2",
             params![session_id, seq, enum_str(&class), confidence],
         )?;
+        if let Some(r) = self.get_redirect(session_id, seq)? {
+            self.journal("redirects", &redirect_key(session_id, seq), "update", &serde_json::to_value(&r)?)?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -452,12 +714,20 @@ impl Ledger {
 
     pub fn upsert_entry(&self, e: &Entry) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        let existed = self.exists("SELECT 1 FROM entries WHERE id=?1", [&e.id])?;
+        self.write_entry(e)?;
+        self.journal("entries", &e.id, if existed { "update" } else { "insert" }, &serde_json::to_value(e)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_entry(&self, e: &Entry) -> Result<()> {
+        self.conn.execute(
             "INSERT INTO entries(id,json,created_at,updated_at) VALUES (?1,?2,?3,?4)
              ON CONFLICT(id) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at",
             params![e.id, json(e)?, e.created_at, e.updated_at],
         )?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO entry_status(id,status,branch,name,predicate_hash,kind,family,updated_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET status=excluded.status, branch=excluded.branch, name=excluded.name,
@@ -474,7 +744,6 @@ impl Ledger {
                 e.updated_at
             ],
         )?;
-        tx.commit()?;
         Ok(())
     }
 
@@ -531,6 +800,29 @@ impl Ledger {
 
     /// Idempotent per (entry, session).
     pub fn add_counter(&self, row: &CounterRow) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let existed = self.exists(
+            "SELECT 1 FROM counters WHERE entry_id=?1 AND session_id=?2",
+            params![row.entry_id, row.session_id],
+        )?;
+        self.write_counter(row, now_ms())?;
+        let op = if existed { "update" } else { "insert" };
+        self.journal("counters", &counter_key(&row.entry_id, &row.session_id), op, &self.counter_json(row)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Journal form of a counter row: the row plus the entry's `content_sha256` and
+    /// `predicate_hash` at fold time (cross-machine aggregation is by content).
+    fn counter_json(&self, row: &CounterRow) -> Result<serde_json::Value> {
+        let mut j = serde_json::to_value(row)?;
+        let e = self.get_entry(&row.entry_id)?;
+        j["content_sha256"] = serde_json::json!(e.as_ref().and_then(|e| e.content_sha256.clone()));
+        j["predicate_hash"] = serde_json::json!(e.as_ref().map(|e| predicate_hash(&e.predicate)));
+        Ok(j)
+    }
+
+    fn write_counter(&self, row: &CounterRow, created_at: UnixMs) -> Result<()> {
         self.conn.execute(
             "INSERT INTO counters(entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
@@ -547,7 +839,7 @@ impl Ledger {
                 row.tokens as i64,
                 row.turns,
                 row.ts,
-                now_ms()
+                created_at
             ],
         )?;
         Ok(())
@@ -627,11 +919,19 @@ impl Ledger {
             lint_ok,
             created_at: now_ms(),
         };
+        let tx = self.conn.unchecked_transaction()?;
+        self.write_proposal(&row)?;
+        self.journal("proposals", &row.id, "insert", &serde_json::to_value(&row)?)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    fn write_proposal(&self, row: &ProposalRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO proposals(id,entry_id,session_id,blob,lint_ok,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT OR REPLACE INTO proposals(id,entry_id,session_id,blob,lint_ok,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
             params![row.id, row.entry_id, row.session_id, row.blob, row.lint_ok, row.created_at],
         )?;
-        Ok(row)
+        Ok(())
     }
 
     pub fn list_proposals(
@@ -664,11 +964,20 @@ impl Ledger {
             receipt: r.clone(),
             created_at: now_ms(),
         };
+        let tx = self.conn.unchecked_transaction()?;
+        self.write_receipt(&row)?;
+        self.journal("receipts", &row.id, "insert", &serde_json::to_value(&row)?)?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    fn write_receipt(&self, row: &ReceiptRow) -> Result<()> {
+        let r = &row.receipt;
         self.conn.execute(
-            "INSERT INTO receipts(id,entry_id,certificate_hash,activation,created_at) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR REPLACE INTO receipts(id,entry_id,certificate_hash,activation,created_at) VALUES (?1,?2,?3,?4,?5)",
             params![row.id, r.entry, r.certificate, enum_str(&r.activation), row.created_at],
         )?;
-        Ok(row)
+        Ok(())
     }
 
     pub fn list_receipts(&self, entry_id: Option<&str>) -> Result<Vec<ReceiptRow>> {
@@ -752,7 +1061,15 @@ impl Ledger {
     /// Insert or replace by id (the ledger keeps the latest status per id).
     pub fn insert_outcome(&self, o: &Outcome) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        let existed = self.exists("SELECT 1 FROM outcomes WHERE id=?1", [&o.id])?;
+        self.write_outcome(o, now_ms())?;
+        self.journal("outcomes", &o.id, if existed { "update" } else { "insert" }, &serde_json::to_value(o)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_outcome(&self, o: &Outcome, created_at: UnixMs) -> Result<()> {
+        self.conn.execute(
             "INSERT OR REPLACE INTO outcomes(id,session_id,ts,machine,family,repo,branch,kind,domain,subject_id,
                subject_json,claim,signature,params_json,evidence_json,result_json,links_json,provenance_json,
                status,json,created_at)
@@ -778,17 +1095,16 @@ impl Ledger {
                 json(&o.provenance)?,
                 enum_str(&o.result.status),
                 json(o)?,
-                now_ms()
+                created_at
             ],
         )?;
-        tx.execute("DELETE FROM outcome_facets WHERE outcome_id=?1", [&o.id])?;
+        self.conn.execute("DELETE FROM outcome_facets WHERE outcome_id=?1", [&o.id])?;
         for f in &o.facets {
-            tx.execute(
+            self.conn.execute(
                 "INSERT INTO outcome_facets(outcome_id,domain,key,value) VALUES (?1,?2,?3,?4)",
                 params![o.id, o.subject.domain, f.key, f.value],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -906,6 +1222,28 @@ impl Ledger {
     }
 }
 
+type RedirectRaw = (u32, String, Option<String>, Option<f64>, String, String, i64);
+
+fn redirect_raw(r: &Row<'_>) -> rusqlite::Result<RedirectRaw> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+}
+
+fn redirect_from_raw(
+    session_id: &str,
+    (seq, prelabel, class, confidence, text_head, deliverable_head, t): RedirectRaw,
+) -> Result<crate::types::Redirect> {
+    Ok(crate::types::Redirect {
+        session_id: session_id.to_string(),
+        seq,
+        prelabel,
+        class: class.map(|c| parse_enum(&c)).transpose()?,
+        confidence,
+        text_head,
+        deliverable_head,
+        t,
+    })
+}
+
 fn counter_row(r: &Row<'_>) -> rusqlite::Result<CounterRow> {
     Ok(CounterRow {
         entry_id: r.get(0)?,
@@ -1002,7 +1340,7 @@ pub(crate) mod tests {
         drop(l);
         let l = Ledger::open(&p).unwrap();
         let n: i64 = l.conn().query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1, "migration must not re-run");
+        assert_eq!(n, SCHEMA_VERSION, "migrations must not re-run");
         l.conn()
             .execute("INSERT INTO schema_version VALUES (99, 0)", [])
             .unwrap();
@@ -1083,7 +1421,7 @@ pub(crate) mod tests {
             harmful: 0,
             evidence: vec![Moment { session_id: "s".into(), seq: 1 }],
             origin: Origin::Session { session_id: "s".into() },
-            predicate: Predicate { repo_glob: "/w/repo".into(), file_exts: vec!["rs".into()], stems: vec![] },
+            predicate: Predicate { repo_glob: "/w/repo".into(), file_exts: vec!["rs".into()], ..Default::default() },
             trigger_line: "Use when editing the ledger.".into(),
             redirect_class: Some(RedirectClass::Correction),
             predecessor: None,
@@ -1105,6 +1443,7 @@ pub(crate) mod tests {
             fork_commit: None,
             families_excluded: vec![],
             links: vec![],
+            content_sha256: None,
         }
     }
 
@@ -1220,6 +1559,141 @@ pub(crate) mod tests {
         assert_eq!(l.get_blob(&h).unwrap().unwrap(), b"abc");
         assert!(l.get_blob(&"0".repeat(64)).unwrap().is_none());
         assert!(l.get_blob("../x").is_err());
+    }
+
+    /// A ledger exercising every journaled write path.
+    fn busy_ledger(l: &Ledger) {
+        let mut a = session("a", "repo", 100);
+        a.redirects = vec![redirect("a", 3, "negation"), redirect("a", 7, "revert")];
+        a.repo_remote = Some("github.com/org/repo".into());
+        a.loaded_versions.insert("e1".into(), 2);
+        l.upsert_session(&a).unwrap();
+        l.upsert_session(&session("b", "other", 200)).unwrap();
+        l.set_redirect_class("a", 3, RedirectClass::Correction, Some(0.9)).unwrap();
+        a.redirects = vec![redirect("a", 3, "negation")];
+        l.upsert_session(&a).unwrap(); // drops redirect 7, keeps the label of 3
+        l.set_session_counted("a", true).unwrap();
+        l.set_history_reflected("b", 42).unwrap();
+        let mut e1 = entry("e1", "alpha", "repo", Status::Provisional);
+        e1.content_sha256 = Some("c".repeat(64));
+        l.upsert_entry(&e1).unwrap();
+        e1.status = Status::Kept;
+        e1.updated_at = 5;
+        l.upsert_entry(&e1).unwrap();
+        l.upsert_entry(&entry("e2", "beta", "other", Status::Draft)).unwrap();
+        l.add_counter(&crow("e1", "a", "a/x", 1, 0, 0, 110)).unwrap();
+        l.add_counter(&crow("e1", "b", "b/y", 1, 1, 0, 210)).unwrap();
+        l.add_counter(&crow("e1", "b", "b/y", 1, 1, 1, 210)).unwrap(); // refold
+        l.insert_proposal(Some("e1"), Some("a"), &serde_json::json!({"edits": []}), true).unwrap();
+        l.insert_receipt(&Receipt { certificate: "d".repeat(64), entry: "e1".into(), activation: Activation::Personal }).unwrap();
+        let o = outcome("o1", "quant", "k", 100, "sig", ResultStatus::Inconclusive, &[("m", "carry")]);
+        l.insert_outcome(&o).unwrap();
+        let mut o2 = o.clone();
+        o2.result.status = ResultStatus::Kept;
+        l.insert_outcome(&o2).unwrap();
+    }
+
+    type State = (Vec<Entry>, Vec<SessionRecord>, Vec<(EntryId, Counters)>, Vec<CounterRow>, usize, usize, Vec<Outcome>);
+
+    fn state(l: &Ledger) -> State {
+        (
+            l.list_entries(&EntryFilter::default()).unwrap(),
+            l.list_sessions(&SessionFilter::default()).unwrap(),
+            l.list_counters().unwrap(),
+            l.counter_rows("e1").unwrap(),
+            l.list_proposals(None, None).unwrap().len(),
+            l.list_receipts(None).unwrap().len(),
+            l.outcomes_by_signature("sig").unwrap(),
+        )
+    }
+
+    #[test]
+    fn every_write_journals_and_a_replay_reproduces_the_ledger() {
+        let (_t, l) = ledger();
+        assert!(!l.machine_id().is_empty());
+        busy_ledger(&l);
+        let rows = l.journal_since(0).unwrap();
+        assert_eq!(l.journal_max_seq().unwrap(), rows.last().unwrap().seq);
+        assert!(rows.windows(2).all(|w| w[0].seq < w[1].seq));
+        assert!(rows.iter().all(|r| r.machine == l.machine_id() && r.op != "snapshot"));
+        let tables: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.table.as_str()).collect();
+        assert_eq!(tables, JOURNAL_TABLES.iter().copied().collect());
+        let ops = |table: &str, key: &str| -> Vec<String> {
+            rows.iter().filter(|r| r.table == table && r.row_key == key).map(|r| r.op.clone()).collect()
+        };
+        // a: insert, label (a redirect write), re-upsert, counted
+        assert_eq!(ops("sessions", "a"), ["insert", "update", "update"]);
+        assert_eq!(ops("sessions", "b"), ["insert", "update"], "history marker");
+        assert_eq!(ops("redirects", &redirect_key("a", 3)), ["insert", "update"], "the label; the re-upsert changed nothing");
+        assert_eq!(ops("entries", "e1"), ["insert", "update"]);
+        assert_eq!(ops("counters", &counter_key("e1", "b")), ["insert", "update"]);
+        assert_eq!(ops("outcomes", "o1"), ["insert", "update"]);
+        let counted = rows.iter().rfind(|r| r.table == "sessions" && r.row_key == "a").unwrap();
+        assert_eq!(counted.json["counted"], true);
+        assert_eq!(counted.json["repo_remote"], "github.com/org/repo");
+        let c = rows.iter().find(|r| r.table == "counters").unwrap();
+        assert_eq!(c.json["content_sha256"], "c".repeat(64));
+        assert_eq!(c.json["predicate_hash"], predicate_hash(&entry("e1", "alpha", "repo", Status::Kept).predicate));
+        // An identical rewrite is not a write.
+        let before = l.journal_max_seq().unwrap();
+        l.add_counter(&crow("e1", "a", "a/x", 1, 0, 0, 110)).unwrap();
+        l.upsert_entry(&l.get_entry("e2").unwrap().unwrap()).unwrap();
+        assert_eq!(l.journal_max_seq().unwrap(), before);
+        assert!(!l.set_redirect_class("a", 99, RedirectClass::Scope, None).unwrap());
+        assert_eq!(l.journal_max_seq().unwrap(), before);
+
+        // Replay into a fresh ledger: identical state, the journal copied verbatim, nothing new
+        // journaled; replaying twice changes nothing.
+        let (_t2, fresh) = ledger();
+        for r in &rows {
+            fresh.apply_journal_row(r).unwrap();
+        }
+        assert_eq!(state(&fresh), state(&l));
+        assert_eq!(fresh.journal_since(0).unwrap(), rows);
+        for r in &rows {
+            fresh.apply_journal_row(r).unwrap();
+        }
+        assert_eq!(state(&fresh), state(&l));
+        assert_eq!(fresh.journal_since(0).unwrap(), rows);
+        assert_eq!(fresh.get_session("a").unwrap().unwrap().redirects[0].class, Some(RedirectClass::Correction));
+        assert!(fresh.apply_journal_row(&JournalRow { table: "nope".into(), ..rows[0].clone() }).is_err());
+    }
+
+    #[test]
+    fn migration_two_backfills_snapshots_of_existing_rows() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("ledger.sqlite");
+        let l = Ledger::open(&p).unwrap();
+        busy_ledger(&l);
+        let want = state(&l);
+        // Back to a version-1 ledger: no journal, no meta.
+        l.conn()
+            .execute_batch("DROP TABLE journal; DROP TABLE meta; DELETE FROM schema_version WHERE version=2;")
+            .unwrap();
+        drop(l);
+        let l = Ledger::open(&p).unwrap();
+        assert_eq!(l.schema_version().unwrap(), 2);
+        let rows = l.journal_since(0).unwrap();
+        assert!(rows.iter().all(|r| r.op == "snapshot"));
+        let count = |t: &str| rows.iter().filter(|r| r.table == t).count();
+        assert_eq!(
+            (count("sessions"), count("redirects"), count("entries"), count("counters"), count("proposals"), count("receipts"), count("outcomes")),
+            (2, 1, 2, 2, 1, 1, 1)
+        );
+        // Table order, then (known, key) within a table.
+        let order: Vec<usize> = rows.iter().map(|r| JOURNAL_TABLES.iter().position(|t| *t == r.table).unwrap()).collect();
+        assert!(order.windows(2).all(|w| w[0] <= w[1]), "{order:?}");
+        let e1 = rows.iter().find(|r| r.table == "entries" && r.row_key == "e1").unwrap();
+        assert_eq!(e1.known, 5, "entries: known = updated_at");
+        let (_t2, fresh) = ledger();
+        for r in &rows {
+            fresh.apply_journal_row(r).unwrap();
+        }
+        assert_eq!(state(&fresh), want);
+        // The machine id is stored once.
+        let m = l.machine_id().to_string();
+        drop(l);
+        assert_eq!(Ledger::open(&p).unwrap().machine_id(), m);
     }
 
     fn outcome(id: &str, domain: &str, ent: &str, ts: i64, sig: &str, status: ResultStatus, facets: &[(&str, &str)]) -> Outcome {

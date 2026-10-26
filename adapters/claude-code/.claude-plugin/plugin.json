@@ -2,7 +2,7 @@
   "name": "rematch",
   "displayName": "rematch",
   "version": "0.1.0",
-  "description": "rematch in Claude Code: traces each session through hooks into the rematch ledger, loads the provisional and kept skills whose predicate matches the directory, runs approved block/stuck/retrieve hooks, and adds /rematch:rematch-status, /rematch:rematch-why and /rematch:rematch-mark.",
+  "description": "rematch in Claude Code: traces each session through hooks into the rematch ledger, starts reflection and shows the digest at session start, loads the provisional and kept skills whose predicate matches the directory and the rematch subagents, runs approved block/stuck/retrieve hooks, and adds /rematch:rematch-status, -why, -mark, -library, -approve, -decline, -off and -on.",
   "author": {
     "name": "rematch"
   },

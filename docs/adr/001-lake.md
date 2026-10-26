@@ -1,6 +1,6 @@
 # ADR 001 — The lake: agent sessions as a queryable backend
 
-Status: accepted for build (L1–L2), proposed (L3–L4) · 2026-10-26 · amends SPEC §"What is deliberately not in the plan" (the indexing line) · extends DESIGN §5 (ledger) and SPEC §"Session outcome records"
+Status: built (L1–L4), live on the author's history · 2026-10-26 · amends SPEC §"What is deliberately not in the plan" (the indexing line) · extends DESIGN §5 (ledger) and SPEC §"Session outcome records"
 
 Revision 2, after an independent architecture review of revision 1 (findings recorded in §"Review"). The one change that resolved three of the five blockers is the **journal**: the ledger gains an append-only table of every write, and the lake is an export of the journal, never of current state. Keys are declared only for questions a reader in the loop asks today; every other Bellwether kind is listed as declined with the question that would justify it.
 
@@ -58,7 +58,7 @@ Declined, each with the question that would justify it (none is asked by a curre
 
 | Kind | Would answer | Why not now |
 |---|---|---|
-| `text:` (B5) on inputs or tool output | free-text search of history ("sessions mentioning docstrings") | no reader searches prose; `expr:tool_cmd` covers the one command question. Add when `create` grows a text query |
+| `text:` (B5) on inputs or tool output | free-text search of history; `has_token(tool_cmd, 'cargo')` | no reader searches prose. Note from the live run: `expr:tool_cmd` is exact on the whole command string, so "sessions that ran cargo test" needs `text:tool_cmd,tokenizer=words` — add it when a reader asks that question |
 | `agg:` (B7) sums per repo/family | tokens and errors per repo from the index alone | `report` gates on recurrence, never on tokens (D10); one `locate` + sum over a few thousand rows is fine |
 | `join:` (B3) sessions ⋈ counters | the attribution anti-join (sessions that loaded content never folded) | `lake doctor` computes it in one pass; a pinned cross-manifest key is maintenance for a diagnostic |
 | `sketch` (B2) MinHash over stems/facets | vocabulary overlap between branches | SPEC's MinHash lives in the ledger's `minhash` table already; revisit if `transfer suggest` needs it across machines |
@@ -107,6 +107,10 @@ rematch report [--window 6w]              the kill criterion from the lake alone
 ### Not in this decision
 
 Embeddings (D28: exploratory; `exact:signature` is the gate, the ledger's MinHash the suggestion). A query engine in rematch (Bellwether plans row groups and returns a residual — `In`, `Between`, `NotOlderThan`, `LatestPerKey`, `ContainsAll`, text — which rematch evaluates per row with arrow-rs; it never re-plans). Replacing SQLite. Indexing inside a session. `reconcile` (nothing in the loop compares two datasets by key).
+
+## Live run (2026-10-26)
+
+On this machine's real root: `lake migrate` set 27 content hashes and 206 session remotes; `lake export --all` wrote 1,178 journal rows and 326 events files in 2.9 s (16 sessions with no source left recorded as missing); `lake index` built all 14 keys with Bellwether 0.1.0 in 0.8 s, pinned; `lake query events --key exact:skill_read --values bellwether-dev` planned 18 of 326 files, `exact:path src/lib.py` 5 of 326; `report` ran from the lake in 57 ms and showed the before-arm the spec asks for (`bellwether-dev`: before 2/92 recurred, with 0/1); `why --asof` distinguished "provisional as of 04:30" from "kept as of the 27th" for the same entry. One correct-but-unhelpful key: `expr:tool_cmd` is an exact match on the full command, and real commands are `cd … && cargo test …`; a `has`-style question on commands needs the declined `text:` key — recorded in the declined table rather than added.
 
 ## Consequences
 

@@ -8,14 +8,18 @@ import * as path from "node:path";
 import rematch, {
 	CallHistory,
 	callKey,
+	changedPaths,
 	changesLoaded,
+	FILES_CHANGED_MAX,
+	filesChanged,
 	hookFromModule,
-	loadedEntryIds,
+	loadedEntriesOf,
 	loadHook,
 	RETRIEVAL_TYPE,
 	retrievalMessage,
 	retrievalQuery,
 	stuckReason,
+	subpathOf,
 	truncateToolResults,
 	truncationMarker,
 } from "./index.ts";
@@ -218,11 +222,42 @@ describe("argv and match helpers", () => {
 		expect(changesLoaded(["status"])).toBe(false);
 	});
 
-	test("loaded entries are the predicate hits minus the retrieve hooks", () => {
+	test("loaded entries are the predicate hits minus the retrieve hooks, versioned", () => {
 		const retrieve = hookFromModule({ id: "r", mode: "retrieve", tool: "*", params: { budget_bytes: 10, min_overlap: 1 } }, "r");
-		const data = { entries: [{ id: "a" }, { id: "r" }, { id: "s" }, { id: "miss", predicate_hit: false }, { name: "no id" }] };
-		expect(loadedEntryIds(data, [retrieve, stuck()])).toEqual(["a", "s"]);
-		expect(loadedEntryIds(undefined, [])).toEqual([]);
+		const data = { entries: [{ id: "a", version: 2, sha: "ab" }, { id: "r" }, { id: "s", version: 1, sha: "" }, { id: "miss", predicate_hit: false }, { name: "no id" }] };
+		expect(loadedEntriesOf(data, [retrieve, stuck()])).toEqual([{ id: "a", version: 2, sha: "ab" }, { id: "s", version: 1 }]);
+		expect(loadedEntriesOf(undefined, [])).toEqual([]);
+	});
+});
+
+describe("identity and changed files (ADR 001)", () => {
+	test("mutating calls name their files, patch payloads included", () => {
+		expect(changedPaths("write", { path: "src/a.rs:1-5" })).toEqual(["src/a.rs"]);
+		expect(changedPaths("Edit", { file_path: "/w/b.rs" })).toEqual(["/w/b.rs"]);
+		expect(changedPaths("edit", { input: "[src/c.rs#AB12]\nreplace\n[src/d.rs#CD34]\n" })).toEqual(["src/c.rs", "src/d.rs"]);
+		expect(changedPaths("apply_patch", { input: "*** Update File: e.rs\n*** Move to: f.rs\n" })).toEqual(["e.rs", "f.rs"]);
+		expect(changedPaths("read", { path: "src/a.rs" })).toEqual([]);
+		expect(changedPaths("write", { path: "skill://x" })).toEqual([]);
+	});
+
+	test("files_changed: bounded, repo-relative, null over budget", () => {
+		const repo = fs.mkdtempSync(path.join(tmp, "repo-"));
+		fs.mkdirSync(path.join(repo, "src"));
+		fs.writeFileSync(path.join(repo, "src", "a.rs"), "fn a() {}");
+		fs.writeFileSync(path.join(repo, "big.bin"), Buffer.alloc(1024 * 1024 + 1));
+		const got = filesChanged(["src/a.rs", "big.bin", "gone.rs"], repo, repo, Date.now() + 5000);
+		expect(got?.map(([p]) => p)).toEqual(["src/a.rs"]);
+		expect(got?.[0][1]).toMatch(/^[0-9a-f]{64}$/);
+		expect(filesChanged(["src/a.rs"], repo, repo, Date.now() - 1)).toBeNull();
+		const many = Array.from({ length: 60 }, () => "src/a.rs");
+		expect(filesChanged(many, repo, null, Date.now() + 5000)).toHaveLength(FILES_CHANGED_MAX);
+		expect(filesChanged(["src/a.rs"], repo, null, Date.now() + 5000)?.[0][0]).toBe(path.join(repo, "src", "a.rs"));
+	});
+
+	test("subpath is toplevel-relative, empty at the top, null outside", () => {
+		expect(subpathOf("/w/repo", "/w/repo/crates/x")).toBe("crates/x");
+		expect(subpathOf("/w/repo", "/w/repo")).toBe("");
+		expect(subpathOf("/w/repo", "/elsewhere")).toBeNull();
 	});
 });
 
@@ -237,7 +272,16 @@ function writeHook(id: string, mode: string, params: object): string {
 	return file;
 }
 
-type HostState = { entries: object[]; hooks: string[]; dirs?: string[]; approvals?: object[]; onApprove?: () => void };
+type HostState = {
+	entries: object[];
+	hooks: string[];
+	dirs?: string[];
+	visible?: string[];
+	approvals?: object[];
+	onApprove?: () => void;
+	/** Answers for `git rev-parse --show-toplevel --verify -q HEAD` and `git remote get-url origin`. */
+	git?: { top: string; head?: string; remote?: string };
+};
 
 /** The `messages` a `context` handler returned (throws when it changed nothing). */
 function contextMessages(r: unknown): unknown[] {
@@ -272,13 +316,18 @@ async function host(name: string, state: HostState) {
 		pi: { settings: {} as { custom?: string[] }, VERSION: "test" },
 		logger: { warn() {}, debug() {} },
 		async exec(cmd: string, argv: string[]) {
+			if (cmd === "git" && state.git) {
+				const g = state.git;
+				if (argv[0] === "rev-parse") return { stdout: g.head ? `${g.top}\n${g.head}\n` : `${g.top}\n`, stderr: "", code: g.head ? 0 : 1, killed: false };
+				if (argv[0] === "remote") return g.remote ? { stdout: `${g.remote}\n`, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "error: No such remote 'origin'", code: 2, killed: false };
+			}
 			if (cmd !== bin) return { stdout: "", stderr: "", code: 128, killed: false };
 			execs.push(argv);
 			switch (argv[0]) {
 				case "match":
 					return ok({ entries: state.entries, hooks: state.hooks });
 				case "skills":
-					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], off: false });
+					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], visible: state.visible ?? [], off: false });
 				case "library":
 					if (argv[1] === "approve") state.onApprove?.();
 					return ok({});
@@ -352,7 +401,7 @@ describe("factory", () => {
 		await h.fire("session_start");
 		const start = h.traceOf()[0];
 		expect(start.ev).toBe("session_start");
-		expect(start.loaded_entries).toEqual(["pkg"]);
+		expect(start.loaded_entries).toEqual([{ id: "pkg" }]);
 		expect(start.hooks_loaded).toEqual(["hook-retrieve"]);
 
 		const messages = [user("fix the ledger migration")];
@@ -425,6 +474,46 @@ describe("factory", () => {
 		expect(h.matches()).toEqual([process.cwd(), process.cwd(), tmp]);
 		await h.fire("context", { messages: [user("q")] });
 		expect(h.matches()).toHaveLength(3);
+	});
+
+	test("session_start carries identity and visible entries; session_shutdown the changed files", async () => {
+		const top = fs.mkdtempSync(path.join(tmp, "top-"));
+		const head = "a".repeat(40);
+		const h = await host("identity", {
+			entries: [{ id: "pkg", predicate_hit: true, version: 3, sha: "s3" }],
+			hooks: [],
+			visible: ["pkg", "kept"],
+			git: { top, head, remote: "git@github.com:Org/Repo.git" },
+		});
+		h.ctx.cwd = path.join(top, "crates", "x");
+		fs.mkdirSync(h.ctx.cwd, { recursive: true });
+		await h.fire("session_start");
+		const start = h.traceOf()[0];
+		expect(start).toMatchObject({
+			repo: top,
+			repo_remote: "git@github.com:Org/Repo.git",
+			subpath: "crates/x",
+			head_sha: head,
+			loaded_entries: [{ id: "pkg", version: 3, sha: "s3" }],
+			visible_entries: ["pkg", "kept"],
+		});
+		fs.writeFileSync(path.join(top, "crates", "x", "lib.rs"), "pub fn x() {}");
+		await h.fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: "lib.rs" }, content: [], isError: false });
+		await h.fire("tool_result", { toolName: "write", toolCallId: "w2", input: { path: "failed.rs" }, content: [], isError: true });
+		await h.fire("session_shutdown");
+		const end = h.traceOf().at(-1) ?? {};
+		expect(end.ev).toBe("session_shutdown");
+		expect((end.files_changed as [string, string][]).map(([p]) => p)).toEqual(["crates/x/lib.rs"]);
+	});
+
+	test("without origin or a repo the identity fields are null and fail open", async () => {
+		const top = fs.mkdtempSync(path.join(tmp, "unborn-"));
+		const h = await host("no-origin", { entries: [], hooks: [], git: { top } });
+		h.ctx.cwd = top;
+		await h.fire("session_start");
+		expect(h.traceOf()[0]).toMatchObject({ repo: top, repo_remote: null, subpath: "", head_sha: null, visible_entries: [] });
+		await h.fire("session_shutdown");
+		expect(h.traceOf().at(-1)?.files_changed).toBeUndefined();
 	});
 
 	test("the factory syncs the cwd and adds the shared skills dir to skills.customDirectories", async () => {

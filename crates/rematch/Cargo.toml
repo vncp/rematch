@@ -9,8 +9,15 @@ publish.workspace = true
 name = "rematch"
 path = "src/main.rs"
 
+[features]
+default = ["lake"]
+# The lake (ADR 001 L2): `rematch lake export|import|rebuild|doctor` with arrow/parquet.
+# Without it the binary builds without arrow and those commands report the missing feature.
+lake = ["dep:rematch-lake"]
+
 [dependencies]
 rematch-core = { path = "../rematch-core" }
+rematch-lake = { path = "../rematch-lake", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

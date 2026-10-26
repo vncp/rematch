@@ -488,6 +488,17 @@ pub fn responses_after(s: &ClaudeSession, after: UnixMs) -> Vec<Response> {
     out.into_iter().map(|(_, r)| r).filter(|r| r.t > after).collect()
 }
 
+/// Whether the user aborted the run (Esc) after `after` (ms): a user entry starting with
+/// [`INTERRUPT_MARKER`] later than it. Claude Code fires no hook on an abort; this entry is
+/// the only trace of one.
+pub fn aborted_after(s: &ClaudeSession, after: UnixMs) -> bool {
+    s.entries.iter().any(|e| {
+        e.get("type").and_then(Value::as_str) == Some("user")
+            && entry_ms(e).is_some_and(|t| t > after)
+            && content_text(e.pointer("/message/content")).trim_start().starts_with(INTERRUPT_MARKER)
+    })
+}
+
 /// The last `max_bytes` of a transcript, parsed (a cut first line is dropped). Live hooks
 /// read only the tail: transcripts reach hundreds of MB.
 pub fn read_session_tail(path: &Path, max_bytes: u64) -> Result<ClaudeSession> {
@@ -596,6 +607,7 @@ impl Synth {
 pub fn trace_records_of(s: &ClaudeSession) -> Vec<TraceRecord> {
     let start_t = s.entries.iter().find_map(entry_ms).unwrap_or(0);
     let repo = repo_of(Path::new(&s.cwd)).map(|p| p.to_string_lossy().into_owned());
+    let (repo_remote, subpath) = crate::identity::session_place(repo.as_deref(), &s.cwd);
     let model = s
         .entries
         .iter()
@@ -629,6 +641,10 @@ pub fn trace_records_of(s: &ClaudeSession) -> Vec<TraceRecord> {
         loaded_entries: Vec::new(),
         hooks_loaded: Vec::new(),
         staging_dirs: Vec::new(),
+        repo_remote,
+        subpath,
+        head_sha: None,
+        visible_entries: Vec::new(),
     });
 
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -732,7 +748,7 @@ pub fn trace_records_of(s: &ClaudeSession) -> Vec<TraceRecord> {
     w.agent_end(last_t, false);
     let reasons = flag_reasons(&w.out);
     let seq = w.seq();
-    w.out.push(TraceRecord::SessionShutdown { seq, t: last_t, flagged: !reasons.is_empty(), reasons });
+    w.out.push(TraceRecord::SessionShutdown { seq, t: last_t, flagged: !reasons.is_empty(), reasons, files_changed: Vec::new() });
     w.out
 }
 

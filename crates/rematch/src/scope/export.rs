@@ -406,9 +406,9 @@ pub fn cmd_import_export(ctx: &AppCtx, args: ImportExportArgs) -> Result<Value> 
             continue;
         }
         let branch = if branch_exists(ctx, &src.branch)? { src.branch.clone() } else { SHARED_BRANCH.to_string() };
-        let glob = derive(branch_anchor(ctx, &branch)?.as_deref(), &[], &[]).repo_glob;
+        let place = derive(branch_anchor(ctx, &branch)?.as_deref(), &[], &[]);
         let origin = Origin::Import { source: format!("export:{}", src.id) };
-        let (e, files, dropped) = super::transfer::copy_for(&src, &branch, glob, origin)?;
+        let (e, files, dropped) = super::transfer::copy_for(&src, &branch, place, origin)?;
         let branch_dir = ctx.paths.staging_branch(&branch);
         let lctx = LintContext {
             branch_other_bytes: branch_always_on_bytes(&branch_dir, &branch_dir.join(&e.name)),

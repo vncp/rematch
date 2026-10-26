@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use crate::ledger::{now_ms, EntryFilter, Ledger};
 use crate::package::{RematchBlock, SkillDoc};
 use crate::paths::RematchPaths;
-use crate::predicate::{matches_repo, predicate_hash};
-use crate::types::{Activation, Edit, Entry, EntryId, HookMode, Kind, Receipt, Status, UnixMs};
+use crate::ledger::sha256_hex;
+use crate::predicate::{matches_place, predicate_hash, Place};
+use crate::types::{Activation, Edit, Entry, EntryId, HookMode, Kind, Receipt, Sha256Hex, Status, UnixMs};
 
 pub const SHARED_BRANCH: &str = "shared";
 pub const REMATCH_JSON: &str = "rematch.json";
@@ -359,6 +360,45 @@ fn sync_files(e: &Entry) -> Result<()> {
     Ok(())
 }
 
+/// Content identity of an entry dir (ADR 001): sha256 of `{"files":[[path, sha256], …]}`
+/// over its files sorted by `/`-separated relative path, leaving out `rematch.json` (the
+/// ledger mirror), `EXPERIENCE.md` (the reflector's notes) and hidden files, with the
+/// `rematch:` frontmatter block (machine-local id, status, version) removed from the
+/// SKILL.md / AGENT.md bytes. Equal packages hash equal on every machine and status.
+pub fn content_sha256(dir: &Path) -> Result<Sha256Hex> {
+    let mut files: Vec<(String, Sha256Hex)> = Vec::new();
+    for p in files_under(dir)? {
+        let rel: Vec<String> = p
+            .strip_prefix(dir)
+            .unwrap_or(&p)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if rel.iter().any(|c| c.starts_with('.')) {
+            continue;
+        }
+        let rel = rel.join("/");
+        if rel == REMATCH_JSON || rel == crate::experience::EXPERIENCE_MD {
+            continue;
+        }
+        let bytes = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
+        let sha = if rel == SKILL_MD || rel == AGENT_MD {
+            match std::str::from_utf8(&bytes).ok().and_then(|t| SkillDoc::parse(t).ok()) {
+                Some(mut doc) => {
+                    doc.frontmatter.remove("rematch");
+                    sha256_hex(doc.render().as_bytes())
+                }
+                None => sha256_hex(&bytes),
+            }
+        } else {
+            sha256_hex(&bytes)
+        };
+        files.push((rel, sha));
+    }
+    files.sort();
+    Ok(sha256_hex(serde_json::json!({ "files": files }).to_string().as_bytes()))
+}
+
 fn persist(ledger: &Ledger, e: &Entry) -> Result<()> {
     sync_files(e)?;
     ledger.upsert_entry(e)
@@ -439,6 +479,7 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
         let hook = e.hook.as_ref().ok_or_else(|| anyhow!("hook entry {} has no hook rule", e.id))?;
         std::fs::write(dir.join("hook.json"), serde_json::to_string_pretty(hook)?)?;
     }
+    e.content_sha256 = Some(content_sha256(&dir)?);
     e.path = dir;
     e.updated_at = now;
     if e.created_at == 0 {
@@ -510,6 +551,9 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     }
     if matches!(to, Status::Retired | Status::Dormant | Status::Stale) {
         remove_hook(paths, &e.id)?;
+    }
+    if matches!(to, Status::Kept | Status::Pinned) {
+        e.content_sha256 = Some(content_sha256(&dst)?);
     }
     e.path = dst;
     e.status = to;
@@ -811,6 +855,15 @@ pub struct MatchedEntry {
     pub kind: Kind,
     pub status: Status,
     pub predicate_hit: bool,
+    #[serde(default = "one_version")]
+    pub version: u32,
+    /// The entry's `content_sha256` (the trace's versioned `loaded_entries`, ADR 001).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<Sha256Hex>,
+}
+
+fn one_version() -> u32 {
+    1
 }
 
 /// Payload of `match --cwd` (DESIGN §2).
@@ -830,15 +883,16 @@ pub fn hook_active(paths: &RematchPaths, e: &Entry) -> bool {
     e.kind != Kind::Hook || paths.hooks_dir().join(format!("{}.ts", e.id)).is_file()
 }
 
-/// A provisional, non-agent, active entry whose repo glob matches `place` (the repo, else
-/// the cwd): what a load-time match contributes.
-fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &str) -> bool {
-    e.status == Status::Provisional && e.kind != Kind::Agent && hook_active(paths, e) && matches_repo(&e.predicate, place)
+/// A provisional, non-agent, active entry whose predicate place matches `place`
+/// ([`matches_place`]: remote + subpath, else the repo glob): what a load-time match contributes.
+fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &Place) -> bool {
+    e.status == Status::Provisional && e.kind != Kind::Agent && hook_active(paths, e) && matches_place(&e.predicate, place)
 }
 
 /// Load-time match (DESIGN §6): a branch's staging dir is contributed when ≥ 1 of its
-/// provisional non-agent, active ([`hook_active`]) entries' repo globs matches the repo
-/// (else cwd). `entries` lists what will load — provisional entries of contributed
+/// provisional non-agent, active ([`hook_active`]) entries' predicates match the place
+/// ([`Place::locate`]: the repo's remote and the cwd's subpath, else the repo (else cwd)
+/// against the glob). `entries` lists what will load — provisional entries of contributed
 /// branches, every provisional agent (omp discovers them through the plugin root in
 /// every session) and every kept/pinned entry — with their glob hit (false for an
 /// unapproved hook, which must not count). `hooks` lists approved hook modules of
@@ -854,7 +908,7 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
     if out.off {
         return Ok(out);
     }
-    let place = repo.unwrap_or(cwd).to_string_lossy().to_string();
+    let place = Place::locate(repo, cwd);
     let provisional =
         ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
     let mut branches: Vec<&str> = provisional
@@ -877,13 +931,15 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         .concat();
     let loaded = provisional.iter().filter(|e| e.kind == Kind::Agent || branches.contains(&e.branch.as_str()));
     for e in loaded.chain(kept.iter()) {
-        let hit = matches_repo(&e.predicate, &place) && hook_active(paths, e);
+        let hit = matches_place(&e.predicate, &place) && hook_active(paths, e);
         out.entries.push(MatchedEntry {
             id: e.id.clone(),
             name: e.name.clone(),
             kind: e.kind,
             status: e.status,
             predicate_hit: hit,
+            version: e.version,
+            sha: e.content_sha256.clone(),
         });
         if hit && e.kind == Kind::Hook {
             out.hooks.push(paths.hooks_dir().join(format!("{}.ts", e.id)));
@@ -907,6 +963,10 @@ pub struct SkillsSync {
     pub links: BTreeMap<String, PathBuf>,
     /// Names in the directory that are not symlinks: never touched.
     pub untouched: Vec<String>,
+    /// Entry ids behind the links after the sync: what a harness scanning the dir now sees
+    /// (`session_start.visible_entries`).
+    #[serde(default)]
+    pub visible: Vec<EntryId>,
     pub off: bool,
 }
 
@@ -965,7 +1025,7 @@ pub fn relink(target: &Path, link: &Path) -> Result<()> {
 /// candidate already linked shadows the kept entry of its name until it is kept or retired.
 /// Only symlinks are touched; hidden names (another sync's temporary links) are skipped. While
 /// rematch is off every link is removed and `dirs` is empty.
-pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&Path>) -> Result<SkillsSync> {
+pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&Place>) -> Result<SkillsSync> {
     let dir = &paths.skills_shared;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let off = paths.is_off();
@@ -1004,8 +1064,7 @@ pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&
         }
     }
     if let Some(place) = place {
-        let place = place.to_string_lossy();
-        for e in live.iter().filter(|e| provisional_hit(paths, e, &place)) {
+        for e in live.iter().filter(|e| provisional_hit(paths, e, place)) {
             want.insert(e.name.clone(), e.path.clone());
         }
     }
@@ -1028,6 +1087,7 @@ pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&
         }
     }
     out.total = want.len();
+    out.visible = want.iter().filter_map(|(n, t)| holder(n, t)).map(|e| e.id.clone()).collect();
     out.links = want;
     if !off {
         out.dirs.push(dir.clone());
@@ -1280,6 +1340,30 @@ mod tests {
     }
 
     #[test]
+    fn content_sha256_is_set_at_stage_and_keep_and_ignores_status_and_mirror() {
+        let x = env();
+        let files = [w("SKILL.md", &skill("hashed")), w("units/a.md", "Unit.\n"), w("scripts/run.sh", "echo ok\n")];
+        let a = stage(&x.ledger, &x.paths, &entry("h1", "hashed", "repo", Status::Provisional), &files).unwrap();
+        let sha = a.content_sha256.clone().expect("set at stage");
+        assert_eq!(content_sha256(&a.path).unwrap(), sha);
+        assert_eq!(x.ledger.get_entry("h1").unwrap().unwrap().content_sha256.as_deref(), Some(sha.as_str()));
+        // Same files under another id, branch and status: the same content.
+        let b = stage(&x.ledger, &x.paths, &entry("h2", "hashed", "other", Status::Draft), &files).unwrap();
+        assert_eq!(b.content_sha256.as_deref(), Some(sha.as_str()), "the rematch: block and rematch.json are left out");
+        let kept = set_status(&x.ledger, &x.paths, "h1", Status::Kept, None).unwrap();
+        assert_eq!(kept.content_sha256.as_deref(), Some(sha.as_str()), "recomputed at keep, unchanged content");
+        std::fs::write(kept.path.join("units/a.md"), "Changed.\n").unwrap();
+        std::fs::write(kept.path.join(".DS_Store"), "x").unwrap();
+        let changed = content_sha256(&kept.path).unwrap();
+        assert_ne!(changed, sha, "a unit edit changes it");
+        std::fs::write(kept.path.join(crate::experience::EXPERIENCE_MD), "notes").unwrap();
+        assert_eq!(content_sha256(&kept.path).unwrap(), changed, "EXPERIENCE.md and hidden files are not content");
+        // The shared dir reports what it exposes.
+        let s = sync_shared_skills(&x.ledger, &x.paths, None).unwrap();
+        assert_eq!(s.visible, vec!["h1".to_string()]);
+    }
+
+    #[test]
     fn archive_moves_pin_disable_and_activation() {
         let x = env();
         stage(&x.ledger, &x.paths, &entry("d1", "draft-one", "repo", Status::Draft), &[]).unwrap();
@@ -1513,12 +1597,12 @@ mod tests {
         stage(&x.ledger, &x.paths, &b, &[w("SKILL.md", &skill("beta"))]).unwrap();
         assert_eq!(link("alpha"), None, "staging alone matched no cwd");
 
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
         assert_eq!((names(&s), s.dirs.clone()), ((vec!["alpha".into()], vec![], 1), vec![dir.clone()]));
         // union: another cwd adds its own and keeps alpha
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/other"))).unwrap();
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/other"))).unwrap();
         assert_eq!(names(&s), (vec!["beta".into()], vec![], 2));
-        assert!(!sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap().changed(), "idempotent");
+        assert!(!sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap().changed(), "idempotent");
         // a directory that is not a link is never touched
         std::fs::create_dir_all(dir.join("mine")).unwrap();
         assert_eq!(sync_shared_skills(&x.ledger, &x.paths, None).unwrap().untouched, vec!["mine".to_string()]);
@@ -1530,7 +1614,7 @@ mod tests {
         let mut a2 = entry("a2", "alpha", "repo2", Status::Provisional);
         a2.predicate.repo_glob = "/w/repo".into();
         stage(&x.ledger, &x.paths, &a2, &[w("SKILL.md", &skill("alpha"))]).unwrap();
-        sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
         assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")));
         sync_shared_skills(&x.ledger, &x.paths, None).unwrap();
         assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")), "a status-change sync keeps the candidate");
@@ -1542,7 +1626,7 @@ mod tests {
 
         // off: every link goes, the user's dir stays
         std::fs::write(&x.paths.off_marker, "").unwrap();
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(Path::new("/w/repo"))).unwrap();
+        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
         assert_eq!((names(&s), s.off, s.dirs.is_empty()), ((vec![], vec!["alpha".into()], 0), true, true));
         assert!(dir.join("mine").is_dir());
     }

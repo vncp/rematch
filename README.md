@@ -34,6 +34,38 @@
 - **See why.** `/rematch why`, `/rematch status`, `/rematch library`. Which entries were loaded for the last deliverable, what was staged, kept, retired, and the raw counts per entry.
 - **Correct it or stop it.** `/rematch mark correction|preference|scope` overrides the classifier for the last turn. `/rematch off`, `REMATCH=0`, `/rematch disable <id>`, `/rematch rollback <skill>`, `rematch uninstall` are immediate.
 
+## Harnesses
+
+The binary, the ledger, lint, the counters and the entries are the same for every harness; an adapter only forwards what its harness exposes ([`docs/DESIGN.md`](docs/DESIGN.md) §18). Session ids carry the harness (`cc:<uuid>`, `codex:<id>`; omp's are bare), so one ledger holds all of them. omp is the reference; Claude Code runs the loop live through a plugin of hooks ([`adapters/claude-code`](adapters/claude-code/README.md)); Codex is read after the fact ([`adapters/codex`](adapters/codex/README.md)).
+
+| Capability | omp | Claude Code | Codex |
+|---|---|---|---|
+| Trace: inputs, tool results, errors, turns, model | ✓ | ✓ (turns and model read from the transcript at `Stop`) | partial (after the fact, from `~/.codex/sessions` at import) |
+| Redirect pre-labels + `mark` | ✓ | ✓ (`/rematch:rematch-mark`) | partial (at import; `rematch mark --session codex:<id>`) |
+| Takeover (input while the agent runs) | ✓ | ✓ (a prompt delivered into the running turn; an Esc abort read from the transcript) | partial (at import: steers, prompts after an aborted turn) |
+| Flag + pending reflection | ✓ | ✓ (at `SessionEnd`, 1.5 s budget) | partial (`reflect --history`) |
+| Provisional skill loading | ✓ | ✓ (plugin `skills/` → the shared dir, synced at `SessionStart`) | partial (shared dir; `skills sync` by hand; visible in every session) |
+| Kept skill loading | ✓ | ✓ | ✓ |
+| Loaded entries for counting | ✓ | ✓ | partial (reconstructed at import from the rollout's skill list) |
+| Subagent entries | ✓ | ✓ (copied into the plugin's `agents/` at `SessionStart`) | — |
+| `block` hooks | ✓ | ✓ (`PreToolUse`, exit 2) | — |
+| `stuck` hooks | ✓ | partial (completed calls only; not in subagents) | — |
+| `retrieve` (unit retrieval) | ✓ (before every request) | partial (once per prompt, when the units change) | — |
+| `truncate` (tool-output truncation) | ✓ | — (no hook rewrites earlier tool results) | — |
+| Digest + one-tap approvals | ✓ | partial (digest at `SessionStart`; approve with `/rematch:rematch-approve <id>`, no dialog) | partial (`$rematch-status` skill) |
+| `/rematch` commands | ✓ (all, plus the `rematch` tool) | partial (status, why, mark, library, approve, decline, off, on; create/improve in a shell) | partial (`$rematch-status` skill) |
+| Reflection trigger (`reflect --pending`) | ✓ (spawned at session start) | ✓ (spawned detached at `SessionStart`; needs omp for the model calls) | — (`rematch reflect --history`) |
+| Batch mode (`run`) | ✓ | — | — (plan: DESIGN §18.2.4) |
+| History import | ✓ | ✓ | ✓ |
+
+Install, one line each (details in each adapter's README):
+
+- **omp:** `scripts/install.sh` (build, `omp plugin link extension/`, `~/.local/bin/rematch`).
+- **Claude Code:** `ln -s <repo>/adapters/claude-code ~/.claude/skills/rematch` (or `claude --plugin-dir <repo>/adapters/claude-code` for one session).
+- **Codex:** `ln -s ~/.rematch/skills ~/.agents/skills/rematch`, then `rematch skills sync --harness codex --cwd <repo>` before starting Codex.
+
+One directory, `~/.rematch/skills/`, delivers skills to all three harnesses: it links every kept entry and every provisional entry whose predicate matched a directory that was synced, so loading is the union of the repos you work in while counting stays with each session's own predicate ([`docs/MANUAL.md`](docs/MANUAL.md#where-skills-load-from), DESIGN §16 "Shared skills"). No model call ever runs inside a Claude Code or Codex session (Claude Code's reflection is a detached background process). Why each Claude Code gap cannot close: DESIGN §18.1 "What Claude Code cannot do".
+
 ## Thirty-second start
 
 From a checkout of this repo, with omp 18.12 and a Rust toolchain:
@@ -47,28 +79,6 @@ rematch doctor --text         # omp version, resolved editor/classifier roles, e
 Then use omp. The first proposal arrives after the first session that ends with a redirect.
 
 Optional, in `~/.omp/agent/config.yml`: `modelRoles.rematch-editor` for the strongest model you have and `modelRoles.rematch-classifier` for a fast one. Without them the editor falls back to `slow` → `default`, the classifier to `smol` → `tiny` → `default`.
-
-## One binary, any harness
-
-The binary, the ledger, lint, the counters and the entries are the same for every harness; an adapter only forwards what its harness exposes ([`docs/DESIGN.md`](docs/DESIGN.md) §18). Session ids carry the harness (`cc:<uuid>`, `codex:<id>`; omp's are bare), so one ledger holds all of them.
-
-| | omp | Claude Code ([`adapters/claude-code`](adapters/claude-code/README.md)) | Codex ([`adapters/codex`](adapters/codex/README.md)) |
-|---|---|---|---|
-| Install | `scripts/install.sh` (omp plugin link) | `claude --plugin-dir adapters/claude-code` for one session; `ln -s $PWD/adapters/claude-code ~/.claude/skills/rematch` for every session | `ln -s ~/.rematch/skills ~/.agents/skills/rematch` + optional `$rematch-status` skill (adapter README) |
-| Live trace | extension, every event | plugin hooks → `rematch trace-event`; turns recovered at `Stop` from the transcript | none: post-hoc from `~/.codex/sessions` rollouts |
-| Skills load from | the shared `~/.rematch/skills/`, added to `skills.customDirectories` per process | the shared `~/.rematch/skills/`, through the plugin's `skills/` link | the shared `~/.rematch/skills/`, through `~/.agents/skills/rematch`; no per-session gating |
-| Shared dir synced for a cwd by | the extension at omp start (`skills sync`) | the `SessionStart` hook (`reloadSkills` when a link changed) | `rematch skills sync --harness codex --cwd <repo>` before Codex starts |
-| Kept entries | `~/.omp/agent/skills/<name>/`, also linked in the shared dir (one skill by realpath) | linked in the shared dir | linked in the shared dir |
-| `block` / `stuck` hooks | yes | yes: `PreToolUse` → `rematch hook-check`, exit 2 | no |
-| `retrieve` hook | before every request | once per prompt, when the unit set changes (`additionalContext`) | no |
-| `truncate` hook | yes | no (no hook rewrites earlier tool results) | no |
-| Loaded entries for counting | live | live (`session_start`) | reconstructed at import from the skill list in the rollout; clean sessions' traces written at import |
-| History import | `import --history --harness omp` | `--harness claude-code` (`~/.claude/projects`) | `--harness codex`; reviewer/subagent threads imported, never reflected |
-| Reflection | spawned at session start | `rematch reflect --pending` from a shell | `rematch reflect --history` from a shell |
-| Commands | `/rematch …`, the `rematch` tool | `/rematch:rematch-status`, `/rematch:rematch-why`, `/rematch:rematch-mark` | `$rematch-status` skill |
-| Batch mode | yes | not wired | not wired (plan in DESIGN §18.2.4) |
-
-One directory, `~/.rematch/skills/`, delivers skills to all three harnesses: it links every kept entry and every provisional entry whose predicate matched a directory that was synced, so loading is the union of the repos you work in while counting stays with each session's own predicate ([`docs/MANUAL.md`](docs/MANUAL.md#where-skills-load-from), DESIGN §16 "Shared skills"). No model call ever runs inside a Claude Code or Codex session; what Claude Code cannot do that omp can is listed in DESIGN §18.1.
 
 ## How it works
 
@@ -94,8 +104,8 @@ The loop design, the scoped editors, the preference for skills and scripts over 
 ## Contents
 
 - [What you can do with it](#what-you-can-do-with-it)
+- [Harnesses](#harnesses)
 - [Thirty-second start](#thirty-second-start)
-- [One binary, any harness](#one-binary-any-harness)
 - [How it works](#how-it-works)
 - [In one minute](#in-one-minute)
 - [Highlights](#highlights)
@@ -193,7 +203,7 @@ Keep at `matched ≥ 4 · recurrence 0 · harm 0`. Four matched sessions with no
 
 ## Create and improve
 
-**Greenfield.** `rematch create <name> --from sessions` searches the ledger (imported history plus traces) for sessions whose features match the request; with three or more, the skill is distilled from what worked and what was redirected. `--from task --task <id>` runs the task once in batch mode (one rollout, no candidates) to obtain a trace; this is the only create that costs a rollout. `--from description` stages a `draft`; `activate <name> --task <id>` or `--unverified` makes it `provisional`. The result is a skill package: a router `SKILL.md` with the trigger line and the checkable laws, `units/` for procedures and pitfalls, `facts/` for measured values with `as_of`, `scripts/` for anything deterministic. Below about 8 KB the package collapses to one file.
+**Greenfield.** `rematch create <name> --from sessions` searches the ledger (imported history plus traces; every machine's sessions through the lake when there is one) for sessions whose features match the request; with three or more, the skill is distilled from what worked and what was redirected. `--from task --task <id>` runs the task once in batch mode (one rollout, no candidates) to obtain a trace; this is the only create that costs a rollout. `--from description` stages a `draft`; `activate <name> --task <id>` or `--unverified` makes it `provisional`. The result is a skill package: a router `SKILL.md` with the trigger line and the checkable laws, `units/` for procedures and pitfalls, `facts/` for measured values with `as_of`, `scripts/` for anything deterministic. Below about 8 KB the package collapses to one file.
 
 **Brownfield.** `rematch improve <skill>` registers the existing skill as a `provisional` entry in place (the file is never moved), audits the sessions that read it and the redirects and errors that happened with it in context, and proposes unit-level edits from the clustered redirects. A skill over 8 KB is split first, mechanically and with no model: router, `units/` by heading, `facts/`, long tables and rejected-hypothesis lists into a ledger-notes unit. The new version is a sibling beside the old one; omp shows the sibling under the bare name and the original under its namespaced name until the counters decide. A `pinned` skill is never replaced.
 
@@ -241,7 +251,7 @@ Every entry records the model family it was created under and keeps a per-family
 
 ## History as a backend
 
-The ledger answers today's questions in milliseconds; it cannot answer *what did the library look like when that session ran*, nor combine two machines, nor index years of sessions. [ADR 001](docs/adr/001-lake.md) adds both without touching the hot path: every ledger write is journaled with the ledger's own clock, the journal is exported to Parquet (one [Bellwether](https://github.com/vncp/bellwether) root per table, files written once), and Bellwether's keys answer the historical questions the loop actually asks — `asof --valid --known` on `entries` for status-at-the-time without lookahead, `exact:signature` and `list:facets` on `outcomes` for the spec's three lookups, `expr:tool_cmd` on `events` for "which sessions ran this command". Only keys a current reader needs are declared; the ADR lists every other kind with the question that would justify it. Status: designed and reviewed; L1–L2 (journal, export, import, rebuild) next, L3–L4 (index, query, `rematch report`) after.
+The ledger answers today's questions in milliseconds; it cannot answer *what did the library look like when that session ran*, nor combine two machines, nor index years of sessions. [ADR 001](docs/adr/001-lake.md) adds both without touching the hot path: every ledger write is journaled with the ledger's own clock, the journal is exported to Parquet (one [Bellwether](https://github.com/vncp/bellwether) root per table, files written once), and Bellwether's keys answer the historical questions the loop actually asks — `asof --valid --known` on `entries` for status-at-the-time without lookahead, `exact:signature` and `list:facets` on `outcomes` for the spec's three lookups, `expr:tool_cmd` on `events` for "which sessions ran this command". Only keys a current reader needs are declared; the ADR lists every other kind with the question that would justify it. Status: L1–L4 built (journal, export, import, rebuild, index, query, the switched readers and `rematch report`); see Status below.
 
 ## Architecture
 
@@ -255,11 +265,13 @@ The ledger answers today's questions in milliseconds; it cannot answer *what did
 | Unit | What it holds | Rule |
 |---|---|---|
 | `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, approved hook modules (`block` and `stuck` on `tool_call`, `truncate` and `retrieve` on `context`; the modules are data, the modes live here), the `rematch` tool and `/rematch` command, the digest; `agents/` (made by `install.sh`, gitignored): a link to `~/.rematch/agents/`, through which omp discovers provisional subagents | forwards raw events; parses nothing beyond the hook-module contract; no model calls; every handler fails open except `block`/`stuck` hooks |
+| `adapters/` | `claude-code/`: a Claude Code plugin (`hooks/hooks.json` → `scripts/hook.sh`, eight `/rematch:rematch-*` commands; `skills/` → the shared skills dir and `agents/` copies, both made at `SessionStart` and gitignored); `codex/`: the `$rematch-status` skill and setup notes | forward hook payloads unchanged to `rematch trace-event` / `hook-check` (schema, matching, digest and hook verdicts stay in Rust); never fail a hook except by an intentional block; no model call inside the session (Claude Code starts `reflect --pending` detached) |
 | `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 135 unit tests + 1 golden import test |
 | `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, `skills sync` (the shared skills dir), doctor, uninstall, `retrieve`, built-in entries, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 60 unit + 43 end-to-end tests (239 cargo tests in all, plus 24 extension tests under `bun test`) |
 | `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
 | `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `skills/` (the shared skill links every harness loads), `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
-| `~/.rematch/lake/` (ADR 001, planned) | the journal exported to Parquet, one Bellwether root per table; `lake-index/` per machine | history as a backend: `report`, `why --asof`, cross-machine `transfer`/`shared`; never on the in-session path |
+| `crates/rematch-lake` (cargo feature `lake`, default on) | the Parquet side of the lake: per-table Arrow schemas, the journal and trace writers, `export`/`import`/`rebuild`/`doctor`, `index`/`query` over an external Bellwether binary (arrow/parquet 59.3) | read only by historical commands (`rematch lake …`, `report`, the readers of DESIGN §19.3); `cargo build --no-default-features` drops it and arrow with it |
+| `~/.rematch/lake/` (ADR 001, L1–L4) | the journal exported to Parquet, one Bellwether root per table, plus one events file per closed session; `lake-index/` per machine | history as a backend: `report`, `why --asof`, cross-machine `transfer`/`shared`; never on the in-session path |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
 
@@ -281,6 +293,12 @@ What was run live against omp 18.12.6 before this README was written: the full i
 ## Status
 
 Built: the interactive loop (Phase 1), create and improve with the mechanical split and the forge import (Phase 1.5), batch mode with worktree isolation and the next-run keep rule, context-hook unit retrieval, and tool-output truncation and stuck detection as entries under the same counters (three built-in hook entries that wait for your approval; Phase 2), team and fork shipping, work-to-home export, stale on drift, split per family, transfer suggestions and `shared` promotion (Phase 3), and omp profile resolution (`OMP_PROFILE` / `PI_PROFILE` / `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, multi-profile history import with `--skip-profile` and `policy.json` `skip_profiles`).
+
+Harnesses: omp is the reference. Claude Code runs the loop live through `adapters/claude-code` (see [Harnesses](#harnesses)); checked with `claude -p --model haiku` (Claude Code 2.1.285) against a temporary root: `session_start`, `input`, `tool_result` (a failing `Bash` call as `is_error`), `turn_end` with the model, `agent_end` and `session_shutdown` traced; a negation in a resumed session pre-labelled, flagged and counted once, whole; `reflect --pending` started detached by the next `SessionStart` (it counted the session and attempted the editor, which the temporary root had no model role for); a prompt queued while a `Bash` call ran traced as `interrupt`; the digest with approval commands delivered at `SessionStart`; a provisional agent copied and listed by `claude plugin details`, then counted in the next session. Not yet observed live: the digest's display in an interactive session, an Esc abort (covered by an end-to-end test on the transcript format), and a Claude Code session reflected by a real editor model. Codex is post-hoc only.
+
+Lake (ADR 001), L1–L4 built. L1: every ledger write is journaled with the ledger's own clock; entries carry `content_sha256`, sessions and predicates `repo_remote` + `subpath`, traces versioned `loaded_entries`. L2: `rematch lake export` writes the journal and every closed session's trace to Parquet under `~/.rematch/lake/` (per-run files, never rewritten, byte-identical for the same journal; also at the end of every `reflect --pending`), `lake import` merges a second machine's lake, `lake rebuild` reproduces the ledger (`library ls` and counters exactly) on a fresh root, `lake doctor` reports watermarks, lag and stray files. L3: `rematch lake index` builds one Bellwether index per table under `~/.rematch/lake-index/` with the ADR 001 key table (all 14 specs accepted by bellwether 0.1.0; the append-table path template uses `{run_seq:int}` because Bellwether refuses a `{seq}` placeholder that disagrees with the stored per-row `seq`), pins the Bellwether version in `lake/manifest.json` (`--repin` to rebuild under another), and `rematch lake query <table> --key … --values …` plans through `locate|latest|asof`, evaluates the returned residual (in, between, not_older_than, latest_per_key, expr_in, contains_any/all; any other kind refused by name) and returns rows as JSON — with no binary or no index it scans every file and says `indexed: false` with the same rows. Details: DESIGN §19.2. L4: `reflect --history` and `improve` read a session's records from its events file, `create --from sessions` and `transfer suggest` read every machine's `sessions` and `outcomes`, `library why <session> --asof <ts>` shows each loaded entry's status and each redirect's class as they stood then, each naming its source (`lake` or `ledger`, the ledger while the lake lags it); `rematch report` computes the kill criterion — entries kept over ≥ 4 matched sessions, recurrence per trigger on sessions with an entry of it loaded against sessions without, and the verdict line — from the lake alone, or from the ledger's journal without one (DESIGN §19.3).
+
+The lake is verified by the test suite on temporary roots: two exports byte-identical, a second machine's lake imported, rebuild reproducing `library ls`, `why --asof` returning the status before a transition, and lake and ledger agreeing for every switched reader and for `report`. It has not yet been run against this machine's real `~/.rematch` history, indexed with Bellwether over it, or combined with a second real machine's lake.
 
 Not yet earned:
 

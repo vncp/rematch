@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::app::AppCtx;
 use crate::editor::CallBudget;
+use crate::lake_read::{self, Lookup, Source};
 use crate::reflect::{self, CandidateSpec, Proposed};
 
 pub const MIN_REFERENCE_SESSIONS: usize = 3;
@@ -109,11 +110,17 @@ pub fn cmd_create(ctx: &AppCtx, a: CreateArgs) -> Result<Value> {
     }
 }
 
-/// Ledger sessions whose stems/exts overlap the request, best first.
-pub fn matching_sessions(ctx: &AppCtx, req_stems: &[String], req_exts: &[String]) -> Result<Vec<(SessionRecord, usize, f64)>> {
+/// Matching sessions with their overlap and stem jaccard, best first.
+pub type Scored = Vec<(SessionRecord, usize, f64)>;
+
+/// Sessions whose stems/exts overlap the request, best first, and where they came from:
+/// the lake's `sessions` (`list:stems` / `list:exts` contains_any, every machine's history)
+/// when the lake holds this ledger's whole journal, else the ledger.
+pub fn matching_sessions(ctx: &AppCtx, req_stems: &[String], req_exts: &[String]) -> Result<(Scored, Source)> {
+    let (candidates, src) = candidate_sessions(ctx, req_stems, req_exts)?;
     let mut scored = Vec::new();
     let need = req_stems.len().clamp(1, 2);
-    for s in ctx.ledger.list_sessions(&SessionFilter::default())? {
+    for s in candidates {
         let overlap = req_stems.iter().filter(|x| s.stems.contains(x)).count()
             + req_exts.iter().filter(|x| s.exts.contains(x)).count();
         if overlap < need {
@@ -123,17 +130,41 @@ pub fn matching_sessions(ctx: &AppCtx, req_stems: &[String], req_exts: &[String]
         scored.push((s, overlap, j));
     }
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
-    Ok(scored)
+    Ok((scored, src))
+}
+
+/// Every session that shares a stem or an extension with the request, in `started_at` order.
+fn candidate_sessions(ctx: &AppCtx, stems: &[String], exts: &[String]) -> Result<(Vec<SessionRecord>, Source)> {
+    if lake_read::current_lake(ctx).is_some() {
+        match lake_sessions(ctx, stems, exts) {
+            Ok(v) => return Ok((v, Source::Lake)),
+            Err(e) => eprintln!("rematch create: lake sessions unreadable, reading the ledger: {e:#}"),
+        }
+    }
+    Ok((ctx.ledger.list_sessions(&SessionFilter::default())?, Source::Ledger))
+}
+
+fn lake_sessions(ctx: &AppCtx, stems: &[String], exts: &[String]) -> Result<Vec<SessionRecord>> {
+    let mut rows = Vec::new();
+    for (key, values) in [("list:stems", stems), ("list:exts", exts)] {
+        if !values.is_empty() {
+            rows.extend(lake_read::lake_rows(ctx, "sessions", Some(&Lookup { key, values: values.to_vec(), window: None }))?);
+        }
+    }
+    let mut out: Vec<(String, SessionRecord)> = lake_read::as_of(rows, i64::MAX)
+        .into_iter()
+        .filter_map(|r| serde_json::from_value(r.json).ok().map(|s| (r.machine, s)))
+        .collect();
+    out.sort_by(|(ma, a), (mb, b)| (a.started_at, ma, &a.id).cmp(&(b.started_at, mb, &b.id)));
+    Ok(out.into_iter().map(|(_, s)| s).collect())
 }
 
 fn reference_of(ctx: &AppCtx, s: &SessionRecord) -> Value {
     let trace = ctx.paths.traces.join(format!("{}.jsonl", s.id));
-    let excerpt = if trace.is_file() {
-        let recs = trace::read_trace(&trace).unwrap_or_default();
-        trace::find_moment(s).map(|m| trace::excerpt_around(&recs, m.seq, 5, 5)).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let records = lake_read::lake_events(ctx, s).or_else(|| trace.is_file().then(|| trace::read_trace(&trace).unwrap_or_default()));
+    let excerpt = records
+        .and_then(|recs| trace::find_moment(s).map(|m| trace::excerpt_around(&recs, m.seq, 5, 5)))
+        .unwrap_or_default();
     json!({
         "session_id": s.id,
         "source": s.source,
@@ -190,11 +221,12 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let req = stems_of_text(&request_text(a));
     let files = read_files(&a.files)?;
     let req_exts = rematch_core::features::exts_of(&a.files.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>());
-    let matches = matching_sessions(ctx, &req, &req_exts)?;
+    let (matches, source) = matching_sessions(ctx, &req, &req_exts)?;
     if matches.len() < MIN_REFERENCE_SESSIONS {
         bail!(
-            "found {} matching session(s); {MIN_REFERENCE_SESSIONS} are needed to distill from sessions (try --from task --task <id>, or --from description for a draft)",
-            matches.len()
+            "found {} matching session(s) in the {}; {MIN_REFERENCE_SESSIONS} are needed to distill from sessions (try --from task --task <id>, or --from description for a draft)",
+            matches.len(),
+            source.name()
         );
     }
     let refs: Vec<&SessionRecord> = matches.iter().take(MAX_REFERENCE_SESSIONS).map(|(s, _, _)| s).collect();
@@ -263,6 +295,7 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     };
     let mut out = stage_result(ctx, p, Some(&best.id), &pred, true)?;
     out["references"] = json!(refs.iter().map(|s| &s.id).collect::<Vec<_>>());
+    out["source"] = json!(source);
     out["model_calls"] = json!(budget.used);
     Ok(out)
 }
@@ -389,4 +422,50 @@ pub fn cmd_activate(ctx: &AppCtx, a: ActivateArgs) -> Result<Value> {
     }
     let how = if a.unverified { "unverified (risk accepted)" } else { "after one reference run" };
     Ok(json!({"entry": e, "lines": [format!("activated {} as provisional {how}", e.name)]}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::testutil::{env, session};
+
+    fn ids(m: &Scored) -> Vec<(String, usize)> {
+        m.iter().map(|(s, n, _)| (s.id.clone(), *n)).collect()
+    }
+
+    /// The reference search over the lake's `sessions` finds the same sessions, in the same
+    /// order, as over the ledger; a ledger write the lake has not seen sends it back.
+    #[test]
+    fn reference_search_agrees_on_the_ledger_and_the_lake() {
+        let t = env();
+        let ctx = &t.ctx;
+        let mk = |id: &str, at: i64, exts: &[&str], stems: &[&str]| {
+            let mut s = session(id, "payments", Some("/w/payments"), "anthropic/claude-opus", at);
+            s.exts = exts.iter().map(|x| x.to_string()).collect();
+            s.stems = stems.iter().map(|x| x.to_string()).collect();
+            ctx.ledger.upsert_session(&s).unwrap();
+        };
+        mk("s-both", 1_000, &["rs"], &["ledger", "migrat"]);
+        mk("s-stems", 2_000, &["py"], &["ledger", "migrat", "test"]);
+        mk("s-one", 3_000, &["rs"], &["ledger", "round"]);
+        mk("s-ext", 4_000, &["rs"], &["docs"]);
+        mk("s-none", 5_000, &["md"], &["readme"]);
+        let (stems, exts) = (vec!["ledger".to_string(), "migrat".to_string()], vec!["rs".to_string()]);
+        let (ledger, src) = matching_sessions(ctx, &stems, &exts).unwrap();
+        assert_eq!(src, Source::Ledger);
+        let want = vec![("s-both".to_string(), 3), ("s-stems".to_string(), 2), ("s-one".to_string(), 2)];
+        assert_eq!(ids(&ledger), want);
+
+        #[cfg(feature = "lake")]
+        {
+            lake_read::export_all(ctx);
+            let (lake, src) = matching_sessions(ctx, &stems, &exts).unwrap();
+            assert_eq!((ids(&lake), src), (want, Source::Lake));
+            let refs = |m: &Scored| m.iter().map(|(s, _, _)| reference_of(ctx, s)).collect::<Vec<_>>();
+            assert_eq!(refs(&lake), refs(&ledger));
+            mk("s-late", 6_000, &["rs"], &["ledger", "migrat"]);
+            let (late, src) = matching_sessions(ctx, &stems, &exts).unwrap();
+            assert_eq!((late.len(), src), (4, Source::Ledger), "the lake lags the ledger: read the ledger");
+        }
+    }
 }

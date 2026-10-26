@@ -29,7 +29,7 @@ use rematch_core::ledger::{enum_str, sha256_hex, EntryFilter, SessionFilter};
 use rematch_core::library::{load_entry, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
 use rematch_core::lint::{lint_entry, LintContext};
 use rematch_core::package::{RematchBlock, SkillDoc};
-use rematch_core::predicate::{count_hit, count_match, predicate_hash};
+use rematch_core::predicate::{count_hit, count_match, predicate_hash, Place};
 use rematch_core::{Activation, Counters, Entry, Family, FamilyCounters, Kind, Receipt, Status};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -486,8 +486,7 @@ pub fn before_numbers(ctx: &AppCtx, e: &Entry) -> Result<Numbers> {
         if s.started_at >= e.created_at {
             continue;
         }
-        let place = s.repo.clone().unwrap_or_else(|| s.cwd.clone());
-        if !count_match(&e.predicate, &place, &s.exts, &s.stems) {
+        if !count_match(&e.predicate, &Place::of_session(&s), &s.exts, &s.stems) {
             continue;
         }
         let fam = s.family.clone().unwrap_or_else(|| Family(rematch_core::counters::UNKNOWN_FAMILY.into()));

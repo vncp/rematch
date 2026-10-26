@@ -48,6 +48,8 @@ fn run_hook(env: &Env, op: &str, stdin: &str, extra_env: &[(&str, &str)]) -> Out
         .env("REMATCH_MACHINE", "test-host")
         .env("REMATCH_BIN", BIN)
         .env("CLAUDE_PLUGIN_ROOT", plugin_root(env))
+        // No omp: SessionStart starts no reflection (`reflect_runs_detached_at_session_start`).
+        .env("OMP_BIN", env.home.join("no-omp"))
         .env_remove("REMATCH")
         .env_remove("CLAUDE_CONFIG_DIR")
         .current_dir(&env.repo)
@@ -82,7 +84,11 @@ fn event(env: &Env, name: &str, fields: Value) -> Out {
         "permission_mode": "default",
     });
     p.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
-    let op = if name == "PreToolUse" { "hook-check" } else { "trace-event" };
+    let op = match name {
+        "PreToolUse" => "hook-check",
+        "SessionStart" => "session-start",
+        _ => "trace-event",
+    };
     let out = run_hook(env, op, &p.to_string(), &[]);
     assert!(out.code == 0 || (op == "hook-check" && out.code == 2), "hook exit {}", out.code);
     out
@@ -114,6 +120,11 @@ fn trace_of(env: &Env, sid: &str) -> Vec<Value> {
     std::fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
+fn sha2_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(b))
+}
+
 fn evs(recs: &[Value]) -> Vec<String> {
     recs.iter().map(|r| r["ev"].as_str().unwrap().to_string()).collect()
 }
@@ -141,9 +152,23 @@ fn hooks_trace_flag_reflect_and_link() {
     std::os::unix::fs::symlink(&legacy, &link).unwrap();
 
     // SessionStart: the relay re-points the plugin's skills/ to the shared dir, removes the
-    // legacy dir and asks for a re-scan.
+    // legacy dir and asks for a re-scan; the digest names what was staged and the approvals
+    // waiting (the three built-in hooks), each with the command that grants it.
     let o = event(&env, "SessionStart", json!({"source":"startup","model":"claude-opus-5-5"}));
-    assert_eq!(o.json(), json!({"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":true}}));
+    let reply = o.json();
+    assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    assert_eq!(reply["hookSpecificOutput"]["reloadSkills"], true);
+    let stuck = env.run(&["builtins", "ls"])["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shown = reply["systemMessage"].as_str().unwrap();
+    assert!(shown.starts_with("rematch digest\n- staged hook context-unit-retrieval in shared"), "{shown}");
+    assert!(shown.contains(&format!("- hook stuck-detector: /rematch:rematch-approve {stuck} · /rematch:rematch-decline {stuck}")), "{shown}");
+    assert!(shown.contains("`rematch library approve|decline <id>` in a shell"), "{shown}");
+    let context = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(context.contains(shown) && context.contains("never run `rematch library approve`"), "{context}");
+    assert!(context.contains(&format!("<approval id=\"{stuck}\" kind=\"hook\" name=\"stuck-detector\">")), "the diff for Claude: {context}");
     assert_eq!(std::fs::read_link(&link).unwrap(), env.root.join("skills"));
     assert!(!legacy.exists());
 
@@ -179,6 +204,7 @@ fn hooks_trace_flag_reflect_and_link() {
     );
     assistant(&env, 6, "msg_3", "Tests pass now; committed after running them.", "end_turn");
     event(&env, "Stop", json!({"stop_hook_active":false,"last_assistant_message":"Tests pass now; committed after running them."}));
+    std::fs::write(&file, "pub fn reconcile() { todo!() }").unwrap();
     let o = event(&env, "SessionEnd", json!({"reason":"prompt_input_exit"}));
     assert!(o.stdout.trim().is_empty());
 
@@ -202,6 +228,9 @@ fn hooks_trace_flag_reflect_and_link() {
     assert_eq!(s0["model"], json!({"provider":"anthropic","id":"claude-opus-5-5"}));
     assert_eq!(s0["mode"], "claude-code:startup");
     assert_eq!(s0["loaded_entries"], json!([]));
+    // Identity (ADR 001): the fake repo has no remote, so a local identity; cwd is the toplevel.
+    assert!(s0["repo_remote"].as_str().unwrap().starts_with("local:"), "{s0}");
+    assert_eq!(s0["subpath"], "");
     assert_eq!((recs[1]["prelabel"].as_str(), recs[1]["idle"].as_bool()), (Some("none"), Some(true)));
     assert_eq!((recs[2]["tool"].as_str(), recs[2]["path"].as_str()), (Some("read"), Some(file.as_str())));
     assert_eq!(recs[2]["content_head"], "pub fn reconcile() {}");
@@ -218,6 +247,8 @@ fn hooks_trace_flag_reflect_and_link() {
     let shutdown = recs.last().unwrap();
     assert_eq!(shutdown["flagged"], true);
     assert_eq!(shutdown["reasons"], json!(["tool_error_cluster", "redirect:negation"]));
+    let edited = sha2_hex(b"pub fn reconcile() { todo!() }");
+    assert_eq!(shutdown["files_changed"], json!([["src/ledger.rs", edited]]), "the Edit's file, repo-relative");
 
     // The pending flag.
     let sid = format!("cc:{UUID}");
@@ -246,13 +277,22 @@ fn hooks_trace_flag_reflect_and_link() {
     let again = env.run(&["skills", "sync", "--harness", "claude-code", "--cwd", &repo]);
     assert_eq!((again["added"].clone(), again["pruned"].clone()), (json!([]), json!([])), "idempotent");
 
-    // The next session in the repo loads it (and needs no re-scan: the links did not change).
+    // The next session in the repo loads it (and needs no re-scan: the links did not change);
+    // its digest names the new skill, once.
     let next = "6e1d9b9f-2222-4d4d-9999-0123456789ab";
     let p = json!({"session_id":next,"transcript_path":"","cwd":repo,"hook_event_name":"SessionStart","source":"startup"});
-    let o = run_hook(&env, "trace-event", &p.to_string(), &[]);
-    assert_eq!((o.code, o.stdout.trim()), (0, ""));
+    let o = run_hook(&env, "session-start", &p.to_string(), &[]);
+    assert_eq!(o.code, 0);
+    let reply = o.json();
+    assert!(reply["hookSpecificOutput"].get("reloadSkills").is_none(), "{reply}");
+    let shown = reply["systemMessage"].as_str().unwrap();
+    assert!(shown.contains("- staged skill run-tests-before-commit in payments") && !shown.contains("staged hook"), "{shown}");
     let s = trace_of(&env, &format!("cc:{next}"));
-    assert_eq!(s[0]["loaded_entries"], json!([id]));
+    let mirror: Value = serde_json::from_str(&std::fs::read_to_string(staged.join("rematch.json")).unwrap()).unwrap();
+    let sha = mirror["content_sha256"].clone();
+    assert!(sha.is_string(), "content_sha256 set at stage: {sha}");
+    assert_eq!(s[0]["loaded_entries"], json!([{"id": id, "version": 1, "sha": sha}]), "versioned loaded_entries");
+    assert_eq!(s[0]["visible_entries"], json!([id]), "the shared dir links it");
     assert_eq!(s[0]["staging_dirs"], json!([env.root.join("skills")]));
 
     // Elsewhere nothing matches: the link stays (union: a session in the repo may use it), and
@@ -261,8 +301,10 @@ fn hooks_trace_flag_reflect_and_link() {
     std::fs::create_dir_all(&other).unwrap();
     let elsewhere = "7f2e0c0a-3333-4e4e-aaaa-0123456789ab";
     let p = json!({"session_id":elsewhere,"cwd":other,"hook_event_name":"SessionStart","source":"startup"});
-    let o = run_hook(&env, "trace-event", &p.to_string(), &[]);
-    assert_eq!((o.code, o.stdout.trim()), (0, ""));
+    let o = run_hook(&env, "session-start", &p.to_string(), &[]);
+    assert_eq!(o.code, 0);
+    assert!(o.json()["hookSpecificOutput"].get("reloadSkills").is_none());
+    assert!(!o.json()["systemMessage"].as_str().unwrap().contains("staged"), "nothing new since the last digest, approvals still wait");
     assert_eq!(std::fs::read_link(&linked).unwrap(), staged);
     assert_eq!(trace_of(&env, &format!("cc:{elsewhere}"))[0]["loaded_entries"], json!([]));
 
@@ -281,7 +323,7 @@ fn approved_stuck_hook_blocks_the_repeat() {
     event(&env, "SessionStart", json!({"source":"startup"}));
     let s0 = &trace(&env)[0];
     assert_eq!(s0["hooks_loaded"], json!([stuck]));
-    assert!(s0["loaded_entries"].as_array().unwrap().contains(&json!(stuck)));
+    assert!(s0["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(stuck)));
     event(&env, "UserPromptSubmit", json!({"prompt":"make the payments tests pass"}));
     // Claude Code sends PreToolUse and PostToolUse(Failure) the same tool_input.
     let pre = json!({"tool_name":"Bash","tool_input":{"command":"cargo test -p payments","description":"Run tests"},"tool_use_id":"toolu_x"});
@@ -338,7 +380,7 @@ fn approved_retrieve_hook_adds_context_once() {
 
     event(&env, "SessionStart", json!({"source":"startup"}));
     let s0 = &trace(&env)[0];
-    assert!(!s0["loaded_entries"].as_array().unwrap().contains(&json!(hook)), "a retrieve hook credits through retrieval records");
+    assert!(!s0["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(hook)), "a retrieve hook credits through retrieval records");
     // A request that shares stems with the unit but not with the package's trigger line
     // (committing changes to a Rust crate) gets nothing: units are gated by the trigger.
     let off = event(&env, "UserPromptSubmit", json!({"prompt":"fix the ledger reconciliation migration in src/ledger.rs"}));
@@ -382,4 +424,124 @@ fn never_fails_a_hook_and_honors_the_kill_switch() {
     event(&env, "SessionStart", json!({"source":"startup"}));
     event(&env, "UserPromptSubmit", json!({"prompt":"hello"}));
     assert!(trace(&env).is_empty(), "off: nothing is traced");
+}
+
+/// Appends a typed user entry to the transcript, stamped now.
+fn user_entry(env: &Env, text: &str) {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let e = json!({"type":"user","timestamp":ts,"sessionId":UUID,"cwd":env.repo,"isSidechain":false,"version":"2.1.285",
+        "message":{"role":"user","content":[{"type":"text","text":text}]}});
+    let p = transcript(env);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut body = std::fs::read_to_string(&p).unwrap_or_default();
+    body.push_str(&format!("{e}\n"));
+    std::fs::write(&p, body).unwrap();
+}
+
+#[test]
+fn takeover_is_a_prompt_while_the_run_is_open() {
+    let env = Env::new();
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(5));
+    event(&env, "SessionStart", json!({"source":"startup"}));
+    event(&env, "UserPromptSubmit", json!({"prompt":"Add the ledger reconciliation command to the payments crate"}));
+    // Esc fires no hook, but the transcript records the abort: the agent loop had ended, so the
+    // next prompt is no takeover (omp: `agent_end` fired before it).
+    pause();
+    user_entry(&env, "[Request interrupted by user]");
+    pause();
+    event(&env, "UserPromptSubmit", json!({"prompt":"Put the command in the cli module of the payments crate instead"}));
+    // No Stop and no abort since that input: the prompt reached a running loop (queued while
+    // Claude worked) — a takeover.
+    event(&env, "UserPromptSubmit", json!({"prompt":"Also print a summary table when the reconciliation finishes"}));
+    let recs = trace(&env);
+    assert_eq!(evs(&recs), vec!["session_start", "input", "agent_end", "input", "agent_end", "input"], "{recs:#?}");
+    assert_eq!(recs[2]["yielded"], false);
+    assert_eq!((recs[3]["prelabel"].as_str(), recs[3]["idle"].as_bool()), (Some("none"), Some(true)));
+    assert_eq!((recs[5]["prelabel"].as_str(), recs[5]["idle"].as_bool()), (Some("interrupt"), Some(false)));
+}
+
+#[test]
+fn reflect_runs_detached_at_session_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let exe = |p: &Path, body: &str| {
+        std::fs::write(p, body).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let omp = env.home.join("omp");
+    exe(&omp, "#!/bin/sh\nexit 0\n");
+    // The binary, except that `reflect` records its arguments after 3 s.
+    let seen = env.home.join("reflect.args");
+    let bin = env.home.join("rematch-stub");
+    exe(&bin, &format!("#!/bin/sh\nif [ \"$1\" = reflect ]; then sleep 3; echo \"$@\" > '{}'; exit 0; fi\nexec '{BIN}' \"$@\"\n", seen.display()));
+    let p = json!({"session_id":UUID,"transcript_path":"","cwd":env.repo,"hook_event_name":"SessionStart","source":"startup"}).to_string();
+    let t0 = std::time::Instant::now();
+    let o = run_hook(&env, "session-start", &p, &[("OMP_BIN", omp.to_str().unwrap()), ("REMATCH_BIN", bin.to_str().unwrap())]);
+    assert!(t0.elapsed() < std::time::Duration::from_millis(2500), "the hook does not wait for the reflection: {:?}", t0.elapsed());
+    assert_eq!(o.code, 0);
+    assert_eq!(evs(&trace(&env)), vec!["session_start"]);
+    assert!(!seen.exists());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !seen.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "reflect --pending", "outlived the hook");
+
+    // Without omp nothing is started: a reflection's model calls would only fail.
+    std::fs::remove_file(&seen).unwrap();
+    exe(&bin, &format!("#!/bin/sh\nif [ \"$1\" = reflect ]; then echo \"$@\" > '{}'; exit 0; fi\nexec '{BIN}' \"$@\"\n", seen.display()));
+    let o = run_hook(&env, "session-start", &p, &[("REMATCH_BIN", bin.to_str().unwrap())]);
+    assert_eq!(o.code, 0);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!seen.exists());
+}
+
+#[test]
+fn agent_entries_are_copied_into_the_plugin() {
+    let env = Env::new();
+    let d = env.run(&[
+        "create",
+        "log-triage",
+        "--from",
+        "description",
+        "--description",
+        "triage long build logs for the failing step",
+        "--editor",
+        &script("editor-agent.sh"),
+    ]);
+    let id = d["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "log-triage", "--unverified"]);
+    let agents = plugin_root(&env).join("agents");
+    let copy = agents.join("log-triage.md");
+
+    // The first session copies it as a real file in Claude Code's agent format (omp's `@smol`
+    // role and tool names do not carry over as they are). Claude Code read its agents before
+    // the hook ran, so this session does not count it.
+    event(&env, "SessionStart", json!({"source":"startup"}));
+    assert!(std::fs::symlink_metadata(&copy).unwrap().file_type().is_file());
+    let text = std::fs::read_to_string(&copy).unwrap();
+    assert!(text.starts_with("---\nname: log-triage\ndescription: Use for a long build or test log"), "{text}");
+    assert!(text.contains("\ntools: Read, Grep\n") && !text.contains("model:") && !text.contains("rematch:"), "{text}");
+    assert!(text.contains("reply with that step's name and its first error line"), "{text}");
+    assert!(agents.join(".rematch").is_file());
+    assert!(!trace(&env)[0]["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(id)));
+
+    // The next session started with the copy in place: it is loaded, versioned like a skill.
+    let next = "6e1d9b9f-2222-4d4d-9999-0123456789ab";
+    let p = json!({"session_id":next,"transcript_path":"","cwd":env.repo,"hook_event_name":"SessionStart","source":"startup"});
+    assert_eq!(run_hook(&env, "session-start", &p.to_string(), &[]).code, 0);
+    let s = trace_of(&env, &format!("cc:{next}"));
+    let loaded = s[0]["loaded_entries"].as_array().unwrap();
+    assert!(loaded.iter().any(|e| e["id"] == json!(id) && e["version"] == 1 && e["sha"].is_string()), "{loaded:?}");
+
+    // Disabled: `skills sync --harness claude-code` prunes the copy; an agent file of the user's
+    // in the same directory is never touched.
+    std::fs::write(agents.join("mine.md"), "---\nname: mine\ndescription: the user's\n---\nbody\n").unwrap();
+    env.run(&["library", "disable", &id]);
+    let mut c = env.cmd(&["skills", "sync", "--harness", "claude-code"]);
+    c.env("CLAUDE_PLUGIN_ROOT", plugin_root(&env));
+    let (v, code) = env.run_cmd(c);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["agents"]["pruned"], json!(["log-triage.md"]), "{v}");
+    assert!(!copy.exists() && agents.join("mine.md").is_file() && !agents.join(".rematch").exists());
 }

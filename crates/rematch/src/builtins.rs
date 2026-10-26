@@ -154,7 +154,7 @@ fn stage(ctx: &AppCtx, b: &Builtin, previous: Option<&Entry>) -> Result<Entry> {
             status: Status::Provisional,
             family: Family(rematch_core::counters::UNKNOWN_FAMILY.into()),
             origin: Origin::Import { source: BUILTIN_SOURCE.into() },
-            predicate: Predicate { repo_glob: "**".into(), file_exts: Vec::new(), stems: Vec::new() },
+            predicate: Predicate { repo_glob: "**".into(), ..Default::default() },
             trigger_line: b.trigger_line.into(),
             path: Default::default(),
         },

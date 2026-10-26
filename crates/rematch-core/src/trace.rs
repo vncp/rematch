@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::family::family_of_ref;
+use crate::identity::normalize_remote;
 use crate::features::{exts_of, head, stems_of_session, strip_selector};
 use crate::redirect::{class_name, mark_class, PRELABEL_INTERRUPT, PRELABEL_NONE, PRELABEL_REVERT};
 use crate::types::{EditorScope, ModelRef, Moment, Redirect, RedirectClass, SessionRecord, UnixMs};
@@ -26,6 +27,9 @@ pub const ERROR_CLUSTER_MIN: usize = 3;
 pub const REDIRECT_TEXT_CHARS: usize = 1024;
 /// Chars of the preceding deliverable kept on a [`Redirect`].
 pub const REDIRECT_DELIVERABLE_CHARS: usize = 2048;
+/// `session_shutdown.files_changed` bounds (ADR 001).
+pub const FILES_CHANGED_MAX: usize = 50;
+pub const FILES_CHANGED_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -71,6 +75,47 @@ pub struct RetrievedUnit {
     pub bytes: u64,
 }
 
+/// One `session_start.loaded_entries` item: `{id, version, sha}` (ADR 001). The plain-id
+/// string of older traces is accepted forever and parses with no version or sha.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LoadedEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+    /// The entry's `content_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+impl LoadedEntry {
+    pub fn id(id: impl Into<String>) -> LoadedEntry {
+        LoadedEntry { id: id.into(), version: None, sha: None }
+    }
+}
+
+impl<'de> Deserialize<'de> for LoadedEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Versioned {
+            id: String,
+            #[serde(default)]
+            version: Option<u32>,
+            #[serde(default)]
+            sha: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Id(String),
+            Versioned(Versioned),
+        }
+        Ok(match Either::deserialize(d)? {
+            Either::Id(id) => LoadedEntry::id(id),
+            Either::Versioned(v) => LoadedEntry { id: v.id, version: v.version, sha: v.sha.filter(|s| !s.is_empty()) },
+        })
+    }
+}
+
 /// One trace line. Field names match DESIGN §3 exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
@@ -96,11 +141,22 @@ pub enum TraceRecord {
         #[serde(default)]
         omp_version: String,
         #[serde(default)]
-        loaded_entries: Vec<String>,
+        loaded_entries: Vec<LoadedEntry>,
         #[serde(default)]
         hooks_loaded: Vec<String>,
         #[serde(default)]
         staging_dirs: Vec<String>,
+        /// Origin (else first) remote URL, raw or normalized; [`fold_trace`] normalizes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_remote: Option<String>,
+        /// cwd relative to `repo` (`""` at the top).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+        /// Entry ids the shared skills dir exposed (DESIGN §16).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        visible_entries: Vec<String>,
     },
     Input {
         seq: u32,
@@ -210,6 +266,10 @@ pub enum TraceRecord {
         reasons: Vec<String>,
         #[serde(default)]
         flagged: bool,
+        /// `[path, sha256]` of changed files (≤ [`FILES_CHANGED_MAX`], none over
+        /// [`FILES_CHANGED_MAX_BYTES`]); absent when the writer ran out of budget.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files_changed: Vec<(String, String)>,
     },
     /// A `retrieve` hook appended package units to the outgoing context (DESIGN §3, §10).
     /// `entry_ids` = the retrieve hooks; `units[].entry_id` = the packages the units came
@@ -387,6 +447,64 @@ pub fn tool_input_files(tool: &str, input: &Value) -> Vec<String> {
     out
 }
 
+/// Tools whose successful calls change files (Claude Code names arrive lowercased).
+pub const MUTATING_TOOLS: &[&str] = &["edit", "write", "multiedit", "notebookedit", "apply_patch", "ast_edit"];
+
+/// Files named by the session's successful [`MUTATING_TOOLS`] calls, first-seen order: the
+/// candidates of `session_shutdown.files_changed`.
+pub fn changed_paths(records: &[TraceRecord]) -> Vec<String> {
+    let (mut out, mut seen) = (Vec::new(), HashSet::new());
+    for r in records {
+        let TraceRecord::ToolResult { tool, input, is_error: false, path, .. } = r else { continue };
+        let tool = tool.to_ascii_lowercase();
+        if !MUTATING_TOOLS.contains(&tool.as_str()) {
+            continue;
+        }
+        let mut files = Vec::new();
+        if let Some(p) = path {
+            push_file(&mut files, p);
+        }
+        files.extend(tool_input_files(&tool, input));
+        for f in files {
+            push_unique(&mut out, &mut seen, f);
+        }
+    }
+    out
+}
+
+/// `session_shutdown.files_changed`: `(path, sha256)` of the first [`FILES_CHANGED_MAX`]
+/// readable regular files of `paths` (relative paths resolve against `cwd`) no larger than
+/// [`FILES_CHANGED_MAX_BYTES`]; a path inside `repo` is recorded relative to it. `None` when
+/// `deadline` passes first (the writer then omits the field).
+pub fn hash_changed_files(
+    paths: &[String],
+    cwd: &Path,
+    repo: Option<&Path>,
+    deadline: std::time::Instant,
+) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for p in paths {
+        if out.len() == FILES_CHANGED_MAX {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        let abs = if Path::new(p).is_absolute() { Path::new(p).to_path_buf() } else { cwd.join(p) };
+        let Ok(meta) = std::fs::metadata(&abs) else { continue };
+        if !meta.is_file() || meta.len() > FILES_CHANGED_MAX_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&abs) else { continue };
+        let shown = repo
+            .and_then(|r| abs.strip_prefix(r).ok())
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| abs.to_string_lossy().into_owned());
+        out.push((shown, crate::ledger::sha256_hex(&bytes)));
+    }
+    Some(out)
+}
+
 pub(crate) fn push_file(out: &mut Vec<String>, raw: &str) {
     let p = strip_selector(raw);
     if p.is_empty() || p.contains("://") {
@@ -485,6 +603,10 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 model,
                 mode,
                 loaded_entries,
+                repo_remote,
+                subpath,
+                head_sha,
+                visible_entries,
                 ..
             } => {
                 if mode == "import" {
@@ -498,9 +620,28 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                     s.family = Some(family_of_ref(m));
                     s.model = Some(m.clone());
                 }
+                s.repo_remote = repo_remote.as_deref().and_then(normalize_remote).or(s.repo_remote.take());
+                s.subpath = subpath.clone().or(s.subpath.take());
+                s.head_sha = head_sha.clone().filter(|h| !h.is_empty()).or(s.head_sha.take());
                 for e in loaded_entries {
-                    if !s.loaded_entries.contains(e) {
-                        s.loaded_entries.push(e.clone());
+                    if e.id.is_empty() {
+                        continue;
+                    }
+                    if !s.loaded_entries.contains(&e.id) {
+                        s.loaded_entries.push(e.id.clone());
+                    }
+                    if let Some(v) = e.version {
+                        s.loaded_versions.insert(e.id.clone(), v);
+                    }
+                    if let Some(sha) = &e.sha {
+                        if !s.loaded_entry_shas.contains(sha) {
+                            s.loaded_entry_shas.push(sha.clone());
+                        }
+                    }
+                }
+                for e in visible_entries {
+                    if !e.is_empty() && !s.visible_entries.contains(e) {
+                        s.visible_entries.push(e.clone());
                     }
                 }
             }
@@ -611,7 +752,12 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                     });
                 }
             }
-            TraceRecord::SessionShutdown { flagged, .. } => shutdown_flagged |= *flagged,
+            TraceRecord::SessionShutdown { flagged, files_changed, .. } => {
+                shutdown_flagged |= *flagged;
+                if !files_changed.is_empty() {
+                    s.files_changed = files_changed.clone();
+                }
+            }
             TraceRecord::Retrieval { entry_ids, units, .. } => {
                 for e in entry_ids.iter().chain(units.iter().map(|u| &u.entry_id)) {
                     if !e.is_empty() && !s.loaded_entries.contains(e) {
@@ -885,6 +1031,57 @@ not json at all
         assert_eq!(s.redirects[2].class, Some(RedirectClass::Preference));
         assert_eq!(s.redirects[2].deliverable_head, "Done.");
         assert!(s.flagged);
+    }
+
+    #[test]
+    fn fold_reads_both_loaded_entries_shapes_and_the_identity_fields() {
+        // The old plain-id shape (above) and the versioned one, mixed, plus the L1 fields.
+        let t = r#"{"seq":0,"t":1,"ev":"session_start","session_id":"S","cwd":"/w/wt/crates/x","repo":"/w/wt","repo_remote":"git@github.com:Org/Repo.git","subpath":"crates/x","head_sha":"abc","loaded_entries":["e0",{"id":"e1","version":3,"sha":"s1"},{"id":"e2"}],"visible_entries":["e1","e9"]}
+{"seq":1,"t":2,"ev":"retrieval","entry_ids":["hook-r"],"units":[],"bytes":0}
+{"seq":2,"t":3,"ev":"session_shutdown","reasons":[],"flagged":false,"files_changed":[["src/a.rs","ff"]]}"#;
+        let recs = parse_trace(t);
+        assert_eq!(recs[0].ev(), "session_start", "{:?}", recs[0]);
+        let TraceRecord::SessionStart { loaded_entries, .. } = &recs[0] else { panic!() };
+        assert_eq!(loaded_entries[0], LoadedEntry::id("e0"));
+        assert_eq!(loaded_entries[1], LoadedEntry { id: "e1".into(), version: Some(3), sha: Some("s1".into()) });
+        let s = fold_trace(&recs, "S");
+        assert_eq!(s.loaded_entries, vec!["e0", "e1", "e2", "hook-r"]);
+        assert_eq!(s.loaded_versions.get("e1"), Some(&3));
+        assert_eq!(s.loaded_versions.len(), 1);
+        assert_eq!(s.loaded_entry_shas, vec!["s1"]);
+        assert_eq!(s.visible_entries, vec!["e1", "e9"]);
+        assert_eq!(s.repo_remote.as_deref(), Some("github.com/org/repo"), "normalized");
+        assert_eq!((s.subpath.as_deref(), s.head_sha.as_deref()), (Some("crates/x"), Some("abc")));
+        assert_eq!(s.files_changed, vec![("src/a.rs".to_string(), "ff".to_string())]);
+        // The versioned shape serializes as objects; a bare id stays an object with only `id`.
+        let back = serde_json::to_value(&recs[0]).unwrap();
+        assert_eq!(back["loaded_entries"], serde_json::json!([{"id":"e0"},{"id":"e1","version":3,"sha":"s1"},{"id":"e2"}]));
+    }
+
+    #[test]
+    fn files_changed_from_mutating_calls_bounded_and_repo_relative() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(repo.join("big.bin"), vec![0u8; (FILES_CHANGED_MAX_BYTES + 1) as usize]).unwrap();
+        let a = repo.join("src/a.rs").to_string_lossy().into_owned();
+        let recs = vec![
+            TraceRecord::ToolResult { seq: 1, t: 1, tool: "read".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(repo.join("README").to_string_lossy().into_owned()) },
+            TraceRecord::ToolResult { seq: 2, t: 2, tool: "Write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(a.clone()) },
+            TraceRecord::ToolResult { seq: 3, t: 3, tool: "edit".into(), call_id: String::new(), input: serde_json::json!({"input": "[big.bin#ABCD]\n"}), args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: None },
+            TraceRecord::ToolResult { seq: 4, t: 4, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: true, error_class: None, content_head: String::new(), skill_read: None, path: Some("failed.rs".into()) },
+            TraceRecord::ToolResult { seq: 5, t: 5, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some("gone.rs".into()) },
+        ];
+        let paths = changed_paths(&recs);
+        assert_eq!(paths, vec![a.clone(), "big.bin".to_string(), "gone.rs".to_string()]);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let got = hash_changed_files(&paths, repo, Some(repo), far).unwrap();
+        assert_eq!(got, vec![("src/a.rs".to_string(), crate::ledger::sha256_hex(b"fn a() {}"))], "big and missing files skipped");
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert_eq!(hash_changed_files(&paths, repo, Some(repo), past), None, "over budget");
+        let many: Vec<String> = (0..60).map(|_| a.clone()).collect();
+        assert_eq!(hash_changed_files(&many, repo, None, far).unwrap().len(), FILES_CHANGED_MAX);
     }
 
     #[test]

@@ -130,7 +130,7 @@ pub fn run_rollout(
     let mut records = sub.read_trajectory(&install.events)?;
     for r in &mut records {
         if let TraceRecord::SessionStart { loaded_entries, model, .. } = r {
-            *loaded_entries = install.loaded.clone();
+            *loaded_entries = install.loaded.iter().map(rematch_core::trace::LoadedEntry::id).collect();
             *model = Some(call.model.clone());
         }
     }

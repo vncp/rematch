@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rematch-core", "crates/rematch"]
+members = ["crates/rematch-core", "crates/rematch-lake", "crates/rematch"]
 resolver = "2"
 
 [workspace.package]

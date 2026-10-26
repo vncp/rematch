@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use crate::app::{new_entry, AppCtx, NewEntry};
 use crate::config::{ROLE_CLASSIFIER, ROLE_EDITOR};
 use crate::editor::{self, CallBudget, EditorDecision, EditorReply};
+use crate::lake_read::{Source, Tally};
 use crate::scope::anchor::{self, AnchorOutcome, AnchorReceipt};
 
 /// Hard rule: at most three model calls per reflection (classifier batch, editor, one lint retry).
@@ -145,6 +146,7 @@ pub fn cmd_reflect(ctx: &AppCtx, a: ReflectArgs) -> Result<Value> {
         };
         reflections.push(r);
     }
+    let lake = crate::lake_cmd::export_after_reflect(ctx);
     let history = history.map(|h| h.report(&reflections));
     let mut lines: Vec<String> = history.iter().map(|(_, line)| line.clone()).collect();
     lines.extend(count.lines.iter().cloned());
@@ -154,6 +156,9 @@ pub fn cmd_reflect(ctx: &AppCtx, a: ReflectArgs) -> Result<Value> {
     let mut out = json!({"count": count.to_json(), "reflections": reflections, "lines": lines});
     if let Some((report, _)) = history {
         out["history"] = report;
+    }
+    if let Some(l) = lake {
+        out["lake"] = l;
     }
     Ok(out)
 }
@@ -224,8 +229,12 @@ fn trace_files(ctx: &AppCtx) -> Result<Vec<(String, PathBuf)>> {
     Ok(v)
 }
 
+/// A trace whose last segment ended: a `session_shutdown` after its last `session_start` (a
+/// resumed Claude Code session appends a `session_start` to its trace, which is unfinished
+/// again until that run ends, so a resumed session is counted once, whole).
 fn finished(records: &[TraceRecord]) -> bool {
-    records.iter().any(|r| matches!(r, TraceRecord::SessionShutdown { .. }))
+    let last_start = records.iter().rposition(|r| matches!(r, TraceRecord::SessionStart { .. })).unwrap_or(0);
+    records[last_start..].iter().any(|r| matches!(r, TraceRecord::SessionShutdown { .. }))
 }
 
 /// Ledger row for a trace. A trace synthesized for an imported session (`reflect --history`)
@@ -233,7 +242,8 @@ fn finished(records: &[TraceRecord]) -> bool {
 /// counts instead of replacing the row with a trace-sourced one; `count` then marks it counted
 /// once like any other session.
 fn fold_for_ledger(records: &[TraceRecord], sid: &str, existing: Option<SessionRecord>) -> SessionRecord {
-    let folded = trace::fold_trace(records, sid);
+    let mut folded = trace::fold_trace(records, sid);
+    rematch_core::identity::fill_session(&mut folded);
     match existing {
         Some(mut imported) if folded.source == "import" && imported.source == "import" => {
             apply_trace_signals(&mut imported, &folded);
@@ -431,6 +441,9 @@ pub fn record_status(ctx: &AppCtx, e: &Entry, to: Status, note: &str) -> Result<
     n.status_since = Some(ctx.now);
     n.status_note = Some(note.to_string());
     n.updated_at = ctx.now;
+    if matches!(to, Status::Kept | Status::Pinned) && n.path.is_dir() {
+        n.content_sha256 = Some(library::content_sha256(&n.path)?);
+    }
     ctx.ledger.upsert_entry(&n)?;
     if n.path.starts_with(&ctx.paths.root) && n.path.join(REMATCH_JSON).is_file() {
         // Keep extra keys (evidence_sha256, source_path) of imported lessons.
@@ -940,7 +953,7 @@ fn deliverable_before(records: &[TraceRecord], seq: u32) -> String {
 
 /// Kept/provisional entry whose predicate matches the session (count-time rule).
 pub fn current_entry_for(ctx: &AppCtx, s: &SessionRecord, branch: &str) -> Result<Option<Entry>> {
-    let place = s.repo.clone().unwrap_or_else(|| s.cwd.clone());
+    let place = predicate::Place::of_session(s);
     for st in [Status::Provisional, Status::Kept, Status::Pinned] {
         for e in ctx.ledger.list_entries(&EntryFilter { status: Some(st), ..Default::default() })? {
             if e.kind == Kind::Lesson {
@@ -1231,6 +1244,8 @@ struct HistoryStage {
     skipped: Vec<Value>,
     /// Eligible sessions left for a later run by `--limit`.
     deferred: usize,
+    /// Where the handed and ruled-out sessions' records came from.
+    tally: Tally,
 }
 
 impl HistoryStage {
@@ -1254,14 +1269,17 @@ impl HistoryStage {
             self.deferred
         );
         sessions.extend(self.skipped);
-        (json!({"handed": self.handed, "deferred": self.deferred, "sessions": sessions}), line)
+        let json = json!({"handed": self.handed, "deferred": self.deferred, "sessions": sessions,
+                          "source": self.tally.source(), "sources": self.tally.sources()});
+        (json, line)
     }
 }
 
 /// `reflect --history`: every imported session that is flagged, has no trace file and no
-/// `history_reflected_at` marker, newest first, gets `traces/<sid>.jsonl` synthesized from its
-/// harness transcript (`import_cmd::read_transcript`: omp, Claude Code or Codex by id prefix,
-/// `mode: "import"`) and `pending/<sid>.json`, so the
+/// `history_reflected_at` marker, newest first, gets `traces/<sid>.jsonl` from its records —
+/// the lake's `events/<harness>/<day>/<sid>.parquet` when there is one (ADR 001 L4), else
+/// synthesized from its harness transcript (`import_cmd::read_transcript`: omp, Claude Code
+/// or Codex by id prefix, `mode: "import"`) — and `pending/<sid>.json`, so the
 /// normal loop (count + reflect, rate limits, ≤ 3 model calls) handles it. At most `limit`
 /// pending files per run. Sessions ruled out for good (subagent files, or not flagged by the
 /// extension's rule) are marked too; a missing session file is left for a later run.
@@ -1281,24 +1299,30 @@ fn stage_history(ctx: &AppCtx, only: Option<&str>, since: Option<i64>, limit: us
             continue;
         }
         let mut skip = |reason: String| st.skipped.push(json!({"session": s.id, "outcome": "skipped", "reason": reason}));
-        let transcript = match crate::import_cmd::read_transcript(ctx, s) {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                skip("no_session_file".into());
-                continue;
+        let (records, subagent, src) = match crate::lake_read::lake_events(ctx, s) {
+            Some(records) => {
+                let sub = matches!(records.first(), Some(TraceRecord::SessionStart { agent: Some(a), .. }) if a.kind == "sub");
+                (records, sub, Source::Lake)
             }
-            Err(e) => {
-                skip(format!("unreadable: {e:#}"));
-                continue;
-            }
+            None => match crate::import_cmd::read_transcript(ctx, s) {
+                Ok(Some(t)) => (t.records, t.subagent, Source::Ledger),
+                Ok(None) => {
+                    skip("no_session_file".into());
+                    continue;
+                }
+                Err(e) => {
+                    skip(format!("unreadable: {e:#}"));
+                    continue;
+                }
+            },
         };
-        if transcript.subagent {
+        st.tally.add(src);
+        if subagent {
             // The adapters trace main sessions only.
             ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
             skip("subagent".into());
             continue;
         }
-        let records = transcript.records;
         let Some(TraceRecord::SessionShutdown { reasons, flagged: true, .. }) = records.last() else {
             ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
             skip("not_flagged".into());

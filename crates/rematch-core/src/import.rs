@@ -301,6 +301,7 @@ pub fn session_record(s: &OmpSession) -> SessionRecord {
         ..Default::default()
     };
     r.repo = repo_of(Path::new(&s.header.cwd)).map(|p| p.to_string_lossy().into_owned());
+    (r.repo_remote, r.subpath) = crate::identity::session_place(r.repo.as_deref(), &s.header.cwd);
     r.branch = basename(r.repo.as_deref().unwrap_or(&s.header.cwd));
     r.started_at = start_ms(s);
     r.ended_at = s.entries.iter().rev().find_map(entry_ms);
@@ -649,6 +650,7 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
     let header = &session.header;
     let start_t = start_ms(session);
     let repo = repo_of(Path::new(&header.cwd)).map(|p| p.to_string_lossy().into_owned());
+    let (repo_remote, subpath) = crate::identity::session_place(repo.as_deref(), &header.cwd);
     let model = session
         .entries
         .iter()
@@ -708,6 +710,10 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
         loaded_entries: Vec::new(),
         hooks_loaded: Vec::new(),
         staging_dirs: Vec::new(),
+        repo_remote,
+        subpath,
+        head_sha: None,
+        visible_entries: Vec::new(),
     });
 
     let mut calls: HashMap<&str, &Value> = HashMap::new();
@@ -833,6 +839,7 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
         t: last_t,
         flagged: !reasons.is_empty(),
         reasons,
+        files_changed: Vec::new(),
     });
     w.out
 }

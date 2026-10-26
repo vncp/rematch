@@ -2,8 +2,8 @@
 //! history → ledger: omp session JSONL, Claude Code and Codex transcripts) and
 //! `import --forge <path>` (compound-forge skills → provisional brownfield entries,
 //! learnings → provisional lessons). Both are idempotent. Also the lookup of a ledger
-//! session's trace records (live trace, else synthesized from its harness transcript) shared
-//! by `improve` and `reflect --history`.
+//! session's trace records (the lake's events file, else the live trace, else synthesized
+//! from its harness transcript) shared by `improve` and `reflect --history`.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,7 @@ use rematch_core::types::{Edit, Entry, Family, Kind, Origin, SessionRecord, Stat
 use serde_json::{json, Value};
 
 use crate::app::{new_entry, AppCtx, NewEntry};
+use crate::lake_read::Source;
 
 pub const FORGE_BRANCH: &str = "forge";
 
@@ -584,18 +585,28 @@ pub fn records_for_session(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Vec
     Ok(read_transcript(ctx, s)?.map(|t| t.records))
 }
 
-/// [`records_for_session`] plus the session row whose redirect and error-cluster seqs address
+/// Trace records of a ledger session for a reader (ADR 001 L4): the lake's
+/// `events/<harness>/<day>/<session>.parquet` by path when there is one, else
+/// [`records_for_session`]. With the source used.
+pub fn session_records(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<(Vec<TraceRecord>, Source)>> {
+    if let Some(records) = crate::lake_read::lake_events(ctx, s) {
+        return Ok(Some((records, Source::Lake)));
+    }
+    Ok(records_for_session(ctx, s)?.map(|r| (r, Source::Ledger)))
+}
+
+/// [`session_records`] plus the session row whose redirect and error-cluster seqs address
 /// those records: an imported row's signals are re-folded from the records (rows imported
 /// before seqs addressed the synthesized trace), keeping matching classifier labels.
-pub fn session_with_records(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<(SessionRecord, Vec<TraceRecord>)>> {
-    let Some(records) = records_for_session(ctx, s)? else {
+pub fn session_with_records(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<(SessionRecord, Vec<TraceRecord>, Source)>> {
+    let Some((records, src)) = session_records(ctx, s)? else {
         return Ok(None);
     };
     let mut row = s.clone();
     if s.source == "import" {
         apply_trace_signals(&mut row, &trace::fold_trace(&records, &s.id));
     }
-    Ok(Some((row, records)))
+    Ok(Some((row, records, src)))
 }
 
 /// Session stem corpus for tf-idf ranking.
@@ -726,6 +737,7 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path, migrate: bool) -> Result<Value> 
         } else {
             // The skill already loads natively through the forge plugin: register only,
             // never copy or write into the forge checkout.
+            e.content_sha256 = Some(library::content_sha256(&dir)?);
             ctx.ledger.upsert_entry(&e)?;
             registered.push(json!({"id": e.id, "name": name, "stems": e.predicate.stems, "path": dir}));
         }
@@ -775,6 +787,7 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path, migrate: bool) -> Result<Value> 
             )?;
             e.status_since = Some(ctx.now);
             std::fs::write(dir.join("LESSON.md"), &bytes)?;
+            e.content_sha256 = Some(library::content_sha256(&dir)?);
             let mut ev = serde_json::to_value(&e)?;
             ev["evidence_sha256"] = json!(sha);
             ev["source_path"] = json!(f);

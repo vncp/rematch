@@ -148,11 +148,11 @@ rematch anchor replay <id>     # runs the replay once and reports pass/fail; sta
 
 When the fix for a correction is "read this big thing and report the one line that matters" (a build log, a long diff, a data dump), the editor may propose a **subagent** (`kind: agent`) instead of a skill. It is an omp task agent: an `AGENT.md` with `name`, `description` (what the main agent sees when deciding to delegate) and optionally `model`, and a body that is the subagent's system prompt. It runs in its own context and returns text, so the big input never enters your session.
 
-- **Provisional:** the entry lives in `~/.rematch/staging/<branch>/<name>/`, and `~/.rematch/agents/<name>.md` links to its `AGENT.md`. omp finds it through the plugin (`extension/agents` is a link to `~/.rematch/agents/`, made by `scripts/install.sh`). Unlike a skill it is offered in **every** session, because omp reads agents only from fixed places; it is counted only in sessions whose repo matches, like a skill.
+- **Provisional:** the entry lives in `~/.rematch/staging/<branch>/<name>/`, and `~/.rematch/agents/<name>.md` links to its `AGENT.md`. omp finds it through the plugin (`extension/agents` is a link to `~/.rematch/agents/`, made by `scripts/install.sh`). Unlike a skill it is offered in **every** session, because omp reads agents only from fixed places; it is counted only in sessions whose repo matches, like a skill. Claude Code gets a copy in the plugin's `agents/` at its next session start ([Claude Code](#claude-code)).
 - **Kept:** after 4 clean counted sessions it is copied to `~/.omp/agent/agents/<name>.md` (a file of yours with that name is saved first and comes back with `rollback` or `uninstall`) and the link is removed.
 - **Retired, dormant, stale:** the link (or the kept copy) is removed; the entry is archived.
-- A project or user agent with the same name wins over a provisional one (omp's precedence).
-- `/rematch off` does not hide provisional agents; `library disable <id>` does.
+- A project or user agent with the same name wins over a provisional one (omp's precedence; Claude Code also ranks plugin agents last).
+- `/rematch off` does not hide provisional agents; `library disable <id>` does (in Claude Code, from its next session start).
 
 ## Text for a repo's AGENTS.md
 
@@ -183,6 +183,7 @@ rematch library pin <id>        # human-owned: never replaced or retired automat
 rematch library unpin <id>
 rematch library disable <id>    # retire now (archived with its evidence; never deleted)
 rematch library rollback <name> # restore the previous kept version (skill or agent), retire the current one
+rematch library why <session> --asof 2026-10-20T13:05   # what the session loaded, with each entry's status and each redirect's class as they stood then
 ```
 
 Sharing beyond your machine (all open a branch or a diff; nothing is merged for you):
@@ -216,15 +217,22 @@ claude --plugin-dir /path/to/rematch/adapters/claude-code          # this sessio
 ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch # every session (loads as rematch@skills-dir)
 ```
 
-Then work as usual. Each session is traced to `~/.rematch/traces/cc:<session id>.jsonl` by the plugin's hooks; a session with a redirect, a tool-error cluster or a mark is flagged when it ends. Claude Code never runs a reflection itself: run `rematch reflect --pending` in a terminal (or open omp, which spawns it), then `rematch digest --text` for what was staged and what waits for approval, and `rematch library approve <id>` to approve a hook.
+Then work as usual. Each session is traced to `~/.rematch/traces/cc:<session id>.jsonl` by the plugin's hooks; a session with a redirect, a tool-error cluster or a mark is flagged when it ends. A prompt you send while Claude is still working counts as a takeover (an interrupt); a prompt after Esc does not, the run had ended.
+
+At the next session start, as in omp, the plugin runs `rematch reflect --pending` in the background (it needs omp on `PATH` or `OMP_BIN`, which makes the model calls; without omp, run `rematch reflect --pending` where omp is installed) and shows the digest: what was staged, kept or retired since the last digest, and every approval waiting, each with the command that grants it. There is no approval dialog in Claude Code: run `/rematch:rematch-approve <id>` (or `/rematch:rematch-decline <id>`, or `rematch library approve|decline <id>` in a terminal). Claude sees the digest too, with each hook's diff, so you can ask it what an approval does; it is told not to approve for you.
 
 | In Claude Code | Same as |
 |---|---|
-| `/rematch:rematch-status` | `rematch status` + the skills linked for this directory (`rematch skills sync --harness claude-code`) |
+| `/rematch:rematch-status` | `rematch status` + the skills and agents synced for this directory (`rematch skills sync --harness claude-code`) |
 | `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
+| `/rematch:rematch-library` | `/rematch library` in omp: every entry with its raw counters |
 | `/rematch:rematch-mark correction` | `/rematch mark correction` in omp: overrides the classifier for the last turn of this session |
+| `/rematch:rematch-approve <id>` · `/rematch:rematch-decline <id>` | the digest's approve/decline dialog in omp |
+| `/rematch:rematch-off` · `/rematch:rematch-on` | `/rematch off` · `/rematch on` |
 
-Provisional and kept skills appear as `rematch:<name>` skills through the shared skills directory (see [Where skills load from](#where-skills-load-from)): at session start the plugin syncs `~/.rematch/skills/` for the session's directory and points its own `skills/` there (created on first start; `rematch skills sync --harness claude-code --cwd <dir>` refreshes it by hand). Approved `block` and `stuck` hooks refuse tool calls; an approved `retrieve` hook adds matching units to your prompt. `rematch off` stops tracing and empties the shared skills directory at once. Upgrading from a version that linked skills into `~/.rematch/claude-skills/`: the first session start re-points the plugin's `skills/` and deletes that directory. To remove the plugin, delete the `~/.claude/skills/rematch` link; `rematch uninstall` removes `~/.rematch`.
+Only you can run `mark`, `approve`, `decline`, `off` and `on` (Claude cannot invoke them). Everything else (`create`, `improve`, `run`, `disable`, `rollback`, …) is the `rematch` CLI in a terminal.
+
+Provisional and kept skills appear as `rematch:<name>` skills through the shared skills directory (see [Where skills load from](#where-skills-load-from)): at session start the plugin syncs `~/.rematch/skills/` for the session's directory and points its own `skills/` there (created on first start; `rematch skills sync --harness claude-code --cwd <dir>` refreshes it by hand). Subagent entries appear as `rematch:<name>` agents: Claude Code reads plugin agents only from real files, so the same sync copies every provisional and kept agent into the plugin's `agents/` (an omp model role such as `@smol` is dropped, so the agent uses the session's model; a copy written at a session's start is counted from the next session; a file of yours there is never touched). Approved `block` and `stuck` hooks refuse tool calls; an approved `retrieve` hook adds matching units to your prompt; `truncate` hooks do not run in Claude Code. `rematch off` stops tracing and empties the shared skills directory at once. Upgrading from a version that linked skills into `~/.rematch/claude-skills/`: the first session start re-points the plugin's `skills/` and deletes that directory. To remove the plugin, delete the `~/.claude/skills/rematch` link; `rematch uninstall` removes `~/.rematch` and the agent copies.
 
 Raise `SessionEnd`'s 1.5 s budget if large sessions end unflagged: `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000 claude`.
 
@@ -260,7 +268,58 @@ One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for e
 - **Status changes apply at once.** Keeping an entry re-points its link to the kept directory; retiring, archiving or disabling one removes its link; `rematch off` removes every link and `rematch on` restores the kept ones. A session sees the directory as it was at its own start; a link removed while it runs dangles there.
 - `rematch skills sync --cwd <dir>` runs the sync by hand and prints what it added and pruned. Directories in `~/.rematch/skills/` that are not links are never touched.
 - `~/.rematch` is shared by every omp profile, and so is the directory: a skill kept under one profile's `skills/` is linked for sessions of every profile and harness.
-- Subagents (`kind: agent`) are not skills: omp loads them (provisional ones through the extension's `agents/` link, kept ones from `~/.omp/agent/agents/`); Claude Code and Codex do not.
+- Subagents (`kind: agent`) are not skills: omp loads them (provisional ones through the extension's `agents/` link, kept ones from `~/.omp/agent/agents/`); Claude Code loads copies in its plugin's `agents/`, refreshed at each session start; Codex does not load them.
+
+## The lake
+
+The ledger keeps current state; the lake keeps history. Every write the ledger makes is journaled with the ledger's own clock, and `rematch lake export` copies the journal, plus the trace of every closed session, into Parquet files under `~/.rematch/lake/` that are written once and never changed. Nothing in a session reads it: `match`, `skills sync` and the hooks never open it, so a slow disk or a large lake costs a session nothing. Design: [ADR 001](adr/001-lake.md); file layout and columns: DESIGN §19.1.
+
+```sh
+rematch lake export            # journal rows since the last export + newly closed sessions (one bounded run)
+rematch lake export --all      # drain everything in one run
+rematch lake doctor --text     # watermarks, how far the export lags the ledger, files per table, events exported/missing/pending, stray files
+rematch lake import --from /Volumes/laptop/.rematch     # merge another machine's lake (its root or its lake/ dir)
+rematch lake rebuild --from ~/backup/lake               # a ledger from a lake, into a root that has none
+rematch lake index                                      # Bellwether indexes for every table (needs a bellwether binary)
+rematch lake query events --key expr:tool_cmd --values 'cargo test'          # the events of sessions that ran it
+rematch lake query entries --key temporal2:entry_id --values <id> --valid 2026-10-20T13:05:00Z --known 2026-10-20T13:05:00Z
+rematch lake query outcomes --key list:facets --values mechanism,universe --all
+```
+
+- **Export runs by itself.** The end of every `reflect --pending` exports one bounded run (at most 50 000 journal rows and 64 sessions); a second export with nothing new writes nothing. Run `lake export --all` after importing years of history.
+- **Imported history is exported too.** A session imported from omp, Claude Code or Codex history has no trace file; its events file is built from the harness's own session file, the same way `reflect --history` reads it. If that file is gone, the session is recorded as missing in `lake/manifest.json` and skipped by later bounded runs; `lake export --all` tries it again. `lake doctor` prints `events: exported N, missing M, pending P`.
+- **Where files live.** `lake/manifest.json` holds the per-machine watermarks (the last journal row in the lake) and which sessions have events (or are missing them); `lake/<table>/<day>/<machine>-<seq>.parquet` holds one export run of `sessions`, `redirects`, `entries`, `counters`, `proposals`, `receipts` (and `outcomes/<domain>/…`); `lake/events/<harness>/<day>/<session>.parquet` holds one closed session's trace; `lake/blobs/` the proposal replies and certificates those rows point at. Copy or sync the whole `lake/` directory freely; never sync `lake-index/` (per machine, L3).
+- **Indexes are optional and local.** `lake index` asks an external `bellwether` binary (`--bellwether <path>`, else `$REMATCH_BELLWETHER`, else `PATH`) to index each table under `~/.rematch/lake-index/<table>/`, with the keys ADR 001 declares; run it after exports, or let `lake query` do it when it finds files the index has not seen. `lake query` answers one lookup (`exact:`/`expr:`/`list:` values, `--from/--to` windows, `--latest`, `--valid/--known` as-of) with the matching rows as JSON; with no binary or no index it reads every file instead and says `"indexed": false` and why. The rows are the same either way. The first index pins the Bellwether version in `lake/manifest.json`; another version is refused until `rematch lake index --repin` rebuilds the indexes (the lake files are not touched). `lake doctor` shows the pin, each table's index and missing keys, and the sessions that were counted with loaded entries but have no counters row. Keys and adaptations: DESIGN §19.2.
+- **Two machines.** Each machine exports under its own name (`$REMATCH_MACHINE`, else the host name, fixed in the ledger at first use). `lake import --from <other>` copies the files you do not have and merges the watermarks; `lake doctor` then lists both machines. The other machine's rows are read-only here: they never enter this ledger.
+- **Rebuild.** `lake rebuild` replays one machine's journal (yours unless `--machine`) into a fresh ledger: `library ls` and the counters come back exactly. It refuses a ledger that already holds anything; `--force` replaces it and keeps the old file as `ledger.sqlite.pre-rebuild-<ms>`. Traces, staging dirs and skills are files, not ledger rows: copy them with the root if you are moving machines.
+- **Before the journal.** Rows that existed when the journal was added are journaled once as `snapshot` rows (their state at that moment, not their history); `lake doctor` shows that range.
+- **After upgrading: `rematch lake migrate`.** Entries and sessions written before this version lack the identity that lets two machines (or two checkouts) recognize the same thing: the content hash of an entry and the repo's remote. `rematch lake migrate` fills them once: `content_sha256` on every entry, `repo_remote` + `subpath` on each entry whose repo is on this machine (its repo path stays as the fallback) and on each session whose repo is here. It reads files only, runs no model and no git, and a second run changes nothing. Until it runs, those entries match by repo path as before; afterwards a worktree or another clone of the same remote loads and counts them too.
+- **Built without it.** The lake needs the cargo feature `lake` (on by default). `cargo build --no-default-features` (or `REMATCH_NO_LAKE=1 scripts/install.sh`) builds a binary without arrow; there every `lake` subcommand except `migrate` answers `built without the lake feature`.
+- **Who reads it.** Historical commands read the lake when there is one and say so in their output (`"source": "lake"` or `"ledger"`): `reflect --history` and `improve` take a session's records from its events file (falling back to the trace or the harness transcript, so a deleted transcript no longer loses an exported session); `create --from sessions` searches every machine's `sessions`; `transfer suggest` reads every machine's outcome facets; `library why --asof` reads `entries` and `redirects`; `rematch report` (below) reads the lake alone. The first four read the ledger instead while the lake is behind it (`lake doctor` shows the lag; `lake export` closes it), so an export lag never hides a local write; the session-start digest never reads the lake.
+
+## The kill-criterion report
+
+```sh
+rematch report --text                   # the last 6 weeks
+rematch report --window 30d --text      # <n>w, <n>d or <n>h, ending now
+rematch report --since 2026-09-15       # from that UTC day to now
+```
+
+SPEC's kill criterion, computed instead of eyeballed: after six weeks of daily use, has an entry reached `kept` over at least four matched sessions, and has recurrence fallen on a trigger the library covers? `report` answers both from the lake when there is one (every machine's history after `lake import`), else from this ledger's journal (`"source": "ledger"`); the output is the JSON envelope, `--text` prints the lines.
+
+- **Kept over ≥ 4.** Every entry whose status at the window's end is `kept`, with the sessions in the window its counter rows matched (on any machine, by entry id or by content hash), their recurrence and harm.
+- **Recurrence per trigger.** Entries are grouped by trigger predicate. Each session started in the window whose files and terms match the predicate falls in one of two arms: *with* (it loaded an entry of that trigger) or *before* (it loaded none). Each arm shows sessions, sessions where the trigger's redirect class recurred (the entry's motivating class; for a classless entry, a correction or preference), the redirects of that class, and the rate (recurred / sessions); then `Δ` = with − before, and `fell` when it is negative. A trigger is *covered* when its with-arm is not empty.
+- **The verdict line.** `verdict: an entry reached kept over ≥ 4 matched sessions: yes (<names>)|no; recurrence fell on a covered trigger: yes (<triggers>)|no`. Built-in entries are listed but never count toward it.
+- **As of the window's end.** Every row is read as its ledger held it then (a status or a redirect label written later does not count), so a report for a past window does not change when entries move on.
+
+On the seed of `report`'s unit test (one trigger, both arms, after `lake export`; machine name shortened):
+
+```
+report · source lake (lag 0 journal row(s)) · machines laptop · window 2026-09-14 21:30 UTC → 2026-10-26 21:30 UTC (6w)
+kept run-tests-before-commit: 4 matched session(s) in the window (≥ 4), recurrence 0, harm 0
+trigger run-tests-before-commit [6675c0a0d803] class correction: with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50) · Δ -0.50 fell
+verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit)
+```
 
 ## Where things are
 
@@ -277,6 +336,8 @@ One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for e
   improver/          editor.md, classifier.md, reflector.md, lint.toml
   jobs/ runs/ tasks/ batch mode
   builtins.version   hash of the shipped built-in entries (installed once; retired ones stay retired)
+  lake/              the journal and closed sessions as Parquet (see The lake); never read by a session
+  lake-index/        Bellwether indexes for this machine (L3; never synced)
   off                kill-switch marker
 ~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/)
 ~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/)

@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::app::{new_entry, AppCtx, NewEntry};
 use crate::editor::CallBudget;
 use crate::import_cmd::{ranked_text_stems, stem_corpus, trigger_text};
+use crate::lake_read::Tally;
 use crate::reflect::{self, CandidateSpec, Proposed};
 
 pub const MIN_AUDIT_SESSIONS: usize = 5;
@@ -140,6 +141,7 @@ fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], br
         ctx.now,
     )?;
     e.status_since = Some(ctx.now);
+    e.content_sha256 = Some(rematch_core::library::content_sha256(dir)?);
     ctx.ledger.upsert_entry(&e)?;
     Ok((e, true))
 }
@@ -209,17 +211,23 @@ fn sorted_clusters(groups: Groups) -> Vec<Value> {
     v
 }
 
-/// Sessions with a signal (redirect or error cluster), each with its trace — live, or
-/// synthesized from the omp session file for imported sessions — and a row whose seqs
-/// address that trace. Sessions whose trace cannot be found are left out.
-fn traced_signals(ctx: &AppCtx, sessions: &[SessionRecord]) -> Result<Vec<(SessionRecord, Vec<TraceRecord>)>> {
+/// Sessions each with its trace records.
+type Traced = Vec<(SessionRecord, Vec<TraceRecord>)>;
+
+/// Sessions with a signal (redirect or error cluster), each with its trace — the lake's
+/// events file, the live trace, or synthesized from the harness transcript for imported
+/// sessions — and a row whose seqs address that trace, plus where the traces came from.
+/// Sessions whose trace cannot be found are left out.
+fn traced_signals(ctx: &AppCtx, sessions: &[SessionRecord]) -> Result<(Traced, Tally)> {
     let mut out = Vec::new();
+    let mut tally = Tally::default();
     for s in sessions.iter().filter(|s| !s.redirects.is_empty() || s.error_clusters > 0) {
-        if let Some(pair) = crate::import_cmd::session_with_records(ctx, s)? {
-            out.push(pair);
+        if let Some((row, records, src)) = crate::import_cmd::session_with_records(ctx, s)? {
+            tally.add(src);
+            out.push((row, records));
         }
     }
-    Ok(out)
+    Ok((out, tally))
 }
 
 /// The editor's moment: the most recent session's earliest redirect the classifier did not
@@ -465,9 +473,12 @@ fn propose_unit_level(
     branch: &str,
     mut out: Value,
 ) -> Result<Value> {
-    // Live traces, or traces synthesized from omp session files for imported sessions: the
-    // excerpt and clusters see imported history too, with seqs that address those records.
-    let traced = traced_signals(ctx, sessions)?;
+    // The lake's events, live traces, or traces synthesized from harness transcripts for
+    // imported sessions: the excerpt and clusters see imported history too, with seqs that
+    // address those records.
+    let (traced, tally) = traced_signals(ctx, sessions)?;
+    out["source"] = json!(tally.source());
+    out["sources"] = tally.sources();
     let rows: Vec<SessionRecord> = sessions
         .iter()
         .map(|s| traced.iter().find(|(t, _)| t.id == s.id).map_or_else(|| s.clone(), |(t, _)| t.clone()))

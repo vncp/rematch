@@ -14,9 +14,13 @@ pub mod import_cmd;
 pub mod improve;
 pub mod jobs;
 pub mod library_cmd;
+pub mod lake_cmd;
+pub mod lake_migrate;
+pub mod lake_read;
 pub mod omp;
 pub mod proc;
 pub mod reflect;
+pub mod report;
 pub mod retrieve;
 pub mod scope;
 pub mod skills_cmd;
@@ -114,6 +118,13 @@ enum Cmd {
     On,
     /// Remove every file rematch wrote (plan only without --yes).
     Uninstall(uninstall::UninstallArgs),
+    /// The lake (ADR 001): export, import, rebuild, doctor, migrate.
+    Lake {
+        #[command(subcommand)]
+        cmd: lake_cmd::LakeCmd,
+    },
+    /// The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm.
+    Report(report::ReportArgs),
 }
 
 impl Cmd {
@@ -148,6 +159,8 @@ impl Cmd {
             Cmd::Off => "off",
             Cmd::On => "on",
             Cmd::Uninstall(_) => "uninstall",
+            Cmd::Lake { .. } => "lake",
+            Cmd::Report(_) => "report",
         }
     }
 }
@@ -183,6 +196,8 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Off => library_cmd::cmd_off(ctx),
         Cmd::On => library_cmd::cmd_on(ctx),
         Cmd::Uninstall(a) => uninstall::cmd_uninstall(ctx, a),
+        Cmd::Lake { cmd } => lake_cmd::cmd_lake(ctx, cmd),
+        Cmd::Report(a) => report::cmd_report(ctx, a),
     }
 }
 
@@ -218,13 +233,17 @@ fn main() {
     let op = cli.cmd.name();
     let text = cli.text;
     let hook_output = matches!(&cli.cmd, Cmd::TraceEvent(a) | Cmd::HookCheck(a) if a.hook_output);
-    let (env, code) = match AppCtx::open_with(cli.cwd.clone(), text) {
-        Ok(ctx) => {
-            let (env, code) = Envelope::from_result(op, dispatch(&ctx, cli.cmd));
-            finish_job(&ctx, op, &env);
-            (env, code)
-        }
-        Err(e) => Envelope::from_result(op, Err(e)),
+    let (env, code) = match cli.cmd {
+        // Runs before the context opens: opening it creates the ledger it is to rebuild.
+        Cmd::Lake { cmd: lake_cmd::LakeCmd::Rebuild(a) } => Envelope::from_result(op, lake_cmd::cmd_lake_rebuild(a)),
+        cmd => match AppCtx::open_with(cli.cwd.clone(), text) {
+            Ok(ctx) => {
+                let (env, code) = Envelope::from_result(op, dispatch(&ctx, cmd));
+                finish_job(&ctx, op, &env);
+                (env, code)
+            }
+            Err(e) => Envelope::from_result(op, Err(e)),
+        },
     };
     if hook_output {
         std::process::exit(trace_event::emit_hook(&env));

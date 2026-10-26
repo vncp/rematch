@@ -174,3 +174,65 @@ impl Env {
         ls["entries"].as_array().unwrap().iter().find(|e| e["id"] == id).cloned().unwrap_or(Value::Null)
     }
 }
+
+// ---- imported omp sessions (`import --history`, `reflect --history`, `improve`) ----
+
+pub fn omp_user(text: &str) -> Value {
+    json!({"role": "user", "content": [{"type": "text", "text": text}], "attribution": "user"})
+}
+
+pub fn omp_assistant(text: &str, calls: Vec<Value>, stop: &str) -> Value {
+    let mut content = vec![json!({"type": "thinking", "thinking": "plan"})];
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    content.extend(calls);
+    json!({"role": "assistant", "content": content, "provider": "anthropic", "model": "claude-opus-5-5",
+           "usage": {"input": 100, "output": 20, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 120}, "stopReason": stop})
+}
+
+pub fn omp_call(id: &str, name: &str, args: Value) -> Value {
+    json!({"type": "toolCall", "id": id, "name": name, "arguments": args})
+}
+
+pub fn omp_result(id: &str, name: &str, text: &str, is_error: bool) -> Value {
+    json!({"role": "toolResult", "toolCallId": id, "toolName": name, "content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+/// omp v3 session file under `<agent>/sessions/-work-payments/` (cwd = the env repo) whose
+/// entries chain `parentId`s, one second apart from `<day>T10:00:00Z`.
+pub fn write_omp_session_in(agent_dir: &Path, repo: &Path, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
+    let dir = agent_dir.join("sessions").join("-work-payments");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![
+        json!({"type": "title", "v": 1, "title": "x", "pad": "  "}),
+        json!({"type": "session", "version": 3, "id": sid, "timestamp": format!("{day}T10:00:00.000Z"), "cwd": repo}),
+    ];
+    let mut parent: Option<String> = None;
+    for (i, m) in messages.iter().enumerate() {
+        let id = format!("{sid}-e{i}");
+        lines.push(json!({"type": "message", "id": id, "parentId": parent, "timestamp": format!("{day}T10:00:{:02}.000Z", i + 1),
+                          "runtime": {"version": "18.12.6"}, "message": m}));
+        parent = Some(id);
+    }
+    let path = dir.join(format!("{day}T10-00-00-000Z_{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    path
+}
+
+pub fn write_omp_session(env: &Env, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
+    write_omp_session_in(&env.agent, &env.repo, sid, day, messages)
+}
+
+/// user → assistant(edit) → toolResult → assistant → user "No, that's wrong …" → assistant.
+pub fn redirected_session(env: &Env, sid: &str, day: &str) -> PathBuf {
+    let file = format!("{}/src/ledger.rs", env.repo.display());
+    write_omp_session(env, sid, day, &[
+        omp_user("Add the ledger reconciliation command to the payments crate"),
+        omp_assistant("", vec![omp_call("c1", "edit", json!({"path": file, "input": "[src/ledger.rs#1A2B]\nPUT 1:\n+pub fn reconcile() {}"}))], "toolUse"),
+        omp_result("c1", "edit", "applied", false),
+        omp_assistant("Added the reconcile command and committed it.", vec![], "stop"),
+        omp_user("No, that's wrong: run the tests before you commit; the reconcile tests fail"),
+        omp_assistant("Running the reconcile tests now.", vec![], "stop"),
+    ])
+}

@@ -1,2 +1,5 @@
 # Created at session start: a symlink to $REMATCH_ROOT/skills, the shared skills dir (see README).
 /skills
+# Created at session start and by `rematch skills sync --harness claude-code`: copies of the
+# agent entries (Claude Code reads plugin agents only from real files), listed in agents/.rematch.
+/agents

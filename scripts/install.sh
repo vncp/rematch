@@ -4,11 +4,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-echo "==> Building rematch (release)..."
+# The cargo feature `lake` (default on) links arrow/parquet for `rematch lake …` (ADR 001);
+# nothing in a session uses it. REMATCH_NO_LAKE=1 builds without it
+# (`--no-default-features`): `rematch lake` then reports "built without the lake feature".
+FEATURES=()
+if [[ "${REMATCH_NO_LAKE:-0}" == "1" ]]; then
+  FEATURES=(--no-default-features)
+fi
+echo "==> Building rematch (release${FEATURES[*]:+, ${FEATURES[*]}})..."
 if [[ -f "$ROOT/Cargo.lock" ]]; then
-  cargo build --release --locked
+  cargo build --release --locked ${FEATURES[@]+"${FEATURES[@]}"}
 else
-  cargo build --release
+  cargo build --release ${FEATURES[@]+"${FEATURES[@]}"}
 fi
 
 # Provisional agents (kind `agent`) are symlinks in $REMATCH_ROOT/agents/; omp discovers

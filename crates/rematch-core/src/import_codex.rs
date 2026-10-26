@@ -30,8 +30,8 @@ use crate::import::{
 };
 use crate::redirect::prelabel;
 use crate::trace::{
-    basename, flag_reasons, fold_trace, push_unique, skill_from_read_path, skills_in_text, AgentInfo, TraceRecord,
-    Usage,
+    basename, flag_reasons, fold_trace, push_unique, skill_from_read_path, skills_in_text, AgentInfo, LoadedEntry,
+    TraceRecord, Usage,
 };
 use crate::types::{ModelRef, SessionRecord, UnixMs};
 
@@ -130,16 +130,21 @@ fn skill_list_paths(body: &str, out: &mut Vec<PathBuf>) {
 /// The rematch entry behind an offered skill, resolved now from the filesystem: a link in
 /// the shared skills dir leads to the entry dir (staging or kept) holding `rematch.json`. An
 /// entry created after `started` was not what Codex offered then (a newer version behind the
-/// same name) and is not attributed. A hook entry's router `SKILL.md` is offered too, but Codex
-/// never runs the hook, so it is not a loaded entry.
-fn rematch_entry_of(skill_md: &Path, started: UnixMs) -> Option<String> {
+/// same name) and is not attributed. Returns the entry (id, version, `content_sha256`) and
+/// whether it loads: a hook entry's router `SKILL.md` is offered (visible) too, but Codex never
+/// runs the hook, so it is not a loaded entry.
+fn rematch_entry_of(skill_md: &Path, started: UnixMs) -> Option<(LoadedEntry, bool)> {
     let dir = skill_md.parent()?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(crate::library::REMATCH_JSON)).ok()?).ok()?;
-    if matches!(v.get("kind").and_then(Value::as_str), Some("hook" | "agent" | "lesson")) {
-        return None;
-    }
+    let loads = !matches!(v.get("kind").and_then(Value::as_str), Some("hook" | "agent" | "lesson"));
     let created = v.get("created_at").and_then(Value::as_i64).unwrap_or(0);
-    (created <= started).then(|| v.get("id").and_then(Value::as_str).map(str::to_string)).flatten().filter(|id| !id.is_empty())
+    let id = v.get("id").and_then(Value::as_str).filter(|id| !id.is_empty() && created <= started)?;
+    let entry = LoadedEntry {
+        id: id.to_string(),
+        version: v.get("version").and_then(Value::as_u64).map(|n| n as u32),
+        sha: v.get("content_sha256").and_then(Value::as_str).map(str::to_string),
+    };
+    Some((entry, loads))
 }
 
 /// `$CODEX_HOME/sessions`, else `~/.codex/sessions`.
@@ -826,10 +831,15 @@ pub fn trace_records_of(s: &CodexSession) -> Vec<TraceRecord> {
     let items_mode = s.lines.iter().any(|l| completed_item(l).is_some());
     let has_user_events = s.lines.iter().any(|l| l.kind == "event_msg" && str_at(&l.payload, "type") == "user_message");
     let has_usage_records = s.lines.iter().any(|l| l.kind == "token_usage_record");
-    let (mut loaded, mut staging_dirs) = (Vec::new(), Vec::new());
+    let (repo_remote, subpath) = crate::identity::session_place(repo.as_deref(), &s.cwd);
+    let (mut loaded, mut visible, mut staging_dirs): (Vec<LoadedEntry>, Vec<String>, Vec<String>) = Default::default();
     for md in s.offered_skills() {
-        if let Some(id) = rematch_entry_of(&md, start_t).filter(|id| !loaded.contains(id)) {
-            loaded.push(id);
+        let Some((entry, loads)) = rematch_entry_of(&md, start_t) else { continue };
+        if !visible.contains(&entry.id) {
+            visible.push(entry.id.clone());
+        }
+        if loads && !loaded.iter().any(|l| l.id == entry.id) {
+            loaded.push(entry);
             staging_dirs.push(md.parent().unwrap_or(&md).to_string_lossy().into_owned());
         }
     }
@@ -861,6 +871,10 @@ pub fn trace_records_of(s: &CodexSession) -> Vec<TraceRecord> {
         loaded_entries: loaded,
         hooks_loaded: Vec::new(),
         staging_dirs,
+        repo_remote,
+        subpath,
+        head_sha: None,
+        visible_entries: visible,
     });
 
     let mut calls: HashMap<&str, &Value> = HashMap::new();
@@ -931,7 +945,7 @@ pub fn trace_records_of(s: &CodexSession) -> Vec<TraceRecord> {
     w.flush_turn();
     w.agent_end(last_t);
     let reasons = flag_reasons(&w.out);
-    w.out.push(TraceRecord::SessionShutdown { seq: w.seq(), t: last_t, flagged: !reasons.is_empty(), reasons });
+    w.out.push(TraceRecord::SessionShutdown { seq: w.seq(), t: last_t, flagged: !reasons.is_empty(), reasons, files_changed: Vec::new() });
     w.out
 }
 
@@ -1271,7 +1285,7 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         let started = iso_ms("2026-10-20T10:00:00.000Z").unwrap();
-        std::fs::write(staged.join("rematch.json"), json!({"id": "e-prov", "created_at": started - 1}).to_string()).unwrap();
+        std::fs::write(staged.join("rematch.json"), json!({"id": "e-prov", "created_at": started - 1, "version": 2, "content_sha256": "ab"}).to_string()).unwrap();
         std::fs::write(newer.join("rematch.json"), json!({"id": "e-new", "created_at": started + 1}).to_string()).unwrap();
         std::fs::write(kept.join("rematch.json"), json!({"id": "e-kept", "created_at": 0}).to_string()).unwrap();
         std::fs::write(hook.join("rematch.json"), json!({"id": "e-hook", "kind": "hook", "created_at": 0}).to_string()).unwrap();
@@ -1300,10 +1314,14 @@ mod tests {
         let s = parse_session(&text, None).unwrap();
         assert_eq!(s.offered_skills().len(), 6, "{:?}", s.offered_skills());
         assert_eq!(s.offered_skills()[5], PathBuf::from("/opt/codex/.system/imagegen/SKILL.md"));
-        let TraceRecord::SessionStart { loaded_entries, staging_dirs, .. } = &trace_records_of(&s)[0] else { panic!() };
-        assert_eq!(loaded_entries, &vec!["e-prov".to_string(), "e-kept".to_string()]);
+        let TraceRecord::SessionStart { loaded_entries, staging_dirs, visible_entries, .. } = &trace_records_of(&s)[0] else { panic!() };
+        let prov = LoadedEntry { id: "e-prov".into(), version: Some(2), sha: Some("ab".into()) };
+        assert_eq!(loaded_entries, &vec![prov, LoadedEntry::id("e-kept")]);
+        assert_eq!(visible_entries, &vec!["e-prov".to_string(), "e-kept".to_string(), "e-hook".to_string()], "the hook router is visible, not loaded");
         assert_eq!(staging_dirs[0], skills.join("rematch/ledger-tests").to_string_lossy());
-        assert_eq!(session_record(&s).loaded_entries, vec!["e-prov".to_string(), "e-kept".to_string()]);
+        let r = session_record(&s);
+        assert_eq!(r.loaded_entries, vec!["e-prov".to_string(), "e-kept".to_string()]);
+        assert_eq!((r.loaded_versions.get("e-prov"), r.loaded_entry_shas.clone()), (Some(&2), vec!["ab".to_string()]));
     }
 
     #[test]

@@ -159,11 +159,15 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
     let mut lines = Vec::new();
     let mut changed = Vec::new();
     let mut registered = 0usize;
+    // The next digest starts after everything shown here, including entries this process
+    // changed after it started (built-ins installed on its first run).
+    let mut seen = ctx.now;
     for e in ctx.ledger.list_entries(&EntryFilter::default())? {
         let since = e.status_since.unwrap_or(e.created_at);
         if since <= last {
             continue;
         }
+        seen = seen.max(since);
         changed.push(json!({"id": e.id, "name": e.name, "status": e.status, "since": since}));
         // Imported registrations (forge/brownfield, files left in place) were not staged:
         // one summary line instead of one per entry.
@@ -207,8 +211,10 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
             s.get("reason").and_then(Value::as_str).unwrap_or("drift")
         ));
     }
+    // Session start never touches the lake: the ledger's own outcome facets.
+    let keys = crate::scope::transfer::ledger_outcome_keys(ctx)?;
     let transfers: Vec<Value> =
-        crate::scope::transfer::suggest(ctx)?.into_iter().map(|s| serde_json::to_value(&s)).collect::<Result<_, _>>()?;
+        crate::scope::transfer::suggest(ctx, &keys)?.into_iter().map(|s| serde_json::to_value(&s)).collect::<Result<_, _>>()?;
     for t in &transfers {
         lines.push(format!(
             "transfer suggestion: {} → {} (`/rematch transfer apply {} --branch {}`)",
@@ -221,7 +227,7 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
     if !approvals.is_empty() {
         lines.push(format!("{} approval(s) pending", approvals.len()));
     }
-    std::fs::write(last_path(ctx), ctx.now.to_string())?;
+    std::fs::write(last_path(ctx), seen.to_string())?;
     Ok(json!({
         "since": last,
         "lines": lines,

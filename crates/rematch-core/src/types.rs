@@ -67,12 +67,22 @@ pub struct ModelRef {
 /// Deterministic trigger predicate (DESIGN §6).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Predicate {
+    /// Repo toplevel path glob (also matches descendants): the place test when the
+    /// predicate or the session has no `repo_remote`.
     pub repo_glob: String,
     #[serde(default)]
     pub file_exts: Vec<String>,
     /// ≤ 10 keyword stems.
     #[serde(default)]
     pub stems: Vec<String>,
+    /// Machine-independent repo identity (`identity::normalize_remote`): with a session
+    /// remote, the place test is remote equality plus `subpath`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote: Option<String>,
+    /// Glob over the session's toplevel-relative cwd (also matches descendants); `None`,
+    /// empty or `**` = the whole repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
 }
 
 /// The unit of evidence everywhere: one trace record in one session.
@@ -286,6 +296,10 @@ pub struct Entry {
     /// Provenance links (`transfers_from` for cross-branch transfers and exports).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    /// sha256 of `{"files":[[path, sha256], …]}` over the entry dir's files, sorted by path
+    /// (`library::content_sha256`); set at stage and keep. Cross-machine identity (ADR 001).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<Sha256Hex>,
 }
 
 fn one() -> u32 {
@@ -561,8 +575,32 @@ pub struct SessionRecord {
     pub error_cluster_seqs: Vec<u32>,
     #[serde(default)]
     pub takeovers: u32,
+    /// Entry ids loaded in the session (`session_start.loaded_entries` plus `retrieval` credit).
     #[serde(default)]
     pub loaded_entries: Vec<EntryId>,
+    /// `content_sha256` of the loaded entries that carried one in `session_start`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_entry_shas: Vec<Sha256Hex>,
+    /// Version each loaded entry had when the session started (versioned `loaded_entries`);
+    /// `counters::fold_session` counts an entry only at that version.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loaded_versions: BTreeMap<EntryId, u32>,
+    /// Entries the shared skills dir exposed at session start (DESIGN §16).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_entries: Vec<EntryId>,
+    /// `identity::normalize_remote` of the repo's origin (else first) remote, or
+    /// `local:<sha256 of the main toplevel>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_remote: Option<String>,
+    /// cwd relative to the repo toplevel (`""` at the top).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    /// HEAD commit at session start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// `(path, sha256)` of the files the session changed, from `session_shutdown`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_changed: Vec<(String, Sha256Hex)>,
     #[serde(default)]
     pub flagged: bool,
     #[serde(default)]
