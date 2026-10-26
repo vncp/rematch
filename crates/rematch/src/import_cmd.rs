@@ -9,11 +9,11 @@ use clap::Args;
 use rematch_core::features::{rank_stems, stems_of_text, MAX_PREDICATE_STEMS};
 use rematch_core::import::{extract_outcomes, read_session, scan_sessions_dir, session_record};
 use rematch_core::ledger::{EntryFilter, SessionFilter};
-use rematch_core::library::{validate_name, REMATCH_JSON};
+use rematch_core::library::{self, validate_name, REMATCH_JSON};
 use rematch_core::outcome::{minhash, outcome_tokens, MINHASH_K};
 use rematch_core::package::{slug, SkillDoc};
 use rematch_core::predicate;
-use rematch_core::types::{Entry, Family, Kind, Origin, Status};
+use rematch_core::types::{Edit, Entry, Family, Kind, Origin, Status};
 use serde_json::{json, Value};
 
 use crate::app::{new_entry, AppCtx, NewEntry};
@@ -31,6 +31,10 @@ pub struct ImportArgs {
     /// compound-forge checkout: skills/* → provisional brownfield entries, learnings/*.md → lessons.
     #[arg(long, value_name = "PATH")]
     pub forge: Option<PathBuf>,
+    /// With --forge: copy each skill into rematch's own staging instead of registering it in place,
+    /// so the forge checkout and plugin can be removed afterwards. Scripts are staged non-executable.
+    #[arg(long, requires = "forge")]
+    pub migrate: bool,
 }
 
 pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
@@ -49,7 +53,7 @@ pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
         out["history"] = h;
     }
     if let Some(forge) = &a.forge {
-        let f = import_forge(ctx, forge)?;
+        let f = import_forge(ctx, forge, a.migrate)?;
         lines.push(format!(
             "forge: {} skills registered ({} existing), {} lessons registered ({} existing)",
             f["skills_registered"], f["skills_existing"], f["lessons_registered"], f["lessons_existing"]
@@ -161,7 +165,35 @@ fn existing_import(ctx: &AppCtx, name: &str, source: &str) -> Result<Option<Entr
         .find(|e| matches!(&e.origin, Origin::Import { source: s } if s == source)))
 }
 
-pub fn import_forge(ctx: &AppCtx, forge: &Path) -> Result<Value> {
+/// Every regular file under `dir` as `Edit::Write`s with paths relative to `dir`. Non-UTF-8
+/// files are skipped (skills are text); symlinks are not followed.
+fn read_tree(dir: &Path) -> Result<Vec<Edit>> {
+    fn walk(root: &Path, cur: &Path, out: &mut Vec<Edit>) -> Result<()> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(cur)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        entries.sort();
+        for p in entries {
+            let meta = std::fs::symlink_metadata(&p)?;
+            if meta.is_dir() {
+                walk(root, &p, out)?;
+            } else if meta.is_file() {
+                let rel = p.strip_prefix(root)?.to_string_lossy().to_string();
+                if rel == REMATCH_JSON {
+                    continue;
+                }
+                match String::from_utf8(std::fs::read(&p)?) {
+                    Ok(content) => out.push(Edit::Write { path: rel, content }),
+                    Err(_) => eprintln!("rematch import: skipping non-text file {}", p.display()),
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out)?;
+    Ok(out)
+}
+
+pub fn import_forge(ctx: &AppCtx, forge: &Path, migrate: bool) -> Result<Value> {
     let forge = crate::app::absolute(forge)?;
     let skills_dir = forge.join("skills");
     if !skills_dir.is_dir() {
@@ -181,8 +213,22 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path) -> Result<Value> {
             skipped.push(json!({"name": name, "reason": "invalid name"}));
             continue;
         }
+        if migrate && name == "compound-forge" {
+            skipped.push(json!({"name": name, "reason": "meta-skill for the forge tool itself; not migrated"}));
+            continue;
+        }
         if let Some(e) = existing_import(ctx, &name, "forge")? {
-            existing.push(json!({"id": e.id, "name": name}));
+            let in_place = !e.path.starts_with(&ctx.paths.staging);
+            if !(migrate && in_place) {
+                existing.push(json!({"id": e.id, "name": name}));
+                continue;
+            }
+            // Registered in place earlier; move the registration into our own staging.
+            let files = read_tree(&dir)?;
+            let mut e = e;
+            e.status = Status::Provisional;
+            let staged = library::stage(&ctx.ledger, &ctx.paths, &e, &files)?;
+            registered.push(json!({"id": staged.id, "name": name, "stems": staged.predicate.stems, "path": staged.path, "migrated_from": dir, "files": files.len()}));
             continue;
         }
         let md = std::fs::read_to_string(dir.join("SKILL.md"))?;
@@ -190,7 +236,7 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path) -> Result<Value> {
         let (text, trigger_line) = trigger_text(&doc);
         let stems = ranked_text_stems(&format!("{name} {text}"), &corpus);
         let pred = predicate::derive(None, &[], &stems);
-        let e = new_entry(
+        let mut e = new_entry(
             NewEntry {
                 kind: Kind::Skill,
                 name: name.clone(),
@@ -204,12 +250,19 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path) -> Result<Value> {
             },
             ctx.now,
         )?;
-        // The skill already loads natively through the forge plugin: register only,
-        // never copy or write into the forge checkout.
-        let mut e = e;
         e.status_since = Some(ctx.now);
-        ctx.ledger.upsert_entry(&e)?;
-        registered.push(json!({"id": e.id, "name": name, "stems": e.predicate.stems, "path": dir}));
+        if migrate {
+            // Copy the whole skill tree into staging/<forge>/<name>/ (SPEC: stage beside, never
+            // over; scripts land mode 0644 until approved). The checkout is never written to.
+            let files = read_tree(&dir)?;
+            let staged = library::stage(&ctx.ledger, &ctx.paths, &e, &files)?;
+            registered.push(json!({"id": staged.id, "name": name, "stems": staged.predicate.stems, "path": staged.path, "migrated_from": dir, "files": files.len()}));
+        } else {
+            // The skill already loads natively through the forge plugin: register only,
+            // never copy or write into the forge checkout.
+            ctx.ledger.upsert_entry(&e)?;
+            registered.push(json!({"id": e.id, "name": name, "stems": e.predicate.stems, "path": dir}));
+        }
     }
 
     let mut lessons = Vec::new();
