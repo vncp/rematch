@@ -265,7 +265,10 @@ impl Ledger {
                tool_errors=excluded.tool_errors, skill_reads=excluded.skill_reads,
                files_touched=excluded.files_touched, exts=excluded.exts, stems=excluded.stems,
                redirects=excluded.redirects, flagged=excluded.flagged,
-               counted=MAX(sessions.counted, excluded.counted), source=excluded.source, json=excluded.json",
+               counted=MAX(sessions.counted, excluded.counted), source=excluded.source,
+               json=json_set(excluded.json,
+                 '$.source_path', COALESCE(json_extract(excluded.json, '$.source_path'), json_extract(sessions.json, '$.source_path')),
+                 '$.history_reflected_at', COALESCE(json_extract(excluded.json, '$.history_reflected_at'), json_extract(sessions.json, '$.history_reflected_at')))",
             params![
                 s.id,
                 s.cwd,
@@ -418,6 +421,15 @@ impl Ledger {
     pub fn set_session_counted(&self, id: &str, counted: bool) -> Result<()> {
         self.conn
             .execute("UPDATE sessions SET counted=?2 WHERE id=?1", params![id, counted])?;
+        Ok(())
+    }
+
+    /// Marks an imported session as dealt with by `reflect --history` (kept across upserts).
+    pub fn set_history_reflected(&self, id: &str, at: UnixMs) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET json=json_set(json, '$.history_reflected_at', ?2) WHERE id=?1",
+            params![id, at],
+        )?;
         Ok(())
     }
 
@@ -1041,6 +1053,20 @@ pub(crate) mod tests {
         // a re-upsert with counted=false must not un-count
         l.upsert_session(&a2).unwrap();
         assert!(l.get_session("a").unwrap().unwrap().counted);
+
+        // The import's source path and the `reflect --history` marker survive a re-fold that
+        // carries neither.
+        let mut imported = session("i", "repo", 300);
+        imported.source = "import".into();
+        imported.source_path = Some("/s/2026_i.jsonl".into());
+        l.upsert_session(&imported).unwrap();
+        l.set_history_reflected("i", 42).unwrap();
+        assert_eq!(l.get_session("i").unwrap().unwrap().history_reflected_at, Some(42));
+        let mut refold = imported.clone();
+        refold.source_path = None;
+        l.upsert_session(&refold).unwrap();
+        let got = l.get_session("i").unwrap().unwrap();
+        assert_eq!((got.source_path.as_deref(), got.history_reflected_at), (Some("/s/2026_i.jsonl"), Some(42)));
     }
 
     pub(crate) fn entry(id: &str, name: &str, branch: &str, status: Status) -> Entry {

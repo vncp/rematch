@@ -391,7 +391,8 @@ pub fn error_cluster_seqs(results: &[(u32, bool)]) -> Vec<u32> {
     out
 }
 
-/// Derives the ledger row for a finished (or in-progress) trace.
+/// Derives the ledger row for a finished (or in-progress) trace. A trace synthesized from an
+/// omp session (`session_start.mode == "import"`) folds to source `"import"`.
 pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
     let mut s = SessionRecord {
         id: session_id.to_string(),
@@ -416,9 +417,13 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 repo,
                 branch_hint,
                 model,
+                mode,
                 loaded_entries,
                 ..
             } => {
+                if mode == "import" {
+                    s.source = "import".to_string();
+                }
                 s.started_at = *t;
                 s.cwd = cwd.clone();
                 s.repo = repo.clone().filter(|r| !r.is_empty());

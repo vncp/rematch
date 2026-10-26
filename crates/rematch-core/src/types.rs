@@ -482,6 +482,13 @@ pub struct SessionRecord {
     pub counted: bool,
     /// `"trace"` (extension) or `"import"` (omp JSONL).
     pub source: String,
+    /// omp session file an imported row was read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// When `reflect --history` dealt with this imported session (handed it to reflection or
+    /// ruled it out). Survives re-imports and re-folds (`Ledger::upsert_session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_reflected_at: Option<UnixMs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -2,18 +2,22 @@
 //! scope leave as a git branch in the target repo, never merged by the binary.
 //!
 //! - team: kept/provisional entries whose predicate recurred across ≥ 2 repos (or that
-//!   are listed with `--entry`) are written to `<repo>/.omp/skills/<name>/` on branch
-//!   `rematch/<name>-<short id>`, committed with an evidence body.
-//! - fork: entries with `fork_path` are written to `<repo>/<fork_path>`; the body adds
-//!   the built fingerprint (`omp --version`, sha256 of the file) and before/after
-//!   numbers per family.
+//!   are listed with `--entry`) are written to `<repo>/.omp/skills/<name>/` (agents:
+//!   `<repo>/.omp/agents/<name>.md`) on branch `rematch/<name>-<short id>`, committed with
+//!   an evidence body. An `AGENTS.fragment.md` in the entry becomes the section
+//!   `## rematch: <name>` of `<repo>/AGENTS.md` (replaced in place when present) and is
+//!   not copied into the skill dir: the team PR is the only way text reaches AGENTS.md.
+//! - fork: entries with `fork_path` (`library set-fork-path`) are written to
+//!   `<repo>/<fork_path>` (`--repo`, else the entry's `fork_repo`); the body adds the
+//!   built fingerprint (`omp --version`, sha256 of the file) and before/after numbers
+//!   per family.
 //!
 //! The branch is built in a temporary worktree from the repo's current HEAD, so the
 //! user's checkout is untouched. `--push` pushes it; `--pr` (requires `--push` and
 //! `gh`) opens a PR. Without them nothing touches the network.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -22,11 +26,11 @@ use clap::{Args, ValueEnum};
 use rematch_core::counters::{harmed, recurred};
 use rematch_core::experience::{parse_experience, EXPERIENCE_MD};
 use rematch_core::ledger::{enum_str, sha256_hex, EntryFilter, SessionFilter};
-use rematch_core::library::load_entry;
+use rematch_core::library::{load_entry, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
 use rematch_core::lint::{lint_entry, LintContext};
 use rematch_core::package::{RematchBlock, SkillDoc};
 use rematch_core::predicate::{count_hit, count_match, predicate_hash};
-use rematch_core::{Activation, Counters, Entry, Family, FamilyCounters, Receipt, Status};
+use rematch_core::{Activation, Counters, Entry, Family, FamilyCounters, Kind, Receipt, Status};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -43,10 +47,11 @@ pub enum ShipScope {
 
 #[derive(Debug, Clone, Args)]
 pub struct ShipArgs {
-    /// team (`<repo>/.omp/skills/`) or fork (`<repo>/<fork_path>`).
+    /// team (`<repo>/.omp/skills/`, `.omp/agents/`, `AGENTS.md`) or fork (`<repo>/<fork_path>`).
     #[arg(long, value_enum)]
     pub scope: ShipScope,
-    /// Target repo (team: defaults to the entry's originating repo; fork: required).
+    /// Target repo (team: defaults to the entry's originating repo; fork: defaults to the
+    /// entry's `fork_repo`).
     #[arg(long)]
     pub repo: Option<PathBuf>,
     /// Entry id or name (repeatable). Listing an entry makes it eligible for team scope.
@@ -115,16 +120,20 @@ pub fn cmd_ship(ctx: &AppCtx, args: ShipArgs) -> Result<Value> {
         bail!("--pr needs the GitHub CLI `gh` on PATH");
     }
     let repo_arg = args.repo.as_deref().map(absolute).transpose()?;
-    if args.scope == ShipScope::Fork && repo_arg.is_none() {
-        return Err(Usage("ship --scope fork needs --repo <fork checkout>".into()).into());
-    }
     let explicit = !args.entries.is_empty();
     let (candidates, mut skipped) = select(ctx, &args)?;
     let mut shipped = Vec::new();
     for e in candidates {
-        let target = match &repo_arg {
-            Some(r) => r.clone(),
-            None => match origin_repo(ctx, &e)? {
+        let target = match (&repo_arg, args.scope) {
+            (Some(r), _) => r.clone(),
+            (None, ShipScope::Fork) => match &e.fork_repo {
+                Some(r) => r.clone(),
+                None => {
+                    skipped.push(skip(&e, "no --repo and the entry has no fork_repo (`library set-fork-path <id> <path> --repo <fork>`)"));
+                    continue;
+                }
+            },
+            (None, ShipScope::Team) => match origin_repo(ctx, &e)? {
                 Some(r) => r,
                 None => {
                     skipped.push(skip(&e, "no --repo and the entry has no originating repo in the ledger"));
@@ -164,7 +173,8 @@ pub fn recurrence_repos(ctx: &AppCtx, e: &Entry) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// `fork_path` may be set by hand in the entry's `rematch.json`; adopt it into the ledger.
+/// `fork_path` is set by `library set-fork-path` (ledger + rematch.json) or by the
+/// editor; a hand edit of the entry's `rematch.json` is adopted into the ledger too.
 fn adopt_fork_path(ctx: &AppCtx, mut e: Entry) -> Result<Entry> {
     if e.fork_path.is_none() {
         if let Some(fp) = load_entry(&e.path).ok().and_then(|d| d.fork_path) {
@@ -186,7 +196,7 @@ fn select(ctx: &AppCtx, args: &ShipArgs) -> Result<(Vec<Entry>, Vec<Skipped>)> {
             if !live(&e) {
                 skipped.push(skip(&e, &format!("status {} (only kept or provisional entries ship)", enum_str(&e.status))));
             } else if args.scope == ShipScope::Fork && e.fork_path.is_none() {
-                skipped.push(skip(&e, "no fork_path in rematch.json (fork scope ships per-model prompt/tool/compaction files)"));
+                skipped.push(skip(&e, "no fork_path (set one with `rematch library set-fork-path <id> <repo-relative path>`; fork scope ships per-model prompt/tool/compaction files)"));
             } else {
                 out.push(e);
             }
@@ -350,20 +360,81 @@ fn publish(repo: &Path, branch: &str, body: &str, args: &ShipArgs) -> Result<(bo
     Ok((true, out.stdout.lines().rev().find(|l| l.starts_with("http")).map(str::to_string)))
 }
 
+/// `existing` (a repo's AGENTS.md) with `fragment` as the section `## rematch: <name>`.
+/// An existing section of that heading — up to the next `#`/`##` heading outside a code
+/// fence — is replaced in place; otherwise the section is appended.
+pub fn upsert_agents_section(existing: &str, name: &str, fragment: &str) -> String {
+    let heading = format!("## rematch: {name}");
+    let section = format!("{heading}\n\n{}\n", fragment.trim());
+    let top_level = |l: &str| {
+        let h = l.chars().take_while(|&c| c == '#').count();
+        (1..=2).contains(&h) && l[h..].chars().next().is_none_or(char::is_whitespace)
+    };
+    let lines: Vec<&str> = existing.lines().collect();
+    let (mut start, mut end, mut fence) = (None, lines.len(), false);
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        match start {
+            None if l.trim_end() == heading => start = Some(i),
+            Some(_) if top_level(l) => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let join = |ls: &[&str]| ls.iter().map(|l| format!("{l}\n")).collect::<String>();
+    match start {
+        Some(s) => {
+            let mut out = join(&lines[..s]);
+            out.push_str(&section);
+            if end < lines.len() {
+                out.push('\n');
+                out.push_str(&join(&lines[end..]));
+            }
+            out
+        }
+        None => {
+            let mut out = existing.trim_end().to_string();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&section);
+            out
+        }
+    }
+}
+
 fn ship_team(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Shipped> {
     lint_before_ship(ctx, e)?;
     let branch = branch_name(e);
     let wt = Worktree::create(repo, &branch)?;
-    let rel_root = format!(".omp/skills/{}", e.name);
+    // A skill is a dir under `.omp/skills/`; an agent is one file under `.omp/agents/`.
+    let agent = e.kind == Kind::Agent;
+    let rel_root = if agent { format!(".omp/agents/{}.md", e.name) } else { format!(".omp/skills/{}", e.name) };
     let dst = wt.path.join(&rel_root);
-    if dst.exists() {
+    if dst.is_dir() {
         std::fs::remove_dir_all(&dst)?;
     }
     let mut rels = Vec::new();
+    let mut fragment = None;
     for (rel, abs) in package_files(&e.path)? {
-        let p = dst.join(&rel);
-        std::fs::create_dir_all(p.parent().expect("file under dst"))?;
-        if rel == "SKILL.md" {
+        if rel == AGENTS_FRAGMENT {
+            fragment = Some(std::fs::read_to_string(&abs)?);
+            continue;
+        }
+        if agent && rel != AGENT_MD {
+            continue;
+        }
+        let (p, shipped_rel) = if agent { (dst.clone(), rel_root.clone()) } else { (dst.join(&rel), format!("{rel_root}/{rel}")) };
+        std::fs::create_dir_all(p.parent().expect("file under the worktree"))?;
+        if rel == SKILL_MD || rel == AGENT_MD {
             let mut doc = SkillDoc::parse(&std::fs::read_to_string(&abs)?)?;
             doc.set_rematch(&RematchBlock {
                 id: e.id.clone(),
@@ -381,12 +452,22 @@ fn ship_team(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Sh
             std::fs::copy(&abs, &p)?;
         }
         non_executable(&p)?;
-        rels.push(format!("{rel_root}/{rel}"));
+        rels.push(shipped_rel);
     }
-    git(&wt.path, &["add", "--", &rel_root])?;
+    let mut paths = vec![rel_root.clone()];
+    if let Some(text) = fragment {
+        let file = wt.path.join("AGENTS.md");
+        let existing = std::fs::read_to_string(&file).unwrap_or_default();
+        std::fs::write(&file, upsert_agents_section(&existing, &e.name, &text))?;
+        non_executable(&file)?;
+        rels.push("AGENTS.md".into());
+        paths.push("AGENTS.md".into());
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    git(&wt.path, &[&["add", "--"][..], &refs].concat())?;
     let body = evidence_body(ctx, e)?;
     let message = format!("rematch: share {} with the team\n\n{body}", e.name);
-    let commit = git_commit(&wt.path, &message, &[&rel_root])?;
+    let commit = git_commit(&wt.path, &message, &refs)?;
     let hashes = file_hashes(&wt.path, &rels)?;
     let top = wt.repo.clone();
     drop(wt);
@@ -422,23 +503,15 @@ pub fn before_numbers(ctx: &AppCtx, e: &Entry) -> Result<Numbers> {
     Ok(n)
 }
 
-fn safe_repo_rel(rel: &str) -> Result<PathBuf> {
-    let p = PathBuf::from(rel);
-    if rel.is_empty() || p.components().any(|c| !matches!(c, Component::Normal(_))) {
-        bail!("fork_path must be repo-relative without traversal: {rel:?}");
-    }
-    Ok(p)
-}
-
 /// The text a fork entry ships: `fork/<file name of fork_path>` when the package has
-/// it, else the SKILL.md body without frontmatter.
+/// it, else the SKILL.md (agents: AGENT.md) body without frontmatter.
 fn fork_content(e: &Entry, fork_path: &str) -> Result<String> {
     let base = Path::new(fork_path).file_name().ok_or_else(|| anyhow!("fork_path has no file name"))?;
     let dedicated = e.path.join("fork").join(base);
     if dedicated.is_file() {
         return Ok(std::fs::read_to_string(dedicated)?);
     }
-    let md = std::fs::read_to_string(e.path.join("SKILL.md"))?;
+    let md = std::fs::read_to_string(e.path.join(rematch_core::library::primary_doc(e.kind)))?;
     Ok(SkillDoc::parse(&md).map(|d| d.body.trim_start().to_string()).unwrap_or(md))
 }
 
@@ -454,7 +527,7 @@ fn omp_version() -> String {
 
 fn ship_fork(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Shipped> {
     let fork_path = e.fork_path.clone().ok_or_else(|| anyhow!("entry has no fork_path"))?;
-    let rel = safe_repo_rel(&fork_path)?;
+    let rel = validate_fork_path(&fork_path)?;
     lint_before_ship(ctx, e)?;
     let content = fork_content(e, &fork_path)?;
     let base_head = git(repo, &["rev-parse", "HEAD"])?;
@@ -571,6 +644,40 @@ mod tests {
         assert!(out["shipped"].as_array().unwrap().is_empty());
         let out = cmd_ship(ctx, args(ShipScope::Team, None, vec![e.name.clone()])).unwrap();
         assert_eq!(out["shipped"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agents_md_section_is_appended_then_replaced_in_place() {
+        let base = "# Repo\n\nIntro.\n\n## Build\n\nmake\n";
+        let once = upsert_agents_section(base, "x", "Rule one.\n");
+        assert_eq!(once, "# Repo\n\nIntro.\n\n## Build\n\nmake\n\n## rematch: x\n\nRule one.\n");
+        assert_eq!(upsert_agents_section(&once, "x", "Rule one.\n"), once, "idempotent");
+        let mid = "# Repo\n\n## rematch: x\n\nold\n\n### nested\n\nold too\n\n## Build\n\nmake\n";
+        assert_eq!(upsert_agents_section(mid, "x", "new"), "# Repo\n\n## rematch: x\n\nnew\n\n## Build\n\nmake\n");
+        let fenced = "## rematch: x\n\n```md\n## not a heading\n```\n";
+        assert_eq!(upsert_agents_section(fenced, "x", "new"), "## rematch: x\n\nnew\n");
+        assert_eq!(upsert_agents_section("", "y", " r \n"), "## rematch: y\n\nr\n");
+        let two = upsert_agents_section(&once, "y", "Rule two.");
+        assert!(two.starts_with(&once) && two.ends_with("\n\n## rematch: y\n\nRule two.\n"), "{two}");
+    }
+
+    #[test]
+    fn ship_team_writes_an_agent_as_one_file_under_omp_agents() {
+        let t = env();
+        let ctx = &t.ctx;
+        let r1 = repo(&t.dir.join("agents-repo"));
+        let mut e = crate::scope::testutil::entry("e-agent-0001", "log-triage", "agents-repo");
+        e.kind = Kind::Agent;
+        let md = "---\nname: log-triage\ndescription: Use for a long build log; returns the first failing step.\n---\nReply with the first failing step.\n";
+        let e = stage(ctx, &e, &[("AGENT.md", md)]);
+        let out = cmd_ship(ctx, args(ShipScope::Team, Some(r1.clone()), vec![e.id.clone()])).unwrap();
+        let branch = out["shipped"][0]["branch"].as_str().unwrap();
+        let files = sh(&r1, &["git", "ls-tree", "-r", "--name-only", branch]);
+        assert!(files.lines().any(|f| f == ".omp/agents/log-triage.md") && !files.contains(".omp/skills"), "one file, no skill dir: {files}");
+        let shipped = sh(&r1, &["git", "show", &format!("{branch}:.omp/agents/log-triage.md")]);
+        let doc = SkillDoc::parse(&shipped).unwrap();
+        assert_eq!(doc.get_str("name"), Some("log-triage"));
+        assert!(shipped.contains("scope: team") && doc.body.contains("first failing step"), "{shipped}");
     }
 
     #[test]

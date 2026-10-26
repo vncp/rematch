@@ -1,5 +1,7 @@
-//! `library ls|why|disable|rollback|pin|unpin|approve|decline|export|import-export`
+//! `library ls|why|disable|rollback|pin|unpin|approve|decline|set-fork-path|export|import-export`
 //! and the `off|on` kill switch.
+
+use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
@@ -25,7 +27,7 @@ pub enum LibraryCmd {
         #[arg(long, default_value = "user request")]
         reason: String,
     },
-    /// Restore the predecessor of a kept skill; retire the current one.
+    /// Restore the predecessor of a kept skill or agent; retire the current one.
     Rollback { skill: String },
     Pin { id: String },
     Unpin { id: String },
@@ -33,6 +35,14 @@ pub enum LibraryCmd {
     Approve { id: String },
     /// Decline an approval (retires the entry; `export:<id>` only suppresses the offer).
     Decline { id: String },
+    /// Set the repo-relative file `ship --scope fork` writes for an entry (and, with
+    /// --repo, the fork checkout it goes to).
+    SetForkPath {
+        id: String,
+        path: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Work → home export of invariant entries.
     Export(crate::scope::export::ExportArgs),
     /// Import an export directory.
@@ -102,6 +112,7 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
             let r = library::decline(&ctx.ledger, &ctx.paths, &e.id, approval_for(&e))?;
             Ok(json!({"entry": r, "lines": [format!("declined {}; entry retired", e.name)]}))
         }
+        LibraryCmd::SetForkPath { id, path, repo } => set_fork_path(ctx, &id, &path, repo.as_deref()),
         LibraryCmd::Export(a) => crate::scope::export::cmd_export(ctx, a),
         LibraryCmd::ImportExport(a) => crate::scope::export::cmd_import_export(ctx, a),
     }
@@ -132,13 +143,33 @@ fn approval_for(e: &Entry) -> Approval {
     }
 }
 
+/// `fork_path` (+ `fork_repo`) into the ledger and the entry's `rematch.json`. A changed
+/// target clears `fork_commit`: the drift baseline belonged to the old one.
+fn set_fork_path(ctx: &AppCtx, id: &str, path: &str, repo: Option<&std::path::Path>) -> Result<Value> {
+    library::validate_fork_path(path)?;
+    let mut e = crate::scope::resolve_entry(ctx, id)?;
+    let repo = repo.map(crate::app::absolute).transpose()?;
+    let before = (e.fork_path.clone(), e.fork_repo.clone());
+    e.fork_path = Some(path.to_string());
+    if repo.is_some() {
+        e.fork_repo = repo;
+    }
+    if (e.fork_path.clone(), e.fork_repo.clone()) != before {
+        e.fork_commit = None;
+    }
+    e.updated_at = ctx.now;
+    crate::scope::save_entry(ctx, &e)?;
+    let to = e.fork_repo.as_ref().map(|r| format!(" in {}", r.display())).unwrap_or_default();
+    Ok(json!({"entry": e, "lines": [format!("{} ships to {path}{to} with `ship --scope fork`", e.name)]}))
+}
+
 fn ls(ctx: &AppCtx) -> Result<Value> {
     let mut entries = Vec::new();
     let mut lines = Vec::new();
     for e in ctx.ledger.list_entries(&EntryFilter::default())? {
         let c = ctx.ledger.counters(&e.id)?;
         lines.push(format!(
-            "{:<11} {:<6} {} [{}] matched {} · recurrence {} · harm {}{}",
+            "{:<11} {:<6} {} [{}] matched {} · recurrence {} · harm {}{}{}",
             enum_str(&e.status),
             enum_str(&e.kind),
             e.name,
@@ -146,12 +177,14 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
             c.matched,
             c.recurrence,
             c.harm,
-            if e.pinned { " · pinned" } else { "" }
+            if e.pinned { " · pinned" } else { "" },
+            e.fork_path.as_deref().map(|p| format!(" · fork:{p}")).unwrap_or_default()
         ));
         entries.push(json!({
             "id": e.id, "name": e.name, "kind": e.kind, "status": e.status, "branch": e.branch, "family": e.family,
             "pinned": e.pinned, "origin": e.origin, "trigger_line": e.trigger_line, "path": e.path,
             "predicate": e.predicate, "counters": c, "evidence": e.evidence.len(), "version": e.version,
+            "fork_path": e.fork_path, "fork_repo": e.fork_repo,
         }));
     }
     if lines.is_empty() {

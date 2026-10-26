@@ -361,3 +361,173 @@ fn uninstall_prints_the_plan_then_removes_the_root() {
     assert_eq!(y["applied"], true);
     assert!(!env.root.exists());
 }
+
+// ---- reflect --history / improve over imported omp sessions ----
+
+fn omp_user(text: &str) -> Value {
+    json!({"role": "user", "content": [{"type": "text", "text": text}], "attribution": "user"})
+}
+
+fn omp_assistant(text: &str, calls: Vec<Value>, stop: &str) -> Value {
+    let mut content = vec![json!({"type": "thinking", "thinking": "plan"})];
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    content.extend(calls);
+    json!({"role": "assistant", "content": content, "provider": "anthropic", "model": "claude-opus-5-5",
+           "usage": {"input": 100, "output": 20, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 120}, "stopReason": stop})
+}
+
+fn omp_call(id: &str, name: &str, args: Value) -> Value {
+    json!({"type": "toolCall", "id": id, "name": name, "arguments": args})
+}
+
+fn omp_result(id: &str, name: &str, text: &str, is_error: bool) -> Value {
+    json!({"role": "toolResult", "toolCallId": id, "toolName": name, "content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+/// omp v3 session file under `<agent>/sessions/-work-payments/` (cwd = the env repo) whose
+/// entries chain `parentId`s, one second apart from `<day>T10:00:00Z`.
+fn write_omp_session(env: &Env, sid: &str, day: &str, messages: &[Value]) -> PathBuf {
+    let dir = env.agent.join("sessions").join("-work-payments");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut lines = vec![
+        json!({"type": "title", "v": 1, "title": "x", "pad": "  "}),
+        json!({"type": "session", "version": 3, "id": sid, "timestamp": format!("{day}T10:00:00.000Z"), "cwd": env.repo}),
+    ];
+    let mut parent: Option<String> = None;
+    for (i, m) in messages.iter().enumerate() {
+        let id = format!("{sid}-e{i}");
+        lines.push(json!({"type": "message", "id": id, "parentId": parent, "timestamp": format!("{day}T10:00:{:02}.000Z", i + 1),
+                          "runtime": {"version": "18.12.6"}, "message": m}));
+        parent = Some(id);
+    }
+    let path = dir.join(format!("{day}T10-00-00-000Z_{sid}.jsonl"));
+    std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    path
+}
+
+/// user → assistant(edit) → toolResult → assistant → user "No, that's wrong …" → assistant.
+fn redirected_session(env: &Env, sid: &str, day: &str) -> PathBuf {
+    let file = format!("{}/src/ledger.rs", env.repo.display());
+    write_omp_session(env, sid, day, &[
+        omp_user("Add the ledger reconciliation command to the payments crate"),
+        omp_assistant("", vec![omp_call("c1", "edit", json!({"path": file, "input": "[src/ledger.rs#1A2B]\nPUT 1:\n+pub fn reconcile() {}"}))], "toolUse"),
+        omp_result("c1", "edit", "applied", false),
+        omp_assistant("Added the reconcile command and committed it.", vec![], "stop"),
+        omp_user("No, that's wrong: run the tests before you commit; the reconcile tests fail"),
+        omp_assistant("Running the reconcile tests now.", vec![], "stop"),
+    ])
+}
+
+#[test]
+fn reflect_history_reflects_flagged_imported_sessions_once() {
+    let env = Env::new();
+    redirected_session(&env, "hist-new", "2026-10-20");
+    redirected_session(&env, "hist-old", "2025-01-05");
+    let d = env.run(&["import", "--history"]);
+    assert_eq!(d["history"]["new"], 2, "{d}");
+    assert_eq!(d["history"]["redirects"], 2, "{d}");
+
+    // --since keeps the 2025 session out; the 2026 one is handed to the normal loop.
+    let editor = script("editor-ok.sh");
+    let r = env.run(&["reflect", "--history", "--since", "2026-01-01", "--editor", &editor]);
+    let h = &r["history"];
+    assert_eq!(h["handed"], json!(["hist-new"]), "{r}");
+    assert_eq!(h["deferred"], 0);
+    assert_eq!(h["sessions"][0]["outcome"], "staged", "{r}");
+    assert_eq!(h["sessions"][0]["name"], "run-tests-before-commit");
+    assert_eq!(r["count"]["folded"], json!(["hist-new"]), "{r}");
+    assert!(env.calls().len() <= 3, "≤ 3 model calls per reflection: {:?}", env.calls());
+    assert!(env.staged_dir().join("SKILL.md").is_file());
+    assert!(!env.root.join("pending/hist-new.json").exists(), "pending consumed");
+    let trace = std::fs::read_to_string(env.root.join("traces/hist-new.jsonl")).unwrap();
+    let first: Value = serde_json::from_str(trace.lines().next().unwrap()).unwrap();
+    assert_eq!((first["ev"].as_str(), first["mode"].as_str()), (Some("session_start"), Some("import")));
+    let last: Value = serde_json::from_str(trace.lines().last().unwrap()).unwrap();
+    assert_eq!(last["reasons"], json!(["redirect:negation"]), "{last}");
+
+    // The ledger row stays the import's, counted once, with the redirect at its trace seq.
+    let w = env.run(&["library", "why", "hist-new"]);
+    assert_eq!(w["session"]["source"], "import", "{w}");
+    assert_eq!(w["session"]["counted"], true);
+    let red = &w["redirects"][0];
+    assert_eq!(red["prelabel"], "negation", "{w}");
+    let seq = red["seq"].as_u64().unwrap();
+    let at: Value = serde_json::from_str(trace.lines().nth(seq as usize).unwrap()).unwrap();
+    assert_eq!((at["ev"].as_str(), at["prelabel"].as_str()), (Some("input"), Some("negation")), "why's seq addresses the trace");
+    assert!(w["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("negation")), "{w}");
+
+    // Idempotent: nothing to hand, nothing to count, no model call.
+    let calls = env.calls().len();
+    let r2 = env.run(&["reflect", "--history", "--since", "2026-01-01", "--editor", &editor]);
+    assert_eq!(r2["history"]["handed"], json!([]), "{r2}");
+    assert_eq!(r2["count"]["folded"], json!([]), "{r2}");
+    assert_eq!(r2["reflections"], json!([]));
+    assert_eq!(env.calls().len(), calls);
+
+    // A re-import keeps the counted flag and the marker; still nothing to reflect.
+    let d2 = env.run(&["import", "--history"]);
+    assert_eq!(d2["history"]["updated"], 2, "{d2}");
+    let w2 = env.run(&["library", "why", "hist-new"]);
+    assert_eq!((w2["session"]["counted"].clone(), w2["redirects"][0]["seq"].clone()), (json!(true), json!(seq)), "{w2}");
+    assert_eq!(env.run(&["count"])["folded"], json!([]));
+
+    // --limit 0 defers the remaining flagged session instead of spending model calls.
+    let r3 = env.run(&["reflect", "--history", "--limit", "0", "--editor", &editor]);
+    assert_eq!((r3["history"]["handed"].clone(), r3["history"]["deferred"].clone()), (json!([]), json!(1)), "{r3}");
+    assert_eq!(env.calls().len(), calls);
+    let r4 = env.run(&["reflect", "--history", "--editor", &editor]);
+    assert_eq!(r4["history"]["handed"], json!(["hist-old"]), "{r4}");
+    // Rate limits apply to imported sessions as to live ones: same trigger predicate, pending canary.
+    assert_eq!(r4["history"]["sessions"][0]["outcome"], "rate_limited", "{r4}");
+
+    let (v, code) = env.run_cmd(env.cmd(&["reflect", "--history", "--since", "yesterday"]));
+    assert_eq!(code, 2, "{v}");
+}
+
+#[test]
+fn improve_builds_its_excerpt_from_imported_history() {
+    let env = Env::new();
+    let skill = env.agent.join("skills/ledger-helper");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "---\nname: ledger-helper\ndescription: Use when editing the ledger module.\n---\n\nUse when editing the ledger module.\n").unwrap();
+    let read = || omp_call("r", "read", json!({"path": "skill://ledger-helper"}));
+    for i in 0..4 {
+        write_omp_session(&env, &format!("imp-{i}"), &format!("2026-10-1{i}"), &[
+            omp_user("Update the ledger module rounding"),
+            omp_assistant("", vec![read()], "toolUse"),
+            omp_result("r", "read", "skill body", false),
+            omp_assistant("Done.", vec![], "stop"),
+        ]);
+    }
+    // The newest session: three failing test runs in a row (a tool-error cluster), no redirect.
+    let bash = |id: &str| omp_call(id, "bash", json!({"command": "cargo test -p ledger"}));
+    write_omp_session(&env, "imp-err", "2026-10-19", &[
+        omp_user("Update the ledger module rounding"),
+        omp_assistant("", vec![read()], "toolUse"),
+        omp_result("r", "read", "skill body", false),
+        omp_assistant("", vec![bash("b1"), bash("b2"), bash("b3")], "toolUse"),
+        omp_result("b1", "bash", "error[E0425]: cannot find value `rounding`", true),
+        omp_result("b2", "bash", "error[E0425]: cannot find value `rounding`", true),
+        omp_result("b3", "bash", "error[E0425]: cannot find value `rounding`", true),
+        omp_assistant("The build fails.", vec![], "stop"),
+    ]);
+    env.run(&["import", "--history"]);
+    assert!(!env.root.join("traces").exists() || std::fs::read_dir(env.root.join("traces")).unwrap().next().is_none(), "no traces: imported only");
+
+    let dump = env.root.parent().unwrap().join("editor-input.txt");
+    let editor = format!("tee -a '{}' | sh '{}'", dump.display(), script("editor-ok.sh"));
+    let u = env.run(&["improve", "ledger-helper", "--editor", &editor]);
+    assert_eq!(u["audit"]["imported"], 5, "{u}");
+    assert_eq!(u["audit"]["error_clusters"], 1, "{u}");
+    let text = std::fs::read_to_string(&dump).unwrap();
+    let body = &text[text.find("<input>").unwrap() + 7..text.find("</input>").unwrap()];
+    let input: Value = serde_json::from_str(body.trim()).unwrap();
+    let excerpt = input["trace_excerpt"].as_array().unwrap();
+    assert!(!excerpt.is_empty(), "excerpt from the imported session: {input}");
+    assert!(excerpt.iter().any(|r| r["ev"] == "tool_result" && r["is_error"] == true && r["tool"] == "bash"), "{input}");
+    let clusters = input["clusters"].as_array().unwrap();
+    assert!(clusters.iter().any(|c| c["class"] == "error_cluster" && c["stems"] == "bash" && c["count"] == 1), "{input}");
+    assert_eq!(input["redirect"]["class"], "error_cluster", "{input}");
+}

@@ -8,7 +8,11 @@ The short version: **use omp as usual.** rematch watches, proposes when you corr
 - [Approving scripts and hooks](#approving-scripts-and-hooks)
 - [Creating a skill on purpose](#creating-a-skill-on-purpose)
 - [Improving a skill you already have](#improving-a-skill-you-already-have)
+- [Learning from sessions before rematch was installed](#learning-from-sessions-before-rematch-was-installed)
 - [Batch mode with a verifier](#batch-mode-with-a-verifier)
+- [Subagents](#subagents)
+- [Text for a repo's AGENTS.md](#text-for-a-repos-agentsmd)
+- [Prompt and tool text for an omp fork](#prompt-and-tool-text-for-an-omp-fork)
 - [Managing the library](#managing-the-library)
 - [Turning it off, rolling back, uninstalling](#turning-it-off-rolling-back-uninstalling)
 - [Where things are](#where-things-are)
@@ -89,9 +93,18 @@ What happens: the skill is registered as a provisional entry (its file is never 
 
 - fewer than 5 traced sessions used it → it refuses with the count and offers the split;
 - over 8 KB → it is split mechanically into a router `SKILL.md` + `units/` + `facts/` and staged beside the original (omp shows the new one under the bare name, the original namespaced) until the counters decide;
-- otherwise → one editor call proposes unit-level edits from the clustered redirects, same lint, staged beside.
+- otherwise → one editor call proposes unit-level edits from the clustered redirects and tool-error clusters (imported sessions included: their excerpt is rebuilt from omp's session files), same lint, staged beside.
 
 A pinned skill is refused.
+
+## Learning from sessions before rematch was installed
+
+```
+rematch import --history                              # omp's session history → the ledger (no model)
+rematch reflect --history [--since 2026-10-01] [--limit 10]
+```
+
+`reflect --history` treats every imported session that the extension would have flagged (a redirect, or a tool-error cluster) like a fresh one: it rebuilds the session's trace from omp's file, then runs the normal reflection (same rate limits, ≤ 3 model calls each). Newest first, at most `--limit` sessions per run (default 10); run it again for the next batch. A session is reflected once; the envelope lists each session's outcome.
 
 ## Batch mode with a verifier
 
@@ -105,6 +118,37 @@ rematch status <job-id>
 
 The worker runs the task in a fresh git worktree with the current harness, proposes an invariant and a domain candidate, probes each, composes, re-runs, and lets the verifier pick. Four rollouts at the default width, ten at `--width 2`. The winner's lessons are staged **provisional**; they become kept only when the *next* run of that task passes with them loaded. The receipt is at `~/.rematch/runs/<task>/receipt.json`.
 
+## Subagents
+
+When the fix for a correction is "read this big thing and report the one line that matters" (a build log, a long diff, a data dump), the editor may propose a **subagent** (`kind: agent`) instead of a skill. It is an omp task agent: an `AGENT.md` with `name`, `description` (what the main agent sees when deciding to delegate) and optionally `model`, and a body that is the subagent's system prompt. It runs in its own context and returns text, so the big input never enters your session.
+
+- **Provisional:** the entry lives in `~/.rematch/staging/<branch>/<name>/`, and `~/.rematch/agents/<name>.md` links to its `AGENT.md`. omp finds it through the plugin (`extension/agents` is a link to `~/.rematch/agents/`, made by `scripts/install.sh`). Unlike a skill it is offered in **every** session, because omp reads agents only from fixed places; it is counted only in sessions whose repo matches, like a skill.
+- **Kept:** after 4 clean counted sessions it is copied to `~/.omp/agent/agents/<name>.md` (a file of yours with that name is saved first and comes back with `rollback` or `uninstall`) and the link is removed.
+- **Retired, dormant, stale:** the link (or the kept copy) is removed; the entry is archived.
+- A project or user agent with the same name wins over a provisional one (omp's precedence).
+- `/rematch off` does not hide provisional agents; `library disable <id>` does.
+
+## Text for a repo's AGENTS.md
+
+`AGENTS.md` is always in context for everyone working in a repo, so rematch never writes it on your machine. An entry may carry an `AGENTS.fragment.md` (the editor proposes one for a rule that applies to every run in the repo). It reaches the repo only through a team branch:
+
+```
+rematch ship --scope team --entry <id> [--push --pr]
+```
+
+The branch adds the skill under `.omp/skills/<name>/` (without the fragment) and a section `## rematch: <name>` to `AGENTS.md` (created if the repo has none). Shipping a newer version replaces that section in place. Fragment headings start at `###`; the fragment counts toward the 8 KB always-on budget like skill text.
+
+## Prompt and tool text for an omp fork
+
+Per-model prompt text, tool descriptions and compaction defaults live in the omp source, so they ship to a fork checkout as a branch. Point an entry at the file it replaces once:
+
+```
+rematch library set-fork-path <id> src/prompts/tools/bash.md --repo ~/src/omp-fork
+rematch ship --scope fork --entry <id>      # --repo defaults to the one recorded above
+```
+
+The file's text is `fork/<file name>` in the entry if it has one, else its `SKILL.md` body. `library ls --text` shows `fork:<path>` for such entries. The editor can propose the path itself (`fork_path`); the path must be relative to the fork without `..`.
+
 ## Managing the library
 
 ```
@@ -112,14 +156,15 @@ rematch library ls --text
 rematch library pin <id>        # human-owned: never replaced or retired automatically
 rematch library unpin <id>
 rematch library disable <id>    # retire now (archived with its evidence; never deleted)
-rematch library rollback <skill># restore the previous kept version, retire the current one
+rematch library rollback <name> # restore the previous kept version (skill or agent), retire the current one
 ```
 
 Sharing beyond your machine (all open a branch or a diff; nothing is merged for you):
 
 ```
-rematch ship --scope team [--entry <id>…] [--push --pr]   # <repo>/.omp/skills/<name> on a branch with evidence
-rematch ship --scope fork --repo <fork>                    # fork_path entries, fingerprint + before/after numbers
+rematch ship --scope team [--entry <id>…] [--push --pr]   # <repo>/.omp/skills/<name> (agents: .omp/agents/<name>.md) + AGENTS.md section, on a branch with evidence
+rematch ship --scope fork [--repo <fork>]                  # fork_path entries, fingerprint + before/after numbers
+rematch library set-fork-path <id> <path> [--repo <fork>]  # which fork file an entry replaces
 rematch library export                                     # invariant entries, per-entry approval, to ~/.rematch/export
 rematch transfer suggest | apply <id> --branch <b>         # invariant lessons across branches with overlapping facets
 ```
@@ -142,11 +187,14 @@ rematch transfer suggest | apply <id> --branch <b>         # invariant lessons a
   pending/           sessions flagged for the next reflection
   ledger.sqlite      sessions, entries, counters, proposals, receipts
   staging/<branch>/  provisional entries, loaded on match
+  agents/            links to provisional agents (extension/agents points here)
+  kept-agents/       entry dirs of kept agents
   drafts/ archive/   never loaded (archive is never deleted)
   improver/          editor.md, classifier.md, reflector.md, lint.toml
   jobs/ runs/ tasks/ batch mode
   off                kill-switch marker
 ~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/)
+~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/)
 ~/.omp/agent/extensions/rematch-hooks/   approved hooks
 ```
 

@@ -15,8 +15,8 @@ use rematch_core::lint::{self, LintConfig, LintContext};
 use rematch_core::package::{self, SkillDoc, SPLIT_THRESHOLD};
 use rematch_core::predicate::{self, MAX_EXTS};
 use rematch_core::redirect;
-use rematch_core::trace;
-use rematch_core::types::{EditorScope, Entry, Family, Kind, Moment, Origin, SessionRecord, Status};
+use rematch_core::trace::{self, TraceRecord};
+use rematch_core::types::{EditorScope, Entry, Family, Kind, Moment, Origin, RedirectClass, SessionRecord, Status};
 use serde_json::{json, Value};
 
 use crate::app::{new_entry, AppCtx, NewEntry};
@@ -135,10 +135,12 @@ fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], br
     Ok((e, true))
 }
 
+/// Cluster groups: (class, key) → (count, examples, `<session>#<seq>` moments).
+type Groups = BTreeMap<(String, String), (usize, Vec<String>, Vec<String>)>;
+
 /// Redirect clusters: (class, top stems) → count + examples.
 fn clusters(sessions: &[SessionRecord]) -> Vec<Value> {
-    type Group = (usize, Vec<String>, Vec<String>); // count, examples, moments
-    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    let mut groups = Groups::new();
     for s in sessions {
         for r in &s.redirects {
             let class = redirect::effective_class(r).map(redirect::class_name).unwrap_or("unclassified").to_string();
@@ -154,12 +156,83 @@ fn clusters(sessions: &[SessionRecord]) -> Vec<Value> {
             }
         }
     }
+    sorted_clusters(groups)
+}
+
+/// Tool-error clusters (class `error_cluster`) grouped by the failing tools of each cluster's
+/// window: count, error heads as examples, `<session>#<seq>` of the result that tipped it.
+fn error_clusters(traced: &[(SessionRecord, Vec<TraceRecord>)]) -> Vec<Value> {
+    let mut groups = Groups::new();
+    for (s, records) in traced {
+        let results: Vec<(u32, &str, bool, &str)> = records
+            .iter()
+            .filter_map(|r| match r {
+                TraceRecord::ToolResult { seq, tool, is_error, content_head, .. } => Some((*seq, tool.as_str(), *is_error, content_head.as_str())),
+                _ => None,
+            })
+            .collect();
+        for &seq in &s.error_cluster_seqs {
+            let Some(end) = results.iter().position(|r| r.0 == seq) else { continue };
+            let window = &results[(end + 1).saturating_sub(trace::ERROR_CLUSTER_WINDOW)..=end];
+            let errors: Vec<_> = window.iter().filter(|r| r.2).collect();
+            let tools: std::collections::BTreeSet<&str> = errors.iter().map(|r| r.1).collect();
+            let g = groups.entry(("error_cluster".into(), tools.into_iter().collect::<Vec<_>>().join(" "))).or_default();
+            g.0 += 1;
+            for e in errors {
+                if g.1.len() < 5 {
+                    g.1.push(format!("{}: {}", e.1, head(e.3, 300)));
+                }
+            }
+            if g.2.len() < 5 {
+                g.2.push(format!("{}#{}", s.id, seq));
+            }
+        }
+    }
+    sorted_clusters(groups)
+}
+
+fn sorted_clusters(groups: Groups) -> Vec<Value> {
     let mut v: Vec<Value> = groups
         .into_iter()
         .map(|((class, stems), (count, examples, moments))| json!({"class": class, "stems": stems, "count": count, "examples": examples, "moments": moments}))
         .collect();
     v.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
     v
+}
+
+/// Sessions with a signal (redirect or error cluster), each with its trace — live, or
+/// synthesized from the omp session file for imported sessions — and a row whose seqs
+/// address that trace. Sessions whose trace cannot be found are left out.
+fn traced_signals(ctx: &AppCtx, sessions: &[SessionRecord]) -> Result<Vec<(SessionRecord, Vec<TraceRecord>)>> {
+    let mut out = Vec::new();
+    for s in sessions.iter().filter(|s| !s.redirects.is_empty() || s.error_clusters > 0) {
+        if let Some(pair) = crate::import_cmd::session_with_records(ctx, s)? {
+            out.push(pair);
+        }
+    }
+    Ok(out)
+}
+
+/// The editor's moment: the most recent session's earliest redirect the classifier did not
+/// dismiss; else the first cluster of the session with the most error clusters (then tool
+/// errors, then recency).
+fn pick_moment(traced: &[(SessionRecord, Vec<TraceRecord>)]) -> Option<(Moment, &[TraceRecord])> {
+    let redirect = traced.iter().rev().find_map(|(s, records)| {
+        s.redirects
+            .iter()
+            .filter(|r| redirect::mark_class(&r.prelabel).is_some() || r.class != Some(RedirectClass::None))
+            .map(|r| r.seq)
+            .min()
+            .map(|seq| (Moment { session_id: s.id.clone(), seq }, records.as_slice()))
+    });
+    redirect.or_else(|| {
+        traced
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _))| !s.error_cluster_seqs.is_empty())
+            .max_by_key(|(i, (s, _))| (s.error_clusters, s.tool_errors, *i))
+            .map(|(_, (s, records))| (Moment { session_id: s.id.clone(), seq: s.error_cluster_seqs[0] }, records.as_slice()))
+    })
 }
 
 pub fn cmd_improve(ctx: &AppCtx, a: ImproveArgs) -> Result<Value> {
@@ -321,23 +394,27 @@ fn propose_unit_level(
     branch: &str,
     mut out: Value,
 ) -> Result<Value> {
-    let cl = clusters(sessions);
-    let errors: u32 = sessions.iter().map(|s| s.error_clusters).sum();
-    let process = cl.iter().filter(|c| c["class"] == "correction").map(|c| c["count"].as_u64().unwrap_or(0)).sum::<u64>() + errors as u64
-        >= cl.iter().filter(|c| c["class"] == "preference" || c["class"] == "scope").map(|c| c["count"].as_u64().unwrap_or(0)).sum::<u64>();
+    // Live traces, or traces synthesized from omp session files for imported sessions: the
+    // excerpt and clusters see imported history too, with seqs that address those records.
+    let traced = traced_signals(ctx, sessions)?;
+    let rows: Vec<SessionRecord> = sessions
+        .iter()
+        .map(|s| traced.iter().find(|(t, _)| t.id == s.id).map_or_else(|| s.clone(), |(t, _)| t.clone()))
+        .collect();
+    let redirect_cl = clusters(&rows);
+    let error_cl = error_clusters(&traced);
+    let errors: u32 = rows.iter().map(|s| s.error_clusters).sum();
+    let process = redirect_cl.iter().filter(|c| c["class"] == "correction").map(|c| c["count"].as_u64().unwrap_or(0)).sum::<u64>() + errors as u64
+        >= redirect_cl.iter().filter(|c| c["class"] == "preference" || c["class"] == "scope").map(|c| c["count"].as_u64().unwrap_or(0)).sum::<u64>();
     let scope = if process { EditorScope::Invariant } else { EditorScope::Domain };
-    // Most recent traced session with a moment gives the excerpt.
-    let mut excerpt = Vec::new();
-    let mut moment = Moment { session_id: sessions.last().map(|s| s.id.clone()).unwrap_or_default(), seq: 0 };
-    for s in sessions.iter().rev() {
-        let tp = ctx.paths.traces.join(format!("{}.jsonl", s.id));
-        if let (true, Some(m)) = (tp.is_file(), trace::find_moment(s)) {
-            excerpt = trace::excerpt_around(&trace::read_trace(&tp)?, m.seq, reflect::EXCERPT_RADIUS, reflect::EXCERPT_RADIUS);
-            moment = m;
-            break;
-        }
-    }
-    let top = cl.first().cloned().unwrap_or(json!({"class": "none", "examples": []}));
+    let (excerpt, moment) = match pick_moment(&traced) {
+        Some((m, records)) => (trace::excerpt_around(records, m.seq, reflect::EXCERPT_RADIUS, reflect::EXCERPT_RADIUS), m),
+        None => (Vec::new(), Moment { session_id: sessions.last().map(|s| s.id.clone()).unwrap_or_default(), seq: 0 }),
+    };
+    let top = redirect_cl.first().or(error_cl.first()).cloned().unwrap_or(json!({"class": "none", "examples": []}));
+    let mut cl = redirect_cl;
+    cl.extend(error_cl);
+    cl.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
     let input = json!({
         "mode": "improve_unit_level",
         "scope": scope,

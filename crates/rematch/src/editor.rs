@@ -95,6 +95,10 @@ pub struct EditorEntry {
     pub hook: Option<HookRule>,
     #[serde(default)]
     pub stems: Vec<String>,
+    /// Fork scope: the repo-relative file in the omp fork that `ship --scope fork` writes
+    /// (content: `fork/<basename>` in `files`, else the SKILL.md body).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_path: Option<String>,
 }
 
 fn skill_kind() -> String {

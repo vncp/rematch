@@ -23,6 +23,7 @@ wins (it exists only where a technical constraint was verified).
 | `omp plugin install <local-path>` links the dir into `~/.omp/plugins/node_modules/<pkg.name>` and enables it in `omp-plugins.lock.json`; `package.json#omp.extensions` lists entries | Install: `omp plugin link <root>/extension` (or `install`). Binary on PATH via `~/.local/bin/rematch` shim written by `scripts/install.sh`. |
 | `omp anonymize` writes a shareable redacted copy of a session | `tests/goldens/` holds anonymized real sessions for the importer tests. |
 | Credentials, `agent.db`, `models.db` live in the agent dir | Batch isolation does **not** swap `PI_CODING_AGENT_DIR` (would lose auth). Isolation = fresh git worktree + `--config <overlay.yml>` (all skill providers off, `skills.customDirectories=[candidate]`, memory off) + `--no-extensions --no-rules --no-session`. |
+| Task agents are discovered from `<cwd>/.omp/agents/*.md` (project), `~/.omp/agent/agents/*.md` (user) and `<extension-root>/agents/*.md` of every enabled plugin, in that precedence, first `name` wins; frontmatter needs `name` + `description`, extra keys are ignored (`omp://task-agent-discovery.md`). No setting adds an agent dir at runtime | Provisional agents load through the plugin root: `extension/agents` is a symlink (made by `install.sh`, gitignored) to `REMATCH_ROOT/agents/`, which holds one symlink per provisional agent. They are visible in **every** session while provisional (counted only where the predicate's glob hits); kept agents are copied to `~/.omp/agent/agents/<name>.md`. A user or project agent of the same name shadows a provisional one. |
 
 ## 1. Topology
 
@@ -31,6 +32,7 @@ extension/index.ts  ──pi.exec JSON envelope──▶  rematch (Rust, static)
    │ writes ~/.rematch/traces/<session>.jsonl           │ owns ledger.sqlite, staging/, library, improver, jobs
    │ writes ~/.rematch/pending/<session>.json            │ spawns `omp -p --no-tools --mode json` (editor, classifier)
    │ factory: `match --cwd` → skills.customDirectories   │ writes staging/<branch>/<name>/ and ~/.omp/agent/skills/<name>/
+   │ extension/agents → ~/.rematch/agents (task agents)  │ links ~/.rematch/agents/<name>.md; copies kept agents to ~/.omp/agent/agents/<name>.md
    └ tool_call: runs ~/.omp/agent/extensions/rematch-hooks/<id>.ts
 ```
 
@@ -43,10 +45,12 @@ Root `REMATCH_ROOT` = `$REMATCH_ROOT` or `~/.rematch`. Agent dir = `$PI_CODING_A
 traces/<session_id>.jsonl         extension trace (schema §3)
 pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect
 ledger.sqlite  blobs/<sha256>     ledger (schema §5) + content-addressed blobs
-staging/<branch>/<name>/          provisional entries (loaded via customDirectories)
+staging/<branch>/<name>/          provisional entries (loaded via customDirectories; agents via agents/)
+agents/<name>.md                  symlink → staging/<branch>/<name>/AGENT.md per provisional agent; `extension/agents` links to this dir, so omp discovers them from the plugin root
+kept-agents/<name>/               entry dir of a kept agent (AGENT.md, rematch.json, EXPERIENCE.md); omp loads the copy ~/.omp/agent/agents/<name>.md
 drafts/<name>/                    draft entries (never loaded)
 archive/<status>/<id>/            retired|dormant|stale entries (never loaded, never deleted)
-predecessors/<name>/<version>/    copies of replaced kept entries (rollback)
+predecessors/<name>/<version>/    copies of replaced kept entries (rollback); agents: predecessors/.agents/<name>/<version>/ (version 0 = the user's own ~/.omp/agent/agents/<name>.md)
 improver/{editor.md,composer.md,reflector.md,classifier.md,lint.toml,omp-no-tools.yml}   shipped in the binary; written on first run and refreshed on upgrade only if the installed copy still matches the previously shipped hash (`.shipped/<name>`); EXPERIENCE.md files live next to entries
 jobs/<job_id>.json  jobs/<job_id>.log      detached job state
 runs/<task>/<seed>/<variant>/     batch workspaces {wt/, skills/, overlay.yml, events.jsonl} (deleted after receipt)
@@ -66,8 +70,8 @@ Human-readable output only with `--text`. Logs go to stderr.
 ```
 doctor                                     omp binary+version, roles resolved (provider/model), extension linked?, ledger schema version, root paths, off?
 import --history [--sessions <dir>] [--forge <path> [--migrate]]
-reflect --pending [--session <id>] [--editor <cmd>] [--detach]   idempotent per pending file (lock `pending/.lock`); --editor overrides every model call (tests); --detach → {job_id}
-match --cwd <dir> [--inputs <json>]        {branch, repo, skill_dirs:[...], entries:[{id,name,status,predicate_hit}], hooks:[path...], off:bool}
+reflect --pending [--session <id>] [--editor <cmd>] [--detach] [--history [--since YYYY-MM-DD] [--limit n]]   idempotent per pending file (lock `pending/.lock`); --editor overrides every model call (tests); --detach → {job_id}; --history first hands flagged imported sessions to the loop (≤ n pending files per run, default 10)
+match --cwd <dir> [--inputs <json>]        {branch, repo, skill_dirs:[...], entries:[{id,name,kind,status,predicate_hit}], hooks:[path...], off:bool}   (provisional agents are listed in every session; they add no skill dir)
 digest --cwd <dir>                         {lines:[...], approvals:[{id,name,kind,diff,reason}], review:[...capability floor...], transfers:[...]}
 record --session <id> --event <json>       accepts `{"ev":"mark","class":…}` only (= mark); every other event belongs in the trace file
 create <name> --from sessions|task|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...] [--editor <cmd>]
@@ -76,17 +80,17 @@ activate <name> [--task <id> | --unverified]
 run --task <id> --verifier <cmd> [--width k] [--seed n]  → {job_id}
 run-worker --job <id>                      internal, detached
 status [job]
-library ls | why [<session_id>] | disable <id> | rollback <skill> | pin <id> | unpin <id> | approve <id> | decline <id> | export [--to <dir>] | import-export [--from <dir>]
+library ls | why [<session_id>] | disable <id> | rollback <name> | pin <id> | unpin <id> | approve <id> | decline <id> | set-fork-path <id> <repo-relative path> [--repo <fork>] | export [--to <dir>] | import-export [--from <dir>]
 task add <id> --repo <path> --prompt <text> [--verifier <cmd>] [--max-time 10m] [--tools ...]
 transfer suggest | transfer apply <lesson_id> --branch <b>
-ship --scope team|fork [--repo <path>] [--entry <id>...]
+ship --scope team|fork [--repo <path>] [--entry <id>...]   (fork: --repo defaults to the entry's fork_repo)
 count [--session <id>] [--editor <cmd>]    fold finished traces into counters and decide (also run by reflect --pending)
 mark --session <id> --class correction|preference|scope
 off | on
 uninstall [--yes]
 ```
 
-`reflect --pending` performs, in order: count (fold all finished traces not yet counted → counters → decide → EXPERIENCE.md), then one reflection per pending file respecting rate limits.
+`reflect --pending` performs, in order: count (fold all finished traces not yet counted → counters → decide → EXPERIENCE.md), then one reflection per pending file respecting rate limits. With `--history` it first stages, newest first, every imported session (`source: import`) that is flagged, has no trace file and no `history_reflected_at` marker: `traces/<sid>.jsonl` synthesized from its omp session file (§3, `mode: "import"`) and `pending/<sid>.json` (`source: "import"`); subagent files and sessions the extension's rule does not flag are marked and skipped. The envelope's `history.sessions` gives each session's outcome (`staged`, `keep_base`, `rate_limited`, `skipped` + reason, …).
 
 ## 3. Trace schema (extension → binary)
 
@@ -107,6 +111,8 @@ uninstall [--yes]
 
 Pre-classification (extension, no model; regex constants live in `rematch-core/src/redirect.rs` and are copied verbatim into the extension): `mark` = `/^\/rematch\s+mark\s+(correction|preference|scope)\b/i`; `interrupt` = input while `!ctx.isIdle()`; `revert` = `/\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i`; `negation` = `/^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i` (leading whitespace trimmed); `reprompt` = Jaccard(tokens(text), tokens(previous input)) ≥ 0.6 with tokens `[a-z0-9]+` on lowercased text. Precedence: mark > interrupt > revert > negation > reprompt > none.
 Session is flagged when any of: ≥1 prelabel ≠ none; `is_error` tool results ≥ 3 in any window of 6 consecutive tool results (tool-error cluster); a `mark`. Flag = write `pending/<session_id>.json`.
+
+Imported sessions get the same trace after the fact (`rematch_core::import::trace_records_of`, the active branch of the omp JSONL): `session_start` (header id/cwd, repo by walking up to `.git`, model of the first assistant message, `mode: "import"`, agent `main` or `sub` for subagent files, `omp_version` from `runtime.version`, no loaded entries/hooks/staging dirs); each user message not attributed to an agent → `input` with the rules above (idle unless the previous assistant stopped `aborted`; slash/`!`/`%` lines other than mark and `/skill:` dropped as live), preceded by `agent_end` for the run it ends; each `toolResult` → `tool_result` paired with its `toolCall` by id; each assistant message → `turn_end` after its tool results, preceded by `model_change` when provider/model changed; then `agent_end` and `session_shutdown` with the flag reasons. Not recoverable from omp JSONL: `input.source` (empty), `branch_hint` beyond the repo basename, `loaded_entries`/`hooks_loaded`/`staging_dirs` (empty), `tool_blocked`, `mark`, retry-fallback `model_change` reasons, `agent_end.is_terminal` (always true). Redirect and error-cluster seqs of an imported ledger row address this synthesized trace.
 
 ## 4. Core types (`rematch-core/src/types.rs`, authoritative in Rust)
 
@@ -138,9 +144,12 @@ pub struct Outcome { … exactly SPEC §"Session outcome records" … }
 Entry directory layout (`<dir>` = staging/drafts/archive/kept path):
 ```
 <dir>/SKILL.md            frontmatter: name, description, rematch: {id, status, branch, family, version, predicate_hash}
+<dir>/AGENT.md            kind=Agent instead of SKILL.md: frontmatter name (= entry name), description, optional model/tools/…, rematch: {…}; body = the subagent's system prompt
 <dir>/rematch.json        serde of Entry + manifest + predicate (the ledger row mirrors it; rematch.json is authoritative for files, ledger for counters)
 <dir>/units/*.md  facts/*.md (each fact has `as_of:`)  scripts/* (mode 0644 until approved; 0755 after)
 <dir>/hook.json           kind=Hook only: {tool, field, regex, message, pass_condition}
+<dir>/AGENTS.fragment.md  optional: text for `<repo>/AGENTS.md`, reaches the repo only through `ship --scope team` (never loaded locally)
+<dir>/fork/<basename>     optional: the text `ship --scope fork` writes to `<fork>/<fork_path>`
 <dir>/EXPERIENCE.md       written by the reflector after keep/retire (read-only to the system)
 ```
 
@@ -151,7 +160,7 @@ Tables (all with `created_at` ms): `schema_version`; `sessions(id PK, cwd, repo,
 ## 6. Predicate semantics (deterministic, same everywhere)
 
 Derivation (binary, on stage): `repo_glob` = the originating session's repo path (exact, as recorded by the extension from `git rev-parse --show-toplevel`) or `**` if no repo; `file_exts` = extensions of files read/edited in the evidence window (≤8); `stems` = up to 10 Porter-stemmed, stop-worded, lowercase tokens ranked by tf-idf against the ledger's session corpus over a weighted document: the originating task turn (the last user input before the redirect) ×2 + basenames of touched files ×2 + the redirect turn ×1. The redirect's own wording ("that's wrong", "every") must not crowd out the task's domain terms, or later sessions on the same task never count (observed on the first real run; fixed in `reflect.rs`). The editor's `entry.stems` are used only when derivation yields nothing: the pre-editor predicate hash is what the rate limits key on.
-Load-time match (`match --cwd`): glob matches repo (or cwd) ⇒ branch dir contributed when ≥1 provisional entry in that branch matches. Both the given path and its `canonicalize()`d form are tried (macOS `/tmp` → `/private/tmp`), on either side.
+Load-time match (`match --cwd`): glob matches repo (or cwd) ⇒ branch dir contributed when ≥1 provisional non-agent entry in that branch matches. Provisional agents are listed in every session (omp discovers them from the plugin root regardless of the cwd) with `predicate_hit` = their glob hit, so the trace's `loaded_entries` carries them only where they would count. Both the given path and its `canonicalize()`d form are tried (macOS `/tmp` → `/private/tmp`), on either side.
 Triage (`trace::triage`) has two independent axes: *kind* process|content decides whether to propose (content = a corrected prose answer with no tool activity and no process words; anything the agent produced with tools, tool-error clusters, takeovers, reverts and procedural text are process); *scope* domain|invariant picks the editor (domain by default; invariant for error clusters, takeovers, reverts, or text about the agent's general way of working, `INVARIANT_TEXT_PATTERN`). After classification, a session whose only redirects are scope|none and that has no cluster/takeover/mark carries no signal: no editor call.
 Count-time match (binary, from a finished trace): glob hit AND (`file_exts` empty OR overlap ≥1) AND (`stems` empty OR overlap ≥ min(2, stems.len())). Inputs = first 5 `input` texts + all `tool_result.path` values.
 
@@ -178,8 +187,8 @@ Editor prompt input (one JSON document in the user prompt, wrapped as data):
 ```
 Editor reply: one fenced ```json block:
 ```json
-{"decision":"EDIT|KEEP_BASE","entry":{"kind":"skill|hook|script|fact|lesson","name":"kebab","description":"...","trigger_line":"Use when ...",
- "files":{"SKILL.md":"...","units/x.md":"...","scripts/x.sh":"..."},"hook":{...}|null,"stems":[...]},
+{"decision":"EDIT|KEEP_BASE","entry":{"kind":"skill|hook|script|fact|lesson|agent","name":"kebab","description":"...","trigger_line":"Use when ...",
+ "files":{"SKILL.md":"...","units/x.md":"...","scripts/x.sh":"...","AGENTS.fragment.md":"..."},"hook":{...}|null,"stems":[...],"fork_path":"src/…"?},
  "manifest":{"evidence":{"session_id":"...","seq":0},"predicted_fix":"...","predicted_regression":"...","rationale":"..."}}
 ```
 Classifier prompt: batched `[{id, text, after_deliverable, prelabel}]` → ```json `[{"id":..,"class":"correction|preference|scope|none","confidence":0-1}]```.
@@ -197,6 +206,7 @@ Factory (async): read env/off; resolve binary (`$REMATCH_BIN` → `<ext>/../targ
 5. Status `pinned` is carried as the `Entry.pinned` flag (status and location unchanged; automatic transitions refuse pinned entries; `disable`/`rollback` are user actions and proceed). `Status::Pinned` remains a valid status for imports.
 6. A kept entry replaced by a sibling becomes `dormant` (files in `predecessors/<name>/<version>/`) rather than `retired`, because `rollback` must be able to restore it and `retired` never leaves. A non-rematch skill that a kept entry replaced is saved as version `0` and restored by `rollback`/`uninstall`.
 7. Declining an approval (`library decline`) retires the entry (SPEC: retired ← "approval declined").
+8. Provisional agents cannot load "on match": omp discovers task agents only from fixed dirs (§0), so they load through the plugin root in every session and are counted where their glob hits. `off` does not unload them (omp reads the plugin's `agents/` itself); `library disable` or `omp plugin disable` does.
 
 ## 12. lint.toml schema
 
@@ -204,7 +214,7 @@ Factory (async): read env/off; resolve binary (`$REMATCH_BIN` → `<ext>/../targ
 
 ```toml
 [limits]
-always_on_bytes = 8192   # SKILL.md bodies (frontmatter excluded) per branch, this entry + LintContext.branch_other_bytes
+always_on_bytes = 8192   # per branch, this entry + LintContext.branch_other_bytes: SKILL.md bodies (frontmatter excluded), AGENT.md `description` values, AGENTS.fragment.md files
 max_stems = 10           # predicate.stems
 max_exts = 8             # predicate.file_exts
 
@@ -233,7 +243,7 @@ facts = ["facts", "workspace facts", "reference"]
 probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]  # a hook regex matching "" or every probe "matches everything"
 ```
 
-Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `rematch.json` and `EXPERIENCE.md`; markdown is linted with its `rematch:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (rule present, pass condition and message non-empty, regex compiles, does not match everything); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
+Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `rematch.json` and `EXPERIENCE.md`; markdown is linted with its `rematch:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`; for `kind=agent` the document is `AGENT.md`: frontmatter `name` equal to the entry name and not `main`/`sub`, non-empty `description`, no trigger-line or form-order check on the system prompt); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (rule present, pass condition and message non-empty, regex compiles, does not match everything); `fragment` (`AGENTS.fragment.md` non-empty, no `#`/`##` heading outside a code fence: it is appended under `## rematch: <name>`); `fork_path` (`Entry.fork_path` repo-relative without `..`, `library::validate_fork_path`); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
 
 ## 13. Ledger SQL (schema_version 1, `rematch_core::ledger`)
 
@@ -311,8 +321,8 @@ pub fn run_tools(call: &ToolsCall) -> anyhow::Result<Verified>;
 - Model calls: `count` makes ≤ 1 batched classifier call per pass (skipped when there are no unclassified non-mark redirects) and one reflector call per keep/retire (deterministic EXPERIENCE record when it fails). Each reflection's `CallBudget(3)` is charged for the classifier when its session was in that batch, then editor + one lint retry. A failed editor call keeps the pending file (`attempts` counter; dropped after 3).
 - Detached jobs: the child of `spawn_detached` writes its final envelope into `jobs/<id>.json` (`status: done|failed`, `result`); a live status whose pid is gone reads as `lost`. `run-worker` manages its own record. `REMATCH_JOB_ID` is stripped from every `run_bounded` child.
 - Ownership: an entry owns its directory iff it lives under REMATCH_ROOT or its SKILL.md carries a `rematch:` block with its id (`reflect::owns_dir`). Registered skills (`import --forge`, `improve`) and lessons are *foreign*: decisions, disable and pin are recorded in the ledger only (`reflect::record_status`), never moving or rewriting their files; their EXPERIENCE.md goes to `REMATCH_ROOT/brownfield/<id>/`; approve/decline/rollback refuse them.
-- `import --forge`: skills register in branch `forge` with `path` = the forge skill dir; each `learnings/*.md` becomes a provisional `lesson` at `REMATCH_ROOT/lessons/forge/lesson-<slug>/` (`LESSON.md` copy + `rematch.json` with `evidence_sha256` = blob hash of the file, `source_path`). `match` omits lessons. `import --history` keeps an existing `source: trace` session row (richer) instead of overwriting it.
-- `improve`: the audit counts every ledger session with the skill in `skill_reads` (traced and imported); < 5 ⇒ `{refused, traced_sessions, offer}`. Siblings share the base predicate (no pending-canary check), get `sibling_of` and stage at `staging/<branch>/<name>/` where branch = `--branch`, else the reading sessions' common repo, else `shared`.
+- `import --forge`: skills register in branch `forge` with `path` = the forge skill dir; each `learnings/*.md` becomes a provisional `lesson` at `REMATCH_ROOT/lessons/forge/lesson-<slug>/` (`LESSON.md` copy + `rematch.json` with `evidence_sha256` = blob hash of the file, `source_path`). `match` omits lessons. `import --history` keeps an existing `source: trace` session row (richer) instead of overwriting it, and records the session file as `source_path`; `count` folding a synthesized trace refreshes the import row's signals and keeps it `source: import` (counted once, never replaced by a trace row).
+- `improve`: the audit counts every ledger session with the skill in `skill_reads` (traced and imported); < 5 ⇒ `{refused, traced_sessions, offer}`. The excerpt and clusters come from each signalling session's live trace, else the trace synthesized from its omp session file (`import_cmd::records_for_session`: recorded `source_path`, else `<agent dir>/sessions/<cwd slug>/*_<id>.jsonl`, else a scan); the moment is the most recent session's earliest undismissed redirect, else the first cluster of the session with the most error clusters; `clusters` lists redirect clusters and `error_cluster` groups (failing tools, error heads). Siblings share the base predicate (no pending-canary check), get `sibling_of` and stage at `staging/<branch>/<name>/` where branch = `--branch`, else the reading sessions' common repo, else `shared`.
 - `create --from sessions`: request stems (name + description) and `--files` extensions vs. session stems/exts; a session matches with overlap ≥ min(2, |request stems|); ≥ 3 needed; up to 8 references. `activate --task` runs one reference rollout and attaches its moment as evidence before draft → provisional.
 - `digest` lines: one per entry whose status changed since `REMATCH_ROOT/digest.last` (imported registrations summarized in one line), plus Scope review/stale/transfer lines; approvals = unapproved scripts or uncompiled hooks of owned provisional/kept entries, plus `export:<id>` items.
 - `reflect` content-triage failures are logged (stderr + envelope) and the pending file deleted; no ledger proposal row.
@@ -324,8 +334,8 @@ New `Entry` fields (serde default, omitted when empty): `fork_path`, `fork_repo`
 
 | Command / fn | Behavior |
 | --- | --- |
-| `ship --scope team` | Kept/provisional entries whose predicate content (`count_hit`, ignoring the one-repo glob) hit sessions in ≥ 2 distinct repos, or listed with `--entry`. Target = `--repo` or the originating session's repo. Lint must pass. A temporary worktree from HEAD gets branch `rematch/<name>-<last 8 id chars>` with `.omp/skills/<name>/` (no `rematch.json`/`EXPERIENCE.md`, mode 0644, `rematch.scope: team`), committed with an evidence body (counters, per family, matched sessions, repos, families, redirect class, predicted fix/regression, latest EXPERIENCE.md record). Receipt `activation: pr`. No network unless `--push`/`--pr`; never merges. |
-| `ship --scope fork` | `--repo` required; entries with `fork_path`. Content = `fork/<basename>` in the package, else the SKILL.md body. Body adds `omp --version`, file sha256, base commit, before numbers (the predicate over sessions that started before the entry existed, `recurred`/`harmed` rules, per family) and after numbers (entry counters). Records `fork_repo` + `fork_commit` (base HEAD). |
+| `ship --scope team` | Kept/provisional entries whose predicate content (`count_hit`, ignoring the one-repo glob) hit sessions in ≥ 2 distinct repos, or listed with `--entry`. Target = `--repo` or the originating session's repo. Lint must pass. A temporary worktree from HEAD gets branch `rematch/<name>-<last 8 id chars>` with `.omp/skills/<name>/` (no `rematch.json`/`EXPERIENCE.md`/`AGENTS.fragment.md`, mode 0644, `rematch.scope: team`) — an agent ships as the single file `.omp/agents/<name>.md` (its AGENT.md) — and, when the entry has `AGENTS.fragment.md`, `<repo>/AGENTS.md` with the section `## rematch: <name>` (file created if missing; an existing section of that heading, up to the next `#`/`##` heading, is replaced: `ship::upsert_agents_section`), committed with an evidence body (counters, per family, matched sessions, repos, families, redirect class, predicted fix/regression, latest EXPERIENCE.md record). Receipt `activation: pr`. No network unless `--push`/`--pr`; never merges. |
+| `ship --scope fork` | Entries with `fork_path` (set by `library set-fork-path <id> <path> [--repo <fork>]` — ledger + `rematch.json`, a changed target clears `fork_commit` — or proposed by the editor as `entry.fork_path`; a hand edit of `rematch.json` is adopted too). Target = `--repo`, else the entry's `fork_repo`. Content = `fork/<basename>` in the package, else the SKILL.md (agents: AGENT.md) body. Body adds `omp --version`, file sha256, base commit, before numbers (the predicate over sessions that started before the entry existed, `recurred`/`harmed` rules, per family) and after numbers (entry counters). Records `fork_repo` + `fork_commit` (base HEAD). |
 | `library export` | `policy.json` `{environment: work|home, export_enabled}`; missing ⇒ home; work refuses unless `export_enabled`. Candidates: kept entries with `lesson_tag: invariant` or `manifest.scope: invariant`. Each is linted with `transfer: true`, `facts/` dropped, `rematch.json` stripped (provisional, no counters/evidence/approvals/path). Without approval the result lists `pending` with `git diff --no-index` diffs and `requires_approval: true`; `--entry <id> --approve` or `--approve-all` writes `<export>/<id>/` and commits it (the export dir is `git init`ed on first use). Receipt `activation: prompted`. `export::decline` records `{id: content sha}` in `export-declined.json` so the digest stops offering it until the content changes. |
 | `library import-export` | Each `<dir>/<id>/rematch.json`: skip when already present (same id or `transfers_from` link), not invariant, or a near-duplicate (`dedup::route_duplicate`) of a live entry; branch = recorded branch when this library knows it, else `shared`; repo glob = that branch's latest session repo, else `**`; lint `transfer: true`; staged provisional with origin `Import{source: "export:<id>"}`. |
 | `stale` | Kept/provisional, unpinned entries go `stale` when (a) a `facts/*.md` `source:` file's sha256 differs from its `source_sha256` frontmatter (written by `stale::snapshot_sources` after staging) or the file is gone, (b) the last 3 counted sessions in the branch (all branches for `shared`) all ran a family ≠ `family` and ∉ `verified_on`, (c) `git rev-parse HEAD` of `fork_repo` ≠ `fork_commit`. `--recanary` stages a new version (new id, version + 1, `predecessor`, family = the one now in use, fork commit cleared, sources re-snapshotted) and retires the stale one. |
@@ -334,7 +344,22 @@ New `Entry` fields (serde default, omitted when empty): `fork_path`, `fork_repo`
 
 File ownership (all scope status changes and rematch.json writes): an entry's files are rematch's only when it is not `reflect::is_foreign` and its dir holds a `rematch.json` with its own id (`scope::owns_files`). User-owned entries (brownfield registrations in place, forge imports) get status changes in the ledger only (`reflect::record_status`); their dirs are never moved or written, and they are never `shared`-promotion sources. Entries with family `unknown/unknown` (imports) never go stale on the model-family rule.
 
-## 16. Batch mode (Phase 2, `crates/rematch/src/batch/`)
+## 16. Harness surfaces and how each is reached
+
+Harness² edits eight surfaces (research D3). Each maps to one omp component; activation follows SPEC §"Scope and who merges" (personal text automatic as `provisional`; executable or blocking behind a one-tap approval; team and fork only as a branch/PR the binary never merges).
+
+| Surface | omp component | Mechanism in rematch | Activation | Status |
+| --- | --- | --- | --- | --- |
+| System prompt | `<repo>/AGENTS.md` (context file); per-model prompt text in the omp fork | `AGENTS.fragment.md` in an entry → section `## rematch: <name>` of `<repo>/AGENTS.md` (`ship --scope team`); fork prompt files via `fork_path` (`ship --scope fork`) | team / fork PR only | built; never written locally (always-on for everyone in the repo, so it needs review) |
+| Guardrails / rules | laws in a triggered skill's router `SKILL.md` | `## Laws` of a skill entry (`kind: rule` entries are skills); lint form order | automatic as `provisional`, counters keep or retire | built; standalone always-on rule files deferred (they would cost every session) |
+| Memory / facts | `facts/*.md` inside a skill (each with `as_of`), `EXPERIENCE.md` beside entries | fact entries and units; `stale` on source drift; the reflector writes EXPERIENCE.md after keep/retire and the editor reads matching records | automatic; domain facts never transfer | built; omp's own memory backend is not written |
+| Tool guidance | the fork's tool descriptions / rules text | `fork_path` (`library set-fork-path` or `entry.fork_path` from the editor) + `fork/<basename>` → `ship --scope fork` | fork PR only | built |
+| Subagents | `~/.omp/agent/agents/<name>.md` (user), `<extension-root>/agents/*.md` | `kind: agent` entry (`AGENT.md` + `rematch.json`); provisional: `extension/agents → REMATCH_ROOT/agents/<name>.md → staging/<branch>/<name>/AGENT.md`; kept: copied to `~/.omp/agent/agents/<name>.md` (predecessor saved); team: `.omp/agents/<name>.md` | automatic as `provisional` (visible in every session, counted where the glob hits) | built |
+| Skills | `~/.omp/agent/skills/<name>/SKILL.md` | `staging/<branch>/<name>/` added to `skills.customDirectories` by the factory on match; kept copied natively; team: `.omp/skills/<name>/` | automatic as `provisional` | built |
+| Scripts | `scripts/<n>` inside a skill | staged mode 0644; `library approve` (or the digest's one tap) makes them 0755 | one tap | built |
+| Hooks / plugins | `~/.omp/agent/extensions/rematch-hooks/<id>.ts`, imported by the extension's `tool_call` handler | `kind: hook` entry (`hook.json`), compiled to a verifier module on approval | one tap | built for `tool_call` block verifiers; other plugin shapes (output trimming, error hints) are not generated |
+
+## 17. Batch mode (Phase 2, `crates/rematch/src/batch/`)
 
 New `Entry` field (serde default, omitted when false): `pending_next_run` — a batch winner staged by a `run` of its `Origin::Task`, decided by that task's next run.
 

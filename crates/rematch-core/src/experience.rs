@@ -180,6 +180,7 @@ fn entry_dirs(paths: &RematchPaths) -> Vec<PathBuf> {
     }
     dirs.extend(children(&paths.drafts));
     dirs.extend(children(&paths.skills_dir()));
+    dirs.extend(children(&paths.kept_agents));
     dirs.sort();
     dirs
 }

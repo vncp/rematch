@@ -14,6 +14,7 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::library::{primary_doc, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
 use crate::package::{router_bytes, SkillDoc, TRIGGER_RE};
 use crate::types::{Entry, Kind, LessonTag, LintFinding, LintReport, Severity};
 
@@ -265,13 +266,26 @@ pub struct LintContext {
     pub transfer: bool,
 }
 
-/// Always-on bytes of every `*/SKILL.md` directly under a branch dir, except `exclude`.
+/// Always-on bytes an entry dir contributes: its SKILL.md body (the router), an
+/// agent's `description` (omp lists it in the task tool every session; the body runs
+/// only inside the subagent) and its `AGENTS.fragment.md` (AGENTS.md is always on).
+pub fn entry_always_on_bytes(dir: &Path) -> usize {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
+    let skill = read(SKILL_MD).map_or(0, |t| router_bytes(&t));
+    let agent = read(AGENT_MD)
+        .and_then(|t| SkillDoc::parse(&t).ok())
+        .and_then(|d| d.get_str("description").map(str::len))
+        .unwrap_or(0);
+    let fragment = read(AGENTS_FRAGMENT).map_or(0, |t| t.len());
+    skill + agent + fragment
+}
+
+/// Always-on bytes of every entry dir directly under a branch dir, except `exclude`.
 pub fn branch_always_on_bytes(branch_dir: &Path, exclude: &Path) -> usize {
     let Ok(rd) = std::fs::read_dir(branch_dir) else { return 0 };
     rd.filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.as_path() != exclude)
-        .filter_map(|p| std::fs::read_to_string(p.join("SKILL.md")).ok())
-        .map(|t| router_bytes(&t))
+        .filter(|p| p.as_path() != exclude && p.is_dir())
+        .map(|p| entry_always_on_bytes(&p))
         .sum()
 }
 
@@ -416,15 +430,17 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
     if p.file_exts.len() > cfg.limits.max_exts {
         rep.add("trigger", Severity::Error, format!("{} file extensions > {}", p.file_exts.len(), cfg.limits.max_exts), Some("rematch.json"));
     }
-    let skill_raw = std::fs::read_to_string(dir.join("SKILL.md")).ok();
+    let agent = entry.kind == Kind::Agent;
+    let primary = primary_doc(entry.kind);
+    let skill_raw = std::fs::read_to_string(dir.join(primary)).ok();
     let skill = skill_raw.as_deref().and_then(|t| SkillDoc::parse(t).ok());
     match &skill {
-        None => rep.add("trigger", Severity::Error, "SKILL.md missing or unparseable", Some("SKILL.md")),
+        None => rep.add("trigger", Severity::Error, format!("{primary} missing or unparseable"), Some(primary)),
         Some(doc) => {
             let tl = entry.trigger_line.trim();
             if tl.is_empty() {
                 rep.add("trigger", Severity::Error, "entry has no trigger line", Some("rematch.json"));
-            } else {
+            } else if !agent {
                 // The always-on trigger text in omp is the skill's `description` (listed in the
                 // system prompt); the body may carry it as well (`## Trigger`, `Use when …`).
                 let in_description = doc.get_str("description").is_some_and(|d| d.contains(tl));
@@ -433,7 +449,23 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
                 }
             }
             if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
-                rep.add("trigger", Severity::Error, "frontmatter description missing (omp requires it)", Some("SKILL.md"));
+                rep.add("trigger", Severity::Error, "frontmatter description missing (omp requires it)", Some(primary));
+            }
+            if agent {
+                // omp's task-agent loader drops a file without `name`, and reserves main/sub.
+                match doc.get_str("name").map(str::trim) {
+                    None | Some("") => rep.add("trigger", Severity::Error, "AGENT.md frontmatter name missing (omp requires it)", Some(AGENT_MD)),
+                    Some(n) if n.eq_ignore_ascii_case("main") || n.eq_ignore_ascii_case("sub") => {
+                        rep.add("trigger", Severity::Error, format!("agent name {n:?} is reserved by omp"), Some(AGENT_MD))
+                    }
+                    Some(n) if n != entry.name => rep.add(
+                        "trigger",
+                        Severity::Error,
+                        format!("AGENT.md name {n:?} differs from the entry name {:?} (the file omp loads is <entry name>.md)", entry.name),
+                        Some(AGENT_MD),
+                    ),
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -454,9 +486,9 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
         }
     }
 
-    // Always-on budget (router bodies of the branch).
-    if let Some(raw) = &skill_raw {
-        let mine = router_bytes(raw);
+    // Always-on budget (router bodies, agent descriptions and AGENTS.md fragments of the branch).
+    let mine = entry_always_on_bytes(dir);
+    if mine > 0 {
         let total = mine + ctx.branch_other_bytes;
         if total > cfg.limits.always_on_bytes {
             rep.add(
@@ -466,13 +498,46 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
                     "always-on text {total} B > {} B in branch (this entry {mine} B); pay for new text by deletion",
                     cfg.limits.always_on_bytes
                 ),
-                Some("SKILL.md"),
+                Some(primary),
             );
         }
     }
 
-    // Form order in SKILL.md: trigger line, then headings in configured order.
-    if let Some(doc) = &skill {
+    // AGENTS.md fragment: it is appended under `## rematch: <name>`, so its own headings
+    // start at level 3 (a `#`/`##` heading would end the section on the next ship).
+    if let Ok(raw) = std::fs::read_to_string(dir.join(AGENTS_FRAGMENT)) {
+        if raw.trim().is_empty() {
+            rep.add("fragment", Severity::Error, "AGENTS.fragment.md is empty", Some(AGENTS_FRAGMENT));
+        }
+        let mut fence = false;
+        for line in raw.lines() {
+            if line.trim_start().starts_with("```") {
+                fence = !fence;
+                continue;
+            }
+            let hashes = line.chars().take_while(|&c| c == '#').count();
+            if !fence && (1..=2).contains(&hashes) && line[hashes..].chars().next().is_none_or(char::is_whitespace) {
+                rep.add(
+                    "fragment",
+                    Severity::Error,
+                    format!("heading {:?}: the fragment sits under `## rematch: {}` in AGENTS.md; use ### or deeper", line.trim(), entry.name),
+                    Some(AGENTS_FRAGMENT),
+                );
+                break;
+            }
+        }
+    }
+
+    // Fork scope target: a repo-relative file.
+    if let Some(fp) = &entry.fork_path {
+        if let Err(e) = validate_fork_path(fp) {
+            rep.add("fork_path", Severity::Error, e.to_string(), Some("rematch.json"));
+        }
+    }
+
+    // Form order in SKILL.md: trigger line, then headings in configured order (an
+    // agent's body is its system prompt, not a skill router).
+    if let Some(doc) = skill.as_ref().filter(|_| !agent) {
         let trigger_pos = form_index(&cfg.form, "trigger").or_else(|| cfg.form.order.iter().position(|s| s == "trigger"));
         let mut seen: Option<(usize, String)> = None;
         let mut fence = false;
@@ -811,5 +876,62 @@ mod tests {
         assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok);
         e.lesson_tag = Some(LessonTag::Domain);
         assert!(!lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok);
+    }
+
+    const AGENT: &str = "---\nname: log-triage\ndescription: Use for a large build log; returns the first failing step.\nmodel: \"@smol\"\n---\nRead the log you are given and reply with the first failing step and its error line.\n";
+
+    fn agent() -> (tempfile::TempDir, Entry) {
+        let t = tempfile::tempdir().unwrap();
+        write(t.path(), "AGENT.md", AGENT);
+        let mut e = entry("a", "log-triage", "repo", Status::Provisional);
+        e.kind = Kind::Agent;
+        (t, e)
+    }
+
+    #[test]
+    fn agents_lint_agent_md_and_budget_the_description_only() {
+        let (t, mut e) = agent();
+        let r = lint(t.path(), &e);
+        assert!(r.ok, "no SKILL.md, no form order for a system prompt: {:?}", r.findings);
+        assert_eq!(entry_always_on_bytes(t.path()), "Use for a large build log; returns the first failing step.".len());
+        write(t.path(), "AGENT.md", &AGENT.replace("name: log-triage\n", ""));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("name missing") && f.path.as_deref() == Some("AGENT.md")));
+        write(t.path(), "AGENT.md", &AGENT.replace("name: log-triage", "name: main"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("reserved")));
+        write(t.path(), "AGENT.md", &AGENT.replace("name: log-triage", "name: other"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("differs from the entry name")));
+        write(t.path(), "AGENT.md", &AGENT.replace("description: Use for a large build log; returns the first failing step.\n", ""));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("description missing")));
+        write(t.path(), "AGENT.md", &AGENT.replace("Read the log", "Fetch https://example.com/ci and read the log"));
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "executable_risk" && f.path.as_deref() == Some("AGENT.md")));
+        write(t.path(), "AGENT.md", AGENT);
+        let ctx = LintContext { branch_other_bytes: 8192, ..Default::default() };
+        assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().findings.iter().any(|f| f.rule == "always_on"));
+        std::fs::remove_file(t.path().join("AGENT.md")).unwrap();
+        e.kind = Kind::Agent;
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("AGENT.md missing")));
+    }
+
+    #[test]
+    fn agents_md_fragments_and_fork_paths() {
+        let (t, mut e) = good();
+        let base = entry_always_on_bytes(t.path());
+        let fragment = "Run `cargo test` for every touched crate before committing.\n\n### Why\n\nCI runs them.\n";
+        write(t.path(), "AGENTS.fragment.md", fragment);
+        assert!(lint(t.path(), &e).ok);
+        assert_eq!(entry_always_on_bytes(t.path()), base + fragment.len(), "fragment counts toward always-on");
+        write(t.path(), "AGENTS.fragment.md", "## Testing\n\nRun the tests.\n");
+        assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "fragment" && f.message.contains("###")));
+        write(t.path(), "AGENTS.fragment.md", "```md\n# not a heading\n```\nSee /Users/someone/notes.\n");
+        let r = lint(t.path(), &e);
+        assert!(!r.findings.iter().any(|f| f.rule == "fragment"), "fenced lines are not headings");
+        assert!(r.findings.iter().any(|f| f.rule == "identifiers" && f.path.as_deref() == Some("AGENTS.fragment.md")));
+        std::fs::remove_file(t.path().join("AGENTS.fragment.md")).unwrap();
+        e.fork_path = Some("src/prompts/system.md".into());
+        assert!(lint(t.path(), &e).ok);
+        for bad in ["../outside.md", "/etc/passwd", "a/../../b", " "] {
+            e.fork_path = Some(bad.into());
+            assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "fork_path"), "{bad}");
+        }
     }
 }

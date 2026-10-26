@@ -163,8 +163,8 @@ Keep at `matched ≥ 4 · recurrence 0 · harm 0`. Four matched sessions with no
 | Status | Where it lives | Loaded |
 |---|---|---|
 | `draft` | `~/.rematch/drafts/<name>/` | never |
-| `provisional` | `~/.rematch/staging/<branch>/<name>/` | on predicate match, via the skill paths |
-| `kept` | `~/.omp/agent/skills/<name>/`, predecessor in `predecessors/` | natively, every match |
+| `provisional` | `~/.rematch/staging/<branch>/<name>/` | on predicate match, via the skill paths; a subagent (`AGENT.md`) via the link `~/.rematch/agents/<name>.md` in every session, counted on match |
+| `kept` | `~/.omp/agent/skills/<name>/` (subagents: `~/.omp/agent/agents/<name>.md`), predecessor in `predecessors/` | natively, every match |
 | `stale` · `dormant` · `retired` | `~/.rematch/archive/<status>/<id>/` | never; never deleted |
 | `pinned` | wherever it is | a flag; never replaced automatically |
 
@@ -192,10 +192,10 @@ Budget: `rollouts = (k+1)² + [k>1]`, four at `k=1`, ten at `--width 2`; model c
 
 | Scope | Activation | Examples |
 |---|---|---|
-| Personal, text | automatic as `provisional` | skill text, laws, facts, lessons |
+| Personal, text | automatic as `provisional` | skill text, laws, facts, lessons, subagents |
 | Personal, executable or blocking | one tap in the session-start digest, with the diff | scripts (0644 → 0755), compiled `tool_call` verifiers |
-| Team (`<repo>/.omp/`) | `ship --scope team`: a branch with the entry and an evidence commit; `--push --pr` opens the PR, never merges | entries whose predicate recurred across two or more repos, or that you list |
-| Fork | `ship --scope fork --repo <fork>`: the entry's `fork_path`, the built fingerprint and before/after counters in the PR body | per-model prompt text, tool descriptions, compaction defaults |
+| Team (`<repo>/.omp/`, `<repo>/AGENTS.md`) | `ship --scope team`: a branch with the entry (skills in `.omp/skills/`, subagents in `.omp/agents/`, an `AGENTS.fragment.md` as a section of `AGENTS.md`) and an evidence commit; `--push --pr` opens the PR, never merges | entries whose predicate recurred across two or more repos, or that you list; the only way text reaches `AGENTS.md` |
+| Fork | `ship --scope fork [--repo <fork>]`: the entry's `fork_path` (set with `library set-fork-path`), the built fingerprint and before/after counters in the PR body | per-model prompt text, tool descriptions, compaction defaults |
 | Work → home | `library export`, per-entry approval with the diff; off by default at work (`policy.json`) | invariant entries only; lint with `transfer: true` blocks domain and workspace facts |
 
 A branch is a repo or project. `shared` holds entries kept in two or more branches; promotion needs a second branch's canary and costs nothing. `transfer suggest` lists kept invariant lessons not yet tried in a branch whose facet structure overlaps on two or more keys (`branches/<branch>/domain.yml`); a transfer is applied as `provisional` and earns its place through that branch's counters.
@@ -227,11 +227,11 @@ Every entry records the model family it was created under and keeps a per-family
 
 | Unit | What it holds | Rule |
 |---|---|---|
-| `extension/index.ts` | trace writer, pre-labels, the skill-path override, approved hook modules, the `rematch` tool and `/rematch` command, the digest | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
+| `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, approved hook modules, the `rematch` tool and `/rematch` command, the digest; `agents/` (made by `install.sh`, gitignored): a link to `~/.rematch/agents/`, through which omp discovers provisional subagents | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
 | `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 106 unit tests |
 | `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 47 unit + 17 end-to-end tests |
 | `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
-| `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
+| `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `agents/` (links to provisional subagents), `kept-agents/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
 

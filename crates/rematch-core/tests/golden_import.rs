@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rematch_core::import::{extract_outcomes, read_session, session_record};
+use rematch_core::import::{extract_outcomes, read_session, session_record, trace_records_of};
+use rematch_core::trace::TraceRecord;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -26,6 +27,11 @@ struct Expected {
     tokens_in: u64,
     tokens_out: u64,
     outcomes: usize,
+    /// Synthesized extension trace (`trace_records_of`).
+    trace_inputs: usize,
+    trace_tool_results: usize,
+    trace_turn_ends: usize,
+    trace_flagged: bool,
 }
 
 fn goldens_dir() -> PathBuf {
@@ -59,6 +65,14 @@ fn goldens_import_to_stable_counts() {
             path.display()
         );
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let trace = trace_records_of(&session);
+        assert_eq!(trace, trace_records_of(&read_session(path).unwrap()), "{name}: synthesis is stable");
+        let count = |ev: &str| trace.iter().filter(|r| r.ev() == ev).count();
+        let trace_flagged = match trace.last() {
+            Some(TraceRecord::SessionShutdown { flagged, .. }) => *flagged,
+            other => panic!("{name}: trace must end with session_shutdown, got {other:?}"),
+        };
+        assert_eq!(trace_flagged, r.flagged, "{name}: import row and trace flag by one rule");
         actual.insert(
             name,
             Expected {
@@ -77,7 +91,11 @@ fn goldens_import_to_stable_counts() {
                 takeovers: r.takeovers,
                 tokens_in: r.tokens_in,
                 tokens_out: r.tokens_out,
-                outcomes: extract_outcomes(&session).len(),
+                outcomes: extract_outcomes(&session, &r).len(),
+                trace_inputs: count("input"),
+                trace_tool_results: count("tool_result"),
+                trace_turn_ends: count("turn_end"),
+                trace_flagged,
             },
         );
     }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use rematch_core::library::REMATCH_JSON;
+use rematch_core::library::{primary_doc, AGENT_MD, REMATCH_JSON, SKILL_MD};
 use rematch_core::lint::{lint_entry, LintConfig, LintContext};
 use rematch_core::package::SkillDoc;
 use rematch_core::{Edit, Entry, LintReport, Origin};
@@ -130,15 +130,18 @@ pub(crate) fn put_edit(edits: &mut Vec<Edit>, rel: &str, content: String) {
     edits.push(Edit::Write { path: rel.to_string(), content });
 }
 
-/// Copies under a new name must not reuse the original's SKILL.md `name:` (omp would
-/// see two skills with one name) nor its `rematch:` block (stage rewrites it).
+/// Copies under a new name must not reuse the original's SKILL.md / AGENT.md `name:`
+/// (omp would see two skills or agents with one name) nor its `rematch:` block (stage
+/// rewrites it).
 pub(crate) fn rename_skill(edits: &mut Vec<Edit>, name: &str) -> Result<()> {
-    if let Some(md) = edit_content(edits, "SKILL.md") {
-        let mut doc = SkillDoc::parse(md)?;
-        doc.set("name", name);
-        doc.frontmatter.remove("rematch");
-        let text = doc.render();
-        put_edit(edits, "SKILL.md", text);
+    for doc_name in [SKILL_MD, AGENT_MD] {
+        if let Some(md) = edit_content(edits, doc_name) {
+            let mut doc = SkillDoc::parse(md)?;
+            doc.set("name", name);
+            doc.frontmatter.remove("rematch");
+            let text = doc.render();
+            put_edit(edits, doc_name, text);
+        }
     }
     Ok(())
 }
@@ -192,8 +195,8 @@ pub(crate) fn lint_config(ctx: &AppCtx) -> Result<LintConfig> {
     LintConfig::load(&ctx.paths.improver.join("lint.toml"))
 }
 
-/// Lint a not-yet-staged copy: materialize the edits (plus the SKILL.md frontmatter
-/// `library::stage` would add) in a temporary dir and run `lint_entry`.
+/// Lint a not-yet-staged copy: materialize the edits (plus the SKILL.md / AGENT.md
+/// frontmatter `library::stage` would add) in a temporary dir and run `lint_entry`.
 pub(crate) fn lint_edits(ctx: &AppCtx, entry: &Entry, edits: &[Edit], lctx: &LintContext) -> Result<LintReport> {
     let tmp = tempfile::tempdir()?;
     let dir = tmp.path();
@@ -206,18 +209,22 @@ pub(crate) fn lint_edits(ctx: &AppCtx, entry: &Entry, edits: &[Edit], lctx: &Lin
             std::fs::write(&p, content)?;
         }
     }
-    let skill = dir.join("SKILL.md");
-    let mut doc = match std::fs::read_to_string(&skill) {
-        Ok(t) => SkillDoc::parse(&t)?,
-        Err(_) => SkillDoc { body: format!("\n# {}\n\n{}\n", entry.name, entry.trigger_line), ..Default::default() },
+    let primary = dir.join(primary_doc(entry.kind));
+    let doc = match std::fs::read_to_string(&primary) {
+        Ok(t) => Some(SkillDoc::parse(&t)?),
+        // stage refuses an agent without AGENT.md; lint reports it
+        Err(_) if entry.kind == rematch_core::Kind::Agent => None,
+        Err(_) => Some(SkillDoc { body: format!("\n# {}\n\n{}\n", entry.name, entry.trigger_line), ..Default::default() }),
     };
-    if doc.get_str("name").is_none() {
-        doc.set("name", entry.name.as_str());
+    if let Some(mut doc) = doc {
+        if doc.get_str("name").is_none() {
+            doc.set("name", entry.name.as_str());
+        }
+        if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
+            doc.set("description", entry.trigger_line.as_str());
+        }
+        std::fs::write(&primary, doc.render())?;
     }
-    if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
-        doc.set("description", entry.trigger_line.as_str());
-    }
-    std::fs::write(&skill, doc.render())?;
     if let Some(h) = &entry.hook {
         std::fs::write(dir.join("hook.json"), serde_json::to_string_pretty(h)?)?;
     }

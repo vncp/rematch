@@ -67,7 +67,7 @@ enum Cmd {
     RunWorker(batch::worker::RunWorkerArgs),
     /// Job status (or all jobs + entry counts).
     Status { job: Option<String> },
-    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, export, import-export.
+    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export.
     Library {
         #[command(subcommand)]
         cmd: library_cmd::LibraryCmd,

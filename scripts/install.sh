@@ -11,6 +11,17 @@ else
   cargo build --release
 fi
 
+# Provisional agents (kind `agent`) are symlinks in $REMATCH_ROOT/agents/; omp discovers
+# task agents in <plugin root>/agents/, so the plugin root links there.
+REMATCH_DIR="${REMATCH_ROOT:-${HOME}/.rematch}"
+mkdir -p "$REMATCH_DIR/agents"
+if [[ -e "$ROOT/extension/agents" && ! -L "$ROOT/extension/agents" ]]; then
+  echo "error: $ROOT/extension/agents exists and is not a symlink; move it away and re-run" >&2
+  exit 1
+fi
+ln -sfn "$REMATCH_DIR/agents" "$ROOT/extension/agents"
+echo "==> Linked $ROOT/extension/agents -> $REMATCH_DIR/agents (provisional agents)"
+
 echo "==> Linking omp plugin from $ROOT/extension..."
 omp plugin link "$ROOT/extension" --scope user
 

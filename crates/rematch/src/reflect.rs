@@ -1,7 +1,8 @@
 //! `reflect --pending` (SPEC §loop 1–8): first `count` (fold finished traces → counters →
 //! decide → EXPERIENCE.md), then one bounded reflection per pending file: triage → moment →
-//! predicate → rate limits → editor → lint (one retry) → dedup → stage. Also `count`,
-//! `mark` and `record`.
+//! predicate → rate limits → editor → lint (one retry) → dedup → stage. `reflect --history`
+//! first hands flagged imported sessions to that loop through synthesized traces. Also
+//! `count`, `mark` and `record`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,8 @@ use rematch_core::counters;
 use rematch_core::dedup;
 use rematch_core::experience::{self, ExperienceQuery};
 use rematch_core::features::{exts_of, head, rank_stems, stems_of_session, stems_of_text, MAX_PREDICATE_STEMS};
-use rematch_core::ledger::{enum_str, EntryFilter};
+use rematch_core::import::{apply_trace_signals, read_session, trace_records_of};
+use rematch_core::ledger::{enum_str, EntryFilter, SessionFilter};
 use rematch_core::library::{self, REMATCH_JSON};
 use rematch_core::lint::{self, LintConfig, LintContext};
 use rematch_core::predicate;
@@ -35,6 +37,8 @@ pub const MAX_MODEL_CALLS: u32 = 3;
 pub const EXCERPT_RADIUS: usize = 15;
 /// A pending file whose editor call failed this many times is dropped.
 pub const MAX_ATTEMPTS: u64 = 3;
+/// Default `reflect --history --limit`: pending files created per run.
+pub const HISTORY_LIMIT: usize = 10;
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct ReflectArgs {
@@ -50,6 +54,15 @@ pub struct ReflectArgs {
     /// Run detached and return a job id.
     #[arg(long)]
     pub detach: bool,
+    /// First hand flagged imported sessions (`import --history`) without a trace to reflection.
+    #[arg(long)]
+    pub history: bool,
+    /// With --history: only sessions started on or after this UTC date.
+    #[arg(long, value_name = "YYYY-MM-DD", requires = "history")]
+    pub since: Option<String>,
+    /// With --history: at most this many sessions handed to reflection per run (default 10).
+    #[arg(long, value_name = "N", requires = "history")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -95,11 +108,26 @@ pub fn cmd_reflect(ctx: &AppCtx, a: ReflectArgs) -> Result<Value> {
         if let Some(e) = &a.editor {
             argv.extend(["--editor".into(), e.clone()]);
         }
+        if a.history {
+            argv.push("--history".into());
+        }
+        if let Some(s) = &a.since {
+            argv.extend(["--since".into(), s.clone()]);
+        }
+        if let Some(n) = a.limit {
+            argv.extend(["--limit".into(), n.to_string()]);
+        }
         let id = crate::jobs::spawn_detached(ctx, "reflect", &argv, &json!({}))?;
         return Ok(json!({"job_id": id, "lines": [format!("reflect running detached: job {id}")]}));
     }
+    let since = a.since.as_deref().map(parse_since).transpose()?;
     let Some(_lock) = crate::jobs::LockFile::acquire(ctx.paths.pending.join(".lock"))? else {
         return Ok(json!({"skipped": "another reflect --pending is running", "lines": ["reflect: already running"]}));
+    };
+    let history = if a.history {
+        Some(stage_history(ctx, a.session.as_deref(), since, a.limit.unwrap_or(HISTORY_LIMIT))?)
+    } else {
+        None
     };
     let count = count_finished(ctx, a.session.as_deref(), a.editor.as_deref())?;
     let classified: BTreeSet<String> =
@@ -116,11 +144,17 @@ pub fn cmd_reflect(ctx: &AppCtx, a: ReflectArgs) -> Result<Value> {
         };
         reflections.push(r);
     }
-    let mut lines = count.lines.clone();
+    let history = history.map(|h| h.report(&reflections));
+    let mut lines: Vec<String> = history.iter().map(|(_, line)| line.clone()).collect();
+    lines.extend(count.lines.iter().cloned());
     for r in &reflections {
         lines.push(reflection_line(r));
     }
-    Ok(json!({"count": count.to_json(), "reflections": reflections, "lines": lines}))
+    let mut out = json!({"count": count.to_json(), "reflections": reflections, "lines": lines});
+    if let Some((report, _)) = history {
+        out["history"] = report;
+    }
+    Ok(out)
 }
 
 fn reflection_line(r: &Value) -> String {
@@ -193,6 +227,21 @@ fn finished(records: &[TraceRecord]) -> bool {
     records.iter().any(|r| matches!(r, TraceRecord::SessionShutdown { .. }))
 }
 
+/// Ledger row for a trace. A trace synthesized for an imported session (`reflect --history`)
+/// refreshes the import row's signals (seqs then address the trace) and keeps the importer's
+/// counts instead of replacing the row with a trace-sourced one; `count` then marks it counted
+/// once like any other session.
+fn fold_for_ledger(records: &[TraceRecord], sid: &str, existing: Option<SessionRecord>) -> SessionRecord {
+    let folded = trace::fold_trace(records, sid);
+    match existing {
+        Some(mut imported) if folded.source == "import" && imported.source == "import" => {
+            apply_trace_signals(&mut imported, &folded);
+            imported
+        }
+        _ => folded,
+    }
+}
+
 /// Entries the user disabled while the session ran (harm).
 fn disabled_during(ctx: &AppCtx, s: &SessionRecord) -> Result<Vec<String>> {
     let end = s.ended_at.unwrap_or(i64::MAX);
@@ -215,7 +264,8 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
         if only.is_some_and(|o| o != sid) {
             continue;
         }
-        if ctx.ledger.get_session(&sid)?.is_some_and(|s| s.counted) {
+        let existing = ctx.ledger.get_session(&sid)?;
+        if existing.as_ref().is_some_and(|s| s.counted) {
             continue;
         }
         let records = trace::read_trace(&path)?;
@@ -223,7 +273,7 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
             sum.skipped_unfinished += 1;
             continue;
         }
-        let s = trace::fold_trace(&records, &sid);
+        let s = fold_for_ledger(&records, &sid, existing);
         ctx.ledger.upsert_session(&s)?;
         sessions.push(s);
     }
@@ -549,9 +599,11 @@ pub fn lint_rules() -> Value {
         {"rule": "identifiers", "summary": "no session ids, task-specific absolute paths, or user names"},
         {"rule": "string_match_user", "summary": "no branching on the user's literal words"},
         {"rule": "executable_risk", "summary": "no URLs, network calls, curl|sh, or destructive git unless the manifest explains it and approval is requested"},
-        {"rule": "trigger", "summary": "non-empty repo glob, ≤10 stems, ≤8 extensions, a trigger line in SKILL.md, non-empty description"},
+        {"rule": "trigger", "summary": "non-empty repo glob, ≤10 stems, ≤8 extensions, a trigger line in SKILL.md, non-empty description; kind=agent: AGENT.md frontmatter name (= entry name, not main/sub) and description"},
         {"rule": "scripts", "summary": "every referenced scripts/<path> is shipped; scripts are non-executable until approved"},
-        {"rule": "always_on", "summary": "SKILL.md bodies within 8192 bytes per branch; pay for new text by deletion"},
+        {"rule": "always_on", "summary": "SKILL.md bodies, agent descriptions and AGENTS.fragment.md within 8192 bytes per branch; pay for new text by deletion"},
+        {"rule": "fragment", "summary": "AGENTS.fragment.md is non-empty and uses ### or deeper headings (it is appended under `## rematch: <name>`)"},
+        {"rule": "fork_path", "summary": "entry.fork_path is a repo-relative file path without `..`"},
         {"rule": "form_order", "summary": "trigger line, then laws, procedure, pitfalls, facts"},
         {"rule": "facts_as_of", "summary": "facts/*.md (and kind=fact SKILL.md) carry as_of"},
         {"rule": "hook", "summary": "hook rule with a message and pass condition; regex compiles and does not match everything"},
@@ -652,6 +704,7 @@ pub fn build_candidate(ctx: &AppCtx, reply: &EditorReply, spec: &CandidateSpec) 
     entry.evidence = vec![evidence.clone()];
     entry.redirect_class = spec.redirect_class;
     entry.hook = er.hook.clone();
+    entry.fork_path = er.fork_path.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     entry.sibling_of = spec.sibling_of.clone();
     entry.lesson_tag = Some(match spec.scope {
         EditorScope::Invariant => LessonTag::Invariant,
@@ -665,11 +718,13 @@ pub fn build_candidate(ctx: &AppCtx, reply: &EditorReply, spec: &CandidateSpec) 
         scope: spec.scope,
     });
 
+    // The name omp loads is the entry name; keep a description (stage keeps both). An
+    // agent's document is AGENT.md; every other kind is a skill with SKILL.md.
+    let primary = library::primary_doc(kind);
     let mut edits = Vec::new();
     for (path, content) in &er.files {
         let mut content = content.clone();
-        if path == "SKILL.md" {
-            // The skill name omp loads is the entry name; keep a description (stage keeps both).
+        if path == primary {
             if let Ok(mut doc) = rematch_core::package::SkillDoc::parse(&content) {
                 if doc.get_str("name") != Some(entry.name.as_str()) {
                     doc.set("name", entry.name.as_str());
@@ -683,7 +738,9 @@ pub fn build_candidate(ctx: &AppCtx, reply: &EditorReply, spec: &CandidateSpec) 
         }
         edits.push(Edit::Write { path: path.clone(), content });
     }
-    if !er.files.contains_key("SKILL.md") {
+    // A missing SKILL.md is synthesized from the trigger line; a missing AGENT.md (the
+    // subagent's system prompt) cannot be, and lint reports it.
+    if kind != Kind::Agent && !er.files.contains_key(primary) {
         let desc = if er.description.trim().is_empty() { entry.trigger_line.clone() } else { er.description.trim().to_string() };
         let body = format!(
             "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n{}\n",
@@ -887,9 +944,10 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
     }
     let records = trace::read_trace(&trace_path)?;
     let session = match ctx.ledger.get_session(sid)? {
-        Some(s) if s.source == "trace" => s,
-        _ => {
-            let s = trace::fold_trace(&records, sid);
+        // `count` already folded this trace into the row.
+        Some(s) if s.source == "trace" || s.counted => s,
+        existing => {
+            let s = fold_for_ledger(&records, sid, existing);
             ctx.ledger.upsert_session(&s)?;
             s
         }
@@ -1102,6 +1160,115 @@ fn closest_entry(ctx: &AppCtx, branch: &str, pred: &Predicate) -> Result<Option<
         }
     }
     Ok(best.map(|(_, id)| id))
+}
+
+// ------------------------------------------------------------------------------------
+// reflect --history
+
+/// `--since YYYY-MM-DD` → UTC midnight in ms.
+fn parse_since(s: &str) -> Result<i64> {
+    let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|e| crate::envelope::Usage(format!("--since {s:?}: expected YYYY-MM-DD ({e})")))?;
+    Ok(d.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc().timestamp_millis())
+}
+
+/// What `reflect --history` did before the reflection loop.
+#[derive(Debug, Default)]
+struct HistoryStage {
+    /// Sessions given a synthesized trace and a pending file this run.
+    handed: Vec<String>,
+    /// Sessions ruled out before reflection: `{session, outcome: "skipped", reason}`.
+    skipped: Vec<Value>,
+    /// Eligible sessions left for a later run by `--limit`.
+    deferred: usize,
+}
+
+impl HistoryStage {
+    /// Per-session report (handed sessions carry their reflection's outcome) and a summary line.
+    fn report(self, reflections: &[Value]) -> (Value, String) {
+        let mut sessions = Vec::new();
+        for sid in &self.handed {
+            let r = reflections.iter().find(|r| r["session"] == json!(sid));
+            let mut row = json!({"session": sid, "outcome": r.and_then(|r| r.get("outcome")).cloned().unwrap_or(json!("pending"))});
+            for key in ["reason", "name", "kind", "id"] {
+                if let Some(v) = r.and_then(|r| r.get(key)) {
+                    row[key] = v.clone();
+                }
+            }
+            sessions.push(row);
+        }
+        let line = format!(
+            "history: {} imported session(s) handed to reflection, {} skipped, {} deferred by --limit",
+            self.handed.len(),
+            self.skipped.len(),
+            self.deferred
+        );
+        sessions.extend(self.skipped);
+        (json!({"handed": self.handed, "deferred": self.deferred, "sessions": sessions}), line)
+    }
+}
+
+/// `reflect --history`: every imported session that is flagged, has no trace file and no
+/// `history_reflected_at` marker, newest first, gets `traces/<sid>.jsonl` synthesized from its
+/// omp session file (`trace_records_of`, `mode: "import"`) and `pending/<sid>.json`, so the
+/// normal loop (count + reflect, rate limits, ≤ 3 model calls) handles it. At most `limit`
+/// pending files per run. Sessions ruled out for good (subagent files, or not flagged by the
+/// extension's rule) are marked too; a missing session file is left for a later run.
+fn stage_history(ctx: &AppCtx, only: Option<&str>, since: Option<i64>, limit: usize) -> Result<HistoryStage> {
+    let mut st = HistoryStage::default();
+    let flagged = ctx.ledger.list_sessions(&SessionFilter { flagged: Some(true), since, ..Default::default() })?;
+    for s in flagged.iter().rev() {
+        if s.source != "import" || s.history_reflected_at.is_some() || only.is_some_and(|o| o != s.id) {
+            continue;
+        }
+        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", s.id));
+        if trace_path.exists() {
+            continue;
+        }
+        if st.handed.len() >= limit {
+            st.deferred += 1;
+            continue;
+        }
+        let mut skip = |reason: String| st.skipped.push(json!({"session": s.id, "outcome": "skipped", "reason": reason}));
+        let Some(path) = crate::import_cmd::locate_session_file(ctx, s)? else {
+            skip("no_session_file".into());
+            continue;
+        };
+        let omp = match read_session(&path) {
+            Ok(o) => o,
+            Err(e) => {
+                skip(format!("unreadable: {e:#}"));
+                continue;
+            }
+        };
+        if omp.header.parent_session.is_some() {
+            // The extension traces main sessions only.
+            ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
+            skip("subagent".into());
+            continue;
+        }
+        let records = trace_records_of(&omp);
+        let Some(TraceRecord::SessionShutdown { reasons, flagged: true, .. }) = records.last() else {
+            ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
+            skip("not_flagged".into());
+            continue;
+        };
+        let mut body = String::new();
+        for r in &records {
+            body.push_str(&serde_json::to_string(r)?);
+            body.push('\n');
+        }
+        std::fs::create_dir_all(&ctx.paths.traces)?;
+        let tmp = trace_path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &trace_path).with_context(|| format!("rename to {}", trace_path.display()))?;
+        std::fs::create_dir_all(&ctx.paths.pending)?;
+        let pending = json!({"session_id": s.id, "flagged_at": ctx.now, "reasons": reasons, "trace": trace_path, "source": "import"});
+        std::fs::write(pending_path(ctx, &s.id), serde_json::to_string(&pending)?)?;
+        ctx.ledger.set_history_reflected(&s.id, ctx.now)?;
+        st.handed.push(s.id.clone());
+    }
+    Ok(st)
 }
 
 // ------------------------------------------------------------------------------------

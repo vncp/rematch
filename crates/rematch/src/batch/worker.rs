@@ -30,7 +30,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rematch_core::dedup::{entry_content, near_duplicate, route_duplicate};
 use rematch_core::features::{head, rank_stems};
 use rematch_core::ledger::{parse_enum, EntryFilter};
-use rematch_core::library::{branch_for, dir_for, set_status, stage, validate_name};
+use rematch_core::library::{branch_for, dir_for, primary_doc, set_status, stage, validate_name};
 use rematch_core::lint::{branch_always_on_bytes, lint_entry, LintConfig, LintContext};
 use rematch_core::package::SkillDoc;
 use rematch_core::predicate::{derive, predicate_hash};
@@ -673,24 +673,30 @@ impl Cycle<'_> {
         Ok(lesson.lint.ok.then_some(lesson))
     }
 
-    /// Normalize the reply's files (SKILL.md frontmatter name/description, hook.json),
-    /// write them under the candidates dir and lint them as a provisional entry.
+    /// Normalize the reply's files (SKILL.md — AGENT.md for agents — frontmatter
+    /// name/description, hook.json), write them under the candidates dir and lint them as
+    /// a provisional entry.
     fn prepare_lesson(&self, label: &str, reply: &EditorReply, scope: EditorScope, reference: &Rollout) -> Result<Lesson> {
         let e = reply.entry.clone().ok_or_else(|| anyhow!("EDIT reply without entry"))?;
         let m = reply.manifest.clone().ok_or_else(|| anyhow!("EDIT reply without manifest"))?;
         validate_name(&e.name)?;
+        let kind: Kind = parse_enum(&e.kind).unwrap_or(Kind::Skill);
+        let primary = primary_doc(kind);
         let mut files = e.files.clone();
-        let skill = files
-            .get("SKILL.md")
-            .cloned()
-            .unwrap_or_else(|| format!("\n# {}\n\n{}\n", e.name, e.trigger_line));
-        let mut doc = SkillDoc::parse(&skill)?;
-        doc.set("name", e.name.as_str());
-        if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
-            let d = if e.description.trim().is_empty() { &e.trigger_line } else { &e.description };
-            doc.set("description", d.as_str());
+        // A missing AGENT.md (the subagent's system prompt) is not synthesized; lint reports it.
+        if kind != Kind::Agent || files.contains_key(primary) {
+            let text = files
+                .get(primary)
+                .cloned()
+                .unwrap_or_else(|| format!("\n# {}\n\n{}\n", e.name, e.trigger_line));
+            let mut doc = SkillDoc::parse(&text)?;
+            doc.set("name", e.name.as_str());
+            if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
+                let d = if e.description.trim().is_empty() { &e.trigger_line } else { &e.description };
+                doc.set("description", d.as_str());
+            }
+            files.insert(primary.into(), doc.render());
         }
-        files.insert("SKILL.md".into(), doc.render());
         if let Some(h) = &e.hook {
             files.insert("hook.json".into(), serde_json::to_string_pretty(h)?);
         }
@@ -767,7 +773,7 @@ impl Cycle<'_> {
             status_since: None,
             status_note: None,
             pending_next_run: true,
-            fork_path: None,
+            fork_path: lesson.editor.fork_path.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
             fork_repo: None,
             fork_commit: None,
             families_excluded: Vec::new(),
@@ -971,10 +977,11 @@ impl Cycle<'_> {
             let mut entry = self.entry_for(l, reference)?;
             entry.name = self.free_name(&entry)?;
             let mut files = l.files.clone();
-            if entry.name != l.name {
-                let mut doc = SkillDoc::parse(files.get("SKILL.md").map(String::as_str).unwrap_or(""))?;
+            let primary = primary_doc(entry.kind);
+            if entry.name != l.name && files.contains_key(primary) {
+                let mut doc = SkillDoc::parse(&files[primary])?;
                 doc.set("name", entry.name.as_str());
-                files.insert("SKILL.md".into(), doc.render());
+                files.insert(primary.into(), doc.render());
             }
             let edits: Vec<Edit> = files.into_iter().map(|(path, content)| Edit::Write { path, content }).collect();
             let staged = stage(&ctx.ledger, &ctx.paths, &entry, &edits)?;

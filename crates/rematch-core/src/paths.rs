@@ -15,6 +15,11 @@ pub struct RematchPaths {
     pub drafts: PathBuf,
     pub archive: PathBuf,
     pub predecessors: PathBuf,
+    /// Symlinks `<name>.md → <entry dir>/AGENT.md` of provisional agents; the plugin's
+    /// `extension/agents` links here, so omp discovers them from the extension root.
+    pub agents: PathBuf,
+    /// Entry dirs of kept agents (omp loads the copy in `<agent_dir>/agents/<name>.md`).
+    pub kept_agents: PathBuf,
     pub improver: PathBuf,
     pub jobs: PathBuf,
     pub runs: PathBuf,
@@ -55,6 +60,8 @@ impl RematchPaths {
             drafts: root.join("drafts"),
             archive: root.join("archive"),
             predecessors: root.join("predecessors"),
+            agents: root.join("agents"),
+            kept_agents: root.join("kept-agents"),
             improver: root.join("improver"),
             jobs: root.join("jobs"),
             runs: root.join("runs"),
@@ -80,6 +87,8 @@ impl RematchPaths {
             &self.drafts,
             &self.archive,
             &self.predecessors,
+            &self.agents,
+            &self.kept_agents,
             &self.improver,
             &self.jobs,
             &self.runs,
@@ -105,6 +114,11 @@ impl RematchPaths {
     /// Kept skills live natively here.
     pub fn skills_dir(&self) -> PathBuf {
         self.agent_dir.join("skills")
+    }
+
+    /// Kept agents live natively here as `<name>.md` (omp's user agent dir).
+    pub fn agents_dir(&self) -> PathBuf {
+        self.agent_dir.join("agents")
     }
 
     /// Compiled verifiers (inert to omp; imported by the extension's `tool_call` handler).
@@ -154,7 +168,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = RematchPaths::with_roots(t.path().join("root"), t.path().join("agent"));
         p.ensure_dirs().unwrap();
-        assert!(p.staging.is_dir() && p.blobs.is_dir());
+        assert!(p.staging.is_dir() && p.blobs.is_dir() && p.agents.is_dir() && p.kept_agents.is_dir());
         assert!(!RematchPaths::off_by(None, &p.off_marker));
         assert!(!RematchPaths::off_by(Some("1"), &p.off_marker));
         assert!(RematchPaths::off_by(Some("0"), &p.off_marker));

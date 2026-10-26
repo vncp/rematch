@@ -1,19 +1,25 @@
 //! `import --history [--sessions <dir>]` (omp session JSONL → ledger) and
 //! `import --forge <path>` (compound-forge skills → provisional brownfield entries,
-//! learnings → provisional lessons). Both are idempotent.
+//! learnings → provisional lessons). Both are idempotent. Also the lookup of a ledger
+//! session's trace records (live trace, else synthesized from its omp session file) shared
+//! by `improve` and `reflect --history`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use rematch_core::features::{rank_stems, stems_of_text, MAX_PREDICATE_STEMS};
-use rematch_core::import::{extract_outcomes, read_session, scan_sessions_dir, session_record};
+use rematch_core::import::{
+    apply_trace_signals, extract_outcomes, read_session, scan_sessions_dir, session_id_from_filename, session_record,
+    trace_records_of,
+};
 use rematch_core::ledger::{EntryFilter, SessionFilter};
 use rematch_core::library::{self, validate_name, REMATCH_JSON};
 use rematch_core::outcome::{minhash, outcome_tokens, MINHASH_K};
 use rematch_core::package::{slug, SkillDoc};
 use rematch_core::predicate;
-use rematch_core::types::{Edit, Entry, Family, Kind, Origin, Status};
+use rematch_core::trace::{self, TraceRecord};
+use rematch_core::types::{Edit, Entry, Family, Kind, Origin, SessionRecord, Status};
 use serde_json::{json, Value};
 
 use crate::app::{new_entry, AppCtx, NewEntry};
@@ -109,7 +115,7 @@ pub fn import_history(ctx: &AppCtx, dir: &Path) -> Result<Value> {
         }
         redirects += rec.redirects.len() as u32;
         ctx.ledger.upsert_session(&rec)?;
-        for o in extract_outcomes(&session) {
+        for o in extract_outcomes(&session, &rec) {
             ctx.ledger.insert_outcome(&o)?;
             ctx.ledger.put_minhash(&o.id, &minhash(&outcome_tokens(&o), MINHASH_K))?;
             outcomes += 1;
@@ -130,6 +136,72 @@ pub fn import_history(ctx: &AppCtx, dir: &Path) -> Result<Value> {
         "outcomes": outcomes,
         "errors": errors,
     }))
+}
+
+/// The omp session file of a ledger session: the path recorded at import, else
+/// `<agent dir>/sessions/<slug of its cwd>/*_<id>.jsonl`, else any `*_<id>.jsonl` under the
+/// sessions dir. Subagent files (`<Name>.jsonl`) are found only through the recorded path.
+pub fn locate_session_file(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<PathBuf>> {
+    if let Some(p) = s.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
+        return Ok(Some(p));
+    }
+    let dir = ctx.paths.agent_dir.join("sessions");
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let is_it = |p: &Path| {
+        p.extension().is_some_and(|e| e == "jsonl") && session_id_from_filename(p).as_deref() == Some(s.id.as_str())
+    };
+    for slug in cwd_slugs(&s.cwd) {
+        for ent in std::fs::read_dir(dir.join(slug)).into_iter().flatten().flatten() {
+            let p = ent.path();
+            if is_it(&p) {
+                return Ok(Some(p));
+            }
+        }
+    }
+    Ok(scan_sessions_dir(&dir)?.into_iter().map(|f| f.path).find(|p| is_it(p)))
+}
+
+/// omp's session directory names for a cwd: `-<path under $HOME, / → ->` inside the home
+/// directory, `--<absolute path, / → ->--` outside it.
+fn cwd_slugs(cwd: &str) -> Vec<String> {
+    let cwd = Path::new(cwd);
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(rel) = cwd.strip_prefix(&home) {
+            out.push(format!("-{}", rel.to_string_lossy().replace('/', "-")));
+        }
+    }
+    out.push(format!("--{}--", cwd.to_string_lossy().trim_start_matches('/').replace('/', "-")));
+    out
+}
+
+/// Trace records of a ledger session: its live trace when present, else the trace
+/// synthesized from its omp session file ([`trace_records_of`]). `None` when neither exists.
+pub fn records_for_session(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Vec<TraceRecord>>> {
+    let tp = ctx.paths.traces.join(format!("{}.jsonl", s.id));
+    if tp.is_file() {
+        return Ok(Some(trace::read_trace(&tp)?));
+    }
+    match locate_session_file(ctx, s)? {
+        Some(p) => Ok(Some(trace_records_of(&read_session(&p)?))),
+        None => Ok(None),
+    }
+}
+
+/// [`records_for_session`] plus the session row whose redirect and error-cluster seqs address
+/// those records: an imported row's signals are re-folded from the records (rows imported
+/// before seqs addressed the synthesized trace), keeping matching classifier labels.
+pub fn session_with_records(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<(SessionRecord, Vec<TraceRecord>)>> {
+    let Some(records) = records_for_session(ctx, s)? else {
+        return Ok(None);
+    };
+    let mut row = s.clone();
+    if s.source == "import" {
+        apply_trace_signals(&mut row, &trace::fold_trace(&records, &s.id));
+    }
+    Ok(Some((row, records)))
 }
 
 /// Session stem corpus for tf-idf ranking.

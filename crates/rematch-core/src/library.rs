@@ -8,6 +8,12 @@
 //!   saved to `predecessors/<name>/<version>/` (version 0 = a skill the plugin did not
 //!   write)
 //! - retired | dormant | stale → `archive/<status>/<id>/` (never loaded, never deleted)
+//! - agents (kind `agent`: `AGENT.md` + `rematch.json`) take the same locations except
+//!   kept, which is `kept-agents/<name>/` with `AGENT.md` copied to
+//!   `<agent_dir>/agents/<name>.md`; a provisional agent is also linked as
+//!   `agents/<name>.md → <entry dir>/AGENT.md`, which omp discovers through the plugin's
+//!   `extension/agents → <root>/agents` symlink. Agent predecessors live in
+//!   `predecessors/.agents/<name>/<version>/` (entry names never start with `.`).
 //!
 //! `pinned` is a flag (human-owned): automatic transitions refuse pinned entries; the
 //! entry keeps its status and location. `Status::Pinned` is accepted as a status too.
@@ -26,6 +32,28 @@ use crate::types::{Activation, Edit, Entry, EntryId, Kind, Receipt, Status, Unix
 pub const SHARED_BRANCH: &str = "shared";
 pub const REMATCH_JSON: &str = "rematch.json";
 pub const HOOKS_README: &str = "README.md";
+pub const SKILL_MD: &str = "SKILL.md";
+pub const AGENT_MD: &str = "AGENT.md";
+/// Text an entry contributes to `<repo>/AGENTS.md`, only through `ship --scope team`.
+pub const AGENTS_FRAGMENT: &str = "AGENTS.fragment.md";
+
+/// The frontmatter document omp loads for an entry of this kind.
+pub fn primary_doc(kind: Kind) -> &'static str {
+    if kind == Kind::Agent {
+        AGENT_MD
+    } else {
+        SKILL_MD
+    }
+}
+
+/// `fork_path` (the file `ship --scope fork` writes) is repo-relative without traversal.
+pub fn validate_fork_path(rel: &str) -> Result<PathBuf> {
+    let p = PathBuf::from(rel);
+    if rel.trim().is_empty() || p.components().any(|c| !matches!(c, Component::Normal(_))) {
+        bail!("fork_path must be repo-relative without traversal: {rel:?}");
+    }
+    Ok(p)
+}
 
 /// What a one-tap approval enables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,11 +128,101 @@ pub fn dir_for(paths: &RematchPaths, e: &Entry, status: Status) -> PathBuf {
     match status {
         Status::Draft => paths.drafts.join(&e.name),
         Status::Provisional => paths.staging.join(&e.branch).join(&e.name),
+        Status::Kept | Status::Pinned if e.kind == Kind::Agent => paths.kept_agents.join(&e.name),
         Status::Kept | Status::Pinned => paths.skills_dir().join(&e.name),
         Status::Retired => paths.archive.join("retired").join(&e.id),
         Status::Dormant => paths.archive.join("dormant").join(&e.id),
         Status::Stale => paths.archive.join("stale").join(&e.id),
     }
+}
+
+/// Staging link of a provisional agent (`<root>/agents/<name>.md`).
+pub fn agent_link(paths: &RematchPaths, name: &str) -> PathBuf {
+    paths.agents.join(format!("{name}.md"))
+}
+
+/// omp's copy of a kept agent (`<agent_dir>/agents/<name>.md`).
+pub fn kept_agent_file(paths: &RematchPaths, name: &str) -> PathBuf {
+    paths.agents_dir().join(format!("{name}.md"))
+}
+
+fn predecessor_root(paths: &RematchPaths, kind: Kind, name: &str) -> PathBuf {
+    match kind {
+        Kind::Agent => paths.predecessors.join(".agents").join(name),
+        _ => paths.predecessors.join(name),
+    }
+}
+
+fn remove_link(p: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(p).is_ok() {
+        std::fs::remove_file(p).with_context(|| format!("remove {}", p.display()))?;
+    }
+    Ok(())
+}
+
+/// omp keeps the first agent of a name, so one name has one staging link: refuse when
+/// another, still-present entry holds it.
+fn check_agent_link(paths: &RematchPaths, name: &str, target: &Path) -> Result<()> {
+    if let Ok(cur) = std::fs::read_link(agent_link(paths, name)) {
+        if cur != target && cur.exists() {
+            bail!("a provisional agent named {name} is already staged from {}", cur.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).with_context(|| format!("link {}", link.display()))
+}
+
+/// Without symlinks the staged AGENT.md is copied (re-copied on every stage).
+#[cfg(not(unix))]
+fn symlink_file(target: &Path, link: &Path) -> Result<()> {
+    std::fs::copy(target, link).with_context(|| format!("copy {}", link.display()))?;
+    Ok(())
+}
+
+fn link_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
+    let target = e.path.join(AGENT_MD);
+    check_agent_link(paths, &e.name, &target)?;
+    let link = agent_link(paths, &e.name);
+    remove_link(&link)?;
+    std::fs::create_dir_all(&paths.agents)?;
+    symlink_file(&target, &link)
+}
+
+/// Remove the staging link of the agent staged at `dir` (or a dangling one).
+fn unlink_agent(paths: &RematchPaths, name: &str, dir: &Path) -> Result<()> {
+    let link = agent_link(paths, name);
+    match std::fs::read_link(&link) {
+        Ok(cur) if cur == dir.join(AGENT_MD) || !cur.exists() => remove_link(&link),
+        Ok(_) => Ok(()),
+        Err(_) if cfg!(not(unix)) => remove_link(&link),
+        Err(_) => Ok(()),
+    }
+}
+
+fn write_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
+    let f = kept_agent_file(paths, &e.name);
+    std::fs::create_dir_all(paths.agents_dir())?;
+    remove_link(&f)?;
+    std::fs::copy(e.path.join(AGENT_MD), &f).with_context(|| format!("copy AGENT.md to {}", f.display()))?;
+    Ok(())
+}
+
+/// Remove omp's copy of a kept agent while it is still the one this entry wrote.
+fn remove_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
+    let f = kept_agent_file(paths, &e.name);
+    let ours = std::fs::read_to_string(&f)
+        .ok()
+        .and_then(|t| SkillDoc::parse(&t).ok())
+        .and_then(|d| d.rematch())
+        .is_some_and(|b| b.id == e.id);
+    if ours {
+        std::fs::remove_file(&f)?;
+    }
+    Ok(())
 }
 
 pub fn load_entry(dir: &Path) -> Result<Entry> {
@@ -214,14 +332,16 @@ fn rematch_block(e: &Entry) -> RematchBlock {
     }
 }
 
-/// Rewrite `rematch.json` and the SKILL.md `rematch:` block from the entry.
+/// Rewrite `rematch.json` and the `rematch:` block of SKILL.md / AGENT.md from the entry.
 fn sync_files(e: &Entry) -> Result<()> {
     std::fs::write(e.path.join(REMATCH_JSON), serde_json::to_string_pretty(e)?)?;
-    let skill = e.path.join("SKILL.md");
-    if skill.is_file() {
-        let mut doc = SkillDoc::parse(&std::fs::read_to_string(&skill)?)?;
-        doc.set_rematch(&rematch_block(e));
-        std::fs::write(&skill, doc.render())?;
+    for name in [SKILL_MD, AGENT_MD] {
+        let p = e.path.join(name);
+        if p.is_file() {
+            let mut doc = SkillDoc::parse(&std::fs::read_to_string(&p)?)?;
+            doc.set_rematch(&rematch_block(e));
+            std::fs::write(&p, doc.render())?;
+        }
     }
     Ok(())
 }
@@ -242,9 +362,10 @@ fn apply_script_modes(e: &Entry) -> Result<()> {
 }
 
 /// Stage a draft or provisional entry: write its files (edits relative to the entry
-/// dir), the SKILL.md frontmatter with the `rematch:` block merged, `hook.json` for
-/// hooks and `rematch.json`; scripts get mode 0644. Re-staging the same id overwrites;
-/// a different entry already at the location is an error.
+/// dir), the SKILL.md (agents: AGENT.md) frontmatter with the `rematch:` block merged,
+/// `hook.json` for hooks and `rematch.json`; scripts get mode 0644; a provisional agent
+/// gets its staging link. Re-staging the same id overwrites; a different entry already
+/// at the location is an error.
 pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit]) -> Result<Entry> {
     validate_name(&entry.name)?;
     validate_name(&entry.branch)?;
@@ -253,7 +374,17 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     }
     let now = now_ms();
     let mut e = entry.clone();
+    let agent = e.kind == Kind::Agent;
     let dir = dir_for(paths, &e, e.status);
+    if agent {
+        let shipped = files.iter().any(|f| matches!(f, Edit::Write { path, .. } if path == AGENT_MD));
+        if !shipped && !dir.join(AGENT_MD).is_file() {
+            bail!("agent entry {} has no {AGENT_MD} (frontmatter name + description, body = system prompt)", e.name);
+        }
+        if e.status == Status::Provisional {
+            check_agent_link(paths, &e.name, &dir.join(AGENT_MD))?;
+        }
+    }
     if dir.join(REMATCH_JSON).is_file() {
         let existing = load_entry(&dir)?;
         if existing.id != e.id {
@@ -278,9 +409,9 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
             }
         }
     }
-    let skill = dir.join("SKILL.md");
-    let mut doc = if skill.is_file() {
-        SkillDoc::parse(&std::fs::read_to_string(&skill)?)?
+    let primary = dir.join(primary_doc(e.kind));
+    let mut doc = if primary.is_file() {
+        SkillDoc::parse(&std::fs::read_to_string(&primary)?)?
     } else {
         SkillDoc { body: format!("\n# {}\n\n{}\n", e.name, e.trigger_line), ..Default::default() }
     };
@@ -290,7 +421,7 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
         doc.set("description", e.trigger_line.as_str());
     }
-    std::fs::write(&skill, doc.render())?;
+    std::fs::write(&primary, doc.render())?;
     if e.kind == Kind::Hook {
         let hook = e.hook.as_ref().ok_or_else(|| anyhow!("hook entry {} has no hook rule", e.id))?;
         std::fs::write(dir.join("hook.json"), serde_json::to_string_pretty(hook)?)?;
@@ -303,6 +434,9 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     e.status_since.get_or_insert(now);
     persist(ledger, &e)?;
     apply_script_modes(&e)?;
+    if agent && e.status == Status::Provisional {
+        link_agent(paths, &e)?;
+    }
     Ok(e)
 }
 
@@ -334,11 +468,21 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     if from == to {
         return Ok(e);
     }
+    let agent = e.kind == Kind::Agent;
+    if agent && to == Status::Provisional {
+        check_agent_link(paths, &e.name, &dir_for(paths, &e, to).join(AGENT_MD))?;
+    }
     let now = now_ms();
     let src = e.path.clone();
     let mut dst = dir_for(paths, &e, to);
     if matches!(to, Status::Retired | Status::Dormant | Status::Stale) {
         dst = unique_archive_dir(dst, now);
+    }
+    if agent && from == Status::Provisional {
+        unlink_agent(paths, &e.name, &src)?;
+    }
+    if agent && matches!(from, Status::Kept | Status::Pinned) && !matches!(to, Status::Kept | Status::Pinned) {
+        remove_kept_agent(paths, &e)?;
     }
     if matches!(to, Status::Kept | Status::Pinned) && !matches!(from, Status::Kept | Status::Pinned) {
         promote_into(ledger, paths, &mut e, &dst, now)?;
@@ -360,14 +504,33 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     e.updated_at = now;
     persist(ledger, &e)?;
     apply_script_modes(&e)?;
+    if agent {
+        match to {
+            Status::Provisional => link_agent(paths, &e)?,
+            Status::Kept | Status::Pinned => write_kept_agent(paths, &e)?,
+            _ => {}
+        }
+    }
     Ok(e)
 }
 
-/// Before a provisional entry takes `<skills>/<name>/`: save whatever is there to
-/// `predecessors/<name>/<version>/`. A replaced rematch entry becomes dormant (its
-/// files live in predecessors, ready for rollback); a pinned one blocks the keep.
+/// Before a provisional entry takes `<skills>/<name>/` (agents: `kept-agents/<name>/`):
+/// save whatever is there to `predecessors/<name>/<version>/` (agents:
+/// `predecessors/.agents/<name>/<version>/`; a user's own `<agent_dir>/agents/<name>.md`
+/// is saved as version 0). A replaced rematch entry becomes dormant (its files live in
+/// predecessors, ready for rollback); a pinned one blocks the keep.
 fn promote_into(ledger: &Ledger, paths: &RematchPaths, e: &mut Entry, dst: &Path, now: UnixMs) -> Result<()> {
+    let pred_root = predecessor_root(paths, e.kind, &e.name);
     if !dst.exists() {
+        let native = kept_agent_file(paths, &e.name);
+        if e.kind == Kind::Agent && native.is_file() {
+            let mut save = pred_root.join("0");
+            if save.exists() {
+                save = unique_archive_dir(save, now);
+            }
+            std::fs::create_dir_all(&save)?;
+            std::fs::copy(&native, save.join(AGENT_MD))?;
+        }
         return Ok(());
     }
     let old = load_entry(dst).ok().and_then(|o| ledger.get_entry(&o.id).ok().flatten());
@@ -377,7 +540,7 @@ fn promote_into(ledger: &Ledger, paths: &RematchPaths, e: &mut Entry, dst: &Path
         }
     }
     let version = old.as_ref().map_or(0, |o| o.version);
-    let mut save = paths.predecessors.join(&e.name).join(version.to_string());
+    let mut save = pred_root.join(version.to_string());
     if save.exists() {
         save = unique_archive_dir(save, now);
     }
@@ -415,8 +578,9 @@ pub struct Rollback {
     pub restored_version: u32,
 }
 
-/// `rollback <skill>`: restore the newest predecessor into `<skills>/<name>/` and
-/// retire the current kept entry with a note.
+/// `rollback <name>`: restore the newest predecessor into `<skills>/<name>/` (agents:
+/// `kept-agents/<name>/` + `<agent_dir>/agents/<name>.md`) and retire the current kept
+/// entry with a note.
 pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rollback> {
     let current = ledger
         .list_entries(&EntryFilter { name: Some(name.into()), ..Default::default() })?
@@ -424,7 +588,8 @@ pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rol
         .rev()
         .find(|e| matches!(e.status, Status::Kept | Status::Pinned))
         .ok_or_else(|| anyhow!("no kept entry named {name:?}"))?;
-    let pred_root = paths.predecessors.join(name);
+    let agent = current.kind == Kind::Agent;
+    let pred_root = predecessor_root(paths, current.kind, name);
     let (version, pred_dir) = std::fs::read_dir(&pred_root)
         .ok()
         .into_iter()
@@ -433,20 +598,31 @@ pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rol
         .filter_map(|d| Some((d.file_name().to_str()?.parse::<u32>().ok()?, d.path())))
         .max_by_key(|(v, _)| *v)
         .ok_or_else(|| anyhow!("no predecessor saved for {name:?}"))?;
-    let skill_dir = paths.skills_dir().join(name);
+    let home = dir_for(paths, &current, Status::Kept);
     let note = format!("rolled back to predecessor v{version}");
     let retired = transition(ledger, paths, current, Status::Retired, Some(&note))?;
-    move_dir(&pred_dir, &skill_dir)?;
+    let prev = load_entry(&pred_dir).ok().and_then(|o| ledger.get_entry(&o.id).ok().flatten());
+    if agent && prev.is_none() {
+        // the user's own agent file that the keep replaced
+        std::fs::create_dir_all(paths.agents_dir())?;
+        std::fs::copy(pred_dir.join(AGENT_MD), kept_agent_file(paths, name))?;
+        std::fs::remove_dir_all(&pred_dir)?;
+    } else {
+        move_dir(&pred_dir, &home)?;
+    }
     let _ = std::fs::remove_dir(&pred_root);
-    let restored = match load_entry(&skill_dir).ok().and_then(|o| ledger.get_entry(&o.id).ok().flatten()) {
+    let restored = match prev {
         Some(mut o) => {
             let now = now_ms();
             o.status = Status::Kept;
             o.status_since = Some(now);
             o.status_note = Some(format!("restored by rollback of {}", retired.id));
-            o.path = skill_dir;
+            o.path = home;
             o.updated_at = now;
             persist(ledger, &o)?;
+            if agent {
+                write_kept_agent(paths, &o)?;
+            }
             Some(o)
         }
         None => None,
@@ -611,6 +787,7 @@ fn remove_hook(paths: &RematchPaths, id: &str) -> Result<()> {
 pub struct MatchedEntry {
     pub id: EntryId,
     pub name: String,
+    pub kind: Kind,
     pub status: Status,
     pub predicate_hit: bool,
 }
@@ -627,10 +804,11 @@ pub struct MatchResult {
 }
 
 /// Load-time match (DESIGN §6): a branch's staging dir is contributed when ≥ 1 of its
-/// provisional entries' repo globs matches the repo (else cwd). `entries` lists what
-/// will load — provisional entries of contributed branches and every kept/pinned
-/// entry — with their glob hit. `hooks` lists approved hook modules of loadable,
-/// matching entries.
+/// provisional non-agent entries' repo globs matches the repo (else cwd). `entries`
+/// lists what will load — provisional entries of contributed branches, every
+/// provisional agent (omp discovers them through the plugin root in every session) and
+/// every kept/pinned entry — with their glob hit. `hooks` lists approved hook modules
+/// of loadable, matching entries.
 pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>, cwd: &Path) -> Result<MatchResult> {
     let mut out = MatchResult {
         branch: branch_for(repo, cwd),
@@ -646,7 +824,7 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
     let mut branches: Vec<&str> = provisional
         .iter()
-        .filter(|e| matches_repo(&e.predicate, &place))
+        .filter(|e| e.kind != Kind::Agent && matches_repo(&e.predicate, &place))
         .map(|e| e.branch.as_str())
         .collect();
     branches.sort();
@@ -662,9 +840,16 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
         .collect::<Result<Vec<_>>>()?
         .concat();
-    for e in provisional.iter().filter(|e| branches.contains(&e.branch.as_str())).chain(kept.iter()) {
+    let loaded = provisional.iter().filter(|e| e.kind == Kind::Agent || branches.contains(&e.branch.as_str()));
+    for e in loaded.chain(kept.iter()) {
         let hit = matches_repo(&e.predicate, &place);
-        out.entries.push(MatchedEntry { id: e.id.clone(), name: e.name.clone(), status: e.status, predicate_hit: hit });
+        out.entries.push(MatchedEntry {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            kind: e.kind,
+            status: e.status,
+            predicate_hit: hit,
+        });
         let hook = paths.hooks_dir().join(format!("{}.ts", e.id));
         if hit && hook.is_file() {
             out.hooks.push(hook);
@@ -675,34 +860,60 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UninstallPlan {
-    /// Directories to remove: kept entries the plugin wrote, `rematch-hooks/`, the root.
+    /// Paths to remove: kept skill dirs and kept agent files the plugin wrote, the
+    /// provisional-agent link dir, `rematch-hooks/`, the root.
     pub remove: Vec<PathBuf>,
-    /// `(from, to)` copies run before removal: original (non-rematch) skills that a
-    /// kept entry replaced, restored from `predecessors/<name>/0/`.
+    /// `(from, to)` copies run before removal: original (non-rematch) skills and agent
+    /// files that a kept entry replaced, restored from the version-0 predecessor.
     pub restore: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Everything the plugin wrote and nothing else: kept skill dirs whose SKILL.md has a
-/// `rematch:` block with an id known to the ledger, the rematch-hooks dir, and the root.
+fn sorted_children(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|d| d.ok().map(|d| d.path())).collect();
+    v.sort();
+    Ok(v)
+}
+
+/// The `rematch:` block of a markdown file names an entry the ledger knows.
+fn written_by_us(ledger: &Ledger, md: &Path) -> Result<bool> {
+    let Ok(text) = std::fs::read_to_string(md) else { return Ok(false) };
+    let Some(block) = SkillDoc::parse(&text).ok().and_then(|doc| doc.rematch()) else { return Ok(false) };
+    Ok(ledger.get_entry(&block.id)?.is_some())
+}
+
+/// Everything the plugin wrote and nothing else: kept skill dirs whose SKILL.md (and
+/// kept `<agent_dir>/agents/*.md` files whose frontmatter) has a `rematch:` block with
+/// an id known to the ledger, the provisional-agent link dir, the rematch-hooks dir,
+/// and the root.
 pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
-    let skills = paths.skills_dir();
-    if skills.is_dir() {
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&skills)?.filter_map(|d| d.ok().map(|d| d.path())).collect();
-        dirs.sort();
-        for d in dirs {
-            let Ok(text) = std::fs::read_to_string(d.join("SKILL.md")) else { continue };
-            let Some(block) = SkillDoc::parse(&text).ok().and_then(|doc| doc.rematch()) else { continue };
-            if ledger.get_entry(&block.id)?.is_none() {
-                continue;
-            }
-            let name = d.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-            let original = paths.predecessors.join(&name).join("0");
-            if original.is_dir() {
-                plan.restore.push((original, d.clone()));
-            }
-            plan.remove.push(d);
+    for d in sorted_children(&paths.skills_dir())? {
+        if !written_by_us(ledger, &d.join(SKILL_MD))? {
+            continue;
         }
+        let name = d.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        let original = paths.predecessors.join(&name).join("0");
+        if original.is_dir() {
+            plan.restore.push((original, d.clone()));
+        }
+        plan.remove.push(d);
+    }
+    for f in sorted_children(&paths.agents_dir())? {
+        if f.extension().is_none_or(|x| x != "md") || !written_by_us(ledger, &f)? {
+            continue;
+        }
+        let name = f.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+        let original = predecessor_root(paths, Kind::Agent, name).join("0").join(AGENT_MD);
+        if original.is_file() {
+            plan.restore.push((original, f.clone()));
+        }
+        plan.remove.push(f);
+    }
+    if paths.agents.exists() {
+        plan.remove.push(paths.agents.clone());
     }
     let hooks = paths.hooks_dir();
     if hooks.exists() {
@@ -714,22 +925,31 @@ pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<Uninstall
     Ok(plan)
 }
 
-/// Execute a plan: remove each kept dir, copy restores into place, then remove the
-/// hooks dir and the root (which holds the predecessors).
+fn remove_path(p: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p)?,
+        Ok(_) => std::fs::remove_file(p)?,
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+/// Execute a plan: remove each replaced kept path, copy restores into place, then
+/// remove the rest (link dir, hooks dir, the root, which holds the predecessors).
 pub fn apply_uninstall(plan: &UninstallPlan) -> Result<()> {
     let restored: Vec<&PathBuf> = plan.restore.iter().map(|(_, to)| to).collect();
     for d in plan.remove.iter().filter(|d| restored.contains(d)) {
-        std::fs::remove_dir_all(d)?;
+        remove_path(d)?;
     }
     for (from, to) in &plan.restore {
-        copy_dir(from, to)?;
+        if from.is_dir() {
+            copy_dir(from, to)?;
+        } else {
+            std::fs::copy(from, to).with_context(|| format!("restore {}", to.display()))?;
+        }
     }
     for d in plan.remove.iter().filter(|d| !restored.contains(d)) {
-        if d.is_dir() {
-            std::fs::remove_dir_all(d)?;
-        } else if d.exists() {
-            std::fs::remove_file(d)?;
-        }
+        remove_path(d)?;
     }
     Ok(())
 }
@@ -1013,18 +1233,146 @@ mod tests {
         }
         stage(&x.ledger, &x.paths, &hook_entry("h1"), &[]).unwrap();
         approve(&x.ledger, &x.paths, "h1", Approval::Hook).unwrap();
+        // agents: the user's own file, one the plugin replaced (original v0), one it wrote
+        let agents = x.paths.agents_dir();
+        std::fs::create_dir_all(&agents).unwrap();
+        for n in ["mine-agent", "replaced-agent"] {
+            std::fs::write(agents.join(format!("{n}.md")), agent_md(n, "user")).unwrap();
+        }
+        for (id, name) in [("a1", "replaced-agent"), ("a2", "fresh-agent")] {
+            stage(&x.ledger, &x.paths, &agent_entry(id, name), &[w("AGENT.md", &agent_md(name, "ours"))]).unwrap();
+            set_status(&x.ledger, &x.paths, id, Status::Kept, None).unwrap();
+        }
+        stage(&x.ledger, &x.paths, &agent_entry("a3", "staged-agent"), &[w("AGENT.md", &agent_md("staged-agent", "p"))]).unwrap();
 
         let plan = uninstall_plan(&x.paths, &x.ledger).unwrap();
         assert_eq!(
             plan.remove,
-            vec![skills.join("fresh"), skills.join("replaced"), x.paths.hooks_dir(), x.paths.root.clone()]
+            vec![
+                skills.join("fresh"),
+                skills.join("replaced"),
+                agents.join("fresh-agent.md"),
+                agents.join("replaced-agent.md"),
+                x.paths.agents.clone(),
+                x.paths.hooks_dir(),
+                x.paths.root.clone()
+            ]
         );
-        assert_eq!(plan.restore, vec![(x.paths.predecessors.join("replaced/0"), skills.join("replaced"))]);
+        assert_eq!(
+            plan.restore,
+            vec![
+                (x.paths.predecessors.join("replaced/0"), skills.join("replaced")),
+                (x.paths.predecessors.join(".agents/replaced-agent/0/AGENT.md"), agents.join("replaced-agent.md")),
+            ]
+        );
         drop(x.ledger);
         apply_uninstall(&plan).unwrap();
         assert!(!x.paths.root.exists() && !x.paths.hooks_dir().exists() && !skills.join("fresh").exists());
         assert_eq!(std::fs::read_to_string(skills.join("replaced/SKILL.md")).unwrap(), "---\nname: replaced\ndescription: user\n---\nuser replaced\n");
         assert!(skills.join("mine/SKILL.md").is_file());
         assert!(skills.join("foreign/SKILL.md").is_file());
+        assert!(!agents.join("fresh-agent.md").exists());
+        assert_eq!(std::fs::read_to_string(agents.join("replaced-agent.md")).unwrap(), agent_md("replaced-agent", "user"));
+        assert_eq!(std::fs::read_to_string(agents.join("mine-agent.md")).unwrap(), agent_md("mine-agent", "user"));
+    }
+
+    fn agent_md(name: &str, prompt: &str) -> String {
+        format!("---\nname: {name}\ndescription: Use for a large build log; returns the first failing step.\nmodel: \"@smol\"\n---\n{prompt}\n")
+    }
+
+    fn agent_entry(id: &str, name: &str) -> Entry {
+        let mut e = entry(id, name, "repo", Status::Provisional);
+        e.kind = Kind::Agent;
+        e
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_link_while_provisional_copy_when_kept_and_roll_back() {
+        let x = env();
+        assert!(stage(&x.ledger, &x.paths, &agent_entry("a0", "log-triage"), &[]).is_err(), "AGENT.md required");
+        // the user's own agent of that name, replaced by the keep
+        let native = kept_agent_file(&x.paths, "log-triage");
+        std::fs::create_dir_all(x.paths.agents_dir()).unwrap();
+        std::fs::write(&native, agent_md("log-triage", "mine")).unwrap();
+
+        let a1 = stage(&x.ledger, &x.paths, &agent_entry("a1", "log-triage"), &[w("AGENT.md", &agent_md("log-triage", "v1"))]).unwrap();
+        let dir = x.paths.staging.join("repo/log-triage");
+        assert_eq!(a1.path, dir);
+        assert!(!dir.join("SKILL.md").exists(), "an agent entry is AGENT.md + rematch.json");
+        let link = agent_link(&x.paths, "log-triage");
+        assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("AGENT.md"));
+        let doc = SkillDoc::parse(&read(&link)).unwrap();
+        assert_eq!(doc.get_str("name"), Some("log-triage"));
+        assert_eq!(doc.get_str("model"), Some("@smol"), "unknown keys preserved");
+        assert_eq!(doc.rematch().unwrap().id, "a1");
+        assert!(doc.body.contains("v1"));
+
+        let mut twin = agent_entry("a9", "log-triage");
+        twin.branch = "other".into();
+        let err = stage(&x.ledger, &x.paths, &twin, &[w("AGENT.md", &agent_md("log-triage", "x"))]).unwrap_err();
+        assert!(err.to_string().contains("already staged"), "{err}");
+        assert!(!x.paths.staging.join("other/log-triage").exists(), "refused before writing");
+
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
+        assert!(m.skill_dirs.is_empty(), "agents contribute no skill dir");
+        let got: Vec<(&str, Kind, bool)> = m.entries.iter().map(|e| (e.id.as_str(), e.kind, e.predicate_hit)).collect();
+        assert_eq!(got, vec![("a1", Kind::Agent, true)]);
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/elsewhere")), Path::new("/elsewhere")).unwrap();
+        assert_eq!(m.entries.iter().map(|e| e.predicate_hit).collect::<Vec<_>>(), vec![false], "listed (it loads), not counted");
+
+        let k1 = set_status(&x.ledger, &x.paths, "a1", Status::Kept, None).unwrap();
+        assert_eq!(k1.path, x.paths.kept_agents.join("log-triage"));
+        assert!(std::fs::symlink_metadata(&link).is_err(), "staging link removed");
+        assert!(!dir.exists());
+        assert!(read(&native).contains("v1"));
+        assert_eq!(SkillDoc::parse(&read(&native)).unwrap().rematch().unwrap().status, Status::Kept);
+        assert_eq!(read(&x.paths.predecessors.join(".agents/log-triage/0/AGENT.md")), agent_md("log-triage", "mine"));
+
+        stage(&x.ledger, &x.paths, &agent_entry("a2", "log-triage"), &[w("AGENT.md", &agent_md("log-triage", "v2"))]).unwrap();
+        let k2 = set_status(&x.ledger, &x.paths, "a2", Status::Kept, None).unwrap();
+        assert_eq!((k2.predecessor.as_deref(), k2.version), (Some("a1"), 2));
+        assert!(read(&native).contains("v2"));
+        let old = x.ledger.get_entry("a1").unwrap().unwrap();
+        assert_eq!((old.status, old.path), (Status::Dormant, x.paths.predecessors.join(".agents/log-triage/1")));
+
+        let rb = rollback(&x.ledger, &x.paths, "log-triage").unwrap();
+        assert_eq!(rb.retired.path, x.paths.archive.join("retired/a2"));
+        let r = rb.restored.unwrap();
+        assert_eq!((r.id.as_str(), r.status, r.path), ("a1", Status::Kept, x.paths.kept_agents.join("log-triage")));
+        assert!(read(&native).contains("v1"));
+        let rb = rollback(&x.ledger, &x.paths, "log-triage").unwrap();
+        assert_eq!((rb.restored_version, rb.restored.is_none()), (0, true));
+        assert_eq!(read(&native), agent_md("log-triage", "mine"), "the user's own agent is back");
+        assert!(rollback(&x.ledger, &x.paths, "log-triage").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_links_follow_draft_activate_retire_and_kept_retire() {
+        let x = env();
+        stage(&x.ledger, &x.paths, &Entry { status: Status::Draft, ..agent_entry("d1", "draft-agent") }, &[w("AGENT.md", &agent_md("draft-agent", "d"))]).unwrap();
+        let link = agent_link(&x.paths, "draft-agent");
+        assert!(std::fs::symlink_metadata(&link).is_err(), "drafts never load");
+        let p = activate_draft(&x.ledger, &x.paths, "draft-agent").unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), p.path.join("AGENT.md"));
+        let d = set_status(&x.ledger, &x.paths, "d1", Status::Dormant, None).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        let back = set_status(&x.ledger, &x.paths, "d1", Status::Provisional, None).unwrap();
+        assert_ne!(d.path, back.path);
+        assert_eq!(std::fs::read_link(&link).unwrap(), back.path.join("AGENT.md"));
+        disable(&x.ledger, &x.paths, "d1", "noisy").unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "retired agents unload");
+
+        stage(&x.ledger, &x.paths, &agent_entry("k1", "kept-agent"), &[w("AGENT.md", &agent_md("kept-agent", "k"))]).unwrap();
+        set_status(&x.ledger, &x.paths, "k1", Status::Kept, None).unwrap();
+        let native = kept_agent_file(&x.paths, "kept-agent");
+        assert!(native.is_file());
+        set_status(&x.ledger, &x.paths, "k1", Status::Stale, None).unwrap();
+        assert!(!native.exists(), "a stale kept agent leaves omp's agent dir");
     }
 }

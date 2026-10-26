@@ -4,7 +4,8 @@ Anonymized real omp session JSONL files used only by the historical importer tes
 (`crates/rematch-core/tests/golden_import.rs`). Each `*.jsonl` here must import to the
 counts recorded for it in `expected.json` (branch entries, family, turns, tool calls and
 errors, error clusters, skill reads, files touched, exts, redirects, takeovers, tokens,
-receipt-derived outcomes).
+receipt-derived outcomes) and to a stable synthesized extension trace (`trace_records_of`:
+inputs, tool results, turn ends, and a flag equal to the ledger row's).
 
 ## How they were produced
 

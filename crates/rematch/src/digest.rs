@@ -51,7 +51,7 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
             hit = hit && predicate::count_hit(&e.predicate, exts, stems);
         }
         entries.push(json!({
-            "id": me.id, "name": me.name, "status": me.status, "predicate_hit": hit,
+            "id": me.id, "name": me.name, "kind": me.kind, "status": me.status, "predicate_hit": hit,
             "families_excluded": e.map(|e| e.families_excluded).unwrap_or_default(),
         }));
     }

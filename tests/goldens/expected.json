@@ -15,7 +15,11 @@
     "takeovers": 0,
     "tokens_in": 32077,
     "tokens_out": 220,
-    "outcomes": 0
+    "outcomes": 0,
+    "trace_inputs": 1,
+    "trace_tool_results": 1,
+    "trace_turn_ends": 2,
+    "trace_flagged": false
   },
   "skill-read.jsonl": {
     "id": "01a175a9-8b4d-73e2-bf6f-abbb6b304887",
@@ -35,7 +39,11 @@
     "takeovers": 0,
     "tokens_in": 32960,
     "tokens_out": 3925,
-    "outcomes": 0
+    "outcomes": 0,
+    "trace_inputs": 2,
+    "trace_tool_results": 1,
+    "trace_turn_ends": 3,
+    "trace_flagged": false
   },
   "subagent-branch-compaction.jsonl": {
     "id": "01a175c2-7805-768a-8e7c-016db4ef27cf",
@@ -60,6 +68,10 @@
     "takeovers": 0,
     "tokens_in": 5092169,
     "tokens_out": 29321,
-    "outcomes": 0
+    "outcomes": 0,
+    "trace_inputs": 0,
+    "trace_tool_results": 216,
+    "trace_turn_ends": 38,
+    "trace_flagged": false
   }
 }
