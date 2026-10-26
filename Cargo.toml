@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/evolve-core", "crates/omp-evolve"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+regex = "1"
+glob = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+serde_yaml = "0.9"
+tempfile = "3"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+
+[profile.release]
+lto = "thin"
+strip = true
