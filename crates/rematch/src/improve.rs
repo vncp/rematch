@@ -45,7 +45,7 @@ fn plugins_node_modules() -> PathBuf {
 }
 
 /// Skill dir by name: agent skills, plugin skills (`node_modules/[@org/]pkg/skills/<name>`),
-/// project `.omp/skills`, then a registered ledger entry.
+/// project and user skill roots omp scans (`.omp`, `.agents`, `.claude`, `.codex`, …), then a registered ledger entry.
 pub fn locate_skill(ctx: &AppCtx, name: &str) -> Result<Option<PathBuf>> {
     let mut cands = vec![ctx.paths.skills_dir().join(name)];
     let nm = plugins_node_modules();
@@ -60,7 +60,16 @@ pub fn locate_skill(ctx: &AppCtx, name: &str) -> Result<Option<PathBuf>> {
         }
     }
     let base = rematch_core::import::repo_of(&ctx.cwd).unwrap_or_else(|| ctx.cwd.clone());
-    cands.push(base.join(".omp").join("skills").join(name));
+    // Project roots omp scans (`omp://skills.md` providers): native, agents, claude, codex,
+    // opencode, github; then the user-level ones that load by default.
+    for rel in [".omp/skills", ".agents/skills", ".agent/skills", ".claude/skills", ".codex/skills", ".opencode/skills", ".github/skills"] {
+        cands.push(base.join(rel).join(name));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for rel in [".agents/skills", ".agent/skills", ".claude/skills", ".codex/skills", ".config/opencode/skills"] {
+            cands.push(home.join(rel).join(name));
+        }
+    }
     if let Some(found) = cands.into_iter().find(|d| d.join("SKILL.md").is_file()) {
         return Ok(Some(std::fs::canonicalize(&found).unwrap_or(found)));
     }
@@ -256,6 +265,26 @@ pub fn cmd_improve(ctx: &AppCtx, a: ImproveArgs) -> Result<Value> {
     if base.pinned || base.status == Status::Pinned {
         bail!("{} is pinned (human-owned); not proposing a replacement", a.skill);
     }
+    // Rate limit (SPEC): no new proposal on a trigger while its canary is pending. A sibling
+    // of this skill already staged provisional (a split or an earlier unit-level version) is
+    // that canary; the counters decide it before another version may be proposed.
+    let sibling_dir = ctx.paths.staging.join(&branch).join(&a.skill);
+    if sibling_dir.join(library::REMATCH_JSON).is_file() {
+        if let Ok(sib) = library::load_entry(&sibling_dir) {
+            if sib.id != base.id && sib.status == Status::Provisional {
+                let c = ctx.ledger.counters(&sib.id)?;
+                return Ok(json!({
+                    "skill": a.skill, "entry": base.id, "branch": branch, "refused": true,
+                    "pending_canary": {"id": sib.id, "version": sib.version, "note": sib.status_note, "path": sibling_dir,
+                        "matched": c.matched, "recurrence": c.recurrence, "harm": c.harm},
+                    "lines": [format!(
+                        "{}: a provisional version (v{}, {}) is already pending its canary at {} — matched {} · recurrence {} · harm {}; the counters decide it before a new version is proposed (`rematch library disable <id>` to withdraw it)",
+                        a.skill, sib.version, sib.status_note.as_deref().unwrap_or("sibling"), sibling_dir.display(), c.matched, c.recurrence, c.harm
+                    )],
+                }));
+            }
+        }
+    }
     let audit = json!({
         "sessions": sessions.len(), "traced": traced, "imported": imported,
         "redirects": sessions.iter().map(|s| s.redirects.len()).sum::<usize>(),
@@ -305,6 +334,44 @@ fn sibling_entry(ctx: &AppCtx, base: &Entry, branch: &str, kind_note: &str) -> R
     Ok(e)
 }
 
+/// Every text file of the original skill directory (the text that already loads today).
+fn original_texts(dir: &Path) -> Result<Vec<String>> {
+    fn walk(cur: &Path, out: &mut Vec<String>) -> Result<()> {
+        for ent in std::fs::read_dir(cur)?.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                walk(&p, out)?;
+            } else if let Ok(s) = std::fs::read_to_string(&p) {
+                out.push(s);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out)?;
+    Ok(out)
+}
+
+/// Downgrade text findings (`identifiers`, `string_match_user`, `executable_risk`) whose quoted
+/// snippet already occurs in the original skill to warnings; recompute `ok`.
+fn inherit_findings(mut report: rematch_core::types::LintReport, originals: &[String]) -> rematch_core::types::LintReport {
+    use rematch_core::types::Severity;
+    for f in &mut report.findings {
+        if f.severity != Severity::Error || !matches!(f.rule.as_str(), "identifiers" | "string_match_user" | "executable_risk") {
+            continue;
+        }
+        let Some(snippet) = f.message.split('`').nth(1).map(str::trim).filter(|s| s.len() >= 3) else {
+            continue;
+        };
+        if originals.iter().any(|o| o.contains(snippet)) {
+            f.severity = Severity::Warn;
+            f.message = format!("{} (inherited from the original skill; not introduced by this change)", f.message);
+        }
+    }
+    report.ok = report.findings.iter().all(|f| f.severity != Severity::Error);
+    report
+}
+
 fn split(ctx: &AppCtx, a: &ImproveArgs, base: &Entry, dir: &Path, md: &str, branch: &str, mut out: Value) -> Result<Value> {
     let edits = package::mechanical_split(md, &a.skill)?;
     if edits.is_empty() {
@@ -337,6 +404,10 @@ fn split(ctx: &AppCtx, a: &ImproveArgs, base: &Entry, dir: &Path, md: &str, bran
             transfer: false,
         },
     )?;
+    // A mechanical split adds no text. Findings about text the skill already carried (and
+    // which already loads today) are reported as warnings, not as a gate: the gate is for new
+    // text. Everything the split itself introduces is still held to the full rules.
+    let report = inherit_findings(report, &original_texts(dir)?);
     if !report.ok {
         let row = ctx.ledger.insert_proposal(Some(&base.id), None, &json!({"decision": "SPLIT", "edits": all, "lint": report}), false)?;
         out["split"] = json!(false);

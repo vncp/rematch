@@ -229,6 +229,26 @@ fn entry_ms(e: &Value) -> Option<UnixMs> {
         .or_else(|| e.pointer("/message/timestamp").and_then(Value::as_i64))
 }
 
+/// A user-role message the harness injected rather than the human typed: task
+/// notifications, system notices/reminders, and hook messages, all of which open with a
+/// known XML frame. Attachment envelopes (`[Image #1]`) are typed by the user and stay.
+pub fn is_injected_frame(text: &str) -> bool {
+    const FRAMES: &[&str] = &[
+        "<task-notification",
+        "<system-notice",
+        "<system-reminder",
+        "<hook-message",
+        "<session-agents",
+        "<ttsr",
+        "<task-result",
+        "<channel-message",
+        "<teammate-message",
+        "Another Claude session sent a message",
+    ];
+    let t = text.trim_start();
+    FRAMES.iter().any(|f| t.starts_with(f))
+}
+
 /// Text blocks of a message `content` (string or block array), joined by newlines.
 pub fn content_text(content: Option<&Value>) -> String {
     match content {
@@ -707,6 +727,12 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
                 w.flush_turn();
                 w.agent_end(t);
                 let text = content_text(m.get("content"));
+                // Frames the harness injects as user-role messages (task notifications, system
+                // notices/reminders, hook messages) are not typed by a human; the live
+                // extension never sees them as `input`, so they must not become redirects.
+                if is_injected_frame(&text) {
+                    continue;
+                }
                 let idle = w.last_stop != Some("aborted");
                 w.last_stop = None;
                 let label = prelabel(&text, w.last_input.as_deref(), idle);
@@ -1700,5 +1726,20 @@ mod tests {
             Some(dir.path().join("r"))
         );
         assert_eq!(repo_of(Path::new("")), None);
+    }
+}
+
+#[cfg(test)]
+mod injected_frames {
+    use super::is_injected_frame;
+
+    #[test]
+    fn harness_frames_are_not_user_turns() {
+        assert!(is_injected_frame("<task-notification>\n<task-id>x</task-id>"));
+        assert!(is_injected_frame("  <system-notice>User interjection"));
+        assert!(is_injected_frame("<system-reminder>\n3 todo items"));
+        assert!(!is_injected_frame("[Image #1] look at this"));
+        assert!(!is_injected_frame("No, revert that"));
+        assert!(!is_injected_frame("<p>html pasted by me</p>"));
     }
 }
