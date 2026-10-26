@@ -1073,6 +1073,12 @@ pub(crate) mod tests {
             sibling_of: None,
             status_since: None,
             status_note: None,
+            pending_next_run: false,
+            fork_path: None,
+            fork_repo: None,
+            fork_commit: None,
+            families_excluded: vec![],
+            links: vec![],
         }
     }
 

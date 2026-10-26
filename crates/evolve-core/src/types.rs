@@ -177,6 +177,28 @@ pub struct Entry {
     /// Why the last status change happened (rollback note, disable reason, decline).
     #[serde(default)]
     pub status_note: Option<String>,
+    /// Batch winner staged provisional by a `run` of its `Origin::Task`: the next
+    /// worker run of that task keeps it on a verifier pass, retires it on a fail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_next_run: bool,
+    /// Fork entries: repo-relative path the entry's file is shipped to in the fork
+    /// (`ship --scope fork`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_path: Option<String>,
+    /// Fork repo the entry was last shipped to (`ship --scope fork`); drift check target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_repo: Option<PathBuf>,
+    /// `git rev-parse HEAD` of `fork_repo` when shipped; a different HEAD ⇒ `stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_commit: Option<String>,
+    /// Families this entry no longer serves after a per-family split (Phase 3). Entries
+    /// load regardless of family (SPEC §Models), so this is informational: `match`
+    /// reports it and the harmed family gets its own sibling entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub families_excluded: Vec<Family>,
+    /// Provenance links (`transfers_from` for cross-branch transfers and exports).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
 }
 
 fn one() -> u32 {

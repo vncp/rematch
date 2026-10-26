@@ -50,12 +50,12 @@ Every subcommand prints a single JSON envelope on stdout (`{"ok":true,"operation
 | --- | --- |
 | `doctor` | Check `omp` binary+version, resolved roles (`provider/model`), extension link status, ledger schema version, root paths, and kill-switch state |
 | `import --history [--sessions <dir>] [--forge <path>]` | Import historical `omp` session JSONL into the ledger and optionally register `compound-forge` skills/learnings as `provisional` |
-| `reflect --pending [--session <id>] [--editor <cmd>]` | Fold finished traces into counters/decisions, then run one reflection per pending flagged session respecting rate limits |
+| `reflect --pending [--session <id>] [--editor <cmd>] [--detach]` | Fold finished traces into counters/decisions, then run one reflection per pending flagged session respecting rate limits (≤ 3 model calls each; `--detach` returns a `job_id`) |
 | `match --cwd <dir> [--inputs <json>]` | Evaluate deterministic predicates for `<dir>`; returns `{branch, repo, skill_dirs, entries, hooks, off}` |
 | `digest --cwd <dir>` | Return session-start summary lines, pending script/hook approvals with diffs, capability-floor reviews, and transfer suggestions |
-| `record --session <id> --event <json>` | Record an explicit event (such as `/evolve mark`) against a session |
-| `create <name> --from sessions\|task\|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...]` | Create a greenfield skill package from matching sessions, a task rollout, or description (`draft`) |
-| `improve <skill> [--split-only] [--branch <b>]` | Register, audit, mechanically split (> 8 KB), or propose unit-level improvements for an existing skill |
+| `record --session <id> --event <json>` | Record a `{"ev":"mark","class":…}` event against a session (same as `mark`) |
+| `create <name> --from sessions\|task\|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...]` | Create a greenfield skill package from ≥ 3 matching sessions, a task rollout, or description (`draft`) |
+| `improve <skill> [--split-only] [--branch <b>]` | Register (files left in place), audit, mechanically split (> 8 KB), or propose unit-level improvements staged beside an existing skill (needs ≥ 5 sessions that read it) |
 | `activate <name> [--task <id> \| --unverified]` | Promote a `draft` entry to `provisional` via a reference task run or explicit `--unverified` acceptance |
 | `run --task <id> --verifier <cmd> [--width k] [--seed n]` | Start a detached batch-mode recursion job with a deterministic verifier; returns `{job_id}` |
 | `run-worker --job <id>` | Internal detached worker entry point for `run` |
@@ -64,7 +64,7 @@ Every subcommand prints a single JSON envelope on stdout (`{"ok":true,"operation
 | `task add <id> --repo <path> --prompt <text> [--verifier <cmd>] [--max-time 10m] [--tools ...]` | Register a repeatable batch task definition |
 | `transfer suggest \| transfer apply <lesson_id> --branch <b>` | Suggest or apply kept `invariant` lessons across branches with overlapping facet structure |
 | `ship --scope team\|fork [--repo <path>] [--entry <id>...]` | Prepare a branch/PR with evidence for team (`<repo>/.omp/`) or fork scope |
-| `count [--session <id>]` | Fold uncounted finished traces into entry counters and run keep/retire/dormant decisions |
+| `count [--session <id>]` | Fold uncounted finished traces into entry counters and run keep/retire/dormant decisions (EXPERIENCE.md on keep/retire) |
 | `mark --session <id> --class correction\|preference\|scope` | Override the redirect classification for the latest turn in `<session>` |
 | `off \| on` | Toggle the persistent kill switch (`$EVOLVE_ROOT/off`) |
 | `uninstall [--yes]` | Remove all files written under `$EVOLVE_ROOT` and evolve-managed skills/hooks |

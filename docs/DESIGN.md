@@ -49,7 +49,8 @@ archive/<status>/<id>/            retired|dormant|stale entries (never loaded, n
 predecessors/<name>/<version>/    copies of replaced kept entries (rollback)
 improver/{editor.md,reflector.md,lint.toml,omp-no-tools.yml}   copied from repo on first run; EXPERIENCE.md files live next to entries
 jobs/<job_id>.json  jobs/<job_id>.log      detached job state
-runs/<task>/<seed>/               batch workspaces (deleted after receipt)
+runs/<task>/<seed>/<variant>/     batch workspaces {wt/, skills/, overlay.yml, events.jsonl} (deleted after receipt)
+runs/<task>/receipt.json          last batch receipt;  runs/<task>/traces/<session>.jsonl  reference traces for `create --from task`
 tasks/<task_id>.json              batch task definitions
 branches/<branch>/domain.yml      facet vocabulary per branch
 export/                           git-tracked work↔home export of invariant entries
@@ -65,12 +66,12 @@ Human-readable output only with `--text`. Logs go to stderr.
 ```
 doctor                                     omp binary+version, roles resolved (provider/model), extension linked?, ledger schema version, root paths, off?
 import --history [--sessions <dir>] [--forge <path>]
-reflect --pending [--session <id>] [--editor <cmd>]      idempotent per pending file; --editor overrides the editor channel (tests)
+reflect --pending [--session <id>] [--editor <cmd>] [--detach]   idempotent per pending file (lock `pending/.lock`); --editor overrides every model call (tests); --detach → {job_id}
 match --cwd <dir> [--inputs <json>]        {branch, repo, skill_dirs:[...], entries:[{id,name,status,predicate_hit}], hooks:[path...], off:bool}
 digest --cwd <dir>                         {lines:[...], approvals:[{id,name,kind,diff,reason}], review:[...capability floor...], transfers:[...]}
-record --session <id> --event <json>       (optional path used by the extension for marks; the trace file is the primary input)
-create <name> --from sessions|task|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...]
-improve <skill> [--split-only] [--branch <b>]
+record --session <id> --event <json>       accepts `{"ev":"mark","class":…}` only (= mark); every other event belongs in the trace file
+create <name> --from sessions|task|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...] [--editor <cmd>]
+improve <skill> [--split-only] [--branch <b>] [--editor <cmd>]
 activate <name> [--task <id> | --unverified]
 run --task <id> --verifier <cmd> [--width k] [--seed n]  → {job_id}
 run-worker --job <id>                      internal, detached
@@ -79,7 +80,7 @@ library ls | why [<session_id>] | disable <id> | rollback <skill> | pin <id> | u
 task add <id> --repo <path> --prompt <text> [--verifier <cmd>] [--max-time 10m] [--tools ...]
 transfer suggest | transfer apply <lesson_id> --branch <b>
 ship --scope team|fork [--repo <path>] [--entry <id>...]
-count [--session <id>]                     fold finished traces into counters and decide (also run by reflect --pending)
+count [--session <id>] [--editor <cmd>]    fold finished traces into counters and decide (also run by reflect --pending)
 mark --session <id> --class correction|preference|scope
 off | on
 uninstall [--yes]
@@ -251,3 +252,103 @@ WAL, `synchronous=NORMAL`, `busy_timeout` 5 s. Migrations are an ordered list; `
 | `outcomes` | id, session_id, ts, machine, family, repo, branch, kind, domain, subject_id, subject_json, claim, signature, params_json, evidence_json, result_json, links_json, provenance_json, status, json, created_at | PK id (latest status per id); exact (signature); temporal (subject_id, ts); (domain) | `subject_id` = `domain` or `domain#type:id,…` (sorted entities), `ledger::subject_id`. `latest`/`asof(ts)` = newest by ts (≤ ts). |
 | `outcome_facets` | outcome_id, domain, key, value | composite (domain, key, value) | prefix seek: `domain = p OR domain LIKE 'p.%'` (via substr). |
 | `minhash` | outcome_id, band, hash | PK(outcome_id, band); (band, hash) | `minhash_neighbors(bands, min_shared)` is a suggestion, never a gate. |
+
+## 14. Binary module map and the omp process interface
+
+`crates/omp-evolve/src/`:
+```
+main.rs        clap dispatch → one JSON envelope on stdout (envelope.rs); exit codes 0/1/2/130; `--version` → {"version"}
+app.rs         AppCtx{paths, ledger, now, cwd, text}: ensure_dirs, improver files (embedded; `$OMP_EVOLVE_IMPROVER` overrides) copied on first run, ledger open; `new_entry`
+envelope.rs    Envelope{ok, operation, data|error}; `--text` renders `data.lines` (else pretty JSON); `Cancelled` → 130, `Usage` → 2
+config.rs      omp config.yml (agent dir + <repo>/.omp/config.yml overlay) → modelRoles lookup; role fallbacks (§0) + `evolve-solver`→default
+proc.rs        bounded process execution with process-group kill (shared by editor, classifier, batch rollouts, verifiers)
+omp.rs         omp invocation builders + JSON event stream parsing/verification (forge omp_runner contract)
+editor.rs      model calls (editor, classifier, reflector) through omp or `--editor <cmd>`; tolerant reply parser; per-reflection CallBudget (≤ 3)
+jobs.rs        detached jobs: `spawn_detached(ctx, kind, argv, payload) -> job_id` (setsid, stdio→jobs/<id>.log, `{job}` token + $OMP_EVOLVE_JOB_ID), `update`, `status` (kill(pid,0) liveness), `LockFile`
+library_cmd.rs library subcommands, off|on
+reflect.rs     count + reflect --pending (§loop 1–8), editor/classifier calls, lint retry, stage, EXPERIENCE.md on decisions
+create.rs      greenfield (sessions | task | description→draft), activate
+improve.rs     brownfield (register, audit, split, unit-level propose, stage beside)
+import_cmd.rs  import --history / --forge
+digest.rs      session-start digest payload; capability-floor review list; transfer suggestions
+doctor.rs      doctor
+uninstall.rs   uninstall
+batch/         Phase 2: tasks.rs (task defs), substrate.rs (worktree + overlay materialization), rollout.rs, verifier.rs, run.rs (k=1/width scheduler), worker.rs (run-worker)
+scope/         Phase 3: ship.rs (team/fork PR), export.rs (work↔home export/import), stale.rs (drift), split.rs (per-family split), transfer.rs
+```
+
+### proc.rs (owned by Binary; used by everyone)
+```rust
+pub struct Bounded { pub stdout: String, pub stderr: String, pub code: Option<i32>, pub killed: bool, pub elapsed_ms: u64 }
+/// Spawns `cmd` in its own process group (`process_group(0)`), stdin null, stdout/stderr piped (bounded buffers),
+/// waits ≤ `timeout`; on timeout or cancel (SIGINT/SIGTERM to the binary ⇒ `Cancelled`, exit 130) fires SIGTERM to the group,
+/// waits 2 s, SIGKILL to the group (also when a lingering grandchild keeps the pipes open after the leader exited).
+pub fn run_bounded(cmd: std::process::Command, timeout: std::time::Duration) -> anyhow::Result<Bounded>;
+pub fn run_bounded_input(cmd: Command, timeout: Duration, stdin: Option<&[u8]>) -> anyhow::Result<Bounded>;  // scripted editors
+```
+
+### omp.rs (owned by Binary)
+```rust
+pub fn omp_bin() -> PathBuf;                       // $OMP_BIN → PATH `omp`
+pub struct NoToolsCall { pub model: ModelRef, pub system_prompt_file: PathBuf, pub prompt: String, pub timeout: Duration }
+pub fn no_tools_argv(call: &NoToolsCall, cwd: &Path, no_tools_config: &Path) -> Vec<String>;   // §9 argv, exactly
+pub struct ToolsCall { pub model: ModelRef, pub cwd: PathBuf, pub prompt: String, pub tools: Option<String>, pub max_time: Duration,
+                       pub config_overlay: Option<PathBuf>, pub extra_args: Vec<String> }
+pub fn tools_argv(call: &ToolsCall) -> Vec<String>;   // `--cwd --model --no-session --no-title --no-extensions --no-rules --no-lsp --approval-mode yolo --mode json --max-time -p -- prompt` (+ `--no-skills` unless overlay supplies customDirectories, + `--tools`)
+pub fn child_env() -> Vec<(String, String)>;       // PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0
+pub fn parse_events(stdout: &str) -> anyhow::Result<Vec<serde_json::Value>>;   // every non-empty line must be JSON
+pub struct Verified { pub text: String, pub events: Vec<serde_json::Value>, pub usage: Option<serde_json::Value> }
+pub fn verify_stream(events: Vec<Value>, expected: &ModelRef, no_tools: bool) -> anyhow::Result<Verified>;   // §9 rules
+pub fn run_no_tools(call: &NoToolsCall, paths: &EvolvePaths) -> anyhow::Result<Verified>;  // tmp cwd, run_bounded, verify
+pub fn run_tools(call: &ToolsCall) -> anyhow::Result<Verified>;
+```
+`--editor <cmd>` (tests): `editor::call` bypasses `run_no_tools`, pipes the prompt to the command's stdin and reads stdout (see below).
+
+### Binary behavior notes (Phase 1 + 1.5)
+
+- Scripted model (`--editor <cmd>`): run with `sh -c`, prompt on stdin, env `OMP_EVOLVE_ROLE=<role>` and `OMP_EVOLVE_PROMPT=editor|classifier|reflector`; stdout is the reply. Without it, the role's model is resolved from config.yml and called through `run_no_tools`. The reflector uses the `evolve-editor` role with `improver/reflector.md`.
+- Model calls: `count` makes ≤ 1 batched classifier call per pass (skipped when there are no unclassified non-mark redirects) and one reflector call per keep/retire (deterministic EXPERIENCE record when it fails). Each reflection's `CallBudget(3)` is charged for the classifier when its session was in that batch, then editor + one lint retry. A failed editor call keeps the pending file (`attempts` counter; dropped after 3).
+- Detached jobs: the child of `spawn_detached` writes its final envelope into `jobs/<id>.json` (`status: done|failed`, `result`); a live status whose pid is gone reads as `lost`. `run-worker` manages its own record. `OMP_EVOLVE_JOB_ID` is stripped from every `run_bounded` child.
+- Ownership: an entry owns its directory iff it lives under EVOLVE_ROOT or its SKILL.md carries an `evolve:` block with its id (`reflect::owns_dir`). Registered skills (`import --forge`, `improve`) and lessons are *foreign*: decisions, disable and pin are recorded in the ledger only (`reflect::record_status`), never moving or rewriting their files; their EXPERIENCE.md goes to `EVOLVE_ROOT/brownfield/<id>/`; approve/decline/rollback refuse them.
+- `import --forge`: skills register in branch `forge` with `path` = the forge skill dir; each `learnings/*.md` becomes a provisional `lesson` at `EVOLVE_ROOT/lessons/forge/lesson-<slug>/` (`LESSON.md` copy + `evolve.json` with `evidence_sha256` = blob hash of the file, `source_path`). `match` omits lessons. `import --history` keeps an existing `source: trace` session row (richer) instead of overwriting it.
+- `improve`: the audit counts every ledger session with the skill in `skill_reads` (traced and imported); < 5 ⇒ `{refused, traced_sessions, offer}`. Siblings share the base predicate (no pending-canary check), get `sibling_of` and stage at `staging/<branch>/<name>/` where branch = `--branch`, else the reading sessions' common repo, else `shared`.
+- `create --from sessions`: request stems (name + description) and `--files` extensions vs. session stems/exts; a session matches with overlap ≥ min(2, |request stems|); ≥ 3 needed; up to 8 references. `activate --task` runs one reference rollout and attaches its moment as evidence before draft → provisional.
+- `digest` lines: one per entry whose status changed since `EVOLVE_ROOT/digest.last` (imported registrations summarized in one line), plus Scope review/stale/transfer lines; approvals = unapproved scripts or uncompiled hooks of owned provisional/kept entries, plus `export:<id>` items.
+- `reflect` content-triage failures are logged (stderr + envelope) and the pending file deleted; no ledger proposal row.
+
+## 15. Scope (Phase 3, `crates/omp-evolve/src/scope/`)
+
+CLI additions: `stale [--dry-run] [--recanary <entry>]`, `split [--review-days 7]`, `transfer promote`; `ship` adds `--push`, `--pr` (needs `--push` and `gh`), `--remote origin`; `library export` adds `--entry <id>… --approve | --approve-all`.
+New `Entry` fields (serde default, omitted when empty): `fork_path`, `fork_repo`, `fork_commit`, `families_excluded`, `links` (`transfers_from`).
+
+| Command / fn | Behavior |
+| --- | --- |
+| `ship --scope team` | Kept/provisional entries whose predicate content (`count_hit`, ignoring the one-repo glob) hit sessions in ≥ 2 distinct repos, or listed with `--entry`. Target = `--repo` or the originating session's repo. Lint must pass. A temporary worktree from HEAD gets branch `omp-evolve/<name>-<last 8 id chars>` with `.omp/skills/<name>/` (no `evolve.json`/`EXPERIENCE.md`, mode 0644, `evolve.scope: team`), committed with an evidence body (counters, per family, matched sessions, repos, families, redirect class, predicted fix/regression, latest EXPERIENCE.md record). Receipt `activation: pr`. No network unless `--push`/`--pr`; never merges. |
+| `ship --scope fork` | `--repo` required; entries with `fork_path`. Content = `fork/<basename>` in the package, else the SKILL.md body. Body adds `omp --version`, file sha256, base commit, before numbers (the predicate over sessions that started before the entry existed, `recurred`/`harmed` rules, per family) and after numbers (entry counters). Records `fork_repo` + `fork_commit` (base HEAD). |
+| `library export` | `policy.json` `{environment: work|home, export_enabled}`; missing ⇒ home; work refuses unless `export_enabled`. Candidates: kept entries with `lesson_tag: invariant` or `manifest.scope: invariant`. Each is linted with `transfer: true`, `facts/` dropped, `evolve.json` stripped (provisional, no counters/evidence/approvals/path). Without approval the result lists `pending` with `git diff --no-index` diffs and `requires_approval: true`; `--entry <id> --approve` or `--approve-all` writes `<export>/<id>/` and commits it (the export dir is `git init`ed on first use). Receipt `activation: prompted`. `export::decline` records `{id: content sha}` in `export-declined.json` so the digest stops offering it until the content changes. |
+| `library import-export` | Each `<dir>/<id>/evolve.json`: skip when already present (same id or `transfers_from` link), not invariant, or a near-duplicate (`dedup::route_duplicate`) of a live entry; branch = recorded branch when this library knows it, else `shared`; repo glob = that branch's latest session repo, else `**`; lint `transfer: true`; staged provisional with origin `Import{source: "export:<id>"}`. |
+| `stale` | Kept/provisional, unpinned entries go `stale` when (a) a `facts/*.md` `source:` file's sha256 differs from its `source_sha256` frontmatter (written by `stale::snapshot_sources` after staging) or the file is gone, (b) the last 3 counted sessions in the branch (all branches for `shared`) all ran a family ≠ `family` and ∉ `verified_on`, (c) `git rev-parse HEAD` of `fork_repo` ≠ `fork_commit`. `--recanary` stages a new version (new id, version + 1, `predecessor`, family = the one now in use, fork commit cleared, sources re-snapshotted) and retires the stale one. |
+| `split` | `counters::family_divergence` ⇒ sibling `<name>--<family slug>` (provisional, same branch, `family` = harmed, `sibling_of`, version + 1, original files + `units/family-note.md`, linted); the original gets `families_excluded += harmed` (informational: entries load regardless of family). Idempotent. `capability_review(window)`: families whose recurrence or harm rose on ≥ 2 entries in the last window vs the one before; review list only. |
+| `transfer suggest / apply / promote` | Facets: `branches/<b>/domain.yml` `facets:` else distinct outcome facet keys of the branch (`docs/domain.yml.md`). Suggest kept invariant lessons for branches overlapping on ≥ 2 keys and not yet tried (same name, link, near-duplicate). Apply: provisional copy (new id, `links: transfers_from`, origin `Import{source: "transfer:<id>"}`, repo glob of the target branch, `facts/` dropped, approvals reset), lint `transfer: true`, rate limits except `NeedsMerge`. Promote: an entry kept in one branch plus kept (same name, link or near-duplicate) or a clean canary (matched ≥ 4, no recurrence/harm) in another ⇒ copy to `shared` (repo glob `**`) and keep it at once; `library` moves the branch version to predecessors (dormant). |
+
+File ownership (all scope status changes and evolve.json writes): an entry's files are omp-evolve's only when it is not `reflect::is_foreign` and its dir holds an `evolve.json` with its own id (`scope::owns_files`). User-owned entries (brownfield registrations in place, forge imports) get status changes in the ledger only (`reflect::record_status`); their dirs are never moved or written, and they are never `shared`-promotion sources. Entries with family `unknown/unknown` (imports) never go stale on the model-family rule.
+
+## 16. Batch mode (Phase 2, `crates/omp-evolve/src/batch/`)
+
+New `Entry` field (serde default, omitted when false): `pending_next_run` — a batch winner staged by a `run` of its `Origin::Task`, decided by that task's next run.
+
+Task (`tasks/<id>.json`): `{id, repo (absolute), prompt, verifier?, max_time_secs (default 600), tools?, seeds (default [1]), created_at}`. omp has no sampling seed: the seed names the workspace and is exported to the rollout as `OMP_EVOLVE_SEED`.
+
+Verifier specs (`run --verifier`, else the task's): `tests` (Cargo.toml → `cargo test`; pyproject/pytest.ini/setup.* → `python3 -m pytest -q`; package.json + bun lock → `bun test`), `parity:<produced>=<expected file | sha256>`, `receipt:<path>` (JSON `verdict: pass|fail`, optional `score`), `[script:]<cmd>` (`sh -c` in the worktree, exit 0 = pass, last stdout JSON line with `score` supplies the score). Verifiers run with env `EVOLVE_TASK`, `EVOLVE_WORKTREE`, `EVOLVE_REPO`, capped at max(task cap, 60 s).
+
+Rollout: `git worktree add --detach <variant>/wt HEAD` (plain `cp -R` for a non-git repo); the harness (kept/pinned entries + provisional entries `list_for_match` loads for the repo, candidates shadowing same-named entries) is written to `<variant>/skills/<name>/`; `--config <variant>/overlay.yml`:
+```yaml
+skills: {enabled: true, enableCodexUser: false, enableClaudeUser: false, enableClaudeProject: false, enablePiUser: false,
+         enablePiProject: false, enableAgentsUser: false, enableAgentsProject: false, customDirectories: ["<variant>/skills"]}
+memory: {backend: "off"}
+memories: {enabled: false}
+```
+(keys from `omp config list`, omp 18.12.6; a probe showed only the custom-dir skill to the model). argv = `omp::tools_argv` with the `evolve-solver` role (→ `default`), env `child_env()` + `OMP_EVOLVE_SEED` + `OMP_EVOLVE=0`, bound = task cap + 60 s. stdout → `events.jsonl` (+ ledger blob); the stream must pass `verify_stream` (else verdict Fail "rollout invalid" without the verifier; a time-capped rollout is still judged). `events_to_trace` maps `session` → `session_start`, `message_end` user/assistant/toolResult → `input`/`turn_end`/`tool_result` (input recovered from the toolCall block), `agent_end`; the worktree path is rewritten to the repo.
+
+Worker (`run-worker`): reference rollout (pending entries of the task loaded) → next-run rule: entries with `pending_next_run` and `Origin::Task{task}` go `kept` (+ `verified_on`, receipt) on a reference pass, `retired` on a fail → if the reference passes a score-less verifier the cycle stops (nothing can rank above it) → k invariant + k domain editor calls (`editor.md`; input = §9 shape with `redirect {class: correction, text: verifier detail}`, `task.prompt`, `verifier.verdict`, `prior_candidates` for i > 1; excerpt = around the longest consecutive tool-error stretch, else the trajectory tail), each linted and probed once → every (invariant, domain) pair composed: the best pair by one editor call with `scope: compose` (+ `candidates`, `behavioral_diff`) while the model-call budget lasts, the rest (and composer KEEP_BASE/failure/lint failure) by deterministic merge (union of files; domain laws that are simhash near-duplicates of an invariant law dropped; same-named entries merged) → each composed harness runs once; with ≥ 2 composed variants the best runs once more and must pass both → selection: (pass, score) desc, then tool errors, turns, lesson count, order; a winner must pass and beat the reference, else KEEP_BASE → winner lessons: a near-duplicate of a branch entry appends evidence to it; else one `rate::can_admit` per winner, staged provisional (origin Task, branch/predicate of the task repo, `lesson_tag` by scope, `pending_next_run: true`, receipt with the verdict). Budget at width k: rollouts = (k+1)² + [k>1] (4 at k=1, 10 at k=2), model calls = 2k + 1. Progress in `jobs/<id>.json` (`phase`, `rollouts_done`, `rollouts_budget`, `model_calls`, `verdicts`); receipt `runs/<task>/receipt.json` (+ blob) with every rollout summary, proposal, lint report and the decision; workspaces and worktrees are removed after the receipt (also on failure). One run per task at a time (`runs/<task>/.lock`).
+
