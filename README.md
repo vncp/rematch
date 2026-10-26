@@ -168,7 +168,7 @@ Keep at `matched ≥ 4 · recurrence 0 · harm 0`. Four matched sessions with no
 
 **Brownfield.** `rematch improve <skill>` registers the existing skill as a `provisional` entry in place (the file is never moved), audits the sessions that read it and the redirects and errors that happened with it in context, and proposes unit-level edits from the clustered redirects. A skill over 8 KB is split first, mechanically and with no model: router, `units/` by heading, `facts/`, long tables and rejected-hypothesis lists into a ledger-notes unit. The new version is a sibling beside the old one; omp shows the sibling under the bare name and the original under its namespaced name until the counters decide. A `pinned` skill is never replaced.
 
-`rematch import --forge <path>` registers compound-forge's fifteen skills as brownfield entries with predicates from their trigger text, and its `learnings/*.md` as lessons with their evidence hash.
+`rematch import --forge <path>` registers compound-forge's skills as brownfield entries with predicates from their trigger text, and its `learnings/*.md` as lessons with their evidence hash. With `--migrate` the skill trees are copied into `staging/forge/` (scripts non-executable) so the forge plugin and checkout can be removed; the forge's own meta-skill is left behind. This is how compound-forge was retired on both of the author's machines.
 
 ## Batch mode
 

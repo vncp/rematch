@@ -98,6 +98,45 @@ fn import_forge_registers_without_touching_the_checkout() {
     assert!(m["entries"].as_array().unwrap().iter().all(|x| x["name"] != l["name"]), "{m}");
 }
 
+#[test]
+fn import_forge_migrate_copies_skills_into_staging_so_the_forge_can_go() {
+    let env = Env::new();
+    let forge = env.home.join("compound-forge");
+    let ux = forge.join("skills/forge-ux");
+    std::fs::create_dir_all(ux.join("scripts")).unwrap();
+    std::fs::create_dir_all(ux.join("references")).unwrap();
+    std::fs::write(ux.join("SKILL.md"), "---\nname: forge-ux\ndescription: UI gates. Use when reviewing user interfaces.\n---\n# forge-ux\n\nRun scripts/check.py.\n").unwrap();
+    std::fs::write(ux.join("scripts/check.py"), "print('ok')\n").unwrap();
+    std::fs::write(ux.join("references/gates.md"), "# gates\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(ux.join("scripts/check.py"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let meta = forge.join("skills/compound-forge");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(meta.join("SKILL.md"), "---\nname: compound-forge\ndescription: Run the forge tool.\n---\n# meta\n").unwrap();
+    let before = listing(&forge);
+
+    // Registered in place first (the common upgrade path), then migrated.
+    env.run(&["import", "--forge", forge.to_str().unwrap()]);
+    let d = env.run(&["import", "--forge", forge.to_str().unwrap(), "--migrate"]);
+    let f = &d["forge"];
+    assert_eq!(f["skills_registered"], 1, "{d}");
+    assert!(f["skipped"].as_array().unwrap().iter().any(|s| s["name"] == "compound-forge"), "meta-skill not migrated: {d}");
+    assert_eq!(listing(&forge), before, "forge checkout untouched");
+    let staged = env.root.join("staging/forge/forge-ux");
+    assert!(staged.join("SKILL.md").is_file() && staged.join("references/gates.md").is_file(), "tree copied");
+    let mode = std::fs::metadata(staged.join("scripts/check.py")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644, "scripts staged non-executable until approved");
+    assert!(std::fs::read_to_string(staged.join("SKILL.md")).unwrap().contains("rematch:"), "frontmatter block written");
+    let e = env.entry(f["skills"][0]["id"].as_str().unwrap());
+    assert_eq!(e["path"], json!(staged));
+    assert_eq!(e["status"], "provisional");
+
+    // Now the forge is gone: the skill still loads from staging for any repo.
+    std::fs::remove_dir_all(&forge).unwrap();
+    let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/forge")]));
+}
+
 fn sha2_digest(b: &[u8]) -> impl std::fmt::LowerHex {
     use sha2::Digest;
     sha2::Sha256::digest(b)

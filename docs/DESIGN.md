@@ -65,7 +65,7 @@ Human-readable output only with `--text`. Logs go to stderr.
 
 ```
 doctor                                     omp binary+version, roles resolved (provider/model), extension linked?, ledger schema version, root paths, off?
-import --history [--sessions <dir>] [--forge <path>]
+import --history [--sessions <dir>] [--forge <path> [--migrate]]
 reflect --pending [--session <id>] [--editor <cmd>] [--detach]   idempotent per pending file (lock `pending/.lock`); --editor overrides every model call (tests); --detach → {job_id}
 match --cwd <dir> [--inputs <json>]        {branch, repo, skill_dirs:[...], entries:[{id,name,status,predicate_hit}], hooks:[path...], off:bool}
 digest --cwd <dir>                         {lines:[...], approvals:[{id,name,kind,diff,reason}], review:[...capability floor...], transfers:[...]}
