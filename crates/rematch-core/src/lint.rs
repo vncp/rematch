@@ -424,8 +424,13 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
             let tl = entry.trigger_line.trim();
             if tl.is_empty() {
                 rep.add("trigger", Severity::Error, "entry has no trigger line", Some("rematch.json"));
-            } else if !doc.body.contains(tl) && !doc.body.lines().any(|l| TRIGGER_RE.is_match(l)) {
-                rep.add("trigger", Severity::Error, "SKILL.md body carries no trigger line", Some("SKILL.md"));
+            } else {
+                // The always-on trigger text in omp is the skill's `description` (listed in the
+                // system prompt); the body may carry it as well (`## Trigger`, `Use when …`).
+                let in_description = doc.get_str("description").is_some_and(|d| d.contains(tl));
+                if !in_description && !doc.body.contains(tl) && !doc.body.lines().any(|l| TRIGGER_RE.is_match(l)) {
+                    rep.add("trigger", Severity::Error, "neither the description nor the SKILL.md body carries the trigger line", Some("SKILL.md"));
+                }
             }
             if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
                 rep.add("trigger", Severity::Error, "frontmatter description missing (omp requires it)", Some("SKILL.md"));

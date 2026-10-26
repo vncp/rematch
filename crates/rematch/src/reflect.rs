@@ -474,13 +474,22 @@ fn reflector_lesson(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_c
     if let Ok(text) = reply {
         if let Some(v) = redirect::extract_json(&text) {
             let s = v.get("situation").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            let l = v.get("lesson").and_then(Value::as_str).unwrap_or("").trim().to_string();
             let tag = match v.get("tag").and_then(Value::as_str) {
                 Some("invariant") => LessonTag::Invariant,
                 _ => LessonTag::Domain,
             };
+            // Prompt 6 / D25: when the record does not support a mechanism, the reflector adds
+            // no lesson. The EXPERIENCE.md record still exists (situation + counters), with the
+            // reason, so the next editor sees that this decision carried no transferable lesson.
+            let no_lesson = v.get("lesson").is_some_and(Value::is_null);
+            let l = if no_lesson {
+                let why = v.get("no_lesson_reason").and_then(Value::as_str).unwrap_or("evidence insufficient").trim();
+                format!("No lesson retained: {why}")
+            } else {
+                v.get("lesson").and_then(Value::as_str).unwrap_or("").trim().to_string()
+            };
             if !s.is_empty() && !l.is_empty() {
-                return (s, l, tag, "reflector");
+                return (s, l, if no_lesson { LessonTag::Domain } else { tag }, "reflector");
             }
         }
         eprintln!("rematch: reflector reply unusable for {}; writing a deterministic record", e.id);

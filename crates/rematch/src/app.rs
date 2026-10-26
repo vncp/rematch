@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rematch_core::ledger::{now_ms, Ledger};
+use rematch_core::ledger::{now_ms, sha256_hex, Ledger};
 use rematch_core::paths::RematchPaths;
 
 pub struct AppCtx {
@@ -19,6 +19,7 @@ pub struct AppCtx {
 /// on first run). `$REMATCH_IMPROVER` points at an alternative source directory.
 pub const IMPROVER_FILES: &[(&str, &str)] = &[
     ("editor.md", include_str!("../../../improver/editor.md")),
+    ("composer.md", include_str!("../../../improver/composer.md")),
     ("reflector.md", include_str!("../../../improver/reflector.md")),
     ("classifier.md", include_str!("../../../improver/classifier.md")),
     ("lint.toml", include_str!("../../../improver/lint.toml")),
@@ -64,21 +65,37 @@ pub fn absolute(p: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// Copy each improver file that does not exist yet (user edits are never overwritten).
+/// Installs the shipped improver files. A file the system wrote and the user never touched
+/// (its sha256 equals the recorded shipped hash in `.shipped/<name>`) is refreshed when the
+/// binary ships a newer version; a file the user edited is left alone. Files from older
+/// installs without a record are treated as shipped. The system itself never amends these
+/// files (D25): only a new binary release does.
 fn install_improver(dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
+    std::fs::create_dir_all(dst.join(".shipped"))?;
     let source = std::env::var_os("REMATCH_IMPROVER").map(PathBuf::from).filter(|p| p.is_dir());
     for (name, builtin) in IMPROVER_FILES {
         let target = dst.join(name);
+        let record = dst.join(".shipped").join(name);
+        let content: String = match source.as_ref().map(|s| s.join(name)).filter(|p| p.is_file()) {
+            Some(src) => std::fs::read_to_string(&src).with_context(|| format!("read {}", src.display()))?,
+            None => (*builtin).to_string(),
+        };
+        let new_hash = sha256_hex(content.as_bytes());
         if target.exists() {
-            continue;
-        }
-        match source.as_ref().map(|s| s.join(name)).filter(|p| p.is_file()) {
-            Some(src) => {
-                std::fs::copy(&src, &target).with_context(|| format!("copy {}", src.display()))?;
+            let current = std::fs::read_to_string(&target).unwrap_or_default();
+            let current_hash = sha256_hex(current.as_bytes());
+            if current_hash == new_hash {
+                let _ = std::fs::write(&record, &new_hash);
+                continue;
             }
-            None => std::fs::write(&target, builtin).with_context(|| format!("write {}", target.display()))?,
+            let shipped = std::fs::read_to_string(&record).ok().map(|s| s.trim().to_string());
+            let user_edited = shipped.is_some_and(|h| h != current_hash);
+            if user_edited {
+                continue;
+            }
         }
+        std::fs::write(&target, &content).with_context(|| format!("write {}", target.display()))?;
+        std::fs::write(&record, &new_hash)?;
     }
     Ok(())
 }

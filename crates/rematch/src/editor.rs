@@ -64,6 +64,11 @@ pub fn wrap_input(kind: &str, input: &Value) -> String {
 
 /// The editor role with `improver/editor.md`.
 pub fn call_editor(ctx: &AppCtx, editor_cmd: Option<&str>, input: &Value) -> Result<String> {
+    // Batch mode's composer (Harness² Prompt 3) has its own mission; interactive mode never
+    // sends `scope: "compose"` (there is no composer without probes, D6).
+    if input.get("scope").and_then(Value::as_str) == Some("compose") {
+        return call(ctx, editor_cmd, ROLE_EDITOR, &ctx.improver_file("composer.md"), &wrap_input("composer", input));
+    }
     call(ctx, editor_cmd, ROLE_EDITOR, &ctx.improver_file("editor.md"), &wrap_input("editor", input))
 }
 

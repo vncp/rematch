@@ -50,13 +50,17 @@ Optional, in `~/.omp/agent/config.yml`: `modelRoles.rematch-editor` for the stro
 
 ## How it works
 
-The session is the evidence. The extension writes every input, tool result and turn to a trace file of its own, and at shutdown flags the session only if it carried a signal: a redirect, a cluster of tool errors, a takeover, or an explicit mark. Nothing runs inside the session. At the start of the next session the binary is spawned detached: it classifies the redirect, finds the moment, runs one editor with the trace excerpt in the prompt, lints the result, and stages it as a `provisional` entry with a deterministic trigger predicate. Sessions whose predicate matches load it from the staging path. For each matched session the binary counts whether the specific redirect class that motivated the entry recurred, and whether harm occurred. Keep at zero recurrences over at least four matched sessions; retire at two recurrences or two harm events; dormant after twelve without a decision.
+Every claim below carries the id of the decision it rests on; the evidence and the paper behind each id are in [`docs/research.md`](docs/research.md) §2.
+
+The session is the evidence. The extension writes every input, tool result and turn to a trace file of its own, and at shutdown flags the session only if it carried a signal: a redirect, a cluster of tool errors, a takeover, or an explicit mark. No proposal exists without that trace (D1). Nothing runs inside the session. At the start of the next session the binary is spawned detached: it classifies the redirect, finds the moment, runs one editor scoped by triage to how the agent works or to what a practitioner knows (D5), lints the result for generalization (D15), and stages it as a `provisional` entry with a deterministic trigger predicate (D12) and a manifest naming the predicted fix and the predicted regression (D16). Sessions whose predicate matches load it from the staging path; there is no withheld arm (D11). For each matched session the binary counts whether the specific redirect class that motivated the entry recurred, and whether harm occurred (D10). Keep at zero recurrences over at least four matched sessions; retire at two recurrences or two harm events; dormant after twelve without a decision (D8, D13). Only failures are reflected on; the system never grades its own successes (D9).
 
 ---
 
 <p align="center"><b>A harness-improvement loop that costs no reruns in interactive use. The real session is the reference rollout, the next matched session is the probe, and a reflection costs at most three model calls.</b></p>
 
-rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust binary the extension calls with a JSON envelope. The extension only records and toggles; the binary proposes and stages. Skill text activates in personal scope on its own. Anything executable (scripts, hooks) and anything beyond personal scope (team `.omp/`, your fork) waits for a one-tap approval or a merged PR. No fork of omp is required; the fork is one of the things it can propose changes to.
+rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust binary the extension calls with a JSON envelope. The extension only records and toggles; the binary proposes and stages. The boundary between what a model may propose and what the system may write is enforced by record types, not by a prompt: proposals carry no score field, and nothing activates without a lint report and, for anything executable, a receipt (D24). Skill text activates in personal scope on its own. Anything executable (scripts, hooks) and anything beyond personal scope (team `.omp/`, your fork) waits for a one-tap approval or a merged PR (D4, D3). No fork of omp is required; the fork is one of the things it can propose changes to.
+
+The loop design, the scoped editors, the preference for skills and scripts over prose, and the experience library come from Harness² (Xu et al., arXiv 2610.14224); the `improver/` prompts are derived from its Appendix H, with every delta listed in [`docs/research.md`](docs/research.md) §5. Compiled hooks for recurring corrections come from Trace (D4); the counters and caps from ACE, Evo-Harness and HCL (D13, D14); the trust boundary from bellwether (D24).
 
 <p align="center">
   <picture>
@@ -90,7 +94,7 @@ rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust bina
 
 1. **Work.** You ask for a function in `src/lib.py`. The agent adds it. You answer: *"That's wrong. Every public function here needs a Google-style docstring and must be exported in `__all__`."* The extension pre-labels the turn as a negation and flags the session at shutdown.
 2. **Reflect.** Next session start, the binary classifies the redirect (`correction`, 0.86), triages it as a process failure about this workload's conventions, and runs the domain editor once with the trace excerpt. The reply passes lint and is staged with a predicate: this repo, `.py` files, the stems of the task turn.
-3. **Keep or retire.** The next session that adds a function to `src/lib.py` loads the entry. The agent exports and documents the function unprompted. The session counts as `matched 1 · recurrence 0 · harm 0`. Three more like it and the entry is `kept`; two redirects of the same class and it is retired.
+3. **Keep or retire.** The next session that adds a function to `src/lib.py` loads the entry. In the scratch run behind the screenshots below the agent exported and documented the function unprompted; that is one session on a toy repository, not a measured gain. The session counts as `matched 1 · recurrence 0 · harm 0`. Three more like it and the entry is `kept`; two redirects of the same class and it is retired.
 
 <p align="center">
   <picture>
@@ -110,14 +114,16 @@ rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust bina
 
 ## Highlights
 
-- **No proposal without a trace.** Every entry cites the moment (`session_id`, `seq`) it came from. A description-only skill is a `draft` that never loads until you run a task with it or accept it unverified.
-- **No reruns in interactive use.** The real session is the reference and the next matched session is the probe. A reflection spends at most three model calls: one batched classifier call, one editor, one lint retry.
-- **Kept by use, retired by counters.** The primary signal is recurrence of the specific redirect class that motivated the entry, not tokens, not turns, not a judge. Counts are raw and shown raw. The status is called `kept`, never `verified`.
-- **Nothing executable without you.** Scripts are staged mode 0644. Hooks are compiled only after approval. Both arrive as one-tap approvals in the session-start digest, with the diff.
-- **Lint is static and free.** No session ids, task paths or user names in the text; no string-match on the user's words; a trigger predicate and a trigger line on every entry; no URLs, network calls or destructive git; always-on text within 8 KB per branch; facts carry `as_of`.
-- **A bad entry cannot cascade.** One admission per trigger predicate per day, ten provisional entries per branch, no new reflection while a canary for the same trigger is pending.
-- **The schema lives in Rust only.** The extension forwards raw events and parses nothing. One static binary owns the ledger, the library, lint, staging, batch mode, PR output. It never holds provider credentials; model calls go through `omp -p` and every event's provider and model are verified.
-- **Rollback and uninstall.** Every kept entry keeps its predecessor. `uninstall` removes every file the plugin wrote and nothing else.
+- **No proposal without a trace (D1).** Every entry cites the moment (`session_id`, `seq`) it came from. Editing a harness without an execution behind it degraded performance in Harness² (73.4 → 63.2 on code). A description-only skill is a `draft` that never loads until you run a task with it or accept it unverified.
+- **No reruns in interactive use (D6, D7).** The real session is the reference and the next matched session is the probe. A reflection spends at most three model calls: one batched classifier call, one editor, one lint retry. There is no composer without probes and no model selector anywhere: a composer choosing between untested texts is blind selection, which produced Harness²'s worst regressions.
+- **Kept by use, retired by counters (D8, D10).** The primary signal is recurrence of the specific redirect class that motivated the entry, not tokens, not turns, not a judge. Counts are raw and shown raw. The status is called `kept`, never `verified`: unvalidated model-written patches were net negative in Harness-R1 (21 of 39 lowered success).
+- **Nothing executable without you (D4).** Scripts are staged mode 0644. Hooks are compiled only after approval. Both arrive as one-tap approvals in the session-start digest, with the diff. Compiled hooks are the form that raised compliance with user corrections from 55.0% to 70.1% in Trace; they are also the form that can act without being read.
+- **Lint is static and free (D15).** No session ids, task paths or user names in the text; no string-match on the user's words; a trigger predicate and a trigger line on every entry; no URLs, network calls or destructive git; always-on text within 8 KB per branch; facts carry `as_of`. HarnessCompass's generalization gate alone recovered most of its gain.
+- **A bad entry cannot cascade (D13).** One admission per trigger predicate per day, ten provisional entries per branch, no new reflection while a canary for the same trigger is pending, caps that force merges, and an archive that is never deleted. Every unbounded library in the literature peaked and then declined.
+- **The library is appended, never rewritten (D14).** Entries are itemized units with their own counters; a model never rewrites the library or the improver prompts (D25). Monolithic rewrites collapsed a context from 18,282 tokens to 122 in ACE, below baseline.
+- **The schema lives in Rust only (D24).** The extension forwards raw events and parses nothing. One static binary owns the ledger, the library, lint, staging, batch mode, PR output. It never holds provider credentials; model calls go through `omp -p` and every event's provider and model are verified. The model family is recorded on every entry and never gated on (D20).
+- **Rollback and uninstall (D13).** Every kept entry keeps its predecessor. `uninstall` removes every file the plugin wrote and nothing else.
+- **Expectations are modest by design (D18, D19).** Published harness gains were 54% overfitting on audit; the deployed-static regime this tool runs in showed low single digits for strong models and more for weak ones. The project has a kill criterion (see Status) and no gain has been measured on real use yet.
 
 ## How a reflection works
 
@@ -208,7 +214,7 @@ Every entry records the model family it was created under and keeps a per-family
 | What can activate on its own | everything you write | nothing (proposals are reviewed) | skill text in personal scope; never scripts, hooks, team or fork changes |
 | Exit for a bad change | you notice | regression on the suite | counters retire it; rollback restores the predecessor; `off` stops everything |
 
-**In short:** the loop (scoped editors, lint for generalization, an experience library, composition only where a verifier exists) comes from Harness². What rematch adds is the zero-rerun interactive mode with a deterministic predicate and raw counters, and a boundary that lets the harness propose without being trusted. The cost: a single user is not blinded, so the counters measure only the recurrence of a specific redirect class, something you would not fake; and nothing is ever called verified.
+**In short:** the loop (scoped editors, lint for generalization, an experience library, composition only where a verifier exists) comes from Harness²; the prompts are derived from its Appendix H, not verbatim (D5, D6; deltas in `docs/research.md` §5). What rematch adds is the zero-rerun interactive mode with a deterministic predicate and raw counters (D10, D12), and a boundary that lets the harness propose without being trusted (D24). The cost: a single user is not blinded, so the counters measure only the recurrence of a specific redirect class, something you would not fake; and nothing is ever called verified.
 
 ## Architecture
 
@@ -224,7 +230,7 @@ Every entry records the model family it was created under and keeps a per-family
 | `extension/index.ts` | trace writer, pre-labels, the skill-path override, approved hook modules, the `rematch` tool and `/rematch` command, the digest | forwards raw events; parses nothing; no model calls; every handler fails open except hooks |
 | `crates/rematch-core` | trace model and parsers (own trace, omp session JSONL), redirect heuristics and classifier batching, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, package model and mechanical split, simhash dedup, EXPERIENCE.md, rate limits, outcome records | pure functions over paths; no process spawning, no network; 106 unit tests |
 | `crates/rematch` | the CLI; `proc.rs` (process-group bounded execution), `omp.rs` (argv builders and per-event provider/model verification), `jobs.rs` (detached jobs), reflect/count, create/improve, import, digest, doctor, uninstall, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials; 47 unit + 17 end-to-end tests |
-| `improver/` | `editor.md`, `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/` on first run; read-only to the system |
+| `improver/` | `editor.md` and `composer.md` (derived from Harness² Appendix H Prompts 1–3; deltas in `docs/research.md` §5), `reflector.md`, `classifier.md`, `lint.toml`, `omp-no-tools.yml` | copied to `~/.rematch/improver/`; refreshed by a new binary only when you have not edited them; never amended by the system (D25) |
 | `~/.rematch/` | `traces/`, `pending/`, `ledger.sqlite` + `blobs/`, `staging/<branch>/`, `drafts/`, `archive/`, `predecessors/`, `jobs/`, `runs/`, `tasks/`, `branches/`, `export/`, `off` | one root per environment (`REMATCH_ROOT`); home and work are separate libraries |
 
 The two-language split is kept on one rule: the schema lives in Rust and the extension forwards raw events. The verified omp facts behind every design choice, and the four places the build deviates from the spec because of them (no `resources_discover` callsite in omp, auth living in the agent dir, no registry publish, no embeddings without credentials), are in [`docs/DESIGN.md`](docs/DESIGN.md). The full product spec is [`docs/SPEC.md`](docs/SPEC.md).
@@ -260,7 +266,7 @@ Open questions from the spec that the build did not settle are at the end of [`d
 
 ## Docs
 
-[Manual](docs/MANUAL.md) · [design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
+[Manual](docs/MANUAL.md) · [research provenance](docs/research.md) · [design contract](docs/DESIGN.md) · [product spec](docs/SPEC.md) · [facet vocabulary (`domain.yml`)](docs/domain.yml.md) · [extension](extension/README.md) · [importer goldens](tests/goldens/README.md)
 
 ## License
 

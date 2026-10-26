@@ -47,7 +47,7 @@ staging/<branch>/<name>/          provisional entries (loaded via customDirector
 drafts/<name>/                    draft entries (never loaded)
 archive/<status>/<id>/            retired|dormant|stale entries (never loaded, never deleted)
 predecessors/<name>/<version>/    copies of replaced kept entries (rollback)
-improver/{editor.md,reflector.md,lint.toml,omp-no-tools.yml}   copied from repo on first run; EXPERIENCE.md files live next to entries
+improver/{editor.md,composer.md,reflector.md,classifier.md,lint.toml,omp-no-tools.yml}   shipped in the binary; written on first run and refreshed on upgrade only if the installed copy still matches the previously shipped hash (`.shipped/<name>`); EXPERIENCE.md files live next to entries
 jobs/<job_id>.json  jobs/<job_id>.log      detached job state
 runs/<task>/<seed>/<variant>/     batch workspaces {wt/, skills/, overlay.yml, events.jsonl} (deleted after receipt)
 runs/<task>/receipt.json          last batch receipt;  runs/<task>/traces/<session>.jsonl  reference traces for `create --from task`
