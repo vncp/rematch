@@ -940,17 +940,14 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
         TraceRecord::Input { seq, text, .. } if *seq == moment.seq => Some(text.clone()),
         _ => None,
     });
-    let task_input: Option<String> = records
-        .iter()
-        .filter_map(|r| match r {
-            TraceRecord::Input { seq, text, prelabel, .. }
-                if *seq < moment.seq && redirect::mark_class(prelabel).is_none() =>
-            {
-                Some(text.clone())
-            }
-            _ => None,
-        })
-        .last();
+    let task_input: Option<String> = records.iter().rev().find_map(|r| match r {
+        TraceRecord::Input { seq, text, prelabel, .. }
+            if *seq < moment.seq && redirect::mark_class(prelabel).is_none() =>
+        {
+            Some(text.clone())
+        }
+        _ => None,
+    });
     let files_for_stems: &[String] = if window_files.is_empty() { &session.files_touched } else { &window_files };
     let mut doc_terms: Vec<String> = Vec::new();
     if let Some(t) = &task_input {
