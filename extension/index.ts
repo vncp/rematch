@@ -196,6 +196,7 @@ export const REVERT = /\b(?:revert|undo|roll ?back|put it back|git restore)\b|\b
 export const NEGATION = /^(?:no|nope|don't|do not|stop|not that|wrong|that's (?:not|wrong)|that is wrong|this is wrong|incorrect|you didn't|you did not|not what i|i said|actually|instead)\b/i;
 export const MARK = /^\/rematch\s+mark\s+(correction|preference|scope)\b/i;
 export const REPROMPT_JACCARD = 0.6;
+export const REPROMPT_MIN_TOKENS = 6;
 
 export function tokens(text: string): Set<string> {
 	return new Set(text.toLowerCase().match(/[a-z0-9]+/g) ?? []);
@@ -215,7 +216,10 @@ export function prelabel(text: string, idle: boolean, previous: string | null): 
 	if (!idle) return "interrupt";
 	if (REVERT.test(text)) return "revert";
 	if (NEGATION.test(text.trimStart())) return "negation";
-	if (previous !== null && jaccard(tokens(text), tokens(previous)) >= REPROMPT_JACCARD) return "reprompt";
+	if (previous !== null) {
+		const now = tokens(text);
+		if (now.size >= REPROMPT_MIN_TOKENS && jaccard(now, tokens(previous)) >= REPROMPT_JACCARD) return "reprompt";
+	}
 	return "none";
 }
 
@@ -637,6 +641,8 @@ type SessionTrace = {
 	seq: number;
 	lastInput: string | null;
 	lastDeliverable: string | null;
+	/** True between `agent_start` and `agent_end`: an input then is a takeover, not a prompt. */
+	agentRunning: boolean;
 	errors: ErrorWindow;
 	reasons: Set<string>;
 	turnsSinceAgentEnd: number;
@@ -817,6 +823,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			seq: 0,
 			lastInput: null,
 			lastDeliverable: null,
+			agentRunning: false,
 			errors: new ErrorWindow(),
 			reasons: new Set(),
 			turnsSinceAgentEnd: 0,
@@ -1157,7 +1164,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		guard("input", (event: { text: string; source: string }, ctx) => {
 			if (!enabled || !trace || !isMain(ctx)) return;
 			const text = typeof event.text === "string" ? event.text : "";
-			const idle = ctx.isIdle();
+			// A takeover is an input while the agent loop is running. `ctx.isIdle()` is also false
+			// while a finished turn settles, which made ordinary prompts count as takeovers (harm).
+			const idle = !trace.agentRunning;
 			const label = prelabel(text, idle, trace.lastInput);
 			// Slash commands and `!`/`%` local executions are not user turns; only `/rematch mark`
 			// (prelabel `mark:<class>`) and `/skill:<name>` invocations carry signal for the trace.
@@ -1249,9 +1258,19 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	);
 
 	pi.on(
+		"agent_start",
+		guard("agent_start", (_event: unknown, ctx) => {
+			if (!trace || !isMain(ctx)) return;
+			trace.agentRunning = true;
+		}),
+	);
+
+	pi.on(
 		"agent_end",
 		guard("agent_end", (event: { messages: unknown; willContinue?: boolean }, ctx) => {
-			if (!enabled || !trace || !isMain(ctx)) return;
+			if (!trace || !isMain(ctx)) return;
+			trace.agentRunning = event.willContinue === true;
+			if (!enabled) return;
 			const last = recordsOf(event.messages).findLast(m => m.role === "assistant");
 			write("agent_end", {
 				turns: trace.turnsSinceAgentEnd,

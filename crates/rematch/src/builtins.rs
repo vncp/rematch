@@ -51,7 +51,7 @@ pub fn specs() -> Vec<Builtin> {
     let mut retrieve = rule(
         HookMode::Retrieve,
         "rematch: units of the loaded skill packages that match this request.",
-        "A request whose loaded packages hold no unit sharing 2 distinct stems with it passes unchanged; \
+        "A request that shares no stem with a loaded package's trigger line, or whose loaded packages hold no unit sharing 2 distinct stems with it, passes unchanged; \
          units only ever come from entries this session loaded, and at most 6000 bytes are added.",
     );
     retrieve.budget_bytes = Some(6000);

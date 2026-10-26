@@ -279,7 +279,7 @@ Built: the interactive loop (Phase 1), create and improve with the mechanical sp
 
 Not yet earned:
 
-- **A `kept` entry from daily use.** The kill criterion in the spec is six weeks of daily use: if no entry reaches `kept` over at least four matched sessions and recurrence has not fallen on any trigger, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
+- **A `kept` skill from daily use.** The three built-in hooks reached `kept` (9/6/5 matched sessions, 0 recurrence, 0 harm) during the build itself; no skill has yet. The kill criterion in the spec is six weeks of daily use: if no entry reaches `kept` over at least four matched sessions and recurrence has not fallen on any trigger, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
 - **The built-in context entries in real use.** All three were approved and fired in one live omp session on this machine (a `retrieval` record for a `bellwether-dev` unit, the stuck-detector blocking a 4th identical call); truncation is only observable in the outgoing request and is covered by the extension tests. None has been counted across real sessions yet.
 - **A batch cycle where a candidate beats the reference.** The one live cycle had a reference that already passed, so both editors chose `KEEP_BASE`; the fake-omp tests cover the other branches.
 - **A merged team PR and a `shared` promotion from real branches.** Both are exercised on scratch repositories only.

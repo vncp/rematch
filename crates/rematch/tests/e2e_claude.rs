@@ -339,7 +339,11 @@ fn approved_retrieve_hook_adds_context_once() {
     event(&env, "SessionStart", json!({"source":"startup"}));
     let s0 = &trace(&env)[0];
     assert!(!s0["loaded_entries"].as_array().unwrap().contains(&json!(hook)), "a retrieve hook credits through retrieval records");
-    let prompt = json!({"prompt":"fix the ledger reconciliation migration in src/ledger.rs"});
+    // A request that shares stems with the unit but not with the package's trigger line
+    // (committing changes to a Rust crate) gets nothing: units are gated by the trigger.
+    let off = event(&env, "UserPromptSubmit", json!({"prompt":"fix the ledger reconciliation migration in src/ledger.rs"}));
+    assert!(off.stdout.trim().is_empty(), "units injected without a trigger hit: {:?}", off.stdout);
+    let prompt = json!({"prompt":"commit the ledger reconciliation migration change to the crate"});
     let o = event(&env, "UserPromptSubmit", prompt.clone());
     let ctx = o.json()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
     assert!(ctx.contains("<unit skill=\"ledger-test-gate\" path=\"units/reconcile.md\">"), "{ctx}");

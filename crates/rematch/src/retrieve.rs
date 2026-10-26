@@ -149,6 +149,21 @@ fn title_and_body(text: &str, file: &Path) -> (String, String) {
     (title, body)
 }
 
+/// Does the package's trigger text (frontmatter `description`, plus any `Use when …`
+/// line of the router body) share at least one stem with the query?
+fn trigger_hits(dir: &Path, overlap: &mut Overlap<'_>) -> bool {
+    let Ok(md) = std::fs::read_to_string(dir.join("SKILL.md")) else { return false };
+    let doc = SkillDoc::parse(&md).unwrap_or(SkillDoc { body: md.clone(), ..Default::default() });
+    let mut trigger = doc.get_str("description").unwrap_or("").to_string();
+    for line in doc.body.lines() {
+        if rematch_core::package::TRIGGER_RE.is_match(line) {
+            trigger.push('\n');
+            trigger.push_str(line);
+        }
+    }
+    overlap.count(&trigger) >= 1
+}
+
 /// Rank and cut the units of `candidates` (`(entry_id, name, entry dir)`).
 pub fn rank(candidates: &[(String, String, PathBuf)], query: &str, budget: usize, min_overlap: u32) -> Retrieval {
     let mut query_stems: Vec<String> = stem_set(query).into_iter().collect();
@@ -157,6 +172,13 @@ pub fn rank(candidates: &[(String, String, PathBuf)], query: &str, budget: usize
     if !query_stems.is_empty() {
         let mut overlap = Overlap::new(&query_stems);
         for (id, name, dir) in candidates {
+            // A package's units are retrievable only when the request is about what the
+            // package is for: its trigger line (frontmatter description / `Use when …`) must
+            // share a stem with the query. Two stems anywhere inside a long unit are not a
+            // signal (observed in live use: a review unit injected into an unrelated prompt).
+            if !trigger_hits(dir, &mut overlap) {
+                continue;
+            }
             let mut files = Vec::new();
             for sub in ["units", "facts"] {
                 md_files(&dir.join(sub), &mut files);
@@ -245,7 +267,7 @@ mod tests {
     fn ranks_by_overlap_then_length_and_cuts_at_budget() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("pkg");
-        write(&d.join("SKILL.md"), "---\nname: pkg\n---\nrouter mentions ledger reconciliation migration\n");
+        write(&d.join("SKILL.md"), "---\nname: pkg\ndescription: Use when reconciling the ledger.\n---\nrouter mentions ledger reconciliation migration\n");
         write(&d.join("units/ledger.md"), "# Ledger reconciliation\n\nRun the reconciliation migration before the ledger tests.\n");
         write(&d.join("units/short.md"), "# Ledger\n\nReconciliation first.\n");
         write(&d.join("units/other.md"), "# Plotting\n\nCharts use the dark theme.\n");
@@ -270,5 +292,19 @@ mod tests {
         assert!(rank(&c, "ledger", 10_000, 2).units.is_empty());
         assert_eq!(rank(&c, "ledger", 10_000, 1).units.len(), 3);
         assert!(rank(&c, "the and of", 10_000, 1).units.is_empty());
+    }
+
+    #[test]
+    fn units_are_gated_by_the_package_trigger_line() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("review");
+        write(&d.join("SKILL.md"), "---\nname: review\ndescription: Use when reviewing a pull request.\n---\n## Trigger\nUse when reviewing a pull request.\n");
+        write(&d.join("units/gates.md"), "# Review gates\n\nRun the tests and the lint before approving the migration of the ledger module.\n");
+        let c = vec![("e1".to_string(), "review".to_string(), d.clone())];
+        // Shares two stems with the unit body (tests, migration, ledger) but none with the trigger.
+        let r = rank(&c, "add a migration for the ledger tests", 10_000, 2);
+        assert!(r.units.is_empty(), "unit matched without a trigger hit: {r:?}");
+        let r = rank(&c, "review this pull request's ledger migration", 10_000, 2);
+        assert_eq!(r.units.len(), 1, "{r:?}");
     }
 }

@@ -25,6 +25,8 @@ pub const MARK_PATTERN: &str = r"(?i)^/rematch\s+mark\s+(correction|preference|s
 
 /// `reprompt` when Jaccard(tokens(text), tokens(previous input)) ≥ this.
 pub const REPROMPT_JACCARD: f64 = 0.6;
+/// A reprompt needs this many tokens in the new input; "four" after "three" is not a redo.
+pub const REPROMPT_MIN_TOKENS: usize = 6;
 
 pub const PRELABEL_NONE: &str = "none";
 pub const PRELABEL_INTERRUPT: &str = "interrupt";
@@ -67,7 +69,8 @@ pub fn prelabel(text: &str, prev_text: Option<&str>, idle: bool) -> &'static str
         return PRELABEL_NEGATION;
     }
     if let Some(prev) = prev_text {
-        if jaccard(&tokenize(text), &tokenize(prev)) >= REPROMPT_JACCARD {
+        let now = tokenize(text);
+        if now.len() >= REPROMPT_MIN_TOKENS && jaccard(&now, &tokenize(prev)) >= REPROMPT_JACCARD {
             return PRELABEL_REPROMPT;
         }
     }
@@ -324,20 +327,23 @@ mod tests {
 
     #[test]
     fn reprompt_threshold_is_inclusive() {
-        // 3 shared of 5 distinct = 0.6 → reprompt; 3 of 6 = 0.5 → none.
+        // 4 shared of 6 distinct ≈ 0.67 → reprompt; 4 of 7 ≈ 0.57 → none. Six tokens minimum.
         assert_eq!(
-            prelabel("fix the parser bug", Some("fix the parser now"), true),
+            prelabel("fix the parser bug in src lib", Some("fix the parser bug in main"), true),
             "reprompt"
         );
         assert_eq!(
             prelabel(
-                "fix the parser bug",
-                Some("fix the parser now please"),
+                "fix the parser bug in src lib",
+                Some("fix the parser bug in main please now"),
                 true
             ),
             "none"
         );
-        assert_eq!(prelabel("fix the parser bug", None, true), "none");
+        assert_eq!(prelabel("fix the parser bug in src lib", None, true), "none");
+        // Short inputs never reprompt, however similar ("four" after "three").
+        assert_eq!(prelabel("reply with four", Some("reply with three"), true), "none");
+        assert_eq!(prelabel("fix the parser bug", Some("fix the parser now"), true), "none");
         assert_eq!(
             prelabel("", Some(""), true),
             "none",

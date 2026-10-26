@@ -34,7 +34,12 @@ fn retrieve_ranks_loaded_package_units_within_the_budget() {
     write(&dir.join("units/charts.md"), "# Charts\n\nPlots use the dark theme.\n");
     write(&dir.join("facts/schedule.md"), "---\nas_of: 2026-10-01\n---\n# Ledger schedule\n\nThe ledger reconciliation runs nightly.\n");
     let repo = env.repo.to_str().unwrap();
+    // The package's trigger line (the scripted editor's: committing changes to a Rust crate)
+    // must share a stem with the query; a query about the unit's words alone yields nothing.
     let q = "fix the ledger reconciliation migration in src/ledger.rs";
+    let r = env.run(&["retrieve", "--cwd", repo, "--budget", "6000", "--query", q]);
+    assert_eq!(paths(&r), vec![], "no trigger hit: {r}");
+    let q = "commit the ledger reconciliation migration change to the crate";
 
     let r = env.run(&["retrieve", "--cwd", repo, "--budget", "6000", "--query", q]);
     assert_eq!(
