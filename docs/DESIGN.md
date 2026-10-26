@@ -104,7 +104,7 @@ uninstall [--yes]
 | `mark` | `class ∈ correction|preference|scope` |
 | `session_shutdown` | `reasons [...], flagged (bool)` |
 
-Pre-classification (extension, no model): `interrupt` = input while `!ctx.isIdle()`; `revert` = text matches `/\b(revert|undo|roll ?back|put it back|git checkout --|git restore)\b/i`; `reprompt` = Jaccard(tokens(text), tokens(previous input)) ≥ 0.6; `negation` = `/^(no|nope|don't|do not|stop|not that|wrong|that's not|i said|actually|instead)\b/i`.
+Pre-classification (extension, no model; regex constants live in `evolve-core/src/redirect.rs` and are copied verbatim into the extension): `mark` = `/^\/evolve\s+mark\s+(correction|preference|scope)\b/i`; `interrupt` = input while `!ctx.isIdle()`; `revert` = `/\b(?:revert|undo|roll ?back|put it back|git restore)\b|\bgit checkout --(?:\s|$)/i`; `negation` = `/^(?:no|nope|don't|do not|stop|not that|wrong|that's not|i said|actually|instead)\b/i` (leading whitespace trimmed); `reprompt` = Jaccard(tokens(text), tokens(previous input)) ≥ 0.6 with tokens `[a-z0-9]+` on lowercased text. Precedence: mark > interrupt > revert > negation > reprompt > none.
 Session is flagged when any of: ≥1 prelabel ≠ none; `is_error` tool results ≥ 3 in any window of 6 consecutive tool results (tool-error cluster); a `mark`. Flag = write `pending/<session_id>.json`.
 
 ## 4. Core types (`evolve-core/src/types.rs`, authoritative in Rust)
@@ -157,10 +157,12 @@ Count-time match (binary, from a finished trace): glob hit AND (`file_exts` empt
 
 Per matched session (predicate hit while the entry was in `loaded_entries`): `recurrence += 1` if a redirect of the entry's `redirect_class` occurred (classifier output, or prelabel ∈ {revert, negation, mark} when class unknown); `harm += 1` if a new tool-error cluster, an `interrupt`, or a user `disable` happened. Tokens/turns recorded.
 Decide: `matched ≥ 4 && recurrence == 0 && harm == 0 → Keep`; `recurrence ≥ 2 || harm ≥ 2 → Retire`; `matched ≥ 12 → Dormant`; `provisional for 30 days && matched < 3 → Dormant`; `Kept && harm ≥ 2 within 30 days → Retire`; else `Continue`. Per-family breakdown kept; if one family shows harm ≥ 1 and another has matched ≥ 2 with zero harm/recurrence, the entry is split (Phase 3): the harmed family gets a sibling proposal.
+Implementation notes (`counters.rs`): each matched session contributes 0/1 recurrence and 0/1 harm (one row per (entry, session)). Prelabel mapping when the classifier gave no class: `revert|negation|mark` → correction, `mark:<class>` → that class; `interrupt|reprompt|none` → no class; a classifier `none` means no class. An entry without a `redirect_class` (motivated by an error cluster or takeover) recurs on any classed redirect. Harm = `error_clusters > 0 || takeovers > 0 || disabled`. Rule order: pinned ⇒ Continue; provisional: Retire, Keep, Dormant(12), Dormant(30 d since `status_since`, < 3 matched); kept: ≥ 2 harm events in the last 30 days and since it became kept ⇒ Retire. Count-time match uses `repo` (else `cwd`) against the glob, where a glob also matches descendants of the path it names.
 
 ## 8. Rate limits
 
 Per predicate_hash: ≤1 admission per UTC day; no reflection while a provisional entry with the same predicate_hash exists (pending canary). Per branch: ≤10 provisional; 5 kept general + 5 kept per branch before a new candidate must merge/revise (near-duplicate by simhash(normalized text) Hamming ≤ 6 or identical script body ⇒ append evidence to existing entry). ≤3 model calls per reflection (classifier batch, editor, one lint-retry).
+Implementation (`rate::can_admit`, checks in this order): pending canary (any provisional entry with the predicate_hash) → `PendingCanary`; an admission today (UTC) → `DailyPredicate`; ≥ 10 provisional in the branch → `BranchProvisionalCap`; kept cap → `NeedsMerge` (for branch `shared`: ≥ 5 kept in `shared`; otherwise ≥ 5 kept in the branch). `NeedsMerge` is a routing signal: the caller merges/revises via `dedup::route_duplicate` instead of dropping the candidate.
 
 ## 9. Editor channel (`omp -p`)
 
@@ -190,3 +192,62 @@ Factory (async): read env/off; resolve binary (`$OMP_EVOLVE_BIN` → `<ext>/../t
 2. Batch isolation uses a `--config` overlay + fresh worktree instead of a private `PI_CODING_AGENT_DIR` (auth lives in the agent dir).
 3. `omp plugin install @<org>/omp-evolve` → `scripts/install.sh` (`cargo build --release`, `omp plugin link extension/`, PATH shim). No registry publish.
 4. "Related thing: embeddings, exploratory only" is not implemented: the binary holds no provider credentials; exact signature + MinHash are implemented.
+5. Status `pinned` is carried as the `Entry.pinned` flag (status and location unchanged; automatic transitions refuse pinned entries; `disable`/`rollback` are user actions and proceed). `Status::Pinned` remains a valid status for imports.
+6. A kept entry replaced by a sibling becomes `dormant` (files in `predecessors/<name>/<version>/`) rather than `retired`, because `rollback` must be able to restore it and `retired` never leaves. A non-evolve skill that a kept entry replaced is saved as version `0` and restored by `rollback`/`uninstall`.
+7. Declining an approval (`library decline`) retires the entry (SPEC: retired ← "approval declined").
+
+## 12. lint.toml schema
+
+`improver/lint.toml` (copied to `EVOLVE_ROOT/improver/` on first run). Every key is optional; a missing key takes the built-in value (`evolve_core::lint::DEFAULT_LINT_TOML`, which the shipped file equals verbatim — a test enforces it). All `[patterns]` entries are Rust `regex` syntax; use TOML multi-line literal strings (`'''…'''`) for patterns containing `'` (inside `'…'`, `''` is **not** an escape).
+
+```toml
+[limits]
+always_on_bytes = 8192   # SKILL.md bodies (frontmatter excluded) per branch, this entry + LintContext.branch_other_bytes
+max_stems = 10           # predicate.stems
+max_exts = 8             # predicate.file_exts
+
+[patterns]               # rule ids in brackets
+session_id = [...]       # [identifiers] UUIDs (v4/v7), omp session file names
+user_names = [...]       # [identifiers] home-dir paths that reveal a user; plus LintContext.user_names (literal, case-insensitive, word-bounded)
+task_paths = [...]       # [identifiers] task-specific absolute paths (/Users, /home, /tmp, /var/folders)
+urls = [...]             # [executable_risk]
+network = [...]          # [executable_risk] curl, wget, nc, ssh, scp
+pipe_shell = [...]       # [executable_risk] curl|wget … | sh
+destructive_git = [...]  # [executable_risk] push -f/--force, reset --hard, clean -fd
+string_match_user = [...] # [string_match_user] branching on the user's literal words
+approval = [...]         # manifest.rationale matching any ⇒ executable_risk findings are Warn ("approval requested"), else Error
+order_exception = [...]  # manifest.rationale matching any ⇒ form_order findings are Warn, else Error
+
+[form]
+order = ["trigger", "laws", "procedure", "pitfalls", "facts"]
+[form.headings]          # lowercase substrings of a ##-heading that classify it; unclassified headings are ignored
+trigger = ["trigger", "when to use", "scope"]
+laws = ["laws", "rules", "invariants", "constraints"]
+procedure = ["procedure", "workflow", "steps"]
+pitfalls = ["pitfalls", "anti-patterns", "gotchas"]
+facts = ["facts", "workspace facts", "reference"]
+
+[hooks]
+probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]  # a hook regex matching "" or every probe "matches everything"
+```
+
+Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `evolve.json` and `EXPERIENCE.md`; markdown is linted with its `evolve:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (rule present, pass condition and message non-empty, regex compiles, does not match everything); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
+
+## 13. Ledger SQL (schema_version 1, `evolve_core::ledger`)
+
+WAL, `synchronous=NORMAL`, `busy_timeout` 5 s. Migrations are an ordered list; `schema_version(version, created_at)` records each applied one; a ledger newer than the binary is refused. Blobs: `<ledger dir>/blobs/<sha256>` (atomic write via rename).
+
+| table | columns (JSON = serde JSON text) | keys / indexes | notes |
+| --- | --- | --- | --- |
+| `sessions` | id, cwd, repo, branch, started_at, ended_at, family, provider, model, turns, tokens_in, tokens_out, tool_calls, tool_errors, skill_reads JSON, files_touched JSON, exts JSON, stems JSON, redirects JSON, flagged, counted, source, json (full `SessionRecord`), created_at | PK id; (branch, started_at); (counted, flagged) | reads deserialize `json`, then take `flagged`/`counted` from the columns and `redirects` from the `redirects` table. `counted` never goes back to 0 on re-upsert. Skill filter: `json_each(skill_reads)`. |
+| `redirects` | id, session_id, seq, prelabel, class, confidence, text_head, deliverable_head, t, created_at | UNIQUE(session_id, seq) | classifier labels (`set_redirect_class`) survive a re-import that carries none. |
+| `entries` | id, json (full `Entry`), created_at, updated_at | PK id | |
+| `entry_status` | id, status, branch, name, predicate_hash, kind, family, updated_at | PK id; (status, branch); (name); (predicate_hash) | written in the same transaction as `entries`; `predicate_hash` = `predicate::predicate_hash`. |
+| `counters` | entry_id, session_id, family, matched, recurrence, harm, tokens, turns, ts (session end), created_at | PK(entry_id, session_id); (family, ts) | one row per matched session ⇒ folding is idempotent. Aggregates and `harm_times` are computed (`ledger::aggregate`). |
+| `proposals` | id (uuid v7), entry_id, session_id, blob (sha256 of proposal JSON), lint_ok, created_at | (entry_id); (session_id) | |
+| `receipts` | id, entry_id, certificate_hash, activation, created_at | (entry_id) | approval certificates are blobs of `{entry, what, files:[[path, sha256]], at}`. |
+| `admissions` | predicate_hash, day (UTC `YYYY-MM-DD`), entry_id, created_at | PK(predicate_hash, day, entry_id) | |
+| `jobs` | id, kind, status, json, created_at, updated_at | (status) | `json` is the binary's job payload. |
+| `outcomes` | id, session_id, ts, machine, family, repo, branch, kind, domain, subject_id, subject_json, claim, signature, params_json, evidence_json, result_json, links_json, provenance_json, status, json, created_at | PK id (latest status per id); exact (signature); temporal (subject_id, ts); (domain) | `subject_id` = `domain` or `domain#type:id,…` (sorted entities), `ledger::subject_id`. `latest`/`asof(ts)` = newest by ts (≤ ts). |
+| `outcome_facets` | outcome_id, domain, key, value | composite (domain, key, value) | prefix seek: `domain = p OR domain LIKE 'p.%'` (via substr). |
+| `minhash` | outcome_id, band, hash | PK(outcome_id, band); (band, hash) | `minhash_neighbors(bands, min_shared)` is a suggestion, never a gate. |

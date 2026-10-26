@@ -170,6 +170,13 @@ pub struct Entry {
     /// Set when this entry was created under an existing one in a sibling slot.
     #[serde(default)]
     pub sibling_of: Option<EntryId>,
+    /// When `status` last changed (unix ms); `None` ⇒ `created_at`. Drives the
+    /// 30-day dormant and kept→retired windows (`counters::decide`).
+    #[serde(default)]
+    pub status_since: Option<UnixMs>,
+    /// Why the last status change happened (rollback note, disable reason, decline).
+    #[serde(default)]
+    pub status_note: Option<String>,
 }
 
 fn one() -> u32 {
@@ -439,6 +446,10 @@ pub struct SessionRecord {
     pub redirects: Vec<Redirect>,
     #[serde(default)]
     pub error_clusters: u32,
+    /// Seq of the tool result that tipped each error cluster into existence (≥3 errors in a
+    /// window of 6 consecutive tool results). `error_clusters == error_cluster_seqs.len()`.
+    #[serde(default)]
+    pub error_cluster_seqs: Vec<u32>,
     #[serde(default)]
     pub takeovers: u32,
     #[serde(default)]

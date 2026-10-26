@@ -1,0 +1,1 @@
+{"name":"@vncp/omp-evolve","version":"0.1.0","private":true,"omp":{"extensions":["./index.ts"]},"peerDependencies":{"@oh-my-pi/pi-coding-agent":"18.12.5"}}

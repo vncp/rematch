@@ -1,0 +1,59 @@
+# Static lint rules for omp-evolve proposals (docs/DESIGN.md §12).
+
+[limits]
+always_on_bytes = 8192
+max_stems = 10
+max_exts = 8
+
+[patterns]
+session_id = [
+  '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[47][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b',
+  '\b\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}[0-9a-zA-Z._-]*_[0-9a-fA-F-]{36}\b',
+]
+user_names = [
+  '''(?:^|[\s"'`(])/Users/[A-Za-z0-9._-]+''',
+  '''(?:^|[\s"'`(])/home/[A-Za-z0-9._-]+''',
+  '''(?:^|[\s"'`(])~/(?:repos|src|code|work|projects|dev|Desktop|Documents|Downloads)/''',
+]
+task_paths = [
+  '''(?:^|[\s"'`(])/(?:Users|home|var/folders|tmp|private/tmp)/[^\s)"'`>]+''',
+]
+urls = [
+  '''https?://[^\s)"'`>]+''',
+]
+network = [
+  '\b(?:curl|wget)\b',
+  '\b(?:nc|ssh|scp)\s+',
+]
+pipe_shell = [
+  '\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba|z|da|k)?sh\b',
+]
+destructive_git = [
+  '\bgit\s+push\s+(?:[^\n]*\s+)?(?:-f|--force)\b',
+  '\bgit\s+reset\s+--hard\b',
+  '\bgit\s+clean\s+-[a-zA-Z]*[fd][a-zA-Z]*\b',
+]
+string_match_user = [
+  '(?i)\bif\s+the\s+user\s+says\b',
+  '(?i)\bwhen\s+the\s+user\s+types\b',
+  '(?i)\buser\s+says\s+"',
+]
+approval = [
+  '(?i)\b(?:approval_requested|requires?\s+approval|human\s+approval|one-tap\s+approval)\b',
+]
+order_exception = [
+  '(?i)\b(?:form\s+order|section\s+order|order\s+exception)\b',
+]
+
+[form]
+order = ["trigger", "laws", "procedure", "pitfalls", "facts"]
+
+[form.headings]
+trigger = ["trigger", "when to use", "scope"]
+laws = ["laws", "rules", "invariants", "constraints"]
+procedure = ["procedure", "workflow", "steps"]
+pitfalls = ["pitfalls", "anti-patterns", "gotchas"]
+facts = ["facts", "workspace facts", "reference"]
+
+[hooks]
+probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]

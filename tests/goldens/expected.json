@@ -1,0 +1,65 @@
+{
+  "bash-clone.jsonl": {
+    "id": "01a175cc-4c09-7506-813d-17c490009c1c",
+    "parent_id": null,
+    "branch_entries": 10,
+    "family": "anthropic/claude-fable",
+    "turns": 2,
+    "tool_calls": 1,
+    "tool_errors": 0,
+    "error_clusters": 0,
+    "skill_reads": [],
+    "files_touched": 0,
+    "exts": [],
+    "redirects": 0,
+    "takeovers": 0,
+    "tokens_in": 32077,
+    "tokens_out": 220,
+    "outcomes": 0
+  },
+  "skill-read.jsonl": {
+    "id": "01a175a9-8b4d-73e2-bf6f-abbb6b304887",
+    "parent_id": null,
+    "branch_entries": 11,
+    "family": "github-copilot/gpt-sol",
+    "turns": 3,
+    "tool_calls": 1,
+    "tool_errors": 0,
+    "error_clusters": 0,
+    "skill_reads": [
+      "seg8"
+    ],
+    "files_touched": 0,
+    "exts": [],
+    "redirects": 0,
+    "takeovers": 0,
+    "tokens_in": 32960,
+    "tokens_out": 3925,
+    "outcomes": 0
+  },
+  "subagent-branch-compaction.jsonl": {
+    "id": "01a175c2-7805-768a-8e7c-016db4ef27cf",
+    "parent_id": "01a175bd-c1f9-73d6-b367-a261c3b1734c",
+    "branch_entries": 482,
+    "family": "github-copilot/gemini-argon",
+    "turns": 38,
+    "tool_calls": 216,
+    "tool_errors": 7,
+    "error_clusters": 0,
+    "skill_reads": [],
+    "files_touched": 16,
+    "exts": [
+      "json",
+      "jsonl",
+      "md",
+      "py",
+      "ts",
+      "yml"
+    ],
+    "redirects": 0,
+    "takeovers": 0,
+    "tokens_in": 5092169,
+    "tokens_out": 29321,
+    "outcomes": 0
+  }
+}
