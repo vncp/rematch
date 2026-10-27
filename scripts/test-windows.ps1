@@ -7,7 +7,7 @@ $Sandbox = Join-Path ([IO.Path]::GetTempPath()) ('rematch windows ' + [guid]::Ne
 $HomeDir = Join-Path $Sandbox 'User home'
 $FixtureBin = Join-Path $Sandbox 'Fixture bin'
 $OriginalLocation = Get-Location
-$Variables = @('HOME', 'USERPROFILE', 'REMATCH_ROOT', 'PI_CODING_AGENT_DIR', 'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'OMP_BIN', 'OMP_PLUGINS_DIR', 'REMATCH', 'Path', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL')
+$Variables = @('HOME', 'USERPROFILE', 'RUSTUP_HOME', 'CARGO_HOME', 'REMATCH_ROOT', 'PI_CODING_AGENT_DIR', 'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'OMP_BIN', 'OMP_PLUGINS_DIR', 'REMATCH', 'Path', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL')
 $Saved = @{}
 foreach ($v in $Variables) { $Saved[$v] = [Environment]::GetEnvironmentVariable($v, 'Process') }
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -28,6 +28,12 @@ function Invoke-Rematch([string[]]$Arguments) {
 
 try {
     New-Item -ItemType Directory -Force -Path $HomeDir, $FixtureBin | Out-Null
+    # Isolate Rematch state without hiding the runner's installed Rust toolchain.
+    if (-not $env:RUSTUP_HOME) {
+        $env:RUSTUP_HOME = (& rustup show home).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the Rust toolchain before isolating HOME.' }
+    }
+    if (-not $env:CARGO_HOME) { $env:CARGO_HOME = Join-Path $HOME '.cargo' }
     $env:HOME = $HomeDir
     $env:USERPROFILE = $HomeDir
     $env:REMATCH_ROOT = Join-Path $HomeDir '.rematch'
