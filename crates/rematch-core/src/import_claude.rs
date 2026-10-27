@@ -50,8 +50,8 @@ pub fn session_id(uuid: &str) -> String {
 
 /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
 pub fn config_dir() -> Option<PathBuf> {
-    let non_empty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    non_empty("CLAUDE_CONFIG_DIR").or_else(|| non_empty("HOME").map(|h| h.join(".claude")))
+    let custom = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    custom.or_else(|| crate::paths::home_dir().map(|h| h.join(".claude")))
 }
 
 /// `<config dir>/projects`.

@@ -1,3 +1,5 @@
+// POSIX-only: sh fixtures, Unix file modes and unprivileged symlinks.
+#![cfg(unix)]
 //! End-to-end for the Codex adapter (DESIGN §18): a handwritten Codex rollout with a
 //! negation redirect → `import --history --harness codex` → `reflect --history` with a
 //! scripted editor stages an entry → `skills sync --harness codex --cwd <repo>` links it

@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! End-to-end: synthetic trace + pending file → `reflect --pending` with a scripted editor
 //! (and through the fake omp) → staged entry → `match` → idempotence / canary → `count`.
 
@@ -8,6 +9,7 @@ use std::process::Command;
 use common::*;
 use serde_json::{json, Value};
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn reflect_stage_match_canary_count() {
     let env = Env::new();
@@ -84,6 +86,7 @@ fn reflect_stage_match_canary_count() {
     assert!(!g2["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("staged skill")), "{g2}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn lint_failure_triggers_one_retry() {
     let env = Env::new();
@@ -99,6 +102,7 @@ fn lint_failure_triggers_one_retry() {
     assert!(!skill.contains("https://"), "{skill}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn keep_base_records_a_proposal_and_stages_nothing() {
     let env = Env::new();
@@ -116,6 +120,7 @@ fn keep_base_records_a_proposal_and_stages_nothing() {
     assert!(staged.is_empty(), "{ls}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn reflect_through_fake_omp_verifies_the_event_stream() {
     let env = Env::new();
@@ -146,6 +151,7 @@ fn reflect_through_fake_omp_verifies_the_event_stream() {
     }
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn fake_omp_with_wrong_model_fails_closed() {
     let env = Env::new();
@@ -187,6 +193,7 @@ fn mark_flags_pending_and_off_refuses_reflect() {
     assert_eq!(code, 2);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn four_clean_matched_sessions_keep_the_entry() {
     let env = Env::new();

@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! Context entries through the binary: `retrieve` over a staged package (ranking, budget,
 //! loaded-only), the built-in hook entries (installed once, offered as approvals, inert
 //! until approved), and the attribution loop (a `retrieval` trace record credits the
@@ -24,6 +25,7 @@ fn paths(v: &Value) -> Vec<(String, u64)> {
     v["units"].as_array().unwrap().iter().map(|u| (u["path"].as_str().unwrap().to_string(), u["overlap"].as_u64().unwrap())).collect()
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn retrieve_ranks_loaded_package_units_within_the_budget() {
     let env = Env::new();
@@ -112,7 +114,7 @@ fn builtins_install_once_and_wait_for_approval() {
     let module = std::fs::read_to_string(env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts"))).unwrap();
     assert!(module.contains(r#"mode: "stuck","#) && !module.contains("=>"), "{module}");
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/shared")]));
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging").join("shared")]));
     assert!(m["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str() && e["predicate_hit"] == true), "{m}");
 
     // idempotent across runs
@@ -166,6 +168,7 @@ fn count(env: &Env) -> Value {
     env.run(&["count", "--editor", &script("editor-ok.sh")])
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn retrieval_record_credits_the_hook_and_the_package_through_count() {
     let env = Env::new();

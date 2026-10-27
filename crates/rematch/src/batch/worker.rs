@@ -154,7 +154,7 @@ pub fn reference_rollout(ctx: &AppCtx, task_id: &str, omp_bin: &Path) -> Result<
         }
         let dir = runs.join("traces");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.jsonl", r.session.id));
+        let path = dir.join(format!("{}.jsonl", rematch_core::paths::id_file_stem(&r.session.id)));
         let mut text = String::new();
         for rec in &r.records {
             text.push_str(&serde_json::to_string(rec)?);

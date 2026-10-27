@@ -373,10 +373,10 @@ static SKILL_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:^|\s)/skill:([A-Za-z0-9][A-Za-z0-9_.-]*)").expect("static pattern")
 });
 static SKILL_FILE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|/)skills/([^/]+)/SKILL\.md$").expect("static pattern"));
+    LazyLock::new(|| Regex::new(r"(?:^|[/\\])skills[/\\]([^/\\]+)[/\\]SKILL\.md$").expect("static pattern"));
 
-/// Skill named by a `read` path: `skill://<name>[/...]` or `.../skills/<name>/SKILL.md`,
-/// read selectors allowed.
+/// Skill named by a `read` path: `skill://<name>[/...]` or `.../skills/<name>/SKILL.md` (`/`
+/// or Windows `\` separators), read selectors allowed.
 pub fn skill_from_read_path(path: &str) -> Option<String> {
     let p = strip_selector(path);
     if let Some(rest) = p.strip_prefix("skill://") {
@@ -1159,6 +1159,8 @@ not json at all
             Some("x")
         );
         assert_eq!(skill_from_read_path("/h/skills/x/README.md"), None);
+        assert_eq!(skill_from_read_path(r"C:\Users\u\.rematch\skills\pdf-tools\SKILL.md:1-5").as_deref(), Some("pdf-tools"));
+        assert_eq!(skill_from_read_path(r"C:\Users\u\.rematch\skills\pdf-tools/SKILL.md").as_deref(), Some("pdf-tools"));
         assert_eq!(skill_from_read_path("skill://"), None);
         assert_eq!(
             skills_in_text("/skill:a then /skill:b-c.d, not x/skill:z"),

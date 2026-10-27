@@ -275,7 +275,7 @@ fn is_temp(rel: &Path) -> bool {
 /// listings compare with a plan's and an index manifest's).
 pub(crate) fn table_dir(lake: &Path, table: &str) -> PathBuf {
     let d = lake.join(table);
-    d.canonicalize().unwrap_or(d)
+    rematch_core::paths::canonicalize(&d).unwrap_or(d)
 }
 
 /// The table's Parquet files: those Bellwether lists, and those it skips (a `_`- or

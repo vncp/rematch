@@ -251,7 +251,9 @@ fn init(ctx: &AppCtx, a: &InitArgs) -> Result<Value> {
         match &a.remote {
             Some(url) => {
                 let target = dir.to_string_lossy().to_string();
-                if let Err(e) = net(&ctx.paths.root, &["clone", "--quiet", url, &target], &budget) {
+                // No line-ending conversion: profile files are hashed and compared byte for
+                // byte across machines (Git for Windows defaults to `core.autocrlf=true`).
+                if let Err(e) = net(&ctx.paths.root, &["clone", "--quiet", "-c", "core.autocrlf=false", url, &target], &budget) {
                     let _ = std::fs::remove_dir_all(&dir);
                     bail!("clone {url}: {e}");
                 }
@@ -284,6 +286,7 @@ fn init(ctx: &AppCtx, a: &InitArgs) -> Result<Value> {
             Some(_) => {}
         }
     }
+    git(&dir, &["config", "core.autocrlf", "false"])?;
     profile::ensure_layout(&ctx.paths)?;
     let adopted = if a.adopt { adopt_all(ctx)? } else { Vec::new() };
     let remaining = budget.deadline.saturating_duration_since(Instant::now());
@@ -353,12 +356,12 @@ fn rematch_owned(ctx: &AppCtx, md: &Path) -> Result<bool> {
 /// dir, or a harness instruction or settings file (`CLAUDE.md`, `AGENTS.md`,
 /// `settings.json`). `None` for anything under the omp agent dir.
 fn foreign_harness(ctx: &AppCtx, p: &Path) -> Option<String> {
-    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let agent = std::fs::canonicalize(&ctx.paths.agent_dir).unwrap_or_else(|_| ctx.paths.agent_dir.clone());
+    let real = rematch_core::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let agent = rematch_core::paths::canonicalize(&ctx.paths.agent_dir).unwrap_or_else(|_| ctx.paths.agent_dir.clone());
     if p.starts_with(&ctx.paths.agent_dir) || real.starts_with(&agent) {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = rematch_core::paths::home_dir();
     let env_dir = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     let roots = [
         ("Claude Code's", env_dir("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|h| h.join(".claude")))),
@@ -367,7 +370,7 @@ fn foreign_harness(ctx: &AppCtx, p: &Path) -> Option<String> {
     ];
     for (who, root) in roots {
         let Some(root) = root else { continue };
-        let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let root_real = rematch_core::paths::canonicalize(&root).unwrap_or_else(|_| root.clone());
         if p.starts_with(&root) || real.starts_with(&root_real) {
             return Some(format!("{who} ({})", root.display()));
         }
@@ -413,7 +416,7 @@ fn adopt_path(ctx: &AppCtx, src: &Path) -> Result<Value> {
             // conflict for the user to resolve, never silently overwritten.
             if same_contents(src, &dst)? {
                 std::fs::remove_file(src)?;
-                std::os::unix::fs::symlink(&dst, src)?;
+                library::symlink_dir(&dst, src)?;
                 return Ok(json!({"name": name.trim_end_matches(".md"), "kind": "agent", "as": "linked (identical copy already in the profile)", "from": src, "to": dst}));
             }
             bail!("the profile already holds a different agents/{name}; diff it against {} and adopt or discard by hand", src.display());
@@ -426,7 +429,7 @@ fn adopt_path(ctx: &AppCtx, src: &Path) -> Result<Value> {
     }
     library::validate_name(&name)?;
     let named = ctx.ledger.list_entries(&EntryFilter { name: Some(name.clone()), ..Default::default() })?;
-    let same = |p: &Path| p == src || std::fs::canonicalize(p).is_ok_and(|c| c == src);
+    let same = |p: &Path| p == src || rematch_core::paths::canonicalize(p).is_ok_and(|c| c == src);
     let existing = named.into_iter().rev().find(|e| same(&e.path) && !matches!(e.status, Status::Retired | Status::Dormant | Status::Stale));
     if let Some(e) = &existing {
         if let Some(n) = library::adopt_kept(&ctx.ledger, &ctx.paths, e)? {
@@ -437,7 +440,7 @@ fn adopt_path(ctx: &AppCtx, src: &Path) -> Result<Value> {
     if dst.exists() {
         if same_tree(src, &dst)? {
             std::fs::remove_dir_all(src)?;
-            std::os::unix::fs::symlink(&dst, src)?;
+            library::symlink_dir(&dst, src)?;
             return Ok(json!({"name": name, "kind": "skill", "as": "linked (identical copy already in the profile)", "from": src, "to": dst}));
         }
         bail!("the profile already holds a different skills/{name}; diff it against {} and adopt or discard by hand", src.display());
@@ -663,7 +666,7 @@ pub fn profile_kept(ctx: &AppCtx) -> Result<Vec<ProfileKept>> {
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canon = |p: &Path| rematch_core::paths::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let held: std::collections::BTreeSet<PathBuf> =
         ctx.ledger.list_entries(&EntryFilter::default())?.iter().flat_map(|e| [e.path.clone(), canon(&e.path)]).collect();
     let index = profile::load_index(&ctx.paths);
@@ -791,7 +794,7 @@ pub fn launchd_plist(bin: &Path, interval: u64, log: &Path, env: &[(String, Stri
 
 /// `~/Library/LaunchAgents/<label>.plist`.
 pub fn launchd_plist_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")))
+    rematch_core::paths::home_dir().map(|h| h.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
 fn install_launchd(ctx: &AppCtx, interval: u64) -> Result<Value> {
@@ -799,7 +802,7 @@ fn install_launchd(ctx: &AppCtx, interval: u64) -> Result<Value> {
         bail!("--interval must be at least 1 second");
     }
     let plist = launchd_plist_path().ok_or_else(|| anyhow!("HOME is not set"))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow!("HOME is not set"))?;
+    let home = rematch_core::paths::home_dir().ok_or_else(|| anyhow!("HOME is not set"))?;
     let bin = launchd_binary()?;
     let log = ctx.paths.root.join("profile-sync.log");
     // launchd starts with a bare environment: carry what picks git, the root and the agent dir.

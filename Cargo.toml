@@ -28,6 +28,8 @@ unicase = "=2.10.0"
 unicode-segmentation = "=1.13.3"
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
+# Windows process trees (job objects), liveness, console control and trace locks.
+windows-sys = "0.61"
 
 [profile.release]
 lto = "thin"

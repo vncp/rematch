@@ -1,0 +1,56 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: '1.4.3'
+      - name: Enable unprivileged symlinks in the disposable Windows runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
+      - name: Test native workspace
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Check without the lake feature
+        run: cargo test -p rematch --no-default-features --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: omp extension behavior
+        run: bun test extension
+      - name: omp extension transpiles
+        run: bun build extension/index.ts --no-bundle --outdir target/extension-check
+      - name: Native Windows installer and CLI smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows.ps1

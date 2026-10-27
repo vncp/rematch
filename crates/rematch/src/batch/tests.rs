@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! End-to-end worker tests: fake omp (`tests/scripts/fake-omp-batch.sh`), scripted editor
 //! (`tests/scripts/batch-editor.sh`), a verifier that passes only when a candidate's skill
 //! made the "agent" create a marker file, in a temp git repo.
@@ -101,6 +102,7 @@ fn worktrees(repo: &Path) -> usize {
     String::from_utf8_lossy(&out.stdout).lines().count()
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn batch_worker_k1_stages_winner_then_next_run_keeps_it() {
     let e = env();
@@ -171,6 +173,7 @@ fn batch_worker_k1_stages_winner_then_next_run_keeps_it() {
     assert_eq!(worktrees(&e.repo), 1);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn batch_next_run_failure_retires_pending_entry() {
     let e = env();
@@ -186,6 +189,7 @@ fn batch_next_run_failure_retires_pending_entry() {
     assert_eq!(out["rollouts"], 4);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn batch_reference_rollout_writes_trace() {
     let e = env();
@@ -205,6 +209,7 @@ fn batch_reference_rollout_writes_trace() {
     assert_eq!(worktrees(&e.repo), 1);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn batch_worker_width2_spends_ten_rollouts() {
     let e = env();

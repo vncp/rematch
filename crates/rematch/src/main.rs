@@ -214,7 +214,7 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Mark(a) => reflect::cmd_mark(ctx, a),
         Cmd::Off => library_cmd::cmd_off(ctx),
         Cmd::On => library_cmd::cmd_on(ctx),
-        Cmd::Uninstall(a) => uninstall::cmd_uninstall(ctx, a),
+        Cmd::Uninstall(_) => unreachable!("uninstall owns its context (main)"),
         Cmd::Lake { cmd } => lake_cmd::cmd_lake(ctx, cmd),
         Cmd::Report(a) => report::cmd_report(ctx, a),
         Cmd::Policy { cmd } => policy_cmd::cmd_policy(ctx, cmd),
@@ -258,6 +258,11 @@ fn main() {
     let (env, code) = match cli.cmd {
         // Runs before the context opens: opening it creates the ledger it is to rebuild.
         Cmd::Lake { cmd: lake_cmd::LakeCmd::Rebuild(a) } => Envelope::from_result(op, lake_cmd::cmd_lake_rebuild(a)),
+        // Owns the context: Windows cannot delete the ledger while its connection is open.
+        Cmd::Uninstall(a) => match AppCtx::open_with(cli.cwd.clone(), text) {
+            Ok(ctx) => Envelope::from_result(op, uninstall::cmd_uninstall(ctx, a)),
+            Err(e) => Envelope::from_result(op, Err(e)),
+        },
         cmd => match AppCtx::open_with(cli.cwd.clone(), text) {
             Ok(ctx) => {
                 let (env, code) = Envelope::from_result(op, dispatch(&ctx, cmd));

@@ -1,3 +1,5 @@
+// POSIX-only: sh fixtures, Unix file modes and unprivileged symlinks.
+#![cfg(unix)]
 //! Binary commands beyond the reflect loop: import (history goldens, forge), create
 //! (description → draft → activate, sessions), improve (refusal, split, unit-level),
 //! approvals, detached jobs, doctor, uninstall.
@@ -12,7 +14,7 @@ use common::*;
 use serde_json::{json, Value};
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+    rematch_core::paths::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
 }
 
 #[test]
@@ -290,7 +292,7 @@ fn improve_refuses_splits_and_proposes_a_sibling() {
     }
     env.run(&["count", "--editor", &script("editor-ok.sh")]);
     assert!(big.join("SKILL.md").is_file(), "count passes never move a registered skill");
-    assert_eq!(env.entry(r["entry"].as_str().unwrap())["path"], json!(big.canonicalize().unwrap()));
+    assert_eq!(env.entry(r["entry"].as_str().unwrap())["path"], json!(rematch_core::paths::canonicalize(&big).unwrap()));
     let u = env.run(&["improve", "ledger-helper", "--editor", &script("editor-ok.sh")]);
     assert_eq!(u["outcome"], "staged", "{u}");
     assert_eq!(u["audit"]["traced"], 5);
@@ -300,7 +302,7 @@ fn improve_refuses_splits_and_proposes_a_sibling() {
     assert!(PathBuf::from(u["staged"]["path"].as_str().unwrap()).join("SKILL.md").is_file());
     let base = env.entry(u["entry"].as_str().unwrap());
     assert_eq!(base["origin"], json!({"kind": "import", "source": "brownfield"}));
-    assert_eq!(base["path"], json!(small.canonicalize().unwrap()));
+    assert_eq!(base["path"], json!(rematch_core::paths::canonicalize(&small).unwrap()));
 
     // Pinned skills are never replaced.
     env.run(&["library", "pin", u["entry"].as_str().unwrap()]);
@@ -338,7 +340,7 @@ fn counters_keep_a_registered_skill_without_moving_it() {
     assert_eq!(d["experience"]["source"], "reflector");
     let e = env.entry(&id);
     assert_eq!(e["status"], "kept");
-    assert_eq!(e["path"], json!(dir.canonicalize().unwrap()), "files left in place");
+    assert_eq!(e["path"], json!(rematch_core::paths::canonicalize(&dir).unwrap()), "files left in place");
     assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), md, "SKILL.md untouched");
     assert!(!dir.join("rematch.json").exists() && !dir.join("EXPERIENCE.md").exists());
     let x = std::fs::read_to_string(env.root.join("brownfield").join(&id).join("EXPERIENCE.md")).unwrap();

@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! Harness surfaces beyond skills, through the binary: subagent entries (approval → staging
 //! link → kept copy in the agent dir → retire), `AGENTS.md` fragments through the team branch
 //! and, once approved, as personal system-prompt text (`match` `prompt_fragments`), and the
@@ -9,7 +10,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{script, Env};
+use common::{editor_script as script, Env};
 use rematch_core::package::SkillDoc;
 use serde_json::{json, Value};
 
@@ -67,6 +68,7 @@ fn doc(p: &Path) -> SkillDoc {
     SkillDoc::parse(&std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))).unwrap()
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     let env = Env::new();
@@ -137,6 +139,7 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     assert!(p["plan"]["remove"].as_array().unwrap().iter().any(|x| x == &json!(env.root.join("agents"))), "{p}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn team_ship_appends_the_agents_md_fragment_and_keeps_it_out_of_the_skill_dir() {
     let env = Env::new();
@@ -159,6 +162,7 @@ fn team_ship_appends_the_agents_md_fragment_and_keeps_it_out_of_the_skill_dir() 
     assert_eq!(std::fs::read_to_string(env.repo.join("AGENTS.md")).unwrap(), "# Payments\n\nBe precise about money.\n", "checkout untouched");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn an_approved_fragment_joins_the_match_until_it_changes() {
     let env = Env::new();

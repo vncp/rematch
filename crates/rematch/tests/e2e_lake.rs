@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! The lake (ADR 001 L2): `lake export | import | rebuild | doctor` end to end through the
 //! binary, plus the `--no-default-features` build without arrow.
 #![cfg(feature = "lake")]
@@ -106,6 +107,7 @@ fn strings<'a>(b: &'a rematch_lake::arrow::record_batch::RecordBatch, col: &str)
     b.column_by_name(col).unwrap().as_any().downcast_ref::<StringArray>().unwrap()
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn export_twice_writes_nothing_new_and_a_fresh_root_with_the_same_journal_writes_the_same_bytes() {
     let a = Env::new();
@@ -178,6 +180,7 @@ fn export_twice_writes_nothing_new_and_a_fresh_root_with_the_same_journal_writes
     assert_eq!(files(&b_env.root.join("lake")), files(&lake), "same journal → byte-identical lake");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn a_second_machines_lake_imports_and_doctor_shows_both_watermarks() {
     let home = Env::new();
@@ -214,6 +217,7 @@ fn a_second_machines_lake_imports_and_doctor_shows_both_watermarks() {
     assert_eq!(e["files"], json!([]), "{e}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn rebuild_from_the_lake_reproduces_library_ls_on_a_fresh_root() {
     let a = Env::new();
@@ -244,6 +248,7 @@ fn rebuild_from_the_lake_reproduces_library_ls_on_a_fresh_root() {
     assert_eq!(fresh.run(&["library", "ls"])["entries"], ls_a["entries"]);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn reflect_pending_ends_with_a_bounded_export() {
     let env = Env::new();
@@ -318,7 +323,7 @@ fn imported_sessions_export_events_from_their_harness_transcripts() {
 /// The binary builds without the `lake` feature, links no arrow, and says so when asked.
 #[test]
 fn builds_without_the_lake_feature() {
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let ws = rematch_core::paths::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let target = ws.join("target").join("no-lake");
     let out = Command::new(&cargo)

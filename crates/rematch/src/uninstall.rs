@@ -16,7 +16,7 @@ pub struct UninstallArgs {
     pub yes: bool,
 }
 
-pub fn cmd_uninstall(ctx: &AppCtx, a: UninstallArgs) -> Result<Value> {
+pub fn cmd_uninstall(ctx: AppCtx, a: UninstallArgs) -> Result<Value> {
     let mut plan = library::uninstall_plan(&ctx.paths, &ctx.ledger)?;
     // Kept copies older versions wrote under ~/.agents/skills for Codex (`.rematch-codex.json`),
     // and the agent copies in the Claude Code plugin's agents/ (listed in its marker).
@@ -41,7 +41,7 @@ pub fn cmd_uninstall(ctx: &AppCtx, a: UninstallArgs) -> Result<Value> {
     let mut lines: Vec<String> = plan.restore.iter().map(|(f, t)| format!("restore {} → {}", f.display(), t.display())).collect();
     lines.extend(plan.remove.iter().map(|p| format!("remove {}", p.display())));
     lines.extend(kept.iter().map(|p| format!("keep {} (the profile: your git repo; only the links into it are removed)", p.display())));
-    let mut note = "the extension link and the PATH shim belong to omp/install.sh: `omp plugin uninstall @vncp/rematch` and remove ~/.local/bin/rematch; links you made for other harnesses (~/.agents/skills/rematch, ~/.claude/skills/rematch) are yours to remove".to_string();
+    let mut note = "the extension link and the PATH shim belong to omp/install.sh (install.ps1 on Windows): `omp plugin uninstall @vncp/rematch` and remove ~/.local/bin/rematch (rematch.exe on Windows); links you made for other harnesses (~/.agents/skills/rematch, ~/.claude/skills/rematch) are yours to remove".to_string();
     if let Some(p) = &plist {
         note.push_str(&format!("; unload the profile sync job first: launchctl unload -w {}", p.display()));
     }
@@ -51,6 +51,8 @@ pub fn cmd_uninstall(ctx: &AppCtx, a: UninstallArgs) -> Result<Value> {
         lines.push(note.into());
         return Ok(json!({"applied": false, "plan": plan, "kept": kept, "note": note, "lines": lines}));
     }
+    // Close the ledger first: Windows cannot delete a file that is still open.
+    drop(ctx);
     library::apply_uninstall(&plan)?;
     lines.insert(0, "uninstalled:".into());
     lines.push(note.into());

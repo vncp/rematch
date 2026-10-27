@@ -247,10 +247,7 @@ mod imp {
 
     pub fn lake_events(ctx: &AppCtx, s: &SessionRecord) -> Option<Vec<TraceRecord>> {
         let lake = rematch_lake::lake_dir(&ctx.paths.root);
-        let path = rematch_lake::events::events_path(&lake, &s.id, s.started_at);
-        if !path.is_file() {
-            return None;
-        }
+        let path = rematch_lake::events::find_events_file(&lake, &s.id, s.started_at)?;
         match rematch_lake::events::read_records(&path) {
             Ok(values) => Some(values.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()),
             Err(e) => {
