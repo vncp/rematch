@@ -487,12 +487,12 @@ fn doctor_reports_every_harness_and_ready() {
     // Nothing but omp: the others are "not set up", never problems.
     let d = doctor(&claude_ok, &launchctl_yes);
     assert_eq!(d["ready"], true, "{d}");
-    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok")] {
+    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("pi", "not set up"), ("opencode", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok")] {
         assert_eq!(status(&d, h), s, "{h}: {d}");
     }
     let lines = text(&d);
-    let firsts: Vec<&str> = lines.iter().take(6).map(|l| l.split(':').next().unwrap()).collect();
-    assert_eq!(firsts, ["omp", "claude-code", "codex", "profile", "lake", "built-ins"], "one line per harness, first: {lines:#?}");
+    let firsts: Vec<&str> = lines.iter().take(8).map(|l| l.split(':').next().unwrap()).collect();
+    assert_eq!(firsts, ["omp", "claude-code", "codex", "pi", "opencode", "profile", "lake", "built-ins"], "one line per harness, first: {lines:#?}");
     assert_eq!(lines.last().unwrap(), "ready: true");
 
     // Claude Code's plugin, Codex's link, a profile, the lake.

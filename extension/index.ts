@@ -18,7 +18,7 @@ export function rematchRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return path.join(env.HOME || os.homedir(), ".rematch");
 }
 
-function isExecutable(p: string): boolean {
+export function isExecutable(p: string): boolean {
 	try {
 		fs.accessSync(p, fs.constants.X_OK);
 		return fs.statSync(p).isFile();
@@ -57,19 +57,19 @@ export function resolveBinary(env: NodeJS.ProcessEnv = process.env, extDir = ext
 type Json = Record<string, unknown>;
 export type Envelope = { ok: boolean; operation?: string; data?: Json; error?: string };
 
-function isRecord(v: unknown): v is Json {
+export function isRecord(v: unknown): v is Json {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function stringsOf(v: unknown): string[] {
+export function stringsOf(v: unknown): string[] {
 	return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
 
-function recordsOf(v: unknown): Json[] {
+export function recordsOf(v: unknown): Json[] {
 	return Array.isArray(v) ? v.filter(isRecord) : [];
 }
 
-function errorText(error: unknown): string {
+export function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
@@ -307,7 +307,7 @@ export function parseSelector(sel: unknown): ModelRef | null {
 	return slash < 0 ? { provider: "", id: clean } : { provider: clean.slice(0, slash), id: clean.slice(slash + 1) };
 }
 
-function textOf(content: unknown): string {
+export function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	return recordsOf(content)
 		.filter(b => b.type === "text" && typeof b.text === "string")
@@ -315,7 +315,7 @@ function textOf(content: unknown): string {
 		.join("\n");
 }
 
-function contentBytes(content: unknown): number {
+export function contentBytes(content: unknown): number {
 	if (typeof content === "string") return Buffer.byteLength(content, "utf8");
 	let n = 0;
 	for (const b of recordsOf(content)) {

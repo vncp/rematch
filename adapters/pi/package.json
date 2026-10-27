@@ -1,0 +1,12 @@
+{
+  "name": "@vncp/rematch-pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "rematch for Pi (@earendil-works/pi-coding-agent): traces, shared skills through resources_discover, approved hooks, the rematch tool and /rematch.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": { "test": "bun test" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "^1.4.0" },
+  "devDependencies": { "@earendil-works/pi-coding-agent": "1.4.0" }
+}

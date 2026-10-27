@@ -11,8 +11,8 @@ Every variable below is named in the docs or read by the code; the last column s
 |---|---|---|---|
 | `REMATCH_ROOT` | `~/.rematch` | root of all rematch state; shared by every omp profile; one root per environment (home and work are separate libraries) | DESIGN §1 |
 | `REMATCH` | on | `REMATCH=0`: off for one process (the extension registers only the `rematch` tool and `/rematch`; the binary refuses reflect and stage) | DESIGN §1 |
-| `REMATCH_BIN` | `target/release/rematch` → `target/debug/rematch` of the checkout → `PATH` | the binary the omp extension and the Claude Code plugin run | extension and Claude Code READMEs |
-| `OMP_BIN` | `omp` on `PATH` | the omp the binary calls for the editor, classifier and batch rollouts; also gates the Claude Code plugin's reflection | DESIGN §14 |
+| `REMATCH_BIN` | checkout `target/release/rematch` → `target/debug/rematch` → `PATH` | binary used by the live harness adapters | adapter READMEs |
+| `OMP_BIN` | `omp` on `PATH` | omp backend for editor, classifier and batch rollouts; adapters use availability to decide whether to start reflection | DESIGN §14, §18 |
 | `REMATCH_MACHINE` | the host name | this machine's name in the lake and the profile; fixed in the ledger at first use | DESIGN §13, §20 |
 | `REMATCH_BELLWETHER` | `bellwether` on `PATH` | the Bellwether binary for `lake index` / `lake query` (`--bellwether` wins) | DESIGN §19.2 |
 | `REMATCH_NO_LAKE` | `0` | `1`: `scripts/install.sh` builds with `--no-default-features` (no lake) | `scripts/install.sh` |
@@ -41,6 +41,15 @@ rematch resolves the omp agent dir exactly as omp does. `~/.rematch` stays share
 | `CLAUDE_CONFIG_DIR` | relocates `~/.claude` (transcripts for `import --history --harness claude-code`) | DESIGN §18.1 |
 | `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` | raises Claude Code's 1.5 s `SessionEnd` budget (e.g. `5000`) | Claude Code README |
 | `CODEX_HOME` | Codex's home (default `~/.codex`); history is read from `$CODEX_HOME/sessions` | DESIGN §18.2.1 |
+| `PI_BIN` | overrides the Pi binary inspected by `doctor` | `doctor.rs` |
+| `REMATCH_PI_AGENT_DIR` | explicit Pi input/config location for Rematch; normally passed by the Pi adapter, else `~/.pi/agent` | Pi API notes |
+| `REMATCH_PI_SESSION_DIR` | explicit Pi history directory; wins over `PI_CODING_AGENT_SESSION_DIR` | Pi API notes |
+| `PI_CODING_AGENT_SESSION_DIR` | Pi history override when it does not point inside omp's config root | `import_pi.rs` |
+| `OPENCODE_DB` | absolute store path or filename under OpenCode's data dir; default `opencode.db` | OpenCode API notes |
+| `XDG_DATA_HOME` | OpenCode history under `<value>/opencode`; default `~/.local/share/opencode` | OpenCode API notes |
+| `XDG_CONFIG_HOME` | OpenCode global config under `<value>/opencode`; default `~/.config/opencode` | OpenCode API notes |
+
+The Pi adapter removes Pi's `PI_CODING_AGENT_DIR` and session-dir override from its Rematch child processes, passing their input locations through `REMATCH_PI_*` instead. Pi's configuration must not become the omp backend's configuration.
 
 ## Set by rematch for child processes
 

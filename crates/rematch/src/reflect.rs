@@ -1293,8 +1293,8 @@ impl HistoryStage {
 /// `reflect --history`: every imported session that is flagged, has no trace file and no
 /// `history_reflected_at` marker, newest first, gets `traces/<sid>.jsonl` from its records —
 /// the lake's `events/<harness>/<day>/<sid>.parquet` when there is one (ADR 001 L4), else
-/// synthesized from its harness transcript (`import_cmd::read_transcript`: omp, Claude Code
-/// or Codex by id prefix, `mode: "import"`) — and `pending/<sid>.json`, so the
+/// synthesized from its harness transcript (`import_cmd::read_transcript`: omp, Claude Code,
+/// Codex, Pi or OpenCode by id prefix, `mode: "import"`) — and `pending/<sid>.json`, so the
 /// normal loop (count + reflect, rate limits, ≤ 3 model calls) handles it. At most `limit`
 /// pending files per run. Sessions ruled out for good (subagent files, or not flagged by the
 /// extension's rule) are marked too; a missing session file is left for a later run.

@@ -9,6 +9,8 @@ pub mod trace; // own trace JSONL → TraceRecord stream + SessionRecord fold
 pub mod import; // omp session JSONL → SessionRecord (+ skill reads, outcomes from receipts)
 pub mod import_claude; // Claude Code ~/.claude/projects/<slug>/<uuid>.jsonl → TraceRecord stream
 pub mod import_codex; // Codex ~/.codex/sessions/**/rollout-*.jsonl → TraceRecord stream
+pub mod import_pi; // Pi <agent dir>/sessions/--<cwd>--/<ts>_<id>.jsonl → TraceRecord stream
+pub mod import_opencode; // OpenCode opencode.db (SQLite) sessions → TraceRecord stream
 pub mod redirect; // heuristics + classifier batch prompt building/parsing
 pub mod features; // tokenization, stop words, Porter stemming, tf-idf stems, Jaccard
 pub mod words; // Bellwether's `words` tokenizer: case fold + UAX #29 words (text keys, `create --ran`)

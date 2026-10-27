@@ -1,35 +1,33 @@
 ---
 title: Harness capabilities
-description: What works in omp, Claude Code and Codex, and the commands each harness offers.
+description: Supported harnesses, verified versions, runtime capabilities and installation limits.
 ---
 
-The binary, ledger, lint, counters and entries are the same for every harness; an adapter forwards only what its harness exposes. omp is the reference; Claude Code runs the loop live through a plugin of hooks; Codex is read after the fact.
+Rematch's binary, shared skills and counters are common. Adapters use each host's own event and skill APIs; they do not make every harness interchangeable.
 
-Session ids carry the harness, so one ledger holds all of them: omp's are bare, Claude Code's `cc:<uuid>`, Codex's `codex:<id>`. No model call ever runs inside a Claude Code or Codex session.
+Reflection model calls and batch rollouts still use **omp**, even when evidence comes from another harness. Session ids distinguish sources: bare omp ids, `cc:`, `codex:`, `pi:` and `oc:`. Pi/OpenCode resume segments add `:r<n>` so finished evidence stays immutable.
 
 ## Capability matrix
 
-| Capability | omp | Claude Code | Codex |
-|---|---|---|---|
-| Trace: inputs, tool results, errors, turns, model | ✓ | ✓ (turns and model read from the transcript at `Stop`) | partial (after the fact, from `~/.codex/sessions` at import) |
-| Redirect pre-labels + `mark` | ✓ | ✓ (`/rematch:rematch-mark`) | partial (at import; `rematch mark --session codex:<id>`) |
-| Takeover (input while the agent runs) | ✓ | ✓ (a prompt delivered into the running turn; an Esc abort read from the transcript) | partial (at import: steers, prompts after an aborted turn) |
-| Flag + pending reflection | ✓ | ✓ (at `SessionEnd`, 1.5 s budget) | partial (`reflect --history`) |
-| Provisional skill loading | ✓ | ✓ (plugin `skills/` → the shared dir, synced at `SessionStart`) | partial (shared dir; `skills sync` by hand; visible in every session) |
-| Kept skill loading | ✓ | ✓ | ✓ |
-| Loaded entries for counting | ✓ | ✓ | partial (reconstructed at import from the rollout's skill list) |
-| Subagent entries | ✓ | ✓ (copied into the plugin's `agents/` at `SessionStart`) | — |
-| `block` hooks | ✓ | ✓ (`PreToolUse`, exit 2) | — |
-| `stuck` hooks | ✓ | partial (completed calls only; not in subagents) | — |
-| `retrieve` (unit retrieval) | ✓ (before every request) | partial (once per prompt, when the units change) | — |
-| `truncate` (tool-output truncation) | ✓ | — (no hook rewrites earlier tool results) | — |
-| Digest + one-tap approvals | ✓ | partial (digest at `SessionStart`; approve with `/rematch:rematch-approve <id>`, no dialog) | partial (`$rematch-status` skill) |
-| `/rematch` commands | ✓ (all, plus the `rematch` tool) | partial (status, why, mark, library, approve, decline, off, on; create/improve in a shell) | partial (`$rematch-status` skill) |
-| Reflection trigger (`reflect --pending`) | ✓ (spawned at session start) | ✓ (spawned detached at `SessionStart`; needs omp for the model calls) | — (`rematch reflect --history`) |
-| Batch mode (`run`) | ✓ | — | — (plan: DESIGN §18.2.4) |
-| History import | ✓ | ✓ | ✓ |
+| Capability | omp | Claude Code | Pi 1.4.0 | OpenCode 1.19.4 | Codex |
+|---|---|---|---|---|---|
+| Live main-session trace | Yes | Yes | Yes | Yes | No: import rollouts |
+| Corrections and explicit marks | Yes | Yes | Yes | Yes | Post-hoc |
+| Shared skills | Yes | Yes | Native resource discovery | In-memory `skills.paths` | Sync before launch |
+| Approved blocking hooks | Yes | Yes | Yes | Yes | No |
+| Stuck-call detection | Yes | Completed calls | Yes | Completed calls | No |
+| Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
+| Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
+| Generated subagents | Yes | Adapted copies | No native subagent definitions | Not delivered | No |
+| Digest | Notifications/dialog | Session-start message | Notifications/dialog | TUI toast or command | CLI/optional status skill |
+| User approval | Dialog or command | Command | Dialog or command | Command | CLI |
+| Detached reflection trigger | Session start | Session start | Session start | Plugin start | Manual |
+| History importer | Yes | Yes | Native session files | Read-only SQLite store | Rollout files |
+| Batch solver | omp | Uses omp | Uses omp | Uses omp | Uses omp |
 
-Why each gap exists: [status and limits](/rematch/background/status/#claude-code-limits).
+**Verified targets:** omp 18.12.6, Claude Code 2.1.285, `@earendil-works/pi-coding-agent` 1.4.0, and `opencode-ai` / `@opencode-ai/plugin` 1.19.4. Old Pi package names and OpenCode 2 are not tested compatibility targets.
+
+Pi and OpenCode acceptance tests launch their **real pinned runtimes** with a local scripted model and isolated state. This proves adapter behavior, not cloud-provider performance or a measured improvement in the agent.
 
 ## Commands per harness
 
@@ -46,6 +44,17 @@ Why each gap exists: [status and limits](/rematch/background/status/#claude-code
 - Everything else (`create`, `improve`, `run`, `disable`, `rollback`, …) is the `rematch` CLI in a terminal.
 - Codex has no `/rematch` command. The optional `$rematch-status` skill runs the sync, digest and approvals, each command after your approval.
 - In omp, most `/rematch <sub>` commands run `rematch <sub>`; `why`, `library`, `disable`, `rollback`, `approve`, `decline`, `mark` and `digest` differ ([the mapping](/rematch/guides/day-to-day/#omp-commands-and-the-cli)). Approving and uninstalling are reserved to you, never the `rematch` tool.
+- Pi uses `/rematch <subcommand>` and a model-facing `rematch` tool. User-only controls stay in commands and digest confirmations. Install with `pi install /path/to/rematch/adapters/pi`.
+- OpenCode registers `/rematch-status`, `-why`, `-library`, `-digest`, `-mark`, `-approve`, `-decline`, `-off` and `-on`. The model-facing tool is read-only. Configure the plugin's checkout path; do not overwrite the rest of `opencode.json`.
+
+## Pi and OpenCode limits
+
+- **Pi:** no native subagent-definition surface. Retrieved context is a hidden custom message that Pi sends as user-role content; it is not counted as a human correction.
+- **OpenCode:** no reliable session-end event. Idle ends a run; finalization happens on process disposal, crash reconciliation, or a six-hour quiet-session cutoff. Resume then starts a new segment.
+- **OpenCode:** main sessions are traced live; child sessions are imported afterwards. Generated agent profiles and an approval dialog are not implemented.
+- **Both:** installation uses a local checkout. Their shared-helper imports are not a standalone npm release. Reflection requires omp; a missing optional harness does not make other integrations unusable.
+
+The adapters' shell checks catch direct attempts to invoke user-only controls. They are not a sandbox against an agent that already has arbitrary shell access.
 
 ## How each adapter is wired
 
@@ -56,4 +65,4 @@ Why each gap exists: [status and limits](/rematch/background/status/#claude-code
 | Skills | plugin `skills/` → `~/.rematch/skills` (made at the first `SessionStart`) | `~/.agents/skills/rematch` → `~/.rematch/skills` |
 | Fails | never fails a hook except by an intentional block | nothing runs in the session |
 
-Hook-by-hook mapping and files: [`adapters/claude-code/README.md`](https://github.com/vncp/rematch/blob/main/adapters/claude-code/README.md), [`adapters/codex/README.md`](https://github.com/vncp/rematch/blob/main/adapters/codex/README.md). Contracts: DESIGN §18.
+Hook mappings, exact installation and smoke coverage: [Claude Code](https://github.com/vncp/rematch/blob/main/adapters/claude-code/README.md), [Pi](https://github.com/vncp/rematch/blob/main/adapters/pi/README.md), [OpenCode](https://github.com/vncp/rematch/blob/main/adapters/opencode/README.md), [Codex](https://github.com/vncp/rematch/blob/main/adapters/codex/README.md). Contract: DESIGN §18.

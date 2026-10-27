@@ -1,7 +1,8 @@
-//! `skills sync --cwd <dir> [--harness omp|claude-code|codex]` (DESIGN §16 "Shared skills"):
-//! `REMATCH_ROOT/skills/` is the one skill directory every harness loads — omp through
+//! `skills sync --cwd <dir> [--harness omp|claude-code|codex|pi|opencode]` (DESIGN §16 "Shared
+//! skills"): `REMATCH_ROOT/skills/` is the one skill directory every harness loads — omp through
 //! `skills.customDirectories`, Claude Code through the plugin's `skills/` symlink, Codex
-//! through `~/.agents/skills/rematch`. The link rules live in
+//! through `~/.agents/skills/rematch`, Pi through the Pi package's `resources_discover`, OpenCode
+//! through its plugin. The link rules live in
 //! [`rematch_core::library::sync_shared_skills`] (kept sources include every
 //! `profile/skills/<name>/` of the profile, DESIGN §20); this module adds the cwd, the
 //! per-harness reach checks, the migration from the per-harness directories of older versions,
@@ -43,6 +44,11 @@ pub enum SyncHarness {
     Omp,
     ClaudeCode,
     Codex,
+    /// Pi: the rematch Pi package returns the shared dir from `resources_discover`.
+    Pi,
+    /// OpenCode: the shared sync only; the rematch OpenCode plugin delivers the dir.
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 /// Per-harness link directories of older versions, removed after the first shared sync.
@@ -407,7 +413,10 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
             lines.push("Codex has no per-session gating: every link is visible in every Codex session; counting still needs a predicate hit".into());
             out["reached_from"] = json!(reached);
         }
-        Some(SyncHarness::Omp) | None => {}
+        Some(SyncHarness::Pi) => lines.push(
+            "Pi loads the shared dir through the rematch Pi package (`resources_discover`), at session start and `/reload`".into(),
+        ),
+        Some(SyncHarness::Omp | SyncHarness::OpenCode) | None => {}
     }
     for m in &migrated {
         lines.push(format!("migrated: removed or re-pointed {}", m.display()));
@@ -416,6 +425,8 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
         SyncHarness::Omp => "omp",
         SyncHarness::ClaudeCode => "claude-code",
         SyncHarness::Codex => "codex",
+        SyncHarness::Pi => "pi",
+        SyncHarness::OpenCode => "opencode",
     }));
     out["migrated"] = json!(migrated);
     out["lines"] = json!(lines);

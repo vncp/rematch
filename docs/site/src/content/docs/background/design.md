@@ -494,7 +494,7 @@ Worker (`run-worker`): reference rollout (pending entries of the task loaded) �
 
 ## 18. Adapters
 
-One binary, one ledger, one lint and one set of counters and entries serve every harness. An adapter only forwards what its harness exposes; the trace schema (§3), the flag rule, matching and hook evaluation stay in Rust. Session ids are prefixed per harness so the ledger and `traces/` never collide: omp ids are bare UUIDs, Claude Code sessions are `cc:<uuid>` (`cc:<uuid>:agent-<id>` for an imported subagent transcript), Codex sessions `codex:<id>`. `import_cmd::Transcripts` dispatches on the prefix wherever a ledger session's transcript is read back (`records_for_session`, `reflect --history`, `improve`).
+One binary, one ledger, one lint and one set of counters and entries serve every harness. Adapters normalize host events into the trace schema (§3); cheap runtime checks stay in the adapter when the host requires an in-process handler, while admissions, reflection and counters stay in Rust. Session ids are namespaced: omp uses bare ids, Claude Code `cc:<id>`, Codex `codex:<id>`, Pi `pi:<id>`, and OpenCode `oc:<id>`. Pi and OpenCode may add `:r<n>` for a resumed segment so finished, counted evidence is never overwritten. `import_cmd::Transcripts` routes history, `reflect --history`, `improve` and lake export through the corresponding parser.
 
 ### 18.1 Claude Code (`adapters/claude-code/`)
 
@@ -608,6 +608,34 @@ Not built: the worker (`batch/worker.rs`), `Substrate::rollout_cmd` (returns `om
 4. Stream check (replacing `omp::verify_stream`): every non-empty line JSON, exactly one `thread.started`, ≥ 1 `turn.completed`, no `turn.failed` or `error` event; otherwise the rollout is invalid (verdict Fail "rollout invalid" without running the verifier), a time-capped run is still judged.
 5. Trajectory: `import_codex::parse_session(stdout)` + `trace_records_of` (unit-tested on an `exec --json` stream), worktree path rewritten to the repo, `loaded_entries` = the materialized tree's ids, model = the `-m` value.
 6. Verifier, receipts, next-run rule and anchor replay unchanged (anchor replay runs with the harness of the run that triggered it).
+
+### 18.3 Pi (`adapters/pi/`, `rematch_core::import_pi`)
+
+Target: `@earendil-works/pi-coding-agent` **1.4.0**, verified under Node with a local scripted model. The retired `@mariozechner/pi-coding-agent` package is not the tested target. Exact API sources and runtime observations: [`adapters/pi/API-NOTES.md`](https://github.com/vncp/rematch/blob/main/adapters/pi/API-NOTES.md).
+
+- Install from the checkout with `pi install /path/to/rematch/adapters/pi`; for a single session use `pi -e /path/to/rematch/adapters/pi`. This is not a published npm artifact: imports of shared helpers stay relative to the checkout.
+- `session_start` runs bounded `match`/`skills sync`; **native `resources_discover`** contributes `REMATCH_ROOT/skills`. No omp settings-registry override is used.
+- Native input, tool-execution, turn and settlement events record evidence. Extension-generated inputs do not become user corrections; successful skill reads are distinguished from failed reads.
+- `/rematch` and the model's `rematch` tool share the CLI bridge. Approval and other user-only controls are refused by the model tool; digest confirmations are user interactions. This is a control-plane restriction, not an OS sandbox.
+- Approved block/stuck rules run before tool calls. Approved retrieval/truncation act on outgoing context only. Pi converts the hidden retrieval message to a **user-role** provider message; it is never counted as a human input.
+- Runtime reload continues an unfinished trace; resuming a closed session creates `pi:<id>:r<n>`. Forked/copied history is context, not new evidence.
+- Pi's `PI_CODING_AGENT_DIR` must not redirect Rematch's omp backend. Child calls pass the Pi paths in `REMATCH_PI_AGENT_DIR` / `REMATCH_PI_SESSION_DIR`, leaving omp model-role resolution separate.
+- History import reads Pi's native session files via `import --history --harness pi`. Native Pi has no subagent-definition surface; agent entries are not loaded or counted there. Reflection and verifier-driven batch rollouts still require omp.
+
+### 18.4 OpenCode (`adapters/opencode/`, `rematch_core::import_opencode`)
+
+Target: `opencode-ai` and `@opencode-ai/plugin` **1.19.4**. The plugin uses the local package directory's `exports["./server"]`; configure `plugin: ["/path/to/rematch/adapters/opencode"]` without replacing other config. This is checkout-based support, not an npm publication or a claim about OpenCode 2.
+
+Verified API and test evidence: [`adapters/opencode/API-NOTES.md`](https://github.com/vncp/rematch/blob/main/adapters/opencode/API-NOTES.md).
+
+- The plugin adds `REMATCH_ROOT/skills` to **in-memory `skills.paths`** and registers `/rematch-*` commands. It does not rewrite user configuration.
+- `chat.message` provides human prompts; synthetic parts and command expansions are excluded. Tool-part state transitions supply successful and failed results, including thrown tools and nonzero bash exits. A successful native `skill` call records skill activity.
+- Approved block/stuck rules run through `hook-check` before tools. Retrieval uses `experimental.chat.system.transform`, appending units to the outgoing request's system content without manufacturing a user input. Truncation uses `experimental.chat.messages.transform`; stored history is unchanged.
+- The model tool is read-only. User approval commands remain explicit; the direct shell-command guard is a pattern check, not an execution sandbox.
+- **Idle is not session end.** A main trace finalizes at last-owner disposal, reconciliation after owner-process death, or six hours quiet with no running turn. A later continuation starts `oc:<id>:r<n>`; a counted segment is not mutated. Parent-written child prompts do not count as human corrections.
+- Native history is read from OpenCode's SQLite store **read-only**, via `import --history --harness opencode`. Prefix routing covers reflection, improvement, counters and lake export.
+- No generated agent-profile renderer, live subagent tracing, approval dialog or OpenCode batch solver is shipped. Reflection continues through omp; an absent omp backend does not block live tracing.
+- Acceptance used the real pinned OpenCode CLI with an isolated HOME/XDG/Rematch root and a local scripted model: plugin loading, shared native skill use, failures, approved blocking, retrieval, resume/crash finalization and counter idempotence. Stuck and truncation policy edges have deterministic tests; the TUI toast and cloud-provider inference were not exercised.
 
 ## 19. The lake (ADR 001)
 

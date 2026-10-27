@@ -18,6 +18,7 @@ pub mod lake_cmd;
 pub mod lake_migrate;
 pub mod lake_read;
 pub mod omp;
+pub mod opencode_event;
 pub mod policy_cmd;
 pub mod profile_cmd;
 pub mod proc;
@@ -39,7 +40,7 @@ use app::AppCtx;
 use envelope::{Envelope, EXIT_OK, EXIT_USAGE};
 
 #[derive(Parser, Debug)]
-#[command(name = "rematch", version, about = "rematch: trace-grounded harness evolution for omp, Claude Code and Codex")]
+#[command(name = "rematch", version, about = "rematch: trace-grounded harness evolution for omp, Claude Code, Codex, Pi and OpenCode")]
 struct Cli {
     /// Human-readable output instead of the JSON envelope.
     #[arg(long, global = true)]
@@ -55,7 +56,7 @@ struct Cli {
 enum Cmd {
     /// omp binary + version, roles, extension link, ledger schema, roots, off state.
     Doctor,
-    /// Import omp session history and/or a compound-forge checkout.
+    /// Import session history (omp, Claude Code, Codex, Pi, OpenCode) and/or a compound-forge checkout.
     Import(import_cmd::ImportArgs),
     /// Count finished traces, then reflect on pending sessions (idempotent).
     Reflect(reflect::ReflectArgs),
@@ -72,9 +73,9 @@ enum Cmd {
     Digest,
     /// Append an event for a session (marks); the trace file stays the primary input.
     Record(reflect::RecordArgs),
-    /// Harness hook payload on stdin → DESIGN §3 trace records (Claude Code adapter).
+    /// Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters).
     TraceEvent(trace_event::TraceEventArgs),
-    /// Harness `PreToolUse` payload on stdin → approved block/stuck hooks verdict (Claude Code adapter).
+    /// Harness pre-tool payload on stdin → approved block/stuck hooks verdict (Claude Code, OpenCode adapters).
     HookCheck(trace_event::TraceEventArgs),
     /// Greenfield: create an entry from sessions, a task, or a description (draft).
     Create(create::CreateArgs),

@@ -927,6 +927,7 @@ dependencies = [
  "regex",
  "rematch-core",
  "rematch-lake",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

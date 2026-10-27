@@ -38,6 +38,20 @@ cargo build --release
 ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
 ```
 </TabItem>
+<TabItem label="Pi">
+```sh
+cargo build --release
+pi install "$PWD/adapters/pi"
+```
+Pi 1.4.x, from a Rematch checkout.
+</TabItem>
+<TabItem label="OpenCode">
+Add the checkout path to OpenCode's `plugin` array:
+```json
+{ "plugin": ["/path/to/rematch/adapters/opencode"] }
+```
+Build Rematch first. Tested with OpenCode 1.19.4.
+</TabItem>
 <TabItem label="Codex">
 ```sh
 ln -s ~/.rematch/skills ~/.agents/skills/rematch
@@ -47,7 +61,7 @@ Run the sync before starting Codex in a repo.
 </TabItem>
 </Tabs>
 
-Then work as usual. After a session with a correction, rematch can propose a change at the next session start.
+The live adapters trace while you work; Codex uses post-hoc import. Reflection uses omp with model access. See [installation and requirements](/rematch/start/install/) before starting.
 
 ## The loop
 

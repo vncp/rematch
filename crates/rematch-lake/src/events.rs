@@ -75,12 +75,17 @@ pub fn read_trace(path: &Path) -> Result<Trace> {
     Ok(Trace { records, closed, start })
 }
 
-/// The harness of a session id (DESIGN §1: `cc:<uuid>` Claude Code, `codex:<id>` Codex).
+/// The harness of a session id (DESIGN §1: `cc:<uuid>` Claude Code, `codex:<id>` Codex,
+/// `pi:<id>` Pi, `oc:<id>` OpenCode).
 pub fn harness_of(session_id: &str) -> &'static str {
     if session_id.starts_with("cc:") {
         "claude-code"
     } else if session_id.starts_with("codex:") {
         "codex"
+    } else if session_id.starts_with("pi:") {
+        "pi"
+    } else if session_id.starts_with("oc:") {
+        "opencode"
     } else {
         "omp"
     }
@@ -288,6 +293,8 @@ mod tests {
     fn harness_and_day() {
         assert_eq!(harness_of("cc:1"), "claude-code");
         assert_eq!(harness_of("codex:1"), "codex");
+        assert_eq!(harness_of("pi:1:r2"), "pi");
+        assert_eq!(harness_of("oc:ses_1"), "opencode");
         assert_eq!(harness_of("019a"), "omp");
         assert_eq!(day_of(0), "1970-01-01");
         assert_eq!(day_of(1_761_436_800_000), "2025-10-26");

@@ -1,12 +1,12 @@
 ---
 title: Install
-description: Install rematch for omp, Claude Code or Codex, check it, and seed it from the sessions you already have.
+description: Install rematch for your coding harness, check the connection, and seed it from existing sessions.
 next: false
 ---
 
 import { Tabs, TabItem, Steps, Aside, LinkCard } from '@astrojs/starlight/components';
 
-Install the binary and connect it to your harness. It takes one command per harness, plus a check.
+Install the binary, connect your harness, and check the connection.
 
 One binary, ledger and library serve every harness; an adapter only forwards what its harness exposes. omp is the reference. What each harness can and cannot do: [harness capabilities](/rematch/reference/harnesses/).
 
@@ -87,6 +87,94 @@ CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000 claude
 ```
 
 </TabItem>
+<TabItem label="Pi">
+
+Use Pi 1.4.x (`@earendil-works/pi-coding-agent`) and Node 22.19 or newer. Keep this checkout available: the adapter imports Rematch's shared helpers from it.
+
+<Steps>
+
+1. Build Rematch and put its binary on your shell's path:
+
+   ```sh
+   cargo build --release
+   export PATH="$PWD/target/release:$PATH"
+   ```
+
+2. Install the local Pi package:
+
+   ```sh
+   pi install "$PWD/adapters/pi"
+   ```
+
+   For one session instead:
+
+   ```sh
+   pi -e "$PWD/adapters/pi"
+   ```
+
+3. Start Pi and check:
+
+   ```text
+   /rematch status
+   ```
+
+</Steps>
+
+Pi discovers `~/.rematch/skills` through its native resource-discovery hook. Tracing and approved runtime hooks run in Pi; background reflection still needs omp with configured model access.
+
+<Aside type="note" title="Which Pi?">
+This adapter targets the maintained `@earendil-works/pi-coding-agent` package. The older `@mariozechner/pi-coding-agent` package is not the tested target.
+</Aside>
+
+Remove the package with `pi remove /path/to/rematch/adapters/pi`. See the [adapter notes](https://github.com/vncp/rematch/blob/main/adapters/pi/README.md) for session resume behavior and limits.
+
+</TabItem>
+<TabItem label="OpenCode">
+
+Use OpenCode **1.19.4** and a local Rematch checkout. OpenCode 2 is not a tested target.
+
+<Steps>
+
+1. Build the Rematch binary:
+
+   ```sh
+   cargo build --release
+   export PATH="$PWD/target/release:$PATH"
+   ```
+
+2. Add this entry to the existing `plugin` array in your global
+   `~/.config/opencode/opencode.json`, or a project's `opencode.json`:
+
+   ```json
+   {
+     "plugin": ["/path/to/rematch/adapters/opencode"]
+   }
+   ```
+
+   Merge it with your existing configuration; do not replace other plugins.
+
+3. Start OpenCode and check:
+
+   ```text
+   /rematch-status
+   ```
+
+</Steps>
+
+The plugin adds Rematch's shared directory to OpenCode's in-memory skill paths.
+It traces main sessions, runs approved hooks, and provides user commands for approvals.
+Reflection still needs omp with configured model access.
+
+<Aside type="note" title="Finishing a session">
+OpenCode's idle event ends a turn, not the session. Rematch waits for process disposal,
+crash recovery or its documented quiet-session cutoff before finalizing evidence.
+A later continuation gets a new trace segment rather than rewriting counted history.
+</Aside>
+
+See the [OpenCode adapter](https://github.com/vncp/rematch/blob/main/adapters/opencode/README.md)
+for supported hooks, session boundaries and history import.
+
+</TabItem>
 <TabItem label="Codex">
 
 You need `rematch` on `PATH` (`scripts/install.sh`, or `cargo build --release`). The omp plugin is not required. Nothing runs inside a Codex session; rematch reads its sessions afterwards.
@@ -153,7 +241,7 @@ rematch import --history
 rematch reflect --history
 ```
 
-- `import --history` reads omp (default agent dir and every profile), Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`). Narrow it with `--harness omp|claude-code|codex` or `--skip-profile <name>`.
+- `import --history` reads available omp, Claude Code, Codex, Pi and OpenCode history. Use `--harness omp|claude-code|codex|pi|opencode` to select one, or `--skip-profile <name>` to exclude an omp profile. Each adapter documents its history location and environment overrides.
 - `reflect --history` handles the newest 10 flagged sessions per run (`--limit`, `--since 2026-10-01`). Run it again for the next batch; a session is reflected once.
 - Each reflection follows the same rules as a live one: same rate limits, at most 3 model calls.
 

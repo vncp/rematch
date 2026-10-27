@@ -1,0 +1,22 @@
+{
+  "name": "@vncp/rematch-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "rematch for OpenCode: traces sessions, loads the shared skills, runs approved hooks",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    "./server": "./index.ts"
+  },
+  "engines": {
+    "opencode": ">=1.19.4 <2"
+  },
+  "scripts": {
+    "test": "bun test test/unit.test.ts",
+    "smoke": "bun test/smoke.ts"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.19.4",
+    "opencode-ai": "1.19.4"
+  }
+}
