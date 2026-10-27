@@ -11,6 +11,7 @@ pub mod import_claude; // Claude Code ~/.claude/projects/<slug>/<uuid>.jsonl →
 pub mod import_codex; // Codex ~/.codex/sessions/**/rollout-*.jsonl → TraceRecord stream
 pub mod redirect; // heuristics + classifier batch prompt building/parsing
 pub mod features; // tokenization, stop words, Porter stemming, tf-idf stems, Jaccard
+pub mod words; // Bellwether's `words` tokenizer: case fold + UAX #29 words (text keys, `create --ran`)
 pub mod outcome; // Outcome signature/normalization, MinHash
 pub mod family; // family_of(provider, model) → Family
 

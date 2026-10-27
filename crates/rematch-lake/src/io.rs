@@ -1,5 +1,6 @@
-//! Parquet files: written once to a temp name and renamed (never rewritten), read back
-//! as journal rows for `lake rebuild`, and listed per table root.
+//! Parquet files: written once to a temp name and renamed (never rewritten, but for an
+//! events file's one schema upgrade), read back as journal rows for `lake rebuild`, and
+//! listed per table root.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,17 @@ pub fn write_once(path: &Path, batch: &RecordBatch) -> Result<bool> {
     if path.exists() {
         return Ok(false);
     }
+    write_atomic(path, batch)?;
+    Ok(true)
+}
+
+/// Replaces the file at `path` with `batch` through a temp name (an events file's schema
+/// upgrade, `events::upgrade`; nothing else rewrites a lake file).
+pub fn replace(path: &Path, batch: &RecordBatch) -> Result<()> {
+    write_atomic(path, batch)
+}
+
+fn write_atomic(path: &Path, batch: &RecordBatch) -> Result<()> {
     let dir = path.parent().ok_or_else(|| anyhow!("no parent for {}", path.display()))?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
@@ -46,7 +58,7 @@ pub fn write_once(path: &Path, batch: &RecordBatch) -> Result<bool> {
         return Err(e.context(format!("write {}", path.display())));
     }
     std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
-    Ok(true)
+    Ok(())
 }
 
 /// Copies `src` to `dst` through a temp name unless `dst` exists. Returns whether it copied.

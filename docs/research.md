@@ -20,6 +20,8 @@ An agent is a model plus a harness, and changing the harness changes results wit
 
 ## 2. Decisions and their evidence
 
+<!-- ANCHOR: decisions -->
+
 | # | Decision in the v2 spec | Evidence | Source |
 | --- | --- | --- | --- |
 | D1 | No proposal without an execution trace | Editing the harness directly, without reference executions or probes, degraded performance: WB-code 73.4 → 63.2, WB-web 69.9 → 65.0 | Harness² §4, Fig. 7 left |
@@ -50,6 +52,8 @@ An agent is a model plus a harness, and changing the harness changes results wit
 | D26 | Verifiers never evolve by agent score | Verifier selected without anchors collapsed to always-pass while downstream scores still rose; self-evolution without execution-based verification scored 31.79 < blank harness 33.95 | Who Verifies the Verifier? (NeurIPS 2026 WS); VERSE (2610.02616) |
 | D27 | Redirect classification needs recurrence thresholds | DSAT detection agreed with humans at κ = 0.50; 42% of invalid misalignment extractions were "normative prior bias"; users leave text feedback ~2× more when dissatisfied | WildFeedback (2408.15549); How Coding Agents Fail Their Users |
 | D28 | Session outcome records with exact signature, MinHash, facets | Research-log of tested hypotheses prevents retesting; "stop at 6 queries" overfit (95% one batch, 15% next) | Adaptive Auto-Harness |
+
+<!-- ANCHOR_END: decisions -->
 
 ---
 

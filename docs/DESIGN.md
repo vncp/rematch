@@ -45,6 +45,7 @@ Root `REMATCH_ROOT` = `$REMATCH_ROOT` or `~/.rematch` (shared across profiles). 
 
 ### Files under REMATCH_ROOT
 
+<!-- ANCHOR: files -->
 ```
 traces/<session_id>.jsonl         extension / adapter trace (schema §3); Claude Code sessions `cc:<uuid>`, Codex `codex:<id>` (§18)
 pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect
@@ -70,6 +71,7 @@ builtins.version  .builtins.lock  hash of the shipped built-in entries (§10) an
 lake/  lake-index/  .lake.lock   the lake (§19.1): journal + closed sessions as Parquet, written by `lake export`; Bellwether indexes per machine (L3, never synced); export/import/rebuild lock
 off                               kill switch marker
 ```
+<!-- ANCHOR_END: files -->
 
 ## 2. CLI (binary `rematch`)
 
@@ -78,7 +80,7 @@ Every subcommand prints exactly one JSON line on stdout:
 Human-readable output only with `--text`. Logs go to stderr.
 
 ```
-doctor                                     omp binary+version, roles resolved (provider/model), extension linked?, ledger schema version, root + agent_dir + profiles (active/existing/skipped), off?
+doctor                                     {ready, problems, harnesses:{omp, claude-code, codex, profile, lake, built-ins}, omp, roles, extension, ledger, improver, paths, profiles, pending, off, lines}: one block per harness/service, each {status: ok|not set up|problem, problems, …}: omp (binary + version, extension linked in omp-plugins.lock.json/node_modules and loadable: package.json is @vncp/rematch and every omp.extensions entry exists), claude-code (<CLAUDE_CONFIG_DIR or ~/.claude>/skills/rematch present and resolving, plugin.json + hooks.json parse, skills/ reaches REMATCH_ROOT/skills, `claude plugin validate` passes — $CLAUDE_BIN else claude on PATH; static checks only without one), codex (~/.agents/skills/rematch reaches REMATCH_ROOT/skills), profile (§20: origin, ahead/behind as of the last fetch, conflicts, launchd: plist written → `launchctl list com.vncp.rematch.profile-sync`, $LAUNCHCTL_BIN else launchctl), lake (§19: journal rows past this machine's watermark, the index pin against the Bellwether binary), built-ins (§10: each one's status; not installed = problem); also roles resolved (provider/model), ledger schema version, improver files, root + agent_dir + profiles (active/existing/skipped), off. A harness that is not set up is never a problem; one set up and broken is. `ready` = no problem. Text: one line per harness (`<name>: <status> · …`), then roles, ledger, agent_dir, root, `problem: …` lines, and last `ready: true` or `ready: false (N problem(s))`
 import --history [--harness omp|claude-code|codex|all] [--sessions <dir>] [--skip-profile <name>...] [--forge <path> [--migrate]]   --harness default all (each harness's default dir that exists); --sessions = the selected harness's dir (with all: an omp dir); clean imported Codex sessions that loaded entries get their synthesized trace written (count folds them)
 reflect --pending [--session <id>] [--editor <cmd>] [--detach] [--history [--since YYYY-MM-DD] [--limit n]]   idempotent per pending file (lock `pending/.lock`); --editor overrides every model call (tests); --detach → {job_id}; --history first hands flagged imported sessions to the loop (≤ n pending files per run, default 10)
 match --cwd <dir> [--inputs <json>]       {branch, repo, skill_dirs:[...], entries:[{id,name,kind,status,predicate_hit,version,sha}], hooks:[path...], off:bool, domain, profile_present}   (provisional agents are listed in every session; they add no skill dir; skill_dirs is kept for compatibility, harnesses load skills/; `domain` = the place's declared domain (§6 "Domain"), or with --inputs the full decision, which then also gates predicate_hit; `profile_present` = `profile/.git` exists, §20)
@@ -87,13 +89,13 @@ digest --cwd <dir>                         {lines:[...], approvals:[{id,name,kin
 record --session <id> --event <json>       accepts `{"ev":"mark","class":…}` only (= mark); every other event belongs in the trace file
 trace-event --harness claude-code [--session <id>] [--hook-output]   one Claude Code hook payload on stdin → §3 records in traces/cc:<uuid>.jsonl (§18.1); --hook-output prints the hook reply instead of the envelope and exits 0 on any error
 hook-check --harness claude-code [--session <id>] [--hook-output]    one PreToolUse payload on stdin → {block, hook_id?, reason?}: approved block/stuck hooks for the payload cwd; a block is traced as tool_blocked and, with --hook-output, exits 2 with the reason on stderr
-create <name> --from sessions|task|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...] [--editor <cmd>]
+create <name> --from sessions|task|description [--task <id>] [--branch <b>] [--description <text>] [--files <p>...] [--ran <word,…>] [--editor <cmd>]   --ran (sessions only): the references are the sessions whose bash commands have every word (case-folded, §19.2 text keys), ranked by overlap with the request without a minimum; from the lake's events `text:tool_cmd` when the lake holds this ledger's journal, else every ledger session's records; {…, references, source, ran}
 improve <skill> [--split-only] [--branch <b>] [--editor <cmd>]
 activate <name> [--task <id> | --unverified]
 run --task <id> --verifier <cmd> [--width k] [--seed n]  → {job_id}
 run-worker --job <id>                      internal, detached
 status [job]
-library ls | why [<session_id>] [--asof <ts>] | disable <id> | rollback <name> | pin <id> | unpin <id> | approve <id> | decline <id> | set-fork-path <id> <repo-relative path> [--repo <fork>] | export [--to <dir>] | import-export [--from <dir>]   (--asof: §19.3)
+library ls | why [<session_id>] [--asof <ts>] | disable <id> | rollback <name> | pin <id> | unpin <id> | approve <id> | decline <id> | set-fork-path <id> <repo-relative path> [--repo <fork>] | export [--to <dir>] | import-export [--from <dir>]   (--asof: §19.3; ls and why also list `profile_kept`: profile/skills/* no entry of this ledger holds, one `kept (profile, from <machine>) …` line each, never counted here, §20)
 task add <id> --repo <path> --prompt <text> [--verifier <cmd>] [--max-time 10m] [--tools ...]
 transfer suggest | transfer apply <lesson_id> --branch <b>
 ship --scope team|fork [--repo <path>] [--entry <id>...]   (fork: --repo defaults to the entry's fork_repo)
@@ -102,11 +104,11 @@ mark --session <id> --class correction|preference|scope
 anchor replay <entry>                      one anchor replay for the kept entry <entry> would replace (§7); reports {kept, anchor:{outcome: replayed|no_verifier, pass, receipt}}, changes no status, writes no receipt
 retrieve --query <text> [--budget 6000] [--min-overlap 2] [--entries <id,…>]   {units:[{entry_id,name,path,title,text,overlap}], used_bytes, query_stems}: units of the package entries loaded for --cwd (match entries with a predicate hit, plus kept/pinned), restricted to --entries (§10 retrieve)
 builtins ls | reinstall [<name>…]         built-in context entries (§10): list with status/approval/counters; re-stage the ones that are not live
-lake export [--all] | import --from <lake> | rebuild [--from <lake>] [--force] [--machine <m>] | doctor | migrate   the lake (§19.1); export also runs, bounded, at the end of `reflect --pending`; rebuild runs before the ledger is opened; every subcommand but `migrate` needs the cargo feature `lake` (default on) and otherwise fails with "built without the lake feature"; `migrate` also (re)applies the domain policy to sessions and entry predicates (§6 "Domain")
-report [--window 6w] [--since YYYY-MM-DD]   the kill criterion (ADR 001 L4, §19.3): {source: lake|ledger, lake_lag, machines, window, kept:[…], triggers:[…], domains:[…], verdict, lines}
+lake export [--all] | import --from <lake> | rebuild [--from <lake>] [--force] [--machine <m>] | doctor | index [<table>…] [--repin] | query <table> --key K (--values v,… | --has w,…) [--from --to] [--valid --known] [--latest] [--all] [--limit n] | migrate   the lake (§19.1, §19.2; --has: a text key's words, all required); export also runs, bounded, at the end of `reflect --pending`; rebuild runs before the ledger is opened; every subcommand but `migrate` needs the cargo feature `lake` (default on) and otherwise fails with "built without the lake feature"; `migrate` also (re)applies the domain policy to sessions and entry predicates (§6 "Domain")
+report [--window 6w] [--since YYYY-MM-DD]   the kill criterion (ADR 001 L4, §19.3): {source: lake|ledger, lake_lag, machines, window, kept:[…], triggers:[…], domains:[…], verdict, profile_kept (with a profile: the count of profile skills no entry here holds, one `profile-kept (not counted on this machine): N` line after the header), lines}
 tune [--dry-run] [--entry <id|name>] [--window 6w]   predicate tuning (§6 "Predicate tuning"): {source: lake|ledger, window, dry_run, entries:[{id, name, version, status, predicate_hash, signals:{read_missed, matched_unread, matched_read, cross_domain_reads, cross_place_reads, source, window_ms}, proposal|null, outcome: staged|would_stage|skipped|no_change, reason?, staged?}], lines}; also run by `count` after its decisions (reported under `tune`)
 policy show | domain set <remote|glob|repo path> <domain> [--subpath <glob>] | domain unset <remote|glob|repo path> [--subpath <glob>] | caps set kept_per_domain <n>   the only writer of policy.json (atomic replace, other keys kept; §6 "Domain", §8); `domain set|unset` report how many recorded sessions `lake migrate` would re-decide
-profile init [--remote <url>] [--adopt] [--timeout 10] | adopt <path> | sync [--no-push] [--timeout 10] | status | install-launchd [--interval 300]   the profile (§20): init = git init or clone, then a sync; sync = commit, fetch + rebase (conflicts aborted, reported), relink the views, push; {offline, conflicts, pulled, pushed, committed, views, collected, lines}
+profile init [--remote <url>] [--adopt] [--timeout 10] | adopt <path> | sync [--no-push] [--timeout 10] | status | install-launchd [--interval 300]   the profile (§20): init = git init or clone, then a sync; sync = commit, fetch + rebase (conflicts aborted, reported), relink the views, push, write profile/.index.json; adopt refuses other harnesses' files (§20); {offline, conflicts, pulled, pushed, committed, views, collected, lines}
 off | on
 uninstall [--yes]
 ```
@@ -115,6 +117,7 @@ uninstall [--yes]
 
 ## 3. Trace schema (extension → binary)
 
+<!-- ANCHOR: trace -->
 `traces/<session_id>.jsonl`, one JSON object per line, written append-only by the extension:
 `{"seq": <u32>, "t": <unix ms>, "ev": "<name>", ...}`. The extension never reads it back.
 
@@ -141,6 +144,8 @@ Claude Code and Codex sessions get the same schema: live from the Claude Code pl
 No trace record carries the session's domain (§6 "Domain"): `session_start` stays as above in the extension and both adapters. The binary decides it from the folded record — `count` (and `reflect`, `create --from task`, `activate`) when it folds a trace, the three importers when they import — so the policy, the branch's `domain.yml` and the inference table in force at that moment apply, and `lake migrate` re-decides it for recorded sessions. Load time knows only the place: `match` reports the place's declared domain as `domain` (§2), which a harness may read but need not echo.
 
 Identity fields by writer (ADR 001): the Claude Code `SessionStart` fills `repo_remote`/`subpath`/`head_sha` by file reads (`identity::identify`: `.git` dir or worktree `gitdir:` file, the common dir's `config`, `HEAD` and refs, no git process), versioned `loaded_entries` from `match`, `visible_entries` from its sync, and `SessionEnd` writes `files_changed`. The three importers fill `repo_remote` and `subpath` from the repo on disk at import time (`identity::session_place`), never `head_sha` or `files_changed` (the import runs after the fact); Codex records its offered rematch skills as `visible_entries` and the loaded ones with version and sha from their `rematch.json`. `count` fills a missing `repo_remote`/`subpath` from the repo on disk (`identity::fill_session`), e.g. an extension trace of a repo without `origin`.
+
+<!-- ANCHOR_END: trace -->
 
 ## 4. Core types (`rematch-core/src/types.rs`, authoritative in Rust)
 
@@ -174,6 +179,7 @@ pub enum RedirectClass { Correction, Preference, Scope, None }
 pub struct Outcome { … exactly SPEC §"Session outcome records" … }
 ```
 
+<!-- ANCHOR: entry-layout -->
 Entry directory layout (`<dir>` = staging/drafts/archive/kept path):
 ```
 <dir>/SKILL.md            frontmatter: name, description, rematch: {id, status, branch, family, version, predicate_hash}
@@ -185,6 +191,7 @@ Entry directory layout (`<dir>` = staging/drafts/archive/kept path):
 <dir>/fork/<basename>     optional: the text `ship --scope fork` writes to `<fork>/<fork_path>`
 <dir>/EXPERIENCE.md       written by the reflector after keep/retire (read-only to the system)
 ```
+<!-- ANCHOR_END: entry-layout -->
 
 ## 5. Ledger (SQLite, `rusqlite` bundled)
 
@@ -280,6 +287,7 @@ Factory (async): read env/off; resolve binary (`$REMATCH_BIN` → `<ext>/../targ
 
 ## 12. lint.toml schema
 
+<!-- ANCHOR: lint -->
 `improver/lint.toml` (copied to `REMATCH_ROOT/improver/` on first run). Every key is optional; a missing key takes the built-in value (`rematch_core::lint::DEFAULT_LINT_TOML`, which the shipped file equals verbatim — a test enforces it). All `[patterns]` entries are Rust `regex` syntax; use TOML multi-line literal strings (`'''…'''`) for patterns containing `'` (inside `'…'`, `''` is **not** an escape).
 
 ```toml
@@ -314,6 +322,7 @@ probes = ["echo ok", "cargo test", "git status", "README.md", "src/lib.rs"]  # a
 ```
 
 Rules (`LintFinding.rule`): `identifiers`, `string_match_user`, `executable_risk` (applied to every file in the entry dir except `rematch.json` and `EXPERIENCE.md`; markdown is linted with its `rematch:` frontmatter block removed; `hook.json` contributes only `message` + `pass_condition`); `trigger` (non-empty repo glob, stem/ext caps, non-empty trigger line present in the SKILL.md body or any `Use when…` line, non-empty `description`; for `kind=agent` the document is `AGENT.md`: frontmatter `name` equal to the entry name and not `main`/`sub`, non-empty `description`, no trigger-line or form-order check on the system prompt); `scripts` (every `scripts/<path>` referenced in markdown exists; no script executable unless listed in `Entry.approved_scripts`); `always_on`; `form_order` (trigger line, then classified headings, non-decreasing in `form.order`); `facts_as_of` (`facts/*.md`, and SKILL.md of `kind=fact`, need frontmatter `as_of`); `hook` (`lint::hook_problems`, per mode: every mode a rule, a non-empty pass condition and a tool (`*` = any), no parameter of another mode; `block`: field, message, regex compiles and does not match everything; `stuck`: message, `repeats` in 2..=20; `truncate`: `max_age_turns` 1..=100, `keep_chars` 200..=100000; `retrieve`: `budget_bytes` 500..=65536, `min_overlap` 1..=20; non-block modes take no regex/field; `hook_module` refuses the same problems); `fragment` (`AGENTS.fragment.md` non-empty, no `#`/`##` heading outside a code fence: it is appended under `## rematch: <name>`); `fork_path` (`Entry.fork_path` repo-relative without `..`, `library::validate_fork_path`); `transfer` (`LintContext.transfer` and a domain lesson or fact). `LintReport.ok` iff no Error.
+<!-- ANCHOR_END: lint -->
 
 ## 13. Ledger SQL (schema_version 2, `rematch_core::ledger`)
 
@@ -427,6 +436,8 @@ File ownership (all scope status changes and rematch.json writes): an entry's fi
 
 ## 16. Harness surfaces and how each is reached
 
+<!-- ANCHOR: surfaces -->
+
 Harness² edits eight surfaces (research D3). Each maps to one omp component; activation follows SPEC §"Scope and who merges" (personal text automatic as `provisional`; executable or blocking behind a one-tap approval; team and fork only as a branch/PR the binary never merges).
 
 | Surface | omp component | Mechanism in rematch | Activation | Status |
@@ -439,6 +450,8 @@ Harness² edits eight surfaces (research D3). Each maps to one omp component; ac
 | Skills | `~/.omp/agent/skills/<name>/SKILL.md` | linked into the shared dir `REMATCH_ROOT/skills/` (below), which the factory adds to `skills.customDirectories`; kept: copied natively to `~/.omp/agent/skills/<name>/` (with a profile: to `profile/skills/<name>/`, linked from there, §20) and linked into the shared dir too (one skill by realpath, §0); team: `.omp/skills/<name>/` | automatic as `provisional` | built |
 | Scripts | `scripts/<n>` inside a skill | staged mode 0644; `library approve` (or the digest's one tap) makes them 0755 | one tap | built |
 | Hooks / plugins | `~/.omp/agent/extensions/rematch-hooks/<id>.ts` (data-only modules; with a profile links to `profile/hooks/<id>.ts`, §20), imported by the extension and run on `tool_call` (`block`, `stuck`) or `context` (`truncate`, `retrieve`) | `kind: hook` entry (`hook.json` with a `mode`), compiled on approval; the three built-in entries (§10) are hook entries of the context modes | one tap | built: block verifiers, stuck detection, age-based tool-output truncation, harness-driven unit retrieval; other plugin shapes (error hints) are not generated |
+
+<!-- ANCHOR_END: surfaces -->
 
 ### Shared skills (`REMATCH_ROOT/skills/`)
 
@@ -612,7 +625,7 @@ lake/outcomes/{domain}/{day}/{machine}-{seq}.parquet the same, split by subject.
 lake/blobs/<sha256>                                  proposal replies and receipt certificates the exported rows point at
 ```
 
-Files are written to `.<name>.tmp-<pid>` and renamed, never rewritten (an existing path is skipped); partition values (`harness`, `day`, `session_id` of events; `day`; `domain` of outcomes) live only in the path. Time columns are `Timestamp(ms, "UTC")`, lists `List<Utf8>` (non-null items), statistics untruncated (`statistics_truncate_length(None)`, `column_index_truncate_length(None)`). Same journal rows ⇒ byte-identical files.
+Files are written to `.<name>.tmp-<pid>` and renamed, never rewritten (an existing path is skipped) — with one exception: an `events` file exported before the `tool_cmd` column existed is rewritten once, by `lake index` (`events::upgrade`: the same records as a fresh export writes them now, so the bytes equal a new export's), because Bellwether reads one schema per root and refuses a key on a column some file lacks (`column "tool_cmd" not in source schema`); a scan before that derives the column from `tool`/`tool_input`. Partition values (`harness`, `day`, `session_id` of events; `day`; `domain` of outcomes) live only in the path. Time columns are `Timestamp(ms, "UTC")`, lists `List<Utf8>` (non-null items), statistics untruncated (`statistics_truncate_length(None)`, `column_index_truncate_length(None)`). Same journal rows ⇒ byte-identical files.
 
 Columns. Every append table starts with `seq` (Int64, journal seq), `known` (ts, ledger clock of the write), `machine`, `op` (`insert`/`update`/`snapshot`), `row_key` and ends with `json` (the record as written, compact JSON):
 
@@ -626,7 +639,7 @@ Columns. Every append table starts with `seq` (Int64, journal seq), `known` (ts,
 | `receipts` | `id`, `entry_id`, `certificate_hash`, `activation`, `created_at` ts |
 | `outcomes` | `id`, `session_id`, `subject_id`, `signature`, `claim`, `facets` list (`domain=<each dotted prefix>`, `key=value`, bare `key`), `valid` ts (`ts`), `result_status` |
 
-`events` columns: `seq` Int64, `t` ts, `ev`, `tool`, `call_id`, `tool_input` (JSON of `input`), `args_hash`, `result_bytes` Int64, `is_error` bool, `path`, `skill_read`, `text`, `prelabel`, `text_head`, `usage_json` (JSON of `usage`), `stop_reason`, `reasons` list, `flagged` bool, `extra` (JSON object of every other field of the record, nulls included; a field whose value does not fit its column's type goes here too; null when none).
+`events` columns: `seq` Int64, `t` ts, `ev`, `tool`, `call_id`, `tool_input` (JSON of `input`), `args_hash`, `result_bytes` Int64, `is_error` bool, `path`, `skill_read`, `text`, `prelabel`, `text_head`, `usage_json` (JSON of `usage`), `stop_reason`, `reasons` list, `flagged` bool, `extra` (JSON object of every other field of the record, nulls included; a field whose value does not fit its column's type goes here too; null when none), `tool_cmd` (derived, not a trace field: `input.command` of a `tool == "bash"` record, else null; every harness's shell tool is `bash` in the trace, §3; `events::read_records` never returns it).
 
 Commands. `lake export [--all]`: journal rows with `seq` > this machine's watermark (rows of other machines, present only after a rebuild, are skipped), one run of ≤ 50 000 rows and ≤ 64 newly settled sessions, `--all` drains both; then the watermark moves to the last row of the run. Sessions go in session-id order: every closed trace file, then every ledger session without one, its records from `import_cmd::records_for_session` (the binary passes that converter to the lake crate as an `EventSource`); a ledger session with no transcript left is added to `events_missing` (it counts toward the 64, has no file, and is retried only by `--all`). `lake import --from <lake | REMATCH_ROOT>`: copies files whose `(table, machine, seq)` (events: `(harness, session_id)`) is absent, and absent blobs; watermarks merge by max per machine; `lake-index/` is outside every lake and never read. `lake rebuild [--from <lake>] [--force] [--machine <m>]`: replays one machine's rows (default: this machine's id) in `seq` order through `Ledger::apply_journal_row` into `ledger.sqlite.rebuild-<pid>`, copies the lake's blobs, then moves the result to `ledger.sqlite`; refuses a ledger holding any journal, entry or session row unless `--force` (the old file is kept as `ledger.sqlite.pre-rebuild-<ms>`). `lake doctor`: machine, `journal_max_seq`, watermark, `lag` = max seq − watermark, files per table, events, blobs, `events: exported N, missing M, pending P` (pending = ledger sessions in neither manifest set), orphans (temp files, names off the layout, files past their machine's watermark), the `op = snapshot` range (rows that predate the journal: state at migration, not transitions). Export, import and rebuild hold `REMATCH_ROOT/.lake.lock`.
 
@@ -638,7 +651,7 @@ Bellwether is an external binary, optional and never linked: `--bellwether <path
 
 | Table | `--path-template` | `--key` |
 |---|---|---|
-| `events` | `{harness}/{day:date}/{session_id}.parquet` | `expr:tool_cmd=json_get(tool_input,'$.command'):exact,counts` (the binary fills the `json_get` conformance vectors itself), `exact:path`, `exact:skill_read` |
+| `events` | `{harness}/{day:date}/{session_id}.parquet` | `exact:tool_cmd,counts`, `text:tool_cmd,tokenizer=words`, `exact:path`, `exact:skill_read` |
 | `sessions` | `{day:date}/{machine}-{run_seq:int}.parquet` | `exact:repo_remote,counts`, `exact:domain`, `list:loaded_entry_shas`, `list:exts`, `list:stems`, `range:started_at` |
 | `redirects` | the same | `temporal:session_id,redirect_seq@known`, `exact:class` |
 | `entries` | the same | `temporal2:entry_id@valid,known` (a storage-version-1 sidecar), `exact:content_sha256` |
@@ -650,21 +663,21 @@ Adaptations, each forced by the binary: (1) the ADR's `{machine}-{seq:int}` plac
 
 Version pin: the first index writes `bellwether --version` (`0.1.0`) to `lake/manifest.json` `bellwether_version_pinned`. Another version: `lake index` refuses (`the lake's indexes were built by bellwether A and this binary is B; run rematch lake index --repin …`), `lake query` scans with that reason, `lake doctor` reports it as `index_refused`. `--repin` deletes every `lake-index/<table>` and rebuilds all tables under the new version; the lake files are never touched.
 
-**`lake query <table> --key K --values v1,v2… [--from --to] [--valid V] [--known K] [--latest] [--all] [--limit n]`** (instants: ms UTC, RFC 3339, or `YYYY-MM-DD`); `rematch_lake::query::run(root, &QuerySpec, bin)` for readers. `K` is a key above by its spec or short name (`expr:tool_cmd`, `exact:path`, `list:stems`, `temporal2:entry_id`, `temporal:content_sha256`, `temporal:session_id,redirect_seq` with values `sid:seq` or `sid\tseq`). The key values go to a Parquet key file (`lake-index/.keys-<pid>-<n>.parquet`, deleted after) whose columns are the key's columns at the dataset's types (`expr`: one Utf8 column named by the expression text; `list`: one Utf8 column named by the list column), then:
+**`lake query <table> --key K (--values v1,v2… | --has w1,w2…) [--from --to] [--valid V] [--known K] [--latest] [--all] [--limit n]`** (instants: ms UTC, RFC 3339, or `YYYY-MM-DD`); `rematch_lake::query::run(root, &QuerySpec, bin)` for readers. `K` is a key above by its spec or short name (`exact:tool_cmd`, `text:tool_cmd`, `exact:path`, `list:stems`, `temporal2:entry_id`, `temporal:content_sha256`, `temporal:session_id,redirect_seq` with values `sid:seq` or `sid\tseq`). A text key takes `--has` (every word required; each argument is split at Unicode word boundaries after case folding, `rematch_core::words`, the tokenizer Bellwether's `words` uses at the versions it pins — `unicase` 2.10.0, `unicode-segmentation` 1.13.3 — so `--has "cargo test"` = `--has cargo,test`; an argument with no word is a usage error); every other key takes `--values`, whose values go to a Parquet key file (`lake-index/.keys-<pid>-<n>.parquet`, deleted after) whose columns are the key's columns at the dataset's types (`list`: one Utf8 column named by the list column), then:
 
 | Key kind | Request | Bellwether |
 |---|---|---|
 | `exact`, `temporal` | values [+ window] | `locate --keys F [--from --to --ts <window column>]` |
-| `expr` | values | `locate --keys F` (the binary refuses a window: "an expr key answers point lookups only"; rematch applies it to the rows) |
+| `text` | words (`--has`) | one `locate --has <column>=<word>` per word (each answers `has_token` exactly at row-group grain: `exact_row_groups: true`); the planned row groups are intersected across words, every plan's residual applied; `--has` "cannot be used with --from/--to/--ts" (window applied by rematch); `plan.lookup` is then the list of lookups and `plan.planned` the intersection `{files, row_groups}` |
 | `list` | values, `--all` or any | `locate --keys F --all` / `--any` (which "cannot be used with --from/--to/--ts"; window applied by rematch) |
 | `temporal` | `--latest` / `--valid V` | `latest` / `asof --at V` |
 | `temporal2` | `--latest [--known K]` / `--valid V --known K` | `latest --known K` (i64::MAX when absent; `latest` without it needs a `temporal` key) / `asof --valid V --known K` |
 | `temporal2` | values only (every version) | none: the binary refuses `locate` on the sidecar's column ("none of the key specs … serves a lookup on [entry_id]"), so a scan |
 | `range:started_at` | window only | none (`locate` needs keys), so a scan; it prunes `exact:repo_remote` windows |
 
-A window is on the table's time column (`events` `t`, `sessions` `started_at`, `redirects` `known`, `entries`/`outcomes` `valid`, `counters` `ts`, `proposals`/`receipts` `created_at`), inclusive, and never combines with `--latest`/`--valid`/`--known`. The plan consumed is the `--json` line's `evidence.record.body.plan`: `entries[{file:{path (canonical), size, etag, tail_blake3}, row_groups:[in-file index…], bytes}]` and `residual`, a tagged tree (`{op: and, all:[…]}`) of `in {columns, values}`, `between {column, lo, hi}`, `not_older_than {columns, ts_column, bounds:[[key, ts]…]}`, `latest_per_key {columns, ts_column}`, `expr_in {expr, values}`, `contains_any {column, values}`, `contains_all {column, values:[[group…]…]}`, every value a canonical encoding (Bellwether ADR 016) as a JSON byte array. rematch encodes each row's cells the same way (Utf8 `06 … 00 00`, Int64 `02` + sign-flipped big-endian, `Timestamp(ms)` `08 04 02` + Int64, Date32 `08 01 05` + Int64, Bool `01 b`, Float64 `04` + sign-aware flip) and compares bytes, so `between` is byte order. Observed shapes: `locate` on `expr` → `expr_in`; on `list` → `contains_any`/`contains_all`; `exact`/`temporal` + window → `and[in, between]`; `latest` → `and[in, not_older_than, latest_per_key]`; `asof --at` → `and[in, between, not_older_than, …]`; temporal2 → `and[in, between(valid), between(known), not_older_than(valid), not_older_than(known), latest_per_key(valid)]`. Any other `op` (`text`, `semi_join`, `join`, `window_partition`) is refused naming it, never ignored. `latest_per_key` keeps every row at its key's greatest time (ties kept, as the plan keeps every row group at the winning time); a null time never wins. `expr_in` is evaluated for `json_get(<column>,'<path>')` only (`.key`, `["key"]`, `[n]`); a number is compared as serde_json prints it, so a float written with trailing zeros, or a repeated JSON member, can drop a row but never add one. The planned row groups are read with the parquet reader (`with_row_groups`) and rows sorted by (file path, row number in the file), so an indexed answer and a scan answer are the same list.
+A window is on the table's time column (`events` `t`, `sessions` `started_at`, `redirects` `known`, `entries`/`outcomes` `valid`, `counters` `ts`, `proposals`/`receipts` `created_at`), inclusive, and never combines with `--latest`/`--valid`/`--known`. The plan consumed is the `--json` line's `evidence.record.body.plan`: `entries[{file:{path (canonical), size, etag, tail_blake3}, row_groups:[in-file index…], bytes}]` and `residual`, a tagged tree (`{op: and, all:[…]}`) of `in {columns, values}`, `between {column, lo, hi}`, `not_older_than {columns, ts_column, bounds:[[key, ts]…]}`, `latest_per_key {columns, ts_column}`, `text {column, operator: has_token|contains|has_prefix, values}` (values as given, folded by the consumer), `contains_any {column, values}`, `contains_all {column, values:[[group…]…]}`, every other value a canonical encoding (Bellwether ADR 016) as a JSON byte array. rematch encodes each row's cells the same way (Utf8 `06 … 00 00`, Int64 `02` + sign-flipped big-endian, `Timestamp(ms)` `08 04 02` + Int64, Date32 `08 01 05` + Int64, Bool `01 b`, Float64 `04` + sign-aware flip) and compares bytes, so `between` is byte order. Observed shapes: `locate` on `exact` → `in`; `--has` → `text {operator: has_token, values: [word]}`; on `list` → `contains_any`/`contains_all`; `exact`/`temporal` + window → `and[in, between]`; `latest` → `and[in, not_older_than, latest_per_key]`; `asof --at` → `and[in, between, not_older_than, …]`; temporal2 → `and[in, between(valid), between(known), not_older_than(valid), not_older_than(known), latest_per_key(valid)]`. Any other `op` (`semi_join`, `join`, `window_partition`, `expr_in`) is refused naming it, never ignored. `latest_per_key` keeps every row at its key's greatest time (ties kept, as the plan keeps every row group at the winning time); a null time never wins. `text` folds the row's value and each argument (`has_token`: one of the value's words equals it; `has_prefix`: one starts with it; `contains`: a substring); a null never matches. The planned row groups are read with the parquet reader (`with_row_groups`) and rows sorted by (file path, row number in the file), so an indexed answer and a scan answer are the same list.
 
-Scan (`indexed: false`, `reason` says why): no binary; no `lake-index/<table>/manifest.json`; a pinned version the binary does not match; files Bellwether does not list; a lookup no key serves (above). The scan reads every file of the table and applies the same predicate locally (`in`/`expr_in`/`contains_*`, the window, and for `--latest`/`--valid`/`--known` per key: times ≤ the instants, then the greatest valid, then the greatest known at it). Before an indexed lookup, a table whose files the index does not track (new, resized, gone) is re-indexed with the same keys (`reindexed: true`): the ADR's "when `lake query` finds a root with files newer than its manifest". Each Bellwether lookup also writes an evidence record under `lake-index/<table>/ledger/` (the index is per machine and rebuildable).
+Scan (`indexed: false`, `reason` says why): no binary; no `lake-index/<table>/manifest.json`; a pinned version the binary does not match; files Bellwether does not list; a lookup no key serves (above). The scan reads every file of the table and applies the same predicate locally (`in`/`text`/`contains_*`, the window, and for `--latest`/`--valid`/`--known` per key: times ≤ the instants, then the greatest valid, then the greatest known at it). Before an indexed lookup, a table whose files the index does not track (new, resized, gone), or whose index was built before the key asked for was declared, is re-indexed (`reindexed: true`): the ADR's "when `lake query` finds a root with files newer than its manifest". `lake index` (and that re-index) first upgrades pre-`tool_cmd` events files (above; `upgraded: n` per table) and removes an index root whose manifest records a key the table no longer declares (an `expr:tool_cmd` index from before the stored column; Bellwether keeps every spec an index was built with and refuses an `expr` name equal to a dataset column), rebuilding it from scratch (`rebuilt: true`). Each Bellwether lookup also writes an evidence record under `lake-index/<table>/ledger/` (the index is per machine and rebuildable).
 
 `lake doctor [--bellwether P]` adds `index`: the binary and its version against the pin (`index_refused`), per table whether it has an index, its untracked/gone/skipped files and each key's completeness, and `sessions_without_counters`: session ids whose newest `sessions` row is `counted` with loaded entries and that have no `counters` row anywhere in the lake (the attribution anti-join the ADR keeps out of the index).
 
@@ -710,6 +723,7 @@ profile/
   profile.json                {"version": 1, "machines": [hostname…]}
   .gitignore                  .conflicts, skills/*/rematch.json, skills/*/EXPERIENCE.md, temp files
   .conflicts                  paths the last sync could not rebase (per machine, ignored)
+  .index.json                 per skills/<name>: {machine, at, commit} of the last commit touching it (`git log -1 --format=%s -- skills/<name>` = "<machine> <ts>"), written by every sync (per machine, ignored)
 ```
 
 **Per machine, never in the profile:** the ledger and its journal, the lake and its indexes, `staging/` (provisional entries), `drafts/`, `archive/`, `predecessors/`, traces, pending files, jobs, credentials and omp's own config (concrete model selectors only through `roles.yml`), and inside `skills/<name>/` the ledger mirror `rematch.json` (absolute paths, this ledger's state) and the reflector's `EXPERIENCE.md`. History is the lake's (§19), not the profile's.
@@ -721,6 +735,10 @@ profile/
 A keep whose name the profile already holds from another machine (a dir without this ledger's `rematch.json`) replaces it like any occupant: the other machine's version is saved as this machine's predecessor version 0, and the next sync carries the new version to every machine (last keep wins; `rollback` here restores it).
 
 **Kept sources.** `library::sync_shared_skills` adds every `profile/skills/<name>/` with a `SKILL.md` (`profile::kept_sources`) to `REMATCH_ROOT/skills/` for names no ledger entry holds, so entries kept on another machine and adopted skills load like this machine's kept entries. They are files, not ledger entries, on machines that did not keep them: they load but are counted only by the machine whose ledger holds the entry, and a hook linked from another machine runs only where its entry is known (built-in entries have per-machine ids and are approved per machine).
+
+**Profile-kept.** `profile_cmd::profile_kept`: the kept sources no entry of this ledger holds (no entry's `path` is the dir) — kept or adopted on another machine. `library ls` lists each after the entries as `kept (profile, from <machine>) skill  <name> [profile] not counted on this machine` (JSON `profile_kept [{name, status: kept, source: profile, from, path, counted: false}]`), `library why` as `kept (profile, from <machine>) <name>: linked into the shared skills dir, not counted on this machine[ · read in this session]` (`profile_kept[].read` from the session's `skill_reads`), and `report` (which already excludes them: they have no counters here) adds one line after its header, `profile-kept (not counted on this machine): N` (JSON `profile_kept`). The machine comes from `.index.json`, else (a name the last sync did not see) from the same `git log`; `unknown` without either.
+
+**omp only.** `profile adopt` refuses another harness's files with `<path> is <why>: the profile holds omp skills and agents only (a dir with SKILL.md, an agent .md); CLAUDE.md, settings and other harnesses' files stay out`: anything under Claude Code's config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or Codex's (`$CODEX_HOME`, else `~/.codex`; `~/.agents`), inside any `.claude`/`.codex`/`.agents` dir, and `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `settings.json`, `settings.local.json` anywhere; paths under the omp agent dir are always accepted. Claude Code and Codex reach the same skills through `REMATCH_ROOT/skills` (§16), never through the profile.
 
 **Commands.**
 

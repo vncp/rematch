@@ -155,12 +155,13 @@ fn export_twice_writes_nothing_new_and_a_fresh_root_with_the_same_journal_writes
     assert_eq!(
         names,
         ["seq", "t", "ev", "tool", "call_id", "tool_input", "args_hash", "result_bytes", "is_error", "path", "skill_read", "text",
-         "prelabel", "text_head", "usage_json", "stop_reason", "reasons", "flagged", "extra"]
+         "prelabel", "text_head", "usage_json", "stop_reason", "reasons", "flagged", "extra", "tool_cmd"]
     );
     let b = &batches[0];
     assert_eq!(b.num_rows(), 5);
     assert_eq!(strings(b, "ev").value(2), "tool_result");
     assert_eq!(strings(b, "tool_input").value(2), r#"{"command":"cargo test -p payments"}"#);
+    assert_eq!(strings(b, "tool_cmd").value(2), "cargo test -p payments", "the bash command, stored for the exact:/text: keys");
     assert_eq!(strings(b, "extra").value(2), r#"{"content_head":"test result: ok","error_class":null}"#);
 
     // A fresh root holding the same journal (and traces) writes the same files, byte for byte.

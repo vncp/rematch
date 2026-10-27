@@ -194,6 +194,71 @@ fn create_from_sessions_needs_three_references() {
     assert_eq!(code, 1, "{v}");
 }
 
+/// `create --from sessions --ran`: the references are the sessions whose bash commands have
+/// every word, from the ledger's records, then from the lake's `events` (`text:tool_cmd`; a
+/// scan without an index) once it is exported.
+#[cfg(feature = "lake")]
+#[test]
+fn create_from_sessions_ran_picks_the_sessions_that_ran_the_command() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().to_string();
+    for (i, cmd) in ["cd x && cargo test --workspace", "CARGO TEST -p ledger", "cargo build", "cargo   test", "npm test"].iter().enumerate() {
+        let sid = format!("ran-{i}");
+        env.write_records(
+            &sid,
+            &[
+                json!({"seq":0,"t":4_000 + i,"ev":"session_start","session_id":sid,"cwd":repo,"repo":repo,"loaded_entries":[]}),
+                json!({"seq":1,"t":4_001 + i,"ev":"input","text":"Fix the parser","idle":true,"prelabel":"none"}),
+                json!({"seq":2,"t":4_002 + i,"ev":"tool_result","tool":"bash","call_id":"c1","input":{"command":cmd},"is_error":false}),
+                json!({"seq":3,"t":4_003 + i,"ev":"session_shutdown","reasons":[],"flagged":false}),
+            ],
+        );
+    }
+    env.run(&["count"]);
+    let create = |extra: &[&str]| {
+        let mut a = vec!["create", "cargo-test-gate", "--from", "sessions", "--description", "gate on tests", "--editor"];
+        let ed = script("editor-ok.sh");
+        a.push(&ed);
+        a.extend_from_slice(extra);
+        env.run_cmd(env.cmd(&a))
+    };
+    let (v, code) = create(&["--ran", "cargo,test,nowhere"]);
+    assert_eq!(code, 1, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("found 0 matching session(s) that ran cargo test nowhere in the ledger"), "{v}");
+    let (v, code) = create(&["--ran", "&&"]);
+    assert_eq!(code, 2, "no word: a usage error: {v}");
+
+    env.run(&["lake", "export", "--all"]);
+    let (v, code) = create(&["--ran", "Cargo,test"]);
+    assert_eq!(code, 0, "{v}");
+    let refs: std::collections::BTreeSet<&str> = v["data"]["references"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(refs, ["ran-0", "ran-1", "ran-3"].into(), "{v}");
+    assert_eq!((v["data"]["source"].clone(), v["data"]["ran"].clone()), (json!("lake"), json!(["cargo", "test"])), "{v}");
+}
+
+/// The same `--ran` from the ledger alone (no lake).
+#[test]
+fn create_from_sessions_ran_reads_the_ledger_without_a_lake() {
+    let env = Env::new();
+    let repo = env.repo.to_string_lossy().to_string();
+    for (i, cmd) in ["cd x && cargo test --workspace", "cargo test", "cargo test --doc", "cargo build"].iter().enumerate() {
+        let sid = format!("led-{i}");
+        env.write_records(
+            &sid,
+            &[
+                json!({"seq":0,"t":5_000 + i,"ev":"session_start","session_id":sid,"cwd":repo,"repo":repo,"loaded_entries":[]}),
+                json!({"seq":1,"t":5_001 + i,"ev":"tool_result","tool":"bash","call_id":"c1","input":{"command":cmd},"is_error":false}),
+                json!({"seq":2,"t":5_002 + i,"ev":"session_shutdown","reasons":[],"flagged":false}),
+            ],
+        );
+    }
+    env.run(&["count"]);
+    let d = env.run(&["create", "cargo-test-gate", "--from", "sessions", "--ran", "cargo,test", "--editor", &script("editor-ok.sh")]);
+    assert_eq!((d["outcome"].clone(), d["source"].clone()), (json!("staged"), json!("ledger")), "{d}");
+    let refs: std::collections::BTreeSet<&str> = d["references"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(refs, ["led-0", "led-1", "led-2"].into(), "{d}");
+}
+
 #[test]
 fn improve_refuses_splits_and_proposes_a_sibling() {
     let env = Env::new();
@@ -372,11 +437,104 @@ fn doctor_reports_omp_roles_and_link() {
     assert!(d["improver"]["files"].as_array().unwrap().iter().all(|f| f["present"] == true));
     std::fs::create_dir_all(env.home.join(".omp/plugins")).unwrap();
     std::fs::write(env.home.join(".omp/plugins/omp-plugins.lock.json"), r#"{"plugins":{"@vncp/rematch":{"enabled":true}}}"#).unwrap();
-    let mut c = env.cmd(&["doctor"]);
-    c.env("OMP_BIN", script("fake-omp.sh"));
-    let (v, _) = env.run_cmd(c);
-    assert_eq!(v["data"]["extension"]["linked"], true);
-    assert_eq!(v["data"]["healthy"], true, "{v}");
+    let doctor = || {
+        let mut c = env.cmd(&["doctor"]);
+        c.env("OMP_BIN", script("fake-omp.sh"));
+        env.run_cmd(c).0
+    };
+    let v = doctor();
+    assert_eq!((v["data"]["extension"]["linked"].clone(), v["data"]["extension"]["loads"].clone()), (json!(true), json!(false)), "{v}");
+    assert_eq!(v["data"]["ready"], false, "listed in the lock, no module: it cannot load: {v}");
+    let modules = env.home.join(".omp/plugins/node_modules/@vncp");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(repo_root().join("extension"), modules.join("rematch")).unwrap();
+    let v = doctor();
+    assert_eq!(v["data"]["harnesses"]["omp"]["extension"]["entries"], json!(["./index.ts"]), "{v}");
+    assert_eq!(v["data"]["ready"], true, "{v}");
+}
+
+/// `doctor`'s harness block: each harness set up in turn (Claude Code's plugin link with a
+/// scripted `claude plugin validate`, Codex's skill-root link, a profile with a launchd job,
+/// the lake), a broken one making `ready: false`, and one text line per harness.
+#[test]
+fn doctor_reports_every_harness_and_ready() {
+    let env = Env::new();
+    let modules = env.home.join(".omp/plugins/node_modules/@vncp");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(repo_root().join("extension"), modules.join("rematch")).unwrap();
+    let bin = env.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = |name: &str, body: &str| {
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        p
+    };
+    let claude_ok = fake("claude-ok", "echo 'Validation passed'");
+    let claude_bad = fake("claude-bad", "echo 'x: invalid manifest' >&2; exit 1");
+    let launchctl_no = fake("launchctl-no", "exit 113");
+    let launchctl_yes = fake("launchctl-yes", "echo '{ \"Label\" = \"com.vncp.rematch.profile-sync\"; }'");
+    let doctor = |claude: &Path, launchctl: &Path| {
+        let mut c = env.cmd(&["doctor"]);
+        c.env("OMP_BIN", script("fake-omp.sh")).env("CLAUDE_BIN", claude).env("LAUNCHCTL_BIN", launchctl).env_remove("REMATCH_BELLWETHER");
+        let (v, code) = env.run_cmd(c);
+        assert_eq!(code, 0, "{v}");
+        v["data"].clone()
+    };
+    let text = |d: &Value| d["lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let status = |d: &Value, h: &str| d["harnesses"][h]["status"].as_str().unwrap().to_string();
+
+    // Nothing but omp: the others are "not set up", never problems.
+    let d = doctor(&claude_ok, &launchctl_yes);
+    assert_eq!(d["ready"], true, "{d}");
+    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok")] {
+        assert_eq!(status(&d, h), s, "{h}: {d}");
+    }
+    let lines = text(&d);
+    let firsts: Vec<&str> = lines.iter().take(6).map(|l| l.split(':').next().unwrap()).collect();
+    assert_eq!(firsts, ["omp", "claude-code", "codex", "profile", "lake", "built-ins"], "one line per harness, first: {lines:#?}");
+    assert_eq!(lines.last().unwrap(), "ready: true");
+
+    // Claude Code's plugin, Codex's link, a profile, the lake.
+    env.run(&["skills", "sync", "--cwd", env.repo.to_str().unwrap()]);
+    let plugin = env.home.join("plugin");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(plugin.join("hooks")).unwrap();
+    std::fs::write(plugin.join(".claude-plugin/plugin.json"), r#"{"name":"rematch"}"#).unwrap();
+    std::fs::write(plugin.join("hooks/hooks.json"), r#"{"hooks":{}}"#).unwrap();
+    std::os::unix::fs::symlink(env.root.join("skills"), plugin.join("skills")).unwrap();
+    std::fs::create_dir_all(env.home.join(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink(&plugin, env.home.join(".claude/skills/rematch")).unwrap();
+    std::fs::create_dir_all(env.home.join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink(env.root.join("skills"), env.home.join(".agents/skills/rematch")).unwrap();
+    env.run(&["profile", "init"]);
+    env.run(&["profile", "install-launchd"]);
+    #[cfg(feature = "lake")]
+    env.run(&["lake", "export", "--all"]);
+    let d = doctor(&claude_ok, &launchctl_yes);
+    for h in ["omp", "claude-code", "codex", "profile", "built-ins"] {
+        assert_eq!(status(&d, h), "ok", "{h}: {d}");
+    }
+    assert_eq!(d["harnesses"]["claude-code"]["validated"], true, "{d}");
+    assert_eq!(d["harnesses"]["profile"]["launchd"]["loaded"], true, "{d}");
+    #[cfg(feature = "lake")]
+    assert_eq!((status(&d, "lake"), d["harnesses"]["lake"]["lag"].clone()), ("ok".to_string(), json!(0)), "{d}");
+    assert_eq!(d["ready"], true, "{d}");
+    eprintln!("doctor --text:\n{}", text(&d).join("\n"));
+
+    // Broken: the plugin does not validate, the job is not loaded, Codex's link points elsewhere.
+    std::fs::remove_file(env.home.join(".agents/skills/rematch")).unwrap();
+    std::os::unix::fs::symlink(env.root.join("codex-skills"), env.home.join(".agents/skills/rematch")).unwrap();
+    let d = doctor(&claude_bad, &launchctl_no);
+    for h in ["claude-code", "codex", "profile"] {
+        assert_eq!(status(&d, h), "problem", "{h}: {d}");
+    }
+    assert_eq!(d["ready"], false);
+    let problems: Vec<&str> = d["problems"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    assert!(problems[0].contains("claude plugin validate") && problems[0].contains("invalid manifest"), "{problems:#?}");
+    assert!(problems[2].contains("launchctl load -w"), "{problems:#?}");
+    assert_eq!(text(&d).last().unwrap(), "ready: false (3 problem(s))");
 }
 
 #[test]

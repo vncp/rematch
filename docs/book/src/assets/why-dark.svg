@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 320" width="1100" height="320" role="img" aria-labelledby="title">
+<title id="title">the next matched session, counted</title>
+<rect x="0.5" y="0.5" width="1099" height="319" rx="16" fill="#121212" stroke="#262626"/>
+<circle cx="26" cy="24" r="6" fill="#ff5f57"/><circle cx="46" cy="24" r="6" fill="#febc2e"/><circle cx="66" cy="24" r="6" fill="#28c840"/>
+<text x="550" y="29" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#9a9a9a">the next matched session, counted</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+<text x="28" y="64" fill="#9a9a9a">$</text><text x="46" y="64" fill="#f2f2f2">rematch library why 01a17614-a543-77f3-8ad1-d28bbdc2c2fe --text</text>
+<text x="28" y="86" fill="#f2f2f2" xml:space="preserve">session 01a17614 · github-copilot/gemini-4-argon · 4 turns · 4 tool calls (0 errors, 0 clusters) · 0 takeovers</text>
+<text x="28" y="108" fill="#4ade80" xml:space="preserve">loaded src-lib-public-functions (provisional): glob hit · predicate hit · this session recurrence 0 harm 0</text>
+<text x="28" y="130" fill="#a9abff" xml:space="preserve">  total matched 1 recurrence 0 harm 0</text>
+<text x="28" y="160" fill="#9a9a9a">$</text><text x="46" y="160" fill="#f2f2f2">rematch library ls --text</text>
+<text x="28" y="182" fill="#f2f2f2" xml:space="preserve">provisional skill  src-lib-public-functions [rematch-e2e-repo] matched 1 · recurrence 0 · harm 0</text>
+<text x="28" y="212" fill="#9a9a9a">$</text><text x="46" y="212" fill="#f2f2f2">rematch digest --cwd . --text</text>
+<text x="28" y="234" fill="#f2f2f2" xml:space="preserve">staged skill src-lib-public-functions in rematch-e2e-repo: Use when adding or modifying public functions in src/lib.py.</text>
+<text x="28" y="256" fill="#9a9a9a" xml:space="preserve">approvals: none pending</text>
+</g></svg>

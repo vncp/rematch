@@ -200,10 +200,15 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
             "fork_path": e.fork_path, "fork_repo": e.fork_repo,
         }));
     }
+    // Kept on another machine (or adopted there): linked here, counted only there.
+    let elsewhere = crate::profile_cmd::profile_kept(ctx)?;
+    for k in &elsewhere {
+        lines.push(format!("{} skill  {} [profile] not counted on this machine", k.label(), k.name));
+    }
     if lines.is_empty() {
         lines.push("library is empty".into());
     }
-    Ok(json!({"entries": entries, "lines": lines}))
+    Ok(json!({"entries": entries, "profile_kept": elsewhere.iter().map(|k| k.to_json()).collect::<Vec<_>>(), "lines": lines}))
 }
 
 /// Latest session for the cwd (repo or cwd match), preferring our own traces.
@@ -397,6 +402,22 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
     if s.loaded_entries.is_empty() {
         lines.push("no rematch entries were loaded".into());
     }
+    // Kept on another machine: in the shared skills dir for this session too, never counted here.
+    let elsewhere: Vec<Value> = crate::profile_cmd::profile_kept(ctx)?
+        .into_iter()
+        .map(|k| {
+            let read = s.skill_reads.iter().any(|r| r == &k.name);
+            lines.push(format!(
+                "{} {}: linked into the shared skills dir, not counted on this machine{}",
+                k.label(),
+                k.name,
+                if read { " · read in this session" } else { "" }
+            ));
+            let mut v = k.to_json();
+            v["read"] = json!(read);
+            v
+        })
+        .collect();
     let redirects: Vec<Value> = s
         .redirects
         .iter()
@@ -433,6 +454,7 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
                      "tool_calls": s.tool_calls, "tool_errors": s.tool_errors, "error_clusters": s.error_clusters,
                      "takeovers": s.takeovers, "skill_reads": s.skill_reads, "source": s.source, "counted": s.counted},
         "loaded": loaded,
+        "profile_kept": elsewhere,
         "redirects": redirects,
         "source": source,
         "asof": past.as_ref().map(|p| json!({"ts": p.ts, "utc": utc(p.ts)})),

@@ -18,8 +18,9 @@ use crate::{lake_dir, Manifest};
 pub enum KeyKind {
     /// `exact:` point lookups (`locate`), optionally in a window.
     Exact,
-    /// `expr:` point lookups on a derived value (`locate`, no window).
-    Expr,
+    /// `text:` words (`locate --has`, one locate per token, no window): rows whose
+    /// column has every token.
+    Text,
     /// `list:` membership (`locate --any|--all`, no window).
     List,
     /// `range:` prunes another key's window; no lookup of its own.
@@ -46,7 +47,7 @@ pub struct KeyDef {
     /// The name `lake query --key` takes.
     pub name: &'static str,
     pub kind: KeyKind,
-    /// Key-file columns in order: dataset columns, or the expression text for `expr`.
+    /// Key-file columns in order (dataset columns); a text key's column.
     pub columns: &'static [&'static str],
     pub types: &'static [KeyType],
     /// The time column: temporal `ts`, temporal2 `valid`, the range column.
@@ -75,10 +76,6 @@ const fn list(spec: &'static str, columns: &'static [&'static str]) -> KeyDef {
     KeyDef { spec, name: spec, kind: KeyKind::List, columns, types: U, time: None, known: None }
 }
 
-/// The tool command an `events` row ran: Bellwether's normalized expression text, which is
-/// also the key-file column a lookup on it is named by.
-pub const TOOL_CMD_EXPR: &str = "json_get(tool_input,'$.command')";
-
 /// Append tables' template. The run's first journal seq is `{run_seq}`, not `{seq}`: a
 /// file stores the column `seq` with one value per row, and Bellwether refuses a path
 /// placeholder whose stored column holds more than the path's value (DESIGN §19.2).
@@ -90,11 +87,12 @@ pub const TABLE_DEFS: &[TableDef] = &[
         template: "{harness}/{day:date}/{session_id}.parquet",
         window: "t",
         keys: &[
+            exact("exact:tool_cmd,counts", "exact:tool_cmd", &["tool_cmd"]),
             KeyDef {
-                spec: "expr:tool_cmd=json_get(tool_input,'$.command'):exact,counts",
-                name: "expr:tool_cmd",
-                kind: KeyKind::Expr,
-                columns: &[TOOL_CMD_EXPR],
+                spec: "text:tool_cmd,tokenizer=words",
+                name: "text:tool_cmd",
+                kind: KeyKind::Text,
+                columns: &["tool_cmd"],
                 types: U,
                 time: None,
                 known: None,
@@ -342,13 +340,27 @@ pub(crate) fn pin_mismatch(pinned: Option<&str>, version: &str) -> Option<String
 
 /// Indexes one table root with its keys (incremental: Bellwether reads only new or
 /// changed files). Returns Bellwether's result, or `None` when the table has no files.
+/// First, `events` files exported before `tool_cmd` are upgraded (`events::upgrade`;
+/// `upgraded` in the result), and an index recording a key this table no longer declares
+/// (`expr:tool_cmd` before `exact:`/`text:tool_cmd`) is removed and built afresh
+/// (`rebuilt: true`): Bellwether keeps every spec an index was built with.
 pub(crate) fn index_table(root: &Path, bin: &Path, t: &TableDef) -> Result<Option<Value>> {
     let lake = lake_dir(root);
     let (seen, _) = table_files(&lake, t.name)?;
     if seen.is_empty() {
         return Ok(None);
     }
+    let mut upgraded = 0usize;
+    if t.name == "events" {
+        for p in &seen {
+            upgraded += usize::from(crate::events::upgrade(p)?);
+        }
+    }
     let idx = index_root(root).join(t.name);
+    let rebuilt = built_specs(&idx)?.is_some_and(|s| s.iter().any(|spec| !t.keys.iter().any(|k| k.spec == spec)));
+    if rebuilt {
+        std::fs::remove_dir_all(&idx).with_context(|| format!("remove {}", idx.display()))?;
+    }
     std::fs::create_dir_all(index_root(root)).with_context(|| format!("create {}", index_root(root).display()))?;
     let mut args: Vec<String> = vec![
         "index".into(),
@@ -363,7 +375,22 @@ pub(crate) fn index_table(root: &Path, bin: &Path, t: &TableDef) -> Result<Optio
         args.push("--key".into());
         args.push(k.spec.into());
     }
-    run_bw(bin, &args).map(Some).with_context(|| format!("index table {}", t.name))
+    let mut r = run_bw(bin, &args).with_context(|| format!("index table {}", t.name))?;
+    r["upgraded"] = json!(upgraded);
+    r["rebuilt"] = json!(rebuilt);
+    Ok(Some(r))
+}
+
+/// The key specs an index root's manifest records as built (`None` without an index).
+pub(crate) fn built_specs(idx: &Path) -> Result<Option<Vec<String>>> {
+    let mp = idx.join("manifest.json");
+    let text = match std::fs::read_to_string(&mp) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", mp.display())),
+    };
+    let m: Value = serde_json::from_str(&text).with_context(|| format!("parse {}", mp.display()))?;
+    Ok(Some(m["key_spec_completeness"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default()))
 }
 
 /// `rematch lake index [<table>…] [--repin]`. Callers hold the lake lock (the manifest is
@@ -420,6 +447,12 @@ pub fn index(root: &Path, tables: &[String], bin: Option<&Path>, repin: bool) ->
                         format!("; {} file(s) Bellwether skips (a `_`/`.` path component): queries scan this table", hidden.len())
                     }
                 ));
+                if r["upgraded"].as_u64().unwrap_or(0) > 0 {
+                    lines.push(format!("{}: {} file(s) exported before tool_cmd upgraded in place", t.name, r["upgraded"]));
+                }
+                if r["rebuilt"] == true {
+                    lines.push(format!("{}: the index recorded keys this table no longer declares; rebuilt", t.name));
+                }
                 out.push(json!({
                     "table": t.name,
                     "indexed": true,
@@ -433,6 +466,8 @@ pub fn index(root: &Path, tables: &[String], bin: Option<&Path>, repin: bool) ->
                     "files_unchanged": r["files_unchanged"],
                     "segments_written": r["segments_written"],
                     "unindexed_files": hidden,
+                    "upgraded": r["upgraded"],
+                    "rebuilt": r["rebuilt"],
                 }));
             }
         }
@@ -556,8 +591,9 @@ mod tests {
         assert_eq!(names.len(), TABLE_DEFS.len());
         assert!(names.contains("events") && crate::tables::TABLES.iter().all(|t| names.contains(t)));
         let ev = table("events").unwrap();
-        assert_eq!(ev.key("expr:tool_cmd").unwrap().columns, &[TOOL_CMD_EXPR]);
-        assert!(ev.key("expr:tool_cmd=json_get(tool_input,'$.command'):exact,counts").is_ok());
+        assert_eq!(ev.key("exact:tool_cmd").unwrap().columns, &["tool_cmd"]);
+        assert_eq!(ev.key("text:tool_cmd,tokenizer=words").unwrap().kind, KeyKind::Text);
+        assert!(ev.key("expr:tool_cmd").is_err(), "the virtual column gave way to the stored one");
         assert!(table("entries").unwrap().key("exact:path").is_err());
         assert!(table("nope").is_err());
         for t in TABLE_DEFS {

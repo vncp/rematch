@@ -139,6 +139,27 @@ fn two_machines_share_one_profile() {
     let pj: Value = serde_json::from_str(&std::fs::read_to_string(pb.join("profile.json")).unwrap()).unwrap();
     assert_eq!(pj, json!({"version": 1, "machines": [A, B]}));
 
+    // B has no ledger entry for A's two skills: listed as kept on A, never counted on B.
+    let index: Value = serde_json::from_str(&std::fs::read_to_string(pb.join(".index.json")).unwrap()).unwrap();
+    assert_eq!(index["skills"]["hand-notes"]["machine"], A, "{index}");
+    assert_eq!(git(&pb, &["status", "--porcelain"]), "", ".index.json is per machine (ignored)");
+    let ls_b = on(&b, B, &["library", "ls"]);
+    let kept_b: Vec<(String, String)> = ls_b["profile_kept"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| (k["name"].as_str().unwrap().to_string(), k["from"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(kept_b, vec![("hand-notes".into(), A.into()), ("run-tests-before-commit".into(), A.into())], "{ls_b}");
+    let line = lines(&ls_b).into_iter().find(|l| l.contains("run-tests-before-commit")).unwrap();
+    eprintln!("B library ls: {line}");
+    assert!(line.starts_with("kept (profile, from machine-a) "), "{line}");
+    assert!(on(&a, A, &["library", "ls"])["profile_kept"].as_array().unwrap().is_empty(), "A's ledger holds both");
+    let report_b = on(&b, B, &["report"]);
+    assert!(lines(&report_b).contains(&"profile-kept (not counted on this machine): 2".to_string()), "{report_b}");
+    assert_eq!(report_b["profile_kept"], 2);
+    assert_eq!(on(&a, A, &["report"])["profile_kept"], 0);
+
     // roles.yml resolves the editor per machine, ahead of config.yml.
     let doctor_b = on(&b, B, &["doctor"]);
     assert_eq!(doctor_b["roles"]["rematch-editor"]["selector"], "openai/gpt-5", "{doctor_b}");
@@ -170,6 +191,14 @@ fn two_machines_share_one_profile() {
     assert_eq!(s["pulled"], true, "{s}");
     assert_eq!(link(&a.agent.join("skills/check-ledger-before-commit")), pa.join("skills/check-ledger-before-commit"));
     assert_eq!(link(&a.root.join("skills/check-ledger-before-commit")), pa.join("skills/check-ledger-before-commit"));
+    let ls_a = on(&a, A, &["library", "ls"]);
+    assert_eq!(ls_a["profile_kept"][0]["name"], "check-ledger-before-commit", "{ls_a}");
+    assert_eq!(ls_a["profile_kept"][0]["from"], B);
+    // B's `why` of its own session lists A's skills it could see and did not count.
+    let why_b = on(&b, B, &["library", "why", "0192c4a0-0000-7000-8000-00000000b01"]);
+    let names: Vec<&str> = why_b["profile_kept"].as_array().unwrap().iter().map(|k| k["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["hand-notes", "run-tests-before-commit"], "{why_b}");
+    assert!(lines(&why_b).iter().any(|l| l.starts_with("kept (profile, from machine-a) hand-notes: linked into the shared skills dir, not counted")), "{why_b}");
 
     // --- A conflicting edit on both: B's sync reports it, aborts the rebase, digest shows it.
     std::fs::write(pa.join("skills/hand-notes/SKILL.md"), "---\nname: hand-notes\ndescription: Use when writing notes.\n---\n\nA: keep notes in bullets.\n").unwrap();
@@ -242,7 +271,24 @@ fn local_profile_without_remote_commits_and_adopts_one_path() {
     assert_eq!((d["created"].clone(), d["remote"].clone(), d["sync"]["offline"].clone()), (json!(true), json!(null), json!(false)), "{d}");
     let p = env.root.join("profile");
     assert!(!git(&p, &["log", "--oneline"]).is_empty());
-    let skill = env.home.join(".agents/skills/scratch");
+    // Other harnesses' files stay out: a Codex skill root, Claude Code's dir and its
+    // instructions file, anywhere.
+    for (rel, is_dir) in [(".agents/skills/codex-only", true), (".claude/skills/cc-only", true), (".claude/CLAUDE.md", false), ("work/CLAUDE.md", false)] {
+        let f = env.home.join(rel);
+        if is_dir {
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("SKILL.md"), "---\nname: x\ndescription: Use for x.\n---\n\nX.\n").unwrap();
+        } else {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, "# instructions\n").unwrap();
+        }
+        let (v, code) = env.run_cmd(env.cmd(&["profile", "adopt", f.to_str().unwrap()]));
+        assert_eq!(code, 1, "{rel}: {v}");
+        let e = v["error"].as_str().unwrap();
+        assert!(e.contains("omp skills and agents only") && e.contains("CLAUDE.md, settings"), "{rel}: {e}");
+        assert!(std::fs::symlink_metadata(&f).unwrap().file_type().is_dir() == is_dir, "{rel} left in place");
+    }
+    let skill = env.home.join("notes/skills/scratch");
     std::fs::create_dir_all(&skill).unwrap();
     std::fs::write(skill.join("SKILL.md"), "---\nname: scratch\ndescription: Use for scratch work.\n---\n\nScratch.\n").unwrap();
     let a = env.run(&["profile", "adopt", skill.to_str().unwrap()]);

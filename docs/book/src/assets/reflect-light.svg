@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 420" width="1100" height="420" role="img" aria-labelledby="title">
+<title id="title">a reflection, from a real session (gemini-4-argon editor)</title>
+<rect x="0.5" y="0.5" width="1099" height="419" rx="16" fill="#171717" stroke="#e5e5e5"/>
+<circle cx="26" cy="24" r="6" fill="#ff5f57"/><circle cx="46" cy="24" r="6" fill="#febc2e"/><circle cx="66" cy="24" r="6" fill="#28c840"/>
+<text x="550" y="29" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#9a9a9a">a reflection, from a real session (gemini-4-argon editor)</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+<text x="28" y="64" fill="#9a9a9a">$</text><text x="46" y="64" fill="#f2f2f2">rematch reflect --pending --text</text>
+<text x="28" y="86" fill="#9a9a9a" xml:space="preserve">counted 1 session(s), 0 counter row(s)</text>
+<text x="28" y="108" fill="#f2f2f2" xml:space="preserve">session 01a1760d: classifier → correction (0.86) · triage process/domain · moment seq 10</text>
+<text x="28" y="130" fill="#4ade80" xml:space="preserve">staged src-lib-public-functions (skill) from session 01a1760d · lint ok · 1 model call</text>
+<text x="28" y="160" fill="#9a9a9a">$</text><text x="46" y="160" fill="#f2f2f2">cat ~/.rematch/staging/rematch-e2e-repo/src-lib-public-functions/SKILL.md</text>
+<text x="28" y="182" fill="#9a9a9a" xml:space="preserve">---</text>
+<text x="28" y="204" fill="#9a9a9a" xml:space="preserve">name: src-lib-public-functions</text>
+<text x="28" y="226" fill="#9a9a9a" xml:space="preserve">description: Use when adding or modifying public functions in src/lib.py.</text>
+<text x="28" y="248" fill="#9a9a9a" xml:space="preserve">rematch: {status: provisional, branch: rematch-e2e-repo, family: github-copilot/gemini-argon, version: 1}</text>
+<text x="28" y="270" fill="#9a9a9a" xml:space="preserve">---</text>
+<text x="28" y="292" fill="#f2f2f2" xml:space="preserve">## Laws</text>
+<text x="28" y="314" fill="#f2f2f2" xml:space="preserve">- Export every public function name in `__all__` at the top of `src/lib.py`.</text>
+<text x="28" y="336" fill="#f2f2f2" xml:space="preserve">- Include a Google-style docstring with `Args:` and `Returns:` on every public function.</text>
+<text x="28" y="358" fill="#f2f2f2" xml:space="preserve">- Verify both `__all__` membership and docstring sections via Python assertions before yielding.</text>
+</g></svg>

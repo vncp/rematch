@@ -84,6 +84,14 @@ pub fn cmd_profile(ctx: &AppCtx, cmd: ProfileCmd) -> Result<Value> {
         ProfileCmd::Adopt { path } => {
             require(ctx)?;
             let p = crate::app::absolute(&ctx.cwd.join(path))?;
+            if let Some(why) = foreign_harness(ctx, &p) {
+                bail!(
+                    "{} is {why}: the profile holds omp skills and agents only (a dir with SKILL.md, an agent .md); \
+                     CLAUDE.md, settings and other harnesses' files stay out. To adopt a skill for omp, copy it to {} first",
+                    p.display(),
+                    ctx.paths.skills_dir().join("<name>").display()
+                );
+            }
             let adopted = adopt_path(ctx, &p)?;
             let views = profile::link_views(&ctx.paths)?;
             library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
@@ -339,6 +347,46 @@ fn rematch_owned(ctx: &AppCtx, md: &Path) -> Result<bool> {
     Ok(ctx.ledger.get_entry(&b.id)?.is_some())
 }
 
+/// What makes `p` another harness's file rather than an omp skill or agent (DESIGN §20: omp
+/// only): under Claude Code's config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or Codex's
+/// (`$CODEX_HOME`, else `~/.codex`; `~/.agents`), inside any `.claude`/`.codex`/`.agents`
+/// dir, or a harness instruction or settings file (`CLAUDE.md`, `AGENTS.md`,
+/// `settings.json`). `None` for anything under the omp agent dir.
+fn foreign_harness(ctx: &AppCtx, p: &Path) -> Option<String> {
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let agent = std::fs::canonicalize(&ctx.paths.agent_dir).unwrap_or_else(|_| ctx.paths.agent_dir.clone());
+    if p.starts_with(&ctx.paths.agent_dir) || real.starts_with(&agent) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let env_dir = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let roots = [
+        ("Claude Code's", env_dir("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|h| h.join(".claude")))),
+        ("Codex's", env_dir("CODEX_HOME").or_else(|| home.as_ref().map(|h| h.join(".codex")))),
+        ("Codex's", home.as_ref().map(|h| h.join(".agents"))),
+    ];
+    for (who, root) in roots {
+        let Some(root) = root else { continue };
+        let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if p.starts_with(&root) || real.starts_with(&root_real) {
+            return Some(format!("{who} ({})", root.display()));
+        }
+    }
+    for c in real.components().chain(p.components()) {
+        match c.as_os_str().to_str() {
+            Some(".claude") => return Some("inside a Claude Code dir (.claude)".into()),
+            Some(".codex" | ".agents") => return Some("inside a Codex dir (.codex, .agents)".into()),
+            _ => {}
+        }
+    }
+    match p.file_name().and_then(|n| n.to_str()) {
+        Some("CLAUDE.md" | "CLAUDE.local.md") => Some("Claude Code's instructions file".into()),
+        Some("AGENTS.md") => Some("a harness instructions file (AGENTS.md)".into()),
+        Some("settings.json" | "settings.local.json") => Some("a harness settings file".into()),
+        _ => None,
+    }
+}
+
 /// Adopt one skill dir or agent file: a kept entry rematch owns moves with its ledger path;
 /// anything else is moved as it is and linked back. A hand-written skill becomes a pinned
 /// entry (measured, never moved or replaced by the loop); one registered before keeps its
@@ -500,6 +548,7 @@ fn sync(ctx: &AppCtx, no_push: bool, timeout: Duration) -> Result<Value> {
     }
     let views = profile::link_views(&ctx.paths)?;
     let skills = library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
+    profile::write_index(&ctx.paths, &index_skills(&ctx.paths))?;
     if remote.is_some() && !offline && conflicts.is_empty() && !no_push && has_head(&dir) {
         let ahead = match remote_ref(&dir, &branch) {
             Some(up) => git(&dir, &["rev-list", "--count", &format!("{up}..HEAD")])?.parse::<u64>().unwrap_or(0),
@@ -574,10 +623,65 @@ pub fn conflict_line(dir: &Path, conflicts: &[String]) -> String {
     )
 }
 
+/// The origin of every kept source (the last commit touching `skills/<name>`), for
+/// `profile/.index.json`.
+fn index_skills(paths: &rematch_core::paths::RematchPaths) -> profile::ProfileIndex {
+    let dir = profile::dir(paths);
+    let skills = profile::kept_sources(paths).into_iter().filter_map(|(name, _)| Some((name.clone(), origin_of(&dir, &name)?))).collect();
+    profile::ProfileIndex { skills }
+}
+
+/// `git log -1 --format=%s -- skills/<name>`: the commit subject `"<machine> <ts>"`.
+fn origin_of(dir: &Path, name: &str) -> Option<profile::SkillOrigin> {
+    let out = git(dir, &["log", "-1", "--format=%H%x1f%s", "--", &format!("skills/{name}")]).ok()?;
+    let (commit, subject) = out.trim().split_once('\u{1f}')?;
+    Some(profile::SkillOrigin::from_subject(subject, commit))
+}
+
+/// A skill in `profile/skills/` that no entry of this ledger holds (kept or adopted on
+/// another machine): it loads here (`skills sync`, `match`) and is never counted here.
+pub struct ProfileKept {
+    pub name: String,
+    pub dir: PathBuf,
+    /// The machine of the last commit that touched it (`.index.json`, else `git log`).
+    pub from: Option<String>,
+}
+
+impl ProfileKept {
+    pub fn label(&self) -> String {
+        format!("kept (profile, from {})", self.from.as_deref().unwrap_or("unknown"))
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({"name": self.name, "status": "kept", "source": "profile", "from": self.from, "path": self.dir, "counted": false})
+    }
+}
+
+/// The profile's kept sources without a ledger entry on this machine (none without a profile).
+pub fn profile_kept(ctx: &AppCtx) -> Result<Vec<ProfileKept>> {
+    let sources = profile::kept_sources(&ctx.paths);
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let held: std::collections::BTreeSet<PathBuf> =
+        ctx.ledger.list_entries(&EntryFilter::default())?.iter().flat_map(|e| [e.path.clone(), canon(&e.path)]).collect();
+    let index = profile::load_index(&ctx.paths);
+    let dir = profile::dir(&ctx.paths);
+    Ok(sources
+        .into_iter()
+        .filter(|(_, p)| !held.contains(p) && !held.contains(&canon(p)))
+        .map(|(name, p)| {
+            let from = index.skills.get(&name).map(|o| o.machine.clone()).or_else(|| origin_of(&dir, &name).map(|o| o.machine));
+            ProfileKept { name, dir: p, from }
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------------------------
 // status / launchd
 
-fn status(ctx: &AppCtx) -> Result<Value> {
+pub fn status(ctx: &AppCtx) -> Result<Value> {
     let dir = profile::dir(&ctx.paths);
     let machine = machine_name();
     if !profile::present(&ctx.paths) {
@@ -685,12 +789,17 @@ pub fn launchd_plist(bin: &Path, interval: u64, log: &Path, env: &[(String, Stri
     )
 }
 
+/// `~/Library/LaunchAgents/<label>.plist`.
+pub fn launchd_plist_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
 fn install_launchd(ctx: &AppCtx, interval: u64) -> Result<Value> {
     if interval == 0 {
         bail!("--interval must be at least 1 second");
     }
+    let plist = launchd_plist_path().ok_or_else(|| anyhow!("HOME is not set"))?;
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| anyhow!("HOME is not set"))?;
-    let plist = home.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist"));
     let bin = launchd_binary()?;
     let log = ctx.paths.root.join("profile-sync.log");
     // launchd starts with a bare environment: carry what picks git, the root and the agent dir.
@@ -711,18 +820,6 @@ fn install_launchd(ctx: &AppCtx, interval: u64) -> Result<Value> {
         format!("stop it with: launchctl unload -w {}", plist.display()),
     ];
     Ok(json!({"plist": plist, "binary": bin, "interval": interval, "log": log, "load": load, "loaded": false, "lines": lines}))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plist_escapes_and_runs_a_full_sync() {
-        let p = launchd_plist(Path::new("/u/a&b/rematch"), 300, Path::new("/r/profile-sync.log"), &[("PATH".into(), "/usr/bin:/bin".into())]);
-        assert!(p.contains("<string>/u/a&amp;b/rematch</string>\n\t\t<string>profile</string>\n\t\t<string>sync</string>\n\t</array>"), "{p}");
-        assert!(p.contains("<integer>300</integer>") && p.contains("<key>PATH</key>") && !p.contains("--no-push"), "{p}");
-    }
 }
 
 /// Byte-equal regular files.
@@ -756,4 +853,16 @@ fn same_tree(a: &Path, b: &Path) -> Result<bool> {
         Ok(out)
     }
     Ok(listing(a)? == listing(b)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_escapes_and_runs_a_full_sync() {
+        let p = launchd_plist(Path::new("/u/a&b/rematch"), 300, Path::new("/r/profile-sync.log"), &[("PATH".into(), "/usr/bin:/bin".into())]);
+        assert!(p.contains("<string>/u/a&amp;b/rematch</string>\n\t\t<string>profile</string>\n\t\t<string>sync</string>\n\t</array>"), "{p}");
+        assert!(p.contains("<integer>300</integer>") && p.contains("<key>PATH</key>") && !p.contains("--no-push"), "{p}");
+    }
 }

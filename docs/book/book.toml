@@ -1,0 +1,17 @@
+[book]
+title = "rematch"
+description = "Let the agent improve its own harness from the sessions you were going to run anyway, and keep only what later sessions confirm."
+authors = ["vncp"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/rematch/"
+git-repository-url = "https://github.com/vncp/rematch"
+edit-url-template = "https://github.com/vncp/rematch/edit/main/docs/book/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"

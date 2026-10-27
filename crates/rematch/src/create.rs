@@ -46,6 +46,11 @@ pub struct CreateArgs {
     pub description: Option<String>,
     #[arg(long, num_args = 1..)]
     pub files: Vec<PathBuf>,
+    /// `--from sessions`: the references are sessions whose bash commands have every one of
+    /// these words (comma-separated, case-folded; `--ran cargo,test` finds
+    /// `cd x && cargo test --workspace`), ranked by their overlap with the request.
+    #[arg(long, value_delimiter = ',')]
+    pub ran: Vec<String>,
     /// Scripted editor command (tests).
     #[arg(long)]
     pub editor: Option<String>,
@@ -119,8 +124,12 @@ pub type Scored = Vec<(SessionRecord, usize, f64)>;
 /// when the lake holds this ledger's whole journal, else the ledger.
 pub fn matching_sessions(ctx: &AppCtx, req_stems: &[String], req_exts: &[String]) -> Result<(Scored, Source)> {
     let (candidates, src) = candidate_sessions(ctx, req_stems, req_exts)?;
+    Ok((score(candidates, req_stems, req_exts, req_stems.len().clamp(1, 2)), src))
+}
+
+/// `candidates` with at least `need` stems/exts in common with the request, best first.
+fn score(candidates: Vec<SessionRecord>, req_stems: &[String], req_exts: &[String], need: usize) -> Scored {
     let mut scored = Vec::new();
-    let need = req_stems.len().clamp(1, 2);
     for s in candidates {
         let overlap = req_stems.iter().filter(|x| s.stems.contains(x)).count()
             + req_exts.iter().filter(|x| s.exts.contains(x)).count();
@@ -130,8 +139,54 @@ pub fn matching_sessions(ctx: &AppCtx, req_stems: &[String], req_exts: &[String]
         let j = jaccard(req_stems, &s.stems);
         scored.push((s, overlap, j));
     }
+    // Stable: equal scores keep `started_at` order.
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)));
-    Ok((scored, src))
+    scored
+}
+
+/// `--ran`: the sessions whose bash commands have every word, best overlap with the request
+/// first (no minimum: running the command is the match). From the lake's `events`
+/// (`text:tool_cmd`, every machine; the session rows from `sessions`) when the lake holds
+/// this ledger's whole journal, else every ledger session's records (events file, trace
+/// or harness transcript).
+pub fn sessions_that_ran(ctx: &AppCtx, words: &[String], req_stems: &[String], req_exts: &[String]) -> Result<(Scored, Source)> {
+    if lake_read::current_lake(ctx).is_some() {
+        match lake_ran(ctx, words) {
+            Ok(v) => return Ok((score(v, req_stems, req_exts, 0), Source::Lake)),
+            Err(e) => eprintln!("rematch create: lake events unreadable, reading the ledger: {e:#}"),
+        }
+    }
+    let mut out = Vec::new();
+    for s in ctx.ledger.list_sessions(&SessionFilter::default())? {
+        if crate::import_cmd::session_records(ctx, &s)?.is_some_and(|(recs, _)| ran(&recs, words)) {
+            out.push(s);
+        }
+    }
+    Ok((score(out, req_stems, req_exts, 0), Source::Ledger))
+}
+
+/// A bash call in `records` whose command has every word.
+fn ran(records: &[TraceRecord], words: &[String]) -> bool {
+    records.iter().any(|r| match r {
+        TraceRecord::ToolResult { tool, input, .. } if tool == "bash" => {
+            input.get("command").and_then(Value::as_str).is_some_and(|c| rematch_core::words::has_all(c, words))
+        }
+        _ => false,
+    })
+}
+
+fn lake_ran(ctx: &AppCtx, words: &[String]) -> Result<Vec<SessionRecord>> {
+    let ids = lake_read::lake_sessions_that_ran(ctx, words)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(String, SessionRecord)> = lake_read::as_of(lake_read::lake_rows(ctx, "sessions", None)?, i64::MAX)
+        .into_iter()
+        .filter_map(|r| serde_json::from_value::<SessionRecord>(r.json).ok().map(|s| (r.machine, s)))
+        .filter(|(_, s)| ids.contains(&s.id))
+        .collect();
+    out.sort_by(|(ma, a), (mb, b)| (a.started_at, ma, &a.id).cmp(&(b.started_at, mb, &b.id)));
+    Ok(out.into_iter().map(|(_, s)| s).collect())
 }
 
 /// Every session that shares a stem or an extension with the request, in `started_at` order.
@@ -222,11 +277,20 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let req = stems_of_text(&request_text(a));
     let files = read_files(&a.files)?;
     let req_exts = rematch_core::features::exts_of(&a.files.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>());
-    let (matches, source) = matching_sessions(ctx, &req, &req_exts)?;
+    let ran_words = rematch_core::words::tokens(&a.ran);
+    if !a.ran.is_empty() && ran_words.is_empty() {
+        return Err(crate::envelope::Usage(format!("--ran {:?} holds no word", a.ran.join(","))).into());
+    }
+    let (matches, source) = if ran_words.is_empty() {
+        matching_sessions(ctx, &req, &req_exts)?
+    } else {
+        sessions_that_ran(ctx, &ran_words, &req, &req_exts)?
+    };
     if matches.len() < MIN_REFERENCE_SESSIONS {
         bail!(
-            "found {} matching session(s) in the {}; {MIN_REFERENCE_SESSIONS} are needed to distill from sessions (try --from task --task <id>, or --from description for a draft)",
+            "found {} matching session(s){} in the {}; {MIN_REFERENCE_SESSIONS} are needed to distill from sessions (try --from task --task <id>, or --from description for a draft)",
             matches.len(),
+            if ran_words.is_empty() { String::new() } else { format!(" that ran {}", ran_words.join(" ")) },
             source.name()
         );
     }
@@ -299,6 +363,7 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let mut out = stage_result(ctx, p, Some(&best.id), &pred, true)?;
     out["references"] = json!(refs.iter().map(|s| &s.id).collect::<Vec<_>>());
     out["source"] = json!(source);
+    out["ran"] = json!(ran_words);
     out["model_calls"] = json!(budget.used);
     Ok(out)
 }

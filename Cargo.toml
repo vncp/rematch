@@ -22,6 +22,10 @@ tempfile = "3"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Bellwether's `words` tokenizer (text keys): the exact versions it pins, so a residual
+# evaluated here folds and splits a value as the index did.
+unicase = "=2.10.0"
+unicode-segmentation = "=1.13.3"
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
 

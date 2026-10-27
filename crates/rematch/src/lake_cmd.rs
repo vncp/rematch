@@ -87,12 +87,16 @@ pub struct IndexArgs {
 pub struct QueryArgs {
     /// The table: events sessions redirects entries counters proposals receipts outcomes.
     pub table: String,
-    /// A key of the table (ADR 001 key table), e.g. exact:path, expr:tool_cmd, list:facets, temporal2:entry_id.
+    /// A key of the table (ADR 001 key table), e.g. exact:path, text:tool_cmd, list:facets, temporal2:entry_id.
     #[arg(long)]
     pub key: String,
     /// Key values, comma-separated (list keys: elements; a two-column key: `a:b`, split at the last ':').
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', conflicts_with = "has")]
     pub values: Vec<String>,
+    /// Text keys (text:tool_cmd): words every row must have, comma-separated, case-folded
+    /// (`--has cargo,test` finds `cd x && cargo test --workspace`).
+    #[arg(long, value_delimiter = ',')]
+    pub has: Vec<String>,
     /// Window start (inclusive) on the table's time column: ms UTC, RFC 3339, or YYYY-MM-DD.
     #[arg(long)]
     pub from: Option<String>,
@@ -139,6 +143,13 @@ pub fn export_after_reflect(ctx: &AppCtx) -> Option<Value> {
     imp::export_after_reflect(ctx)
 }
 
+/// The lake's block of `rematch doctor`: `{status: ok | not set up | problem, line,
+/// problems, …}` — present, export lag (journal rows past this machine's watermark), the
+/// Bellwether pin against the binary on hand.
+pub fn doctor_status(ctx: &AppCtx) -> Result<Value> {
+    imp::doctor_status(ctx)
+}
+
 #[cfg(feature = "lake")]
 mod imp {
     use anyhow::{anyhow, Result};
@@ -154,6 +165,37 @@ mod imp {
     fn lock(root: &std::path::Path) -> Result<LockFile> {
         LockFile::acquire(root.join(".lake.lock"))?
             .ok_or_else(|| anyhow!("another lake export, import, index or rebuild is running"))
+    }
+
+    pub fn doctor_status(ctx: &AppCtx) -> Result<Value> {
+        let lake = rematch_lake::lake_dir(&ctx.paths.root);
+        if !rematch_lake::Manifest::path(&lake).is_file() {
+            return Ok(json!({"status": "not set up", "present": false, "problems": [],
+                             "line": "lake: not set up (no lake/manifest.json; `rematch lake export --all` writes it)"}));
+        }
+        let m = rematch_lake::Manifest::load(&lake)?;
+        let lag = crate::lake_read::lag(ctx)?;
+        let bin = rematch_lake::index::resolve_bin(None);
+        let version = bin.as_deref().and_then(|b| rematch_lake::index::version(b).ok());
+        let pinned = m.bellwether_version_pinned.clone();
+        let mut problems = Vec::new();
+        if let (Some(p), Some(v)) = (&pinned, &version) {
+            if p != v {
+                problems.push(format!("lake indexes pinned to bellwether {p}, the binary is {v}: run `rematch lake index --repin`"));
+            }
+        }
+        let status = if problems.is_empty() { "ok" } else { "problem" };
+        let line = format!(
+            "lake: {status} · lag {lag} journal row(s) · index {} · bellwether {}",
+            pinned.as_deref().map(|p| format!("pinned {p}")).unwrap_or_else(|| "not built".into()),
+            match (&bin, &version) {
+                (Some(b), Some(v)) => format!("{v} ({})", b.display()),
+                (Some(b), None) => format!("not runnable ({})", b.display()),
+                (None, _) => "not found (queries scan)".into(),
+            }
+        );
+        Ok(json!({"status": status, "present": true, "lag": lag, "watermarks": m.watermarks, "pinned": pinned,
+                  "bellwether": bin, "bellwether_version": version, "problems": problems, "line": line}))
     }
 
     /// An instant: integer ms UTC, RFC 3339, or a `YYYY-MM-DD` date (its UTC midnight).
@@ -177,10 +219,17 @@ mod imp {
             (lo, hi) => Some((lo.unwrap_or(i64::MIN), hi.unwrap_or(i64::MAX))),
         };
         let (valid, known) = (at("valid", &a.valid)?, at("known", &a.known)?);
+        let text = rematch_lake::index::table(&a.table)?.key(&a.key)?.kind == rematch_lake::index::KeyKind::Text;
+        let values = match (text, a.has.is_empty()) {
+            (true, false) => a.has,
+            (false, true) => a.values,
+            (true, true) => return Err(crate::envelope::Usage(format!("{} takes its words as --has <word,word…>", a.key)).into()),
+            (false, false) => return Err(crate::envelope::Usage(format!("--has is for text keys (text:tool_cmd); {} takes --values", a.key)).into()),
+        };
         let spec = rematch_lake::query::QuerySpec {
             table: a.table,
             key: a.key,
-            values: a.values,
+            values,
             window,
             asof: (valid.is_some() || known.is_some()).then_some(rematch_lake::query::AsOf { valid, known }),
             latest: a.latest,
@@ -300,5 +349,9 @@ mod imp {
 
     pub fn export_after_reflect(_ctx: &AppCtx) -> Option<Value> {
         None
+    }
+
+    pub fn doctor_status(_ctx: &AppCtx) -> Result<Value> {
+        Ok(serde_json::json!({"status": "not built", "present": false, "problems": [], "line": format!("lake: {MISSING}")}))
     }
 }

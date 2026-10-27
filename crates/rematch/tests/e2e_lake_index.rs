@@ -54,6 +54,15 @@ fn seed(env: &Env) -> String {
             ],
         );
     }
+    // A fifth, loading nothing, whose command is one word among others.
+    env.write_records(
+        "k-4",
+        &[
+            json!({"seq":0,"t":3_010,"ev":"session_start","session_id":"k-4","cwd":env.repo,"repo":env.repo,"loaded_entries":[]}),
+            json!({"seq":1,"t":3_011,"ev":"tool_result","tool":"bash","call_id":"c1","input":{"command":"cd x && cargo test --workspace"},"is_error":false}),
+            json!({"seq":2,"t":3_012,"ev":"session_shutdown","reasons":[],"flagged":false}),
+        ],
+    );
     let c = env.run(&["count", "--editor", &script("editor-ok.sh")]);
     assert_eq!(c["counter_rows"], 4, "{c}");
 
@@ -160,14 +169,26 @@ fn index_then_query_events_entries_and_outcomes_planned_by_bellwether() {
     assert_eq!(manifest["bellwether_version_pinned"], json!(version(&bw)), "pinned on first index");
     assert!(!env.root.join("lake/lake-index").exists() && env.root.join("lake-index/events/manifest.json").is_file());
 
-    // events: the sessions that ran `cargo test`, through expr:tool_cmd.
-    let ev = query(&env, &bw, &["events", "--key", "expr:tool_cmd", "--values", "cargo test"]);
+    // events: the sessions that ran exactly `cargo test` (exact:tool_cmd), and those whose
+    // command has the words cargo and test (text:tool_cmd, one `locate --has` per word).
+    let ev = query(&env, &bw, &["events", "--key", "exact:tool_cmd", "--values", "cargo test"]);
     assert_eq!(ev["indexed"], true, "{ev}");
     assert_eq!(ids(&ev["rows"], "session_id"), BTreeSet::from(["k-0".into(), "k-1".into()]), "{ev}");
-    assert_eq!(ev["plan"]["residual"]["op"], "expr_in", "{ev}");
+    assert_eq!(ev["plan"]["residual"]["op"], "in", "{ev}");
     assert_eq!(ev["plan"]["planned"]["files"], 2, "the index planned only the two files holding the command: {ev}");
-    let scan = unindexed(&env, &bw, "events", &["--key", "expr:tool_cmd", "--values", "cargo test"]);
+    let scan = unindexed(&env, &bw, "events", &["--key", "exact:tool_cmd", "--values", "cargo test"]);
     assert_eq!(scan["rows"], ev["rows"], "a scan returns the same rows");
+    let has = query(&env, &bw, &["events", "--key", "text:tool_cmd", "--has", "cargo,test"]);
+    eprintln!("--has cargo,test: {}", serde_json::to_string_pretty(&has).unwrap());
+    assert_eq!(has["indexed"], true, "{has}");
+    assert_eq!(ids(&has["rows"], "session_id"), BTreeSet::from(["k-0".into(), "k-1".into(), "k-4".into()]), "{has}");
+    assert_eq!(ids(&has["rows"], "tool_cmd"), BTreeSet::from(["cargo test".into(), "cd x && cargo test --workspace".into()]));
+    assert_eq!(has["plan"]["residual"]["all"][0]["op"], "text", "{has}");
+    assert_eq!(has["plan"]["planned"]["files"], 3, "cargo is in 5 files, test in 3: {has}");
+    let scan = unindexed(&env, &bw, "events", &["--key", "text:tool_cmd", "--has", "cargo,test"]);
+    assert_eq!(scan["rows"], has["rows"]);
+    let (v, code) = env.run_cmd(env.cmd(&["lake", "query", "events", "--key", "text:tool_cmd", "--values", "cargo"]));
+    assert_eq!(code, 2, "a text key takes --has: {v}");
 
     // entries: the status as of a same-day instant, with no lookahead.
     let asof = |valid: i64, known: i64| {
@@ -226,7 +247,30 @@ fn a_new_export_is_indexed_before_the_next_query_and_another_version_is_refused_
     };
     let env = Env::new();
     seed(&env);
-    env.run(&["lake", "index", "events", "--bellwether", &bw]);
+    // k-4's file as an export before `tool_cmd` wrote it: a scan derives the column, and
+    // `lake index` upgrades the file before declaring keys on it.
+    let k4 = env.root.join("lake/events/omp/1970-01-01/k-4.parquet");
+    let records = rematch_lake::events::read_records(&k4).unwrap();
+    let cols = &rematch_lake::events::COLUMNS[..rematch_lake::events::COLUMNS.len() - 1];
+    let rows: Vec<_> = records.iter().map(|r| rematch_lake::events::cells(r)[..cols.len()].to_vec()).collect();
+    rematch_lake::io::replace(&k4, &rematch_lake::columns::batch(cols, &rows).unwrap()).unwrap();
+    let old = query(&env, &bw, &["events", "--key", "text:tool_cmd", "--has", "cargo,test"]);
+    assert_eq!((old["indexed"].clone(), ids(&old["rows"], "session_id")), (json!(false), BTreeSet::from(["k-0".into(), "k-1".into(), "k-4".into()])), "{old}");
+    let ix = env.run(&["lake", "index", "events", "--bellwether", &bw]);
+    assert_eq!(ix["tables"][0]["upgraded"], 1, "{ix}");
+    let has = query(&env, &bw, &["events", "--key", "text:tool_cmd", "--has", "cargo,test"]);
+    assert_eq!((has["indexed"].clone(), has["rows"].clone()), (json!(true), old["rows"].clone()), "{has}");
+    // An index built with a key the table no longer declares is rebuilt, not extended.
+    let events = env.root.join("lake/events");
+    let idx = env.root.join("lake-index/events");
+    let mut c = std::process::Command::new(&bw);
+    c.args(["index", "--json"]).arg(&events).arg("--index").arg(&idx);
+    c.args(["--path-template", "{harness}/{day:date}/{session_id}.parquet", "--key", "exact:ev"]);
+    assert!(c.output().unwrap().status.success());
+    let ix = env.run(&["lake", "index", "events", "--bellwether", &bw]);
+    assert_eq!((ix["tables"][0]["rebuilt"].clone(), ix["tables"][0]["upgraded"].clone()), (json!(true), json!(0)), "{ix}");
+    let ix = env.run(&["lake", "index", "events", "--bellwether", &bw]);
+    assert_eq!(ix["tables"][0]["rebuilt"], false, "{ix}");
     env.write_records(
         "k-9",
         &[
@@ -236,7 +280,7 @@ fn a_new_export_is_indexed_before_the_next_query_and_another_version_is_refused_
         ],
     );
     env.run(&["lake", "export", "--all"]);
-    let ev = query(&env, &bw, &["events", "--key", "expr:tool_cmd", "--values", "cargo test"]);
+    let ev = query(&env, &bw, &["events", "--key", "exact:tool_cmd", "--values", "cargo test"]);
     assert_eq!((&ev["indexed"], &ev["reindexed"]), (&json!(true), &json!(true)), "{ev}");
     assert_eq!(ids(&ev["rows"], "session_id"), BTreeSet::from(["k-0".into(), "k-1".into(), "k-9".into()]), "{ev}");
 
@@ -248,7 +292,7 @@ fn a_new_export_is_indexed_before_the_next_query_and_another_version_is_refused_
     let (v, code) = env.run_cmd(env.cmd(&["lake", "index", "--bellwether", &bw]));
     assert_ne!(code, 0, "{v}");
     assert!(v.to_string().contains("--repin"), "{v}");
-    let scan = query(&env, &bw, &["events", "--key", "expr:tool_cmd", "--values", "cargo test"]);
+    let scan = query(&env, &bw, &["events", "--key", "exact:tool_cmd", "--values", "cargo test"]);
     assert_eq!(scan["indexed"], false, "{scan}");
     assert!(scan["reason"].as_str().unwrap().contains("0.0.0-other"), "{scan}");
     assert_eq!(scan["rows"], ev["rows"]);
@@ -258,7 +302,7 @@ fn a_new_export_is_indexed_before_the_next_query_and_another_version_is_refused_
     assert_eq!(re["repinned"], true, "{re}");
     let m: Value = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
     assert_eq!(m["bellwether_version_pinned"], json!(version(&bw)));
-    assert_eq!(query(&env, &bw, &["events", "--key", "expr:tool_cmd", "--values", "cargo test"])["indexed"], true);
+    assert_eq!(query(&env, &bw, &["events", "--key", "exact:tool_cmd", "--values", "cargo test"])["indexed"], true);
 }
 
 #[test]

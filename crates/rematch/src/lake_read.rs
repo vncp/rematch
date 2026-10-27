@@ -162,6 +162,13 @@ pub fn lake_events(ctx: &AppCtx, s: &SessionRecord) -> Option<Vec<TraceRecord>> 
     imp::lake_events(ctx, s)
 }
 
+/// Ids of the sessions whose events hold a bash command with every word of `words`
+/// (`events` `text:tool_cmd`: indexed when `lake index` built it, else a scan), every
+/// machine's sessions. Errors without the `lake` feature.
+pub fn lake_sessions_that_ran(ctx: &AppCtx, words: &[String]) -> Result<std::collections::BTreeSet<String>> {
+    imp::lake_sessions_that_ran(ctx, words)
+}
+
 #[cfg(feature = "lake")]
 mod imp {
     use std::path::PathBuf;
@@ -227,6 +234,17 @@ mod imp {
         raw.into_iter().map(|v| journal_row(table, v)).collect()
     }
 
+    pub fn lake_sessions_that_ran(ctx: &AppCtx, words: &[String]) -> Result<std::collections::BTreeSet<String>> {
+        let spec = rematch_lake::query::QuerySpec {
+            table: "events".into(),
+            key: "text:tool_cmd".into(),
+            values: words.to_vec(),
+            ..Default::default()
+        };
+        let out = rematch_lake::query::run(&ctx.paths.root, &spec, None)?;
+        Ok(out.rows.iter().filter_map(|r| r["session_id"].as_str().map(str::to_string)).collect())
+    }
+
     pub fn lake_events(ctx: &AppCtx, s: &SessionRecord) -> Option<Vec<TraceRecord>> {
         let lake = rematch_lake::lake_dir(&ctx.paths.root);
         let path = rematch_lake::events::events_path(&lake, &s.id, s.started_at);
@@ -264,6 +282,10 @@ mod imp {
     }
 
     pub fn lake_rows(_ctx: &AppCtx, _table: &str, _lookup: Option<&Lookup>) -> Result<Vec<JournalRow>> {
+        bail!("built without the lake feature")
+    }
+
+    pub fn lake_sessions_that_ran(_ctx: &AppCtx, _words: &[String]) -> Result<std::collections::BTreeSet<String>> {
         bail!("built without the lake feature")
     }
 

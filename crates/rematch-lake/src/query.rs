@@ -1,13 +1,14 @@
 //! `lake query` (ADR 001 L3): a key lookup over one lake table. With an index, the keys
-//! go to Bellwether in a Parquet key file (`locate`, `latest` or `asof`), the planned row
-//! groups are read with the parquet reader, and the residual predicate the plan returns
-//! is evaluated here, row by row; rematch never re-plans. Without an index (or without
-//! the binary, or for a lookup no Bellwether key serves) every file of the table is read
-//! and the same predicate is computed locally: the rows are the same, and the envelope
-//! says `indexed: false` and why.
+//! go to Bellwether in a Parquet key file (`locate`, `latest` or `asof`) — a text key's
+//! words as one `locate --has` each, their planned row groups intersected —, the planned
+//! row groups are read with the parquet reader, and the residual predicate the plan
+//! returns is evaluated here, row by row; rematch never re-plans. Without an index (or
+//! without the binary, or for a lookup no Bellwether key serves) every file of the table
+//! is read and the same predicate is computed locally: the rows are the same, and the
+//! envelope says `indexed: false` and why.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,6 +23,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rematch_core::words;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -36,13 +38,14 @@ pub struct AsOf {
 }
 
 /// One lookup. `key` is a key of the table's row in the ADR key table, by its query name
-/// (`exact:path`, `expr:tool_cmd`, `list:facets`, `temporal2:entry_id`, …) or full spec.
+/// (`exact:path`, `text:tool_cmd`, `list:facets`, `temporal2:entry_id`, …) or full spec.
 #[derive(Clone, Debug, Default)]
 pub struct QuerySpec {
     pub table: String,
     pub key: String,
-    /// Key values; list keys: elements; a composite key's value joins its columns with a
-    /// tab (or a `:` before the last column).
+    /// Key values; list keys: elements; text keys: words, every one required (each value
+    /// is split at word boundaries); a composite key's value joins its columns with a tab
+    /// (or a `:` before the last column).
     pub values: Vec<String>,
     /// Inclusive window, ms UTC, on the table's time column ([`TableDef::window`]).
     pub window: Option<(i64, i64)>,
@@ -323,6 +326,9 @@ fn read_file(t: &TableDef, table_dir: &Path, path: &Path, row_groups: Option<&[u
     let parts = path_values(t, rel);
     let shared_path = Rc::new(path.to_path_buf());
     let mut frame: Option<Rc<Frame>> = None;
+    // An events file exported before `tool_cmd` (not yet upgraded by `lake index`): the
+    // column is derived here, so a scan finds what an upgraded file stores.
+    let mut derive_cmd = false;
     let mut cursor = (0usize, 0usize); // (index into starts, offset within that row group)
     for batch in reader {
         let batch = batch.with_context(|| format!("decode {}", path.display()))?;
@@ -334,6 +340,10 @@ fn read_file(t: &TableDef, table_dir: &Path, path: &Path, row_groups: Option<&[u
                     if !names.iter().any(|n| n == p) {
                         names.push((*p).to_string());
                     }
+                }
+                if t.name == "events" && !names.iter().any(|n| n == "tool_cmd") {
+                    derive_cmd = true;
+                    names.push("tool_cmd".into());
                 }
                 let index = names.iter().enumerate().map(|(i, n)| (n.clone(), i)).collect();
                 Rc::new(Frame { names, index })
@@ -356,6 +366,19 @@ fn read_file(t: &TableDef, table_dir: &Path, path: &Path, row_groups: Option<&[u
                 if fr.index[*p] >= cols.len() {
                     vals.push(v.clone());
                 }
+            }
+            if derive_cmd {
+                let at = |c: &str| fr.index.get(c).and_then(|&i| vals.get(i));
+                let tool = match at("tool") {
+                    Some(Val::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let input = match at("tool_input") {
+                    Some(Val::Str(s)) => serde_json::from_str::<Value>(s).ok(),
+                    _ => None,
+                };
+                let cmd = crate::events::command_of(tool, input.as_ref());
+                vals.push(cmd.map_or(Val::Null, Val::Str));
             }
             out.push(Row { path: shared_path.clone(), n, frame: fr.clone(), vals });
         }
@@ -394,13 +417,27 @@ pub enum Pred {
     LatestPerKey { columns: Vec<String>, ts_column: String },
     NotOlderThan { columns: Vec<String>, ts_column: String, bounds: Vec<(Vec<u8>, Vec<u8>)> },
     And { all: Vec<Pred> },
-    ExprIn { expr: String, values: Vec<Vec<u8>> },
+    /// A text key's residual: rows whose `column` matches at least one of `values` under
+    /// `operator`, both case-folded (`rematch_core::words`); a null never matches.
+    Text { column: String, operator: TextOp, values: Vec<String> },
     ContainsAny { column: String, values: Vec<Vec<u8>> },
     ContainsAll { column: String, values: Vec<Vec<Vec<u8>>> },
 }
 
+/// A text match (`bellwether_types::TextOp`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOp {
+    /// One of the value's words equals the argument.
+    HasToken,
+    /// The value contains the argument.
+    Contains,
+    /// One of the value's words starts with the argument.
+    HasPrefix,
+}
+
 const KNOWN_OPS: [&str; 8] =
-    ["in", "between", "latest_per_key", "not_older_than", "and", "expr_in", "contains_any", "contains_all"];
+    ["in", "between", "latest_per_key", "not_older_than", "and", "text", "contains_any", "contains_all"];
 
 /// Parses a residual, refusing any kind rematch does not evaluate by name (applying
 /// none would return a superset of the rows asked for).
@@ -417,88 +454,6 @@ pub fn parse_residual(v: &Value) -> Result<Pred> {
     }
     check(v)?;
     Pred::deserialize(v).context("parse the plan's residual")
-}
-
-/// A `json_get(<column>,'<path>')` expression: the one `expr` key the lake declares.
-#[derive(Debug, PartialEq, Eq)]
-struct JsonGet {
-    column: String,
-    path: Vec<Seg>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Seg {
-    Key(String),
-    Index(usize),
-}
-
-fn parse_json_get(expr: &str) -> Option<JsonGet> {
-    let inner = expr.strip_prefix("json_get(")?.strip_suffix(')')?;
-    let (col, lit) = inner.split_once(',')?;
-    let column = if let Some(q) = col.strip_prefix('"').and_then(|c| c.strip_suffix('"')) {
-        q.replace("\"\"", "\"")
-    } else if !col.is_empty() && col.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        col.to_string()
-    } else {
-        return None;
-    };
-    let path = lit.strip_prefix('\'')?.strip_suffix('\'')?.replace("''", "'");
-    let mut rest = path.strip_prefix('$')?;
-    let mut segs = Vec::new();
-    while !rest.is_empty() {
-        if let Some(r) = rest.strip_prefix('.') {
-            let end = r.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(r.len());
-            if end == 0 {
-                return None;
-            }
-            segs.push(Seg::Key(r[..end].to_string()));
-            rest = &r[end..];
-        } else if let Some(r) = rest.strip_prefix("[\"") {
-            let mut key = String::new();
-            let mut chars = r.char_indices();
-            let mut close = None;
-            while let Some((i, c)) = chars.next() {
-                match c {
-                    '\\' => key.push(chars.next()?.1),
-                    '"' => {
-                        close = Some(i);
-                        break;
-                    }
-                    c => key.push(c),
-                }
-            }
-            rest = r[close?..].strip_prefix("\"]")?;
-            segs.push(Seg::Key(key));
-        } else {
-            let r = rest.strip_prefix('[')?;
-            let end = r.find(']')?;
-            segs.push(Seg::Index(r[..end].parse().ok()?));
-            rest = &r[end + 1..];
-        }
-    }
-    Some(JsonGet { column, path: segs })
-}
-
-impl JsonGet {
-    /// The expression's value as text: a string's text, a number's token, `true`/`false`;
-    /// `None` for JSON null, an object, an array, a missing path or invalid JSON.
-    fn eval(&self, row: &Row) -> Option<String> {
-        let Val::Str(s) = row.get(&self.column) else { return None };
-        let doc: Value = serde_json::from_str(s).ok()?;
-        let mut cur = &doc;
-        for seg in &self.path {
-            cur = match seg {
-                Seg::Key(k) => cur.as_object()?.get(k)?,
-                Seg::Index(i) => cur.as_array()?.get(*i)?,
-            };
-        }
-        match cur {
-            Value::String(s) => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        }
-    }
 }
 
 /// Applies `p` to `rows`, keeping their order. `LatestPerKey` keeps every row at the
@@ -547,21 +502,17 @@ pub fn eval(p: &Pred, rows: Vec<Row>) -> Result<Vec<Row>> {
                 .collect();
             rows.into_iter().zip(keep).filter_map(|(r, k)| k.then_some(r)).collect()
         }
-        Pred::ExprIn { expr, values } => {
-            let g = parse_json_get(expr).ok_or_else(|| {
-                anyhow!("the plan's residual expr_in on {expr} is not evaluated by rematch (only json_get(<column>,'<path>'))")
-            })?;
-            let set: HashSet<&[u8]> = values.iter().map(Vec::as_slice).collect();
-            rows.into_iter()
-                .filter(|r| {
-                    g.eval(r).is_some_and(|s| {
-                        let mut v = Vec::new();
-                        canon_str(&s, &mut v);
-                        set.contains(v.as_slice())
-                    })
+        Pred::Text { column, operator, values } => rows
+            .into_iter()
+            .filter(|r| {
+                let Val::Str(s) = r.get(column) else { return false };
+                values.iter().any(|v| match operator {
+                    TextOp::HasToken => words::has_token(s, v),
+                    TextOp::Contains => words::contains(s, v),
+                    TextOp::HasPrefix => words::has_prefix(s, v),
                 })
-                .collect()
-        }
+            })
+            .collect(),
         Pred::ContainsAny { column, values } => {
             let set: HashSet<&[u8]> = values.iter().map(Vec::as_slice).collect();
             rows.into_iter().filter(|r| list_canon(r, column).iter().any(|e| set.contains(e.as_slice()))).collect()
@@ -590,7 +541,8 @@ fn list_canon(r: &Row, column: &str) -> Vec<Vec<u8>> {
     }
 }
 
-/// The residual with its byte values replaced by their counts (for the envelope).
+/// The residual with its byte values replaced by their counts (for the envelope); a text
+/// residual's values are words and stay.
 fn residual_summary(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -598,6 +550,7 @@ fn residual_summary(v: &Value) -> Value {
                 .filter(|(k, _)| k.as_str() != "lo" && k.as_str() != "hi")
                 .map(|(k, x)| {
                     let y = match (k.as_str(), x) {
+                        ("values", Value::Array(_)) if m.get("op").and_then(Value::as_str) == Some("text") => x.clone(),
                         ("values" | "bounds", Value::Array(a)) => json!(a.len()),
                         _ => residual_summary(x),
                     };
@@ -659,6 +612,8 @@ struct Request {
     k: &'static KeyDef,
     lookup: Lookup,
     tuples: Vec<Vec<Val>>,
+    /// A text key's words, each required (`rematch_core::words::tokens` of the values).
+    tokens: Vec<String>,
     local: Vec<Pred>,
     window: Option<Pred>,
     /// Why Bellwether cannot plan this lookup (served by a scan).
@@ -695,7 +650,16 @@ fn request(spec: &QuerySpec) -> Result<Request> {
     } else if spec.values.is_empty() {
         bail!("{} needs at least one value", k.name);
     }
-    let tuples = if k.kind == KeyKind::Range { Vec::new() } else { tuples(k, &spec.values)? };
+    let tokens = if k.kind == KeyKind::Text {
+        let t = words::tokens(&spec.values);
+        if t.is_empty() {
+            bail!("{}: {:?} holds no word (values split at Unicode word boundaries)", k.name, spec.values);
+        }
+        t
+    } else {
+        Vec::new()
+    };
+    let tuples = if matches!(k.kind, KeyKind::Range | KeyKind::Text) { Vec::new() } else { tuples(k, &spec.values)? };
     let cols = || k.columns.iter().map(|c| c.to_string()).collect::<Vec<_>>();
     let canon_strs = || {
         spec.values
@@ -712,7 +676,11 @@ fn request(spec: &QuerySpec) -> Result<Request> {
         KeyKind::Exact | KeyKind::Temporal | KeyKind::Temporal2 => {
             local.push(Pred::In { columns: cols(), values: tuples.iter().map(|t| encode_tuple(t)).collect() })
         }
-        KeyKind::Expr => local.push(Pred::ExprIn { expr: k.columns[0].to_string(), values: canon_strs() }),
+        KeyKind::Text => local.extend(tokens.iter().map(|w| Pred::Text {
+            column: k.columns[0].into(),
+            operator: TextOp::HasToken,
+            values: vec![w.clone()],
+        })),
         KeyKind::List if spec.all => {
             local.push(Pred::ContainsAll { column: k.columns[0].into(), values: canon_strs().into_iter().map(|v| vec![v]).collect() })
         }
@@ -749,7 +717,7 @@ fn request(spec: &QuerySpec) -> Result<Request> {
         )),
         _ => None,
     };
-    Ok(Request { t, k, lookup, tuples, local, window, unplannable })
+    Ok(Request { t, k, lookup, tuples, tokens, local, window, unplannable })
 }
 
 fn temporal_keys(t: &TableDef) -> String {
@@ -772,8 +740,8 @@ fn temporal_at(a: AsOf) -> Result<i64> {
 
 static KEYFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Writes the key file Bellwether reads: one column per key column, named by it (an
-/// `expr` key's column is named by its expression), typed as the dataset's.
+/// Writes the key file Bellwether reads: one column per key column, named by it, typed
+/// as the dataset's.
 fn write_keys(dir: &Path, k: &KeyDef, spec: &QuerySpec, tuples: &[Vec<Val>]) -> Result<PathBuf> {
     let mut fields = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
@@ -873,26 +841,81 @@ pub fn run(root: &Path, spec: &QuerySpec, bellwether: Option<&Path>) -> Result<Q
             format!("{} file(s) of {} sit under a `_`/`.` path component, which Bellwether never lists", hidden.len(), r.t.name),
         );
     }
-    let mut reindexed = false;
-    if let Some((untracked, gone)) = index::staleness(root, r.t.name)? {
-        if !untracked.is_empty() || !gone.is_empty() {
-            index::index_table(root, &bin, r.t)?;
-            reindexed = true;
-        }
+    // Re-index when the table has files the index does not track, or the index was built
+    // before this key was declared.
+    let stale = index::staleness(root, r.t.name)?.is_some_and(|(untracked, gone)| !untracked.is_empty() || !gone.is_empty());
+    let missing = index::built_specs(&idx)?.is_some_and(|s| !s.iter().any(|x| x == r.k.spec));
+    let reindexed = stale || missing;
+    if reindexed {
+        index::index_table(root, &bin, r.t)?;
     }
-    let keyfile = write_keys(&index::index_root(root), r.k, spec, &r.tuples)?;
-    let res = lookup(&bin, &lake, &idx, &r, spec, &keyfile);
-    let _ = std::fs::remove_file(&keyfile);
-    let out = res?;
-    let plan = &out["evidence"]["record"]["body"]["plan"];
-    let residual = parse_residual(&plan["residual"])?;
+    let outs: Vec<Value> = if r.k.kind == KeyKind::Text {
+        // One `locate --has` per word; a row must have every one.
+        r.tokens.iter().map(|w| index::run_bw(&bin, &text_args(&lake, &idx, r.t, r.k, w))).collect::<Result<_>>()?
+    } else {
+        let keyfile = write_keys(&index::index_root(root), r.k, spec, &r.tuples)?;
+        let res = lookup(&bin, &lake, &idx, &r, spec, &keyfile);
+        let _ = std::fs::remove_file(&keyfile);
+        vec![res?]
+    };
+    let mut residuals = Vec::with_capacity(outs.len());
+    let mut planned: Option<BTreeMap<String, BTreeSet<usize>>> = None;
+    for out in &outs {
+        let plan = &out["evidence"]["record"]["body"]["plan"];
+        residuals.push(parse_residual(&plan["residual"])?);
+        let entries = plan_entries(plan, r.lookup)?;
+        planned = Some(match planned {
+            None => entries,
+            // Row groups planned for every word (a row group holds a row with all of them
+            // only if each lookup planned it).
+            Some(prev) => prev
+                .into_iter()
+                .filter_map(|(p, g)| {
+                    let both: BTreeSet<usize> = g.intersection(entries.get(&p)?).copied().collect();
+                    (!both.is_empty()).then_some((p, both))
+                })
+                .collect(),
+        });
+    }
+    let planned = planned.unwrap_or_default();
     let table_dir = index::table_dir(&lake, r.t.name);
     let mut rows = Vec::new();
-    let mut entries: Vec<(&str, Vec<usize>)> = plan["entries"]
+    for (p, rgs) in &planned {
+        read_file(r.t, &table_dir, Path::new(p), Some(&rgs.iter().copied().collect::<Vec<_>>()), &mut rows)?;
+    }
+    for residual in &residuals {
+        rows = eval(residual, rows)?;
+    }
+    if let Some(w) = &r.window {
+        // Idempotent when Bellwether already planned the window; required when the key
+        // (text, list) takes none.
+        rows = eval(w, rows)?;
+    }
+    let one = |k: &str| outs.first().map(|o| o[k].clone()).unwrap_or(Value::Null);
+    let summaries: Vec<Value> =
+        outs.iter().map(|o| residual_summary(&o["evidence"]["record"]["body"]["plan"]["residual"])).collect();
+    let summary = if outs.len() == 1 {
+        json!({"lookup": one("lookup"), "files_total": one("files_total"), "row_groups_total": one("row_groups_total"),
+               "planned": one("planned"), "residual": summaries[0]})
+    } else {
+        json!({
+            "lookup": outs.iter().map(|o| o["lookup"].clone()).collect::<Vec<_>>(),
+            "files_total": one("files_total"),
+            "row_groups_total": one("row_groups_total"),
+            "planned": {"files": planned.len(), "row_groups": planned.values().map(BTreeSet::len).sum::<usize>()},
+            "residual": {"op": "and", "all": summaries},
+        })
+    };
+    Ok(QueryOutput { indexed: true, rows: finish(rows, spec.limit), plan: Some(summary), reason: None, reindexed })
+}
+
+/// A plan's files and their row groups.
+fn plan_entries(plan: &Value, lookup: Lookup) -> Result<BTreeMap<String, BTreeSet<usize>>> {
+    plan["entries"]
         .as_array()
-        .ok_or_else(|| anyhow!("bellwether {:?}: plan without entries", r.lookup))?
+        .ok_or_else(|| anyhow!("bellwether {lookup:?}: plan without entries"))?
         .iter()
-        .map(|e| -> Result<(&str, Vec<usize>)> {
+        .map(|e| -> Result<(String, BTreeSet<usize>)> {
             let p = e["file"]["path"].as_str().ok_or_else(|| anyhow!("plan entry without a path: {e}"))?;
             let rgs = e["row_groups"]
                 .as_array()
@@ -900,27 +923,22 @@ pub fn run(root: &Path, spec: &QuerySpec, bellwether: Option<&Path>) -> Result<Q
                 .iter()
                 .map(|g| g.as_u64().map(|g| g as usize).ok_or_else(|| anyhow!("bad row group {g}")))
                 .collect::<Result<_>>()?;
-            Ok((p, rgs))
+            Ok((p.to_string(), rgs))
         })
-        .collect::<Result<_>>()?;
-    entries.sort();
-    for (p, rgs) in &entries {
-        read_file(r.t, &table_dir, Path::new(p), Some(rgs), &mut rows)?;
-    }
-    rows = eval(&residual, rows)?;
-    if let Some(w) = &r.window {
-        // Idempotent when Bellwether already planned the window; required when the key
-        // (expr, list) takes none.
-        rows = eval(w, rows)?;
-    }
-    let summary = json!({
-        "lookup": out["lookup"],
-        "files_total": out["files_total"],
-        "row_groups_total": out["row_groups_total"],
-        "planned": out["planned"],
-        "residual": residual_summary(&plan["residual"]),
-    });
-    Ok(QueryOutput { indexed: true, rows: finish(rows, spec.limit), plan: Some(summary), reason: None, reindexed })
+        .collect()
+}
+
+/// `locate --has <column>=<word>`: a text key's lookup of one word (it takes no window).
+fn text_args(lake: &Path, idx: &Path, t: &TableDef, k: &KeyDef, word: &str) -> Vec<String> {
+    vec![
+        "locate".into(),
+        "--json".into(),
+        lake.join(t.name).to_string_lossy().into_owned(),
+        "--index".into(),
+        idx.to_string_lossy().into_owned(),
+        "--has".into(),
+        format!("{}={word}", k.columns[0]),
+    ]
 }
 
 fn lookup(bin: &Path, lake: &Path, idx: &Path, r: &Request, spec: &QuerySpec, keyfile: &Path) -> Result<Value> {
@@ -1056,23 +1074,29 @@ mod tests {
     }
 
     #[test]
-    fn expr_in_recomputes_json_get() {
-        let f = frame(&["tool_input"]);
-        let rs = rows(&f, vec![
-            vec![s(r#"{"command":"cargo test"}"#)],
-            vec![s(r#"{"command":"cargo build"}"#)],
-            vec![s(r#"{"command":null}"#)],
-            vec![s("not json")],
-            vec![Val::Null],
-            vec![s(r#"{"a":{"b c":[10,"x"]}}"#)],
-        ]);
-        let p = Pred::ExprIn { expr: "json_get(tool_input,'$.command')".into(), values: vec![cs("cargo test")] };
-        assert_eq!(ns(&eval(&p, rs).unwrap()), [0]);
-        let g = parse_json_get(r#"json_get(tool_input,'$.a["b c"][1]')"#).unwrap();
-        assert_eq!(g.path, [Seg::Key("a".into()), Seg::Key("b c".into()), Seg::Index(1)]);
-        let p = Pred::ExprIn { expr: "lower(tool_input)".into(), values: vec![] };
-        let e = eval(&p, Vec::new()).unwrap_err().to_string();
-        assert!(e.contains("lower(tool_input)"), "{e}");
+    fn text_residuals_fold_and_split_like_bellwether() {
+        let f = frame(&["tool_cmd"]);
+        let rs = || {
+            rows(&f, vec![
+                vec![s("cd x && cargo test --workspace")],
+                vec![s("cargo build")],
+                vec![s("CARGO TEST")],
+                vec![Val::Null],
+            ])
+        };
+        let has = |w: &str| Pred::Text { column: "tool_cmd".into(), operator: TextOp::HasToken, values: vec![w.into()] };
+        assert_eq!(ns(&eval(&Pred::And { all: vec![has("cargo"), has("test")] }, rs()).unwrap()), [0, 2]);
+        let any = Pred::Text { column: "tool_cmd".into(), operator: TextOp::HasToken, values: vec!["build".into(), "workspace".into()] };
+        assert_eq!(ns(&eval(&any, rs()).unwrap()), [0, 1], "one of the values");
+        let pre = Pred::Text { column: "tool_cmd".into(), operator: TextOp::HasPrefix, values: vec!["work".into()] };
+        assert_eq!(ns(&eval(&pre, rs()).unwrap()), [0]);
+        let sub = Pred::Text { column: "tool_cmd".into(), operator: TextOp::Contains, values: vec!["o te".into()] };
+        assert_eq!(ns(&eval(&sub, rs()).unwrap()), [0, 2]);
+        // The request: every word of every value, one residual each.
+        let r = request(&QuerySpec { table: "events".into(), key: "text:tool_cmd".into(), values: vec!["Cargo test".into(), "cargo".into()], ..Default::default() }).unwrap();
+        assert_eq!(r.tokens, ["cargo", "test"]);
+        assert_eq!(r.local, vec![has("cargo"), has("test")]);
+        assert!(request(&QuerySpec { table: "events".into(), key: "text:tool_cmd".into(), values: vec!["&&".into()], ..Default::default() }).is_err());
     }
 
     #[test]
@@ -1084,12 +1108,13 @@ mod tests {
             {"op":"latest_per_key","columns":["entry_id"],"ts_column":"valid"},
             {"op":"contains_all","column":"facets","values":[[[6,97,0,0]]]},
             {"op":"contains_any","column":"facets","values":[[6,97,0,0]]},
-            {"op":"expr_in","expr":"json_get(x,'$.a')","values":[[6,97,0,0]]}]});
+            {"op":"text","column":"tool_cmd","operator":"has_token","values":["CARGO"]}]});
         let Pred::And { all } = parse_residual(&v).unwrap() else { panic!() };
         assert_eq!(all.len(), 7);
-        let bad = json!({"op":"and","all":[{"op":"text","column":"body","operator":"contains","values":["x"]}]});
+        assert_eq!(all[6], Pred::Text { column: "tool_cmd".into(), operator: TextOp::HasToken, values: vec!["CARGO".into()] });
+        let bad = json!({"op":"and","all":[{"op":"semi_join","columns":["a"],"keys_from":{}}]});
         let e = parse_residual(&bad).unwrap_err().to_string();
-        assert!(e.contains("`text`"), "{e}");
+        assert!(e.contains("`semi_join`"), "{e}");
         assert_eq!(residual_summary(&v)["all"][0]["values"], 1);
     }
 

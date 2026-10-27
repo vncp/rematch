@@ -1,6 +1,7 @@
 //! `events/{harness}/{day}/{session_id}.parquet`: one row per trace record (DESIGN §3) of a
 //! closed session, flattened; every record field without a column of its own is kept as
-//! JSON in `extra`.
+//! JSON in `extra`. One column is derived, not a trace field: `tool_cmd`, a bash call's
+//! command (the `exact:` and `text:` keys' column).
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,8 @@ use crate::columns::{b, i, js, l, opt, req, s, Cell, Col, Ty};
 use crate::tables::path_component;
 
 /// Columns of an events file, in order; the trace field each is read from is in
-/// [`FIELDS`] (`tool_input` ← `input`, `usage_json` ← `usage`).
+/// [`FIELDS`] (`tool_input` ← `input`, `usage_json` ← `usage`); `tool_cmd`, last, is
+/// derived ([`command_of`]).
 pub const COLUMNS: &[Col] = &[
     req("seq", Ty::Int64),
     req("t", Ty::TsMs),
@@ -34,6 +36,7 @@ pub const COLUMNS: &[Col] = &[
     opt("reasons", Ty::ListUtf8),
     opt("flagged", Ty::Bool),
     opt("extra", Ty::Utf8),
+    opt("tool_cmd", Ty::Utf8),
 ];
 
 /// Trace field behind each column of [`COLUMNS`] except `extra`.
@@ -100,6 +103,14 @@ pub fn events_path(lake: &Path, session_id: &str, start_ms: i64) -> PathBuf {
         .join(format!("{}.parquet", path_component(session_id)))
 }
 
+/// The derived column: the command of a `bash` call (`input.command`), else `None`.
+pub fn command_of(tool: Option<&str>, input: Option<&Value>) -> Option<String> {
+    if tool != Some("bash") {
+        return None;
+    }
+    input?.get("command")?.as_str().map(str::to_string)
+}
+
 fn cell_of(col: &Col, v: Option<&Value>) -> Cell {
     match col.name {
         "tool_input" | "usage_json" => js(v),
@@ -115,6 +126,7 @@ fn cell_of(col: &Col, v: Option<&Value>) -> Cell {
 /// One record → cells aligned with [`COLUMNS`]. A field whose value does not fit its
 /// column's type (and is not null) moves to `extra` instead of being dropped.
 pub fn cells(record: &Value) -> Vec<Cell> {
+    let cmd = command_of(record.get("tool").and_then(Value::as_str), record.get("input"));
     let mut rest: Map<String, Value> = record.as_object().cloned().unwrap_or_default();
     let mut out = Vec::with_capacity(COLUMNS.len());
     for (col, field) in COLUMNS.iter().zip(FIELDS) {
@@ -128,12 +140,32 @@ pub fn cells(record: &Value) -> Vec<Cell> {
         out.push(c);
     }
     out.push(if rest.is_empty() { Cell::Null } else { Cell::S(Value::Object(rest).to_string()) });
+    out.push(cmd.map_or(Cell::Null, Cell::S));
     out
 }
 
 pub fn batch(trace: &Trace) -> Result<RecordBatch> {
     let rows: Vec<Vec<Cell>> = trace.records.iter().map(cells).collect();
     crate::columns::batch(COLUMNS, &rows)
+}
+
+/// Rewrites an events file exported before `tool_cmd` existed with the column appended
+/// (the same records, as a fresh export writes them now); `false` when it has the column.
+/// Bellwether takes one schema per root, so `lake index` upgrades such files before it
+/// declares keys on the column — the one rewrite a lake file gets (DESIGN §19.1).
+pub fn upgrade(path: &Path) -> Result<bool> {
+    let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+        .with_context(|| format!("read {}", path.display()))?
+        .schema()
+        .clone();
+    if schema.field_with_name("tool_cmd").is_ok() {
+        return Ok(false);
+    }
+    let records = read_records(path)?;
+    let rows: Vec<Vec<Cell>> = records.iter().map(cells).collect();
+    crate::io::replace(path, &crate::columns::batch(COLUMNS, &rows)?)?;
+    Ok(true)
 }
 
 fn col<'a, T: 'static>(b: &'a RecordBatch, name: &str, path: &Path) -> Result<&'a T> {
@@ -208,6 +240,10 @@ mod tests {
         let mistyped = cells(&json!({"seq":1,"t":1,"ev":"x","is_error":"yes"}));
         assert_eq!(mistyped[8], Cell::Null);
         assert_eq!(mistyped[18], Cell::S(r#"{"is_error":"yes"}"#.into()));
+        assert_eq!(c[19], Cell::S("cargo test".into()), "tool_cmd: the bash command");
+        assert_eq!(mistyped[19], Cell::Null);
+        let other = cells(&json!({"seq":1,"t":1,"ev":"tool_result","tool":"python","input":{"command":"x"}}));
+        assert_eq!(other[19], Cell::Null, "only bash calls have a tool_cmd");
     }
 
     #[test]
@@ -236,6 +272,16 @@ mod tests {
         crate::io::write_once(&p, &batch(&trace).unwrap()).unwrap();
         let back: Vec<TraceRecord> = read_records(&p).unwrap().into_iter().map(|v| serde_json::from_value(v).unwrap()).collect();
         assert_eq!(back, originals);
+        assert!(!upgrade(&p).unwrap(), "a current file is left alone");
+
+        // A file exported before tool_cmd: upgraded in place to what an export writes now.
+        let old = dir.path().join("old.parquet");
+        let cols = &COLUMNS[..COLUMNS.len() - 1];
+        let rows: Vec<Vec<Cell>> = trace.records.iter().map(|r| cells(r)[..cols.len()].to_vec()).collect();
+        crate::io::write_once(&old, &crate::columns::batch(cols, &rows).unwrap()).unwrap();
+        assert!(upgrade(&old).unwrap());
+        assert_eq!(std::fs::read(&old).unwrap(), std::fs::read(&p).unwrap(), "byte-identical to a fresh export");
+        assert!(!upgrade(&old).unwrap());
     }
 
     #[test]

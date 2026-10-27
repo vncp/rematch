@@ -464,6 +464,12 @@ pub fn cmd_report(ctx: &AppCtx, a: ReportArgs) -> Result<Value> {
         utc(end),
         if a.since.is_some() { String::new() } else { format!(" ({})", a.window) },
     )];
+    // Skills kept on another machine load here but are counted only there (DESIGN §20).
+    if rematch_core::profile::present(&ctx.paths) {
+        let n = crate::profile_cmd::profile_kept(ctx)?.len();
+        lines.push(format!("profile-kept (not counted on this machine): {n}"));
+        out["profile_kept"] = json!(n);
+    }
     lines.extend(body);
     out["source"] = json!(src);
     out["lake_lag"] = json!(lag);

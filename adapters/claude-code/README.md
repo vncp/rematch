@@ -20,7 +20,7 @@ ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
 
 `~/.claude/plugins/` is Claude Code's marketplace cache and settings only list `enabledPlugins` by `name@marketplace`; a marketplace install would copy the plugin and drop the `skills/` symlink, so use one of the two routes above. A `--plugin-dir` copy named `rematch` takes precedence over the `skills-dir` one for that session. Check the load with `claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch`: 8 hooks, under Skills the eight commands plus every linked skill, under Agents the rematch subagents.
 
-Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [`docs/MANUAL.md`](../../docs/MANUAL.md#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`. Subagents are copied into the plugin's `agents/` (below).
+Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [Where skills load from](https://vncp.github.io/rematch/concepts/entries.html#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`. Subagents are copied into the plugin's `agents/` (below).
 
 Upgrading from a version that used `~/.rematch/claude-skills/`: the first `SessionStart` re-points `skills/` here to `~/.rematch/skills` and deletes `~/.rematch/claude-skills/` (only links lived there).
 

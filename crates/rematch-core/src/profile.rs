@@ -31,12 +31,15 @@ pub const PROFILE_DIR: &str = "profile";
 pub const PROFILE_JSON: &str = "profile.json";
 /// Paths of the last sync's rebase conflicts, one per line (per machine, gitignored).
 pub const CONFLICTS_FILE: &str = ".conflicts";
+/// Where each `skills/<name>` came from, as of the last sync (per machine, gitignored).
+pub const INDEX_FILE: &str = ".index.json";
 pub const ROLES_FILE: &str = "roles.yml";
 pub const PROFILE_VERSION: u32 = 1;
 
 /// Lines every profile's `.gitignore` carries: per-machine files inside synced dirs.
 pub const GITIGNORE_LINES: &[&str] = &[
     CONFLICTS_FILE,
+    INDEX_FILE,
     // The ledger mirror (absolute paths, counters' evidence) and the reflector's notes are
     // written from this machine's ledger.
     "skills/*/rematch.json",
@@ -198,6 +201,46 @@ pub fn kept_sources(paths: &RematchPaths) -> Vec<(String, PathBuf)> {
         .collect();
     v.sort();
     v
+}
+
+/// `profile/.index.json`: per `skills/<name>`, the machine and time of the last commit that
+/// touched it (`git log -1 --format=%s -- skills/<name>` is `"<machine> <ts>"`), written by
+/// every `profile sync` so `library ls`, `why` and `report` name the machine without git.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIndex {
+    #[serde(default)]
+    pub skills: BTreeMap<String, SkillOrigin>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillOrigin {
+    pub machine: String,
+    /// The commit's `<ts>` (`%Y-%m-%dT%H:%M:%SZ`).
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub commit: String,
+}
+
+impl SkillOrigin {
+    /// From a commit subject `"<machine> <ts>"` (a subject without a space is all machine).
+    pub fn from_subject(subject: &str, commit: &str) -> SkillOrigin {
+        let s = subject.trim();
+        let (machine, at) = s.rsplit_once(' ').unwrap_or((s, ""));
+        SkillOrigin { machine: machine.to_string(), at: at.to_string(), commit: commit.to_string() }
+    }
+}
+
+/// The last sync's index; empty when there is none or it does not parse.
+pub fn load_index(paths: &RematchPaths) -> ProfileIndex {
+    std::fs::read_to_string(dir(paths).join(INDEX_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+pub fn write_index(paths: &RematchPaths, index: &ProfileIndex) -> Result<()> {
+    let p = dir(paths).join(INDEX_FILE);
+    let tmp = dir(paths).join(format!(".{INDEX_FILE}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(index)?)).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &p).with_context(|| format!("rename into {}", p.display()))
 }
 
 /// Read the conflicts the last sync left (empty when none).
