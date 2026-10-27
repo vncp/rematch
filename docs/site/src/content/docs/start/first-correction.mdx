@@ -1,0 +1,82 @@
+---
+title: Your first correction
+description: Correct the agent once, open the next session, and read what rematch made of it.
+next: false
+---
+
+import { Steps, Tabs, TabItem, Aside, LinkCard } from '@astrojs/starlight/components';
+import Diagram from '../../../components/Diagram.astro';
+
+rematch learns only from sessions in which you corrected the agent. This page walks through one: what you type, what you see in the next session, and how to ask why.
+
+The example is a real run on a scratch repository. It is one session on a toy repo, not a measured gain.
+
+<Steps>
+
+1. **Correct the agent the way you normally would.**
+
+   You ask for a function in `src/lib.py`; the agent adds it. You answer:
+
+   > That's wrong. Every public function here needs a Google-style docstring and must be exported in `__all__`.
+
+   The turn is pre-labelled as a negation. When the session ends, it is flagged for reflection. Other signals that flag a session: *"revert that"*, interrupting the agent, or three tool errors in any six results.
+
+2. **Open the next session.**
+
+   A reflection runs in the background (about 20 s, up to 3 model calls). It may stage nothing, for example after a `scope` redirect, an editor answer of `KEEP_BASE`, or a reply that still fails lint after its one retry. When it does stage something, one line appears at the top of the session:
+
+   ```text
+   staged skill src-lib-public-functions in my-repo: Use when adding or modifying public functions in src/lib.py.
+   ```
+
+   Behind that line, the redirect was classified `correction` (0.86), and one editor call wrote a skill that passed lint:
+
+   <Diagram
+   	name="reflect"
+   	alt="Terminal: rematch reflect --pending reports the classifier's verdict, the triage, and that src-lib-public-functions was staged with lint ok after one model call; the staged SKILL.md shows the rematch frontmatter block and three checkable laws about __all__ and docstrings."
+   	caption="A reflection with gemini-4-argon as classifier and editor. Output condensed to the lines that matter."
+   />
+
+3. **Work on the same kind of task again.**
+
+   The skill is now provisional: a skill that hasn't proven itself yet. It loads only in sessions whose repo, file types and task words match the one that produced it. In this run the agent exported and documented the next function unprompted; that is one session, not a measured gain.
+
+   Staged is not kept. Later matched sessions can still retire it ([what happens next](/rematch/start/what-happens-next/)).
+
+4. **Ask why.**
+
+   <Tabs syncKey="harness">
+   <TabItem label="omp">
+   ```text
+   /rematch why
+   ```
+   </TabItem>
+   <TabItem label="Claude Code">
+   ```text
+   /rematch:rematch-why
+   ```
+   </TabItem>
+   <TabItem label="Terminal">
+   ```sh
+   rematch library why --text
+   ```
+   </TabItem>
+   </Tabs>
+
+   For the last session it shows which entries loaded, whether each predicate hit, the redirects it saw with their class, and the running counters:
+
+   <Diagram
+   	name="why"
+   	alt="Terminal: rematch library why shows the next session with the entry loaded, glob hit and predicate hit, recurrence 0 harm 0, total matched 1; library ls lists the provisional entry with its raw counts; digest shows the staged line and no pending approvals."
+   	caption="The next matched session: <code>why</code> explains the load and the count; <code>ls</code> shows the counts raw."
+   />
+
+</Steps>
+
+<Aside type="tip" title="Nothing staged?">
+If the classifier missed your correction, label it yourself: `/rematch mark correction` in the session, or afterwards `rematch mark --session <id> --class correction`. See [correct the classifier](/rematch/guides/correct-the-classifier/).
+</Aside>
+
+In Claude Code, the staged line arrives as a `rematch digest` message at session start. Codex sessions are reflected after `rematch import --history --harness codex` and `rematch reflect --history`.
+
+<LinkCard title="Next: what happens next" href="/rematch/start/what-happens-next/" />

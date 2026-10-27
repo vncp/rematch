@@ -1,0 +1,55 @@
+---
+title: The lake and bitemporal history
+description: Why history lives apart from the ledger, and how it answers "what did the library look like then".
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The ledger keeps current state; the lake keeps history. The lake answers what the ledger cannot: what the library looked like when a session ran, what two machines saw together, and years of sessions at once.
+
+## Off the hot path
+
+- Every ledger write is journaled with the ledger's own clock.
+- `rematch lake export` copies the journal and the trace of every closed session into Parquet under `~/.rematch/lake/`, one [Bellwether](https://github.com/vncp/bellwether) root per table. Files are written once and never changed.
+- Nothing in a session reads it. `match`, `skills sync` and the hooks never open it, so a slow disk or a large lake costs a session nothing.
+
+## Questions it answers
+
+| Question | Key |
+|---|---|
+| What status did this entry have at that time, without lookahead? | `asof --valid --known` on `entries` |
+| The spec's three related-thing lookups | `exact:signature` and `list:facets` on `outcomes` |
+| Which sessions ran this command? | `exact:tool_cmd` on `events` |
+| Which ran a command with these words? | `text:tool_cmd` on `events` |
+
+Only keys a current reader needs are declared. The ADR lists every other kind with the question that would justify it.
+
+## Bitemporal semantics
+
+`known` is the origin machine's ledger write time. `asof --valid V --known K` on `entries` answers: what status did the ledger hold for this entry at K, effective at V?
+
+- **No lookahead.** A transition written at 14:00 is invisible to a question about 13:00 on the same day. Bellwether enforces the same invariant for prices.
+- **No missing rows.** The exporter writes up to a watermark `seq`, not up to a day, so a reader never misses rows the ledger already knew. The only lag is between the last export and now; `lake doctor` prints it.
+- **Restatements are deduped.** `counters` rows for the same `(entry_id, session_id)` keep the row with the greatest `known ≤ K`; `redirects` likewise per `(session_id, seq)`.
+
+## Identity that survives machines
+
+| Identity | Rule |
+|---|---|
+| `repo_remote` | `origin` (else the first remote) normalized to `host/org/repo`; no remote → `local:<sha256 of the toplevel path>`. Forks are different remotes by design; worktrees share the remote. |
+| monorepo sub-path | the predicate keeps `repo_glob` as the sub-path: `(repo_remote, subpath glob, exts, stems)` |
+| `head_sha` | recorded at session start |
+| `files_changed` | (path, sha256), computed once at shutdown; ≤ 50 files, none over 1 MB |
+| `content_sha256` | stored on the entry at stage, keep and version time, never hashed per session |
+| `loaded_entries` | `[{id, version, sha}]` in the trace; counting matches on `(id, version)` |
+| `visible_entries` | what the shared skills dir exposed, so `improve` can tell what the model could see from what counted |
+| row ids | `redirects` keyed by `(session_id, seq)`; entry ids stay machine-local, and cross-machine aggregation is by `content_sha256` |
+
+<Aside type="note">
+L1–L4 are built: journal, export, import, rebuild, index, query, the switched readers and `rematch report`. Where it has run live: [status and limits](/rematch/background/status/).
+</Aside>
+
+## See also
+
+- Guide: [query history](/rematch/guides/query-history/).
+- Decision record: [ADR 001](/rematch/background/adr-001-lake/); file layout and columns: DESIGN §19.1.

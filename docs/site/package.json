@@ -1,0 +1,17 @@
+{
+  "name": "rematch-docs",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "gen": "bun scripts/gen.ts",
+    "dev": "bun --bun astro dev",
+    "build": "bun --bun astro build",
+    "preview": "bun --bun astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.7",
+    "astro": "7.4.2",
+    "sharp": "0.35.5",
+    "starlight-links-validator": "0.27.0"
+  }
+}

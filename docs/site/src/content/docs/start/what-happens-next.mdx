@@ -1,0 +1,56 @@
+---
+title: What happens next
+description: How later sessions keep or retire what rematch staged, and where to watch it happen.
+next: false
+---
+
+import { Aside, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+Later sessions decide whether a staged skill stays. You are never asked: three raw counters settle it.
+
+## The counters
+
+Every session in which the skill loaded and its predicate matched is counted. In the example, the next session counted as:
+
+```text
+matched 1 · recurrence 0 · harm 0
+```
+
+| Counter | Goes up when |
+|---|---|
+| matched | a session's repo, file types and task words matched the skill's trigger |
+| recurrence | the same kind of correction happened again while the skill was loaded |
+| harm | a new cluster of tool errors, a takeover, or you disabled it, while it was loaded |
+
+## The outcomes
+
+| After | Status | What it means |
+|---|---|---|
+| 4 matched sessions, 0 recurrence, 0 harm | **kept** | copied into `~/.omp/agent/skills/`; loads natively from then on |
+| 2 recurrences or 2 harms | **retired** | archived with its evidence, never deleted, never loaded |
+| 12 matched sessions without a decision | **dormant** | archived; returns when its trigger matches again |
+
+So three more sessions like the example keep it. Two more corrections of the same kind retire it. The full rule set: [counters and the kill criterion](/rematch/concepts/counters/).
+
+<Aside type="note" title="Kept, never verified">
+Four clean matched sessions are evidence that the skill did its one job, nothing more. That is why the status is `kept`.
+</Aside>
+
+## Watch it
+
+```sh
+rematch library ls --text
+```
+
+Every entry with its raw counts:
+
+```text
+provisional skill foo [repo] matched 2 · recurrence 0 · harm 0
+```
+
+The other views, and how to retire an entry, roll it back or turn rematch off, are in [day to day](/rematch/guides/day-to-day/).
+
+<CardGrid>
+	<LinkCard title="Next: day to day" description="Everything optional you can do from here." href="/rematch/guides/day-to-day/" />
+	<LinkCard title="How it decides" description="The loop, step by step." href="/rematch/concepts/loop/" />
+</CardGrid>

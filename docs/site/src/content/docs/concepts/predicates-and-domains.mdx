@@ -1,0 +1,132 @@
+---
+title: Predicates, domains and tuning
+description: The deterministic trigger that decides where an entry loads and which sessions count for it.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every entry carries a trigger predicate: a repo, file types and a few task words. It decides where the entry loads and which finished sessions count for it. No model is involved anywhere on this page.
+
+Counters mean something only if "matched" is computed the same way for every session ([D12](/rematch/background/decisions/)).
+
+## What a predicate holds
+
+| Field | Derived from (at stage time) |
+|---|---|
+| `repo_glob` | the originating session's repo path (`git rev-parse --show-toplevel`), or `**` with no repo |
+| `repo_remote` + `subpath` | the repo's normalized remote (`host/org/repo`) and `**`; the glob stays as fallback |
+| `file_exts` | extensions of files read or edited in the evidence window (≤ 8) |
+| `stems` | up to 10 stemmed, stop-worded, lowercase tokens ranked by tf-idf against the session corpus |
+| `domain` | the originating session's domain, if it has one ([below](#domains)) |
+
+The stems come from a weighted document: the task turn (the last input before the redirect) ×2, basenames of touched files ×2, the redirect turn ×1. The redirect's own words ("that's wrong", "every") must not crowd out the task's terms, or later sessions on the same task never count. That was observed on the first real run and fixed.
+
+The editor's `entry.stems` are used only when derivation yields nothing. The rate limits key on the pre-editor predicate hash.
+
+## When it matches
+
+**Place.** With a remote on both sides, the remotes must be equal and the `subpath` glob must match the cwd (or an ancestor) relative to the toplevel. Otherwise the repo glob decides.
+
+- A worktree or another clone of the same remote matches its repo's entries wherever it lives.
+- A fork is another remote, so it does not.
+- A repo without a remote is `local:<sha256 of the main worktree's toplevel>`; linked worktrees share it.
+- Remotes are normalized: scheme, user, port, `.git` and trailing `/` stripped; host lowercased; path lowercased on github.com and gitlab.com.
+
+| Match | When | Rule |
+|---|---|---|
+| **Load-time** (`match --cwd`) | session start | the place matches; a branch contributes when at least one active provisional entry in it matches |
+| **Count-time** | a finished trace | place hit, and file extensions overlap (or the entry has none), and at least min(2, stems) stems appear in the first 5 inputs or the files read |
+
+- A hook entry is active only once its approved module exists. Before approval it contributes nothing and never counts.
+- Provisional agents are listed in every session, with `predicate_hit` set only where they would count.
+- Paths are tried as given and canonicalized (macOS `/tmp` → `/private/tmp`).
+- An entry whose version was recorded at session start counts only at that version.
+
+To see a decision: `rematch match --cwd .` for loading, `rematch library why <session>` for counting ([troubleshooting](/rematch/guides/troubleshooting/#staged-but-a-later-session-did-not-load-it)).
+
+## Domains
+
+A domain is a dotted lowercase path: `web`, `web.frontend`, `mobile`, `quant.options`, `3d.animation`. When both an entry's trigger and a session have one, the entry loads and counts only if the session's domain equals the trigger's or extends it.
+
+| Trigger | Session | Loads and counts |
+|---|---|---|
+| `quant` | `quant.options` | yes |
+| `web` | `mobile` | no |
+| either side without a domain | — | as before domains existed |
+
+So a review skill learned on web work never triggers on mobile or 3D work, even when the words are the same.
+
+### How a session's domain is decided
+
+First answer wins:
+
+1. **You declared it** in `~/.rematch/policy.json`, with `rematch policy domain set` ([policy.json](/rematch/reference/configuration/policy-json/)).
+2. **The branch says so** in `~/.rematch/branches/<branch>/domain.yml` ([domain.yml](/rematch/reference/configuration/domain-yml/)). The branch is the repo's directory name.
+3. **Inference** from the files touched and the words used, with [domain_rules.toml](/rematch/reference/configuration/domain-rules/).
+
+Inference scores extensions 2 each and words 1 each. The best domain needs at least 2 and must beat the runner-up by at least 1, otherwise the session gets none. A second level (`web.frontend`) only comes from a word rule.
+
+```sh
+rematch policy domain set github.com/acme/web web.frontend          # a normalized remote…
+rematch policy domain set . web.frontend                            # …or a repo path (its remote is used)
+rematch policy domain set 'github.com/acme/*' quant                 # a glob over remotes
+rematch policy domain set github.com/acme/app mobile --subpath ios  # only below ios/ in that repo
+rematch policy domain unset github.com/acme/app --subpath ios
+rematch policy show --text
+```
+
+### What uses it
+
+- **New entries** take the domain of the session they came from. `create --from sessions` and `improve` take the domain most of their reference sessions share.
+- **At session start** only rules 1 and 2 apply (files and words are not known yet). `rematch match --cwd <dir>` prints the place's domain. When the session ends, `count` decides the full domain.
+- **`why` shows it**: the recorded domain, what today's policy decides, and `ok|mismatch` per loaded entry. A mismatch makes the place a miss.
+- **After declaring or changing a domain**, run `rematch lake migrate`. `policy domain set` tells you how many recorded sessions would change.
+- **The digest proposes, never applies.** When five or more sessions in an undeclared repo read skills of one domain, it suggests `rematch policy domain set <remote> <d>`.
+- **At most 8 kept entries per top-level domain** on this machine (`rematch policy caps set kept_per_domain <n>`). Past it, a new candidate merges into an existing entry.
+- **`report` groups triggers by domain** ([read the report](/rematch/guides/read-the-report/)).
+
+`why` with domains, in a monorepo with `ios/` declared `mobile`:
+
+```text
+domain mobile · policy now: mobile (policy.json)
+loaded web-review v1 (provisional) sha 9d8209857232: domain web.frontend mismatch · place miss · predicate miss · this session not counted · …
+loaded ios-review v1 (provisional) sha 7947e0f201a9: domain mobile ok · place hit · predicate hit · this session recurrence 1 harm 0 · …
+```
+
+## Tuning
+
+A predicate is a guess made at stage time. Sessions tell whether it was right, and `rematch tune` proposes a corrected one without a model call. The new predicate is a new provisional sibling that the counters judge like any entry.
+
+```sh
+rematch tune --dry-run --text                    # signals and proposals for every entry; writes nothing
+rematch tune --entry ledger-helper --text        # stage the tune of one entry (id or name)
+rematch tune --window 30d --dry-run              # <n>w, <n>d or <n>h, ending now (default 6w)
+```
+
+| Signal | Means | Threshold | Change |
+|---|---|---|---|
+| **read-but-missed** | a session read the entry while it was visible, at a covered place, and the predicate did not hit | 3 sessions | stems found in ≥ 2 of them join (≤ 10); their extensions join a non-empty list (≤ 8) |
+| **matched-but-unread** | the predicate hit, the entry loaded, nothing read it | 4 sessions, with < 3 read-but-missed | stems only unread sessions carry go; two always stay |
+
+"Read" means the model opened the skill: `skill://name`, `skills/<name>/SKILL.md`, or a retrieved unit.
+
+On a root where `ledger-helper` (stems `ledger helper round audit`) was read in three imported sessions about the order book parser:
+
+```text
+tune · source ledger · window 6w (2026-09-15 00:00 UTC → 2026-10-27 00:00 UTC) · 3 session(s) · dry run
+ledger-helper v1: read-but-missed 3 · matched-but-unread 0 · matched-and-read 0 → predicate tune: +[orderbook, parser, quot] -[] from 3 session(s) → would stage v2 (provisional, predicate b2c09424571f)
+```
+
+### Rules
+
+- **Nothing is edited in place.** A tune stages a sibling: same files, version + 1, a new predicate, and a `status_note` such as `predicate tune: +[orderbook, parser, quot] -[] from 3 session(s)`. Its evidence session ids are in the sibling's `rematch.json` (`tune.evidence`).
+- **The parent keeps serving** until the counters keep or retire the sibling. A kept sibling replaces a kept parent through the anchor replay.
+- **Domains are never changed or widened**, and stems are never pooled across domains. Reads in another domain or at an uncovered place are shown and never used. An entry without a domain whose reads all carry one domain, in three or more sessions, gets that domain.
+- **Guards:** one tune per entry every 7 days, one pending at a time; never on pinned, built-in or hook entries; never a change of repo, remote or subpath, never `**`. `--dry-run` runs every guard and says `would stage` or `skipped: <reason>`.
+- **It runs by itself** after every `count` that counted a session (so after `reflect --pending`); its lines start with `tune:`.
+- **Read it back** in `library why <session>` (`predicate tune v2 pending (…)`) and in `report`, which counts each session against the predicate of the version it loaded.
+
+## See also
+
+- Guides: [troubleshooting](/rematch/guides/troubleshooting/), [read the report](/rematch/guides/read-the-report/).
+- Reference: [policy.json](/rematch/reference/configuration/policy-json/), [domain_rules.toml](/rematch/reference/configuration/domain-rules/), DESIGN §6 in the [design contract](/rematch/background/design/).

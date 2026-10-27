@@ -1,0 +1,93 @@
+---
+title: The loop
+description: How a correction in one session becomes a provisional entry, and how later sessions keep or retire it.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+import Diagram from '../../../components/Diagram.astro';
+
+A session that ended with a correction produces at most one bounded proposal at the start of the next session. Later sessions that match load it, and counters decide whether it stays. The real session is the reference run, and the next matched session is the probe, so interactive use costs no reruns.
+
+<Diagram
+	name="loop"
+	alt="The rematch loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off."
+/>
+
+Inside a session, the extension only records and loads. Everything that proposes or decides runs in the binary, outside the session's model loop: started detached at the next session start, alongside your work. The line between them: [the evidence boundary](/rematch/concepts/evidence-boundary/).
+
+## How a reflection works
+
+<Steps>
+
+1. **Flag.** At shutdown the session is flagged only if it carried a signal: a pre-labelled redirect (`interrupt`, `revert`, `negation`, `reprompt`), three tool errors in any six consecutive results, or `/rematch mark`. Clean sessions produce nothing.
+   - Enforced by the extension, within a 2-second budget, so it writes one small file.
+
+2. **Classify.** One batched call labels each redirect `correction`, `preference`, `scope` or `none`. A session whose only redirects are `scope` or `none` gets no editor call. A mark overrides the classifier.
+   - `reflect.rs`
+
+3. **Triage.** The first failure is *process* (anything the agent produced with tools, error clusters, takeovers, reverts, procedural text) or *content* (a corrected prose answer). Content failures are logged, not proposed on. The scope picks the editor: *domain* by default, *invariant* when the failure is about the agent's general way of working.
+   - `trace::triage`
+
+4. **Predicate.** The trigger: repo, the extensions of files touched in the evidence window, and up to ten stems from the task turn, the touched files and the redirect. Its hash keys the rate limits. Details: [predicates](/rematch/concepts/predicates-and-domains/).
+   - `predicate::derive`
+
+5. **Propose.** One editor session through `omp -p --no-tools`, given the trace excerpt, the deliverable, the redirect, the current entry if any, and matching lessons. The prompt treats the trace as data. The reply is edits plus a manifest: evidence moment, predicted fix, predicted regression. `KEEP_BASE` is a valid answer.
+   - `improver/editor.md`; `omp.rs` verifies provider and model on every event
+
+6. **Lint.** Static and free: every rule in `improver/lint.toml`. On an error the editor gets one retry with the findings. Rules: [lint](/rematch/reference/lint/).
+   - `lint::lint_entry`
+
+7. **Stage.** Written to `staging/<branch>/<name>/` as provisional, with the predicate, model family, originating session and manifest. A near-duplicate routes its evidence to the existing entry instead.
+   - `library::stage`, `dedup`
+
+8. **Load.** At the next session start the entries matching the working directory are linked into the shared skills directory, which joins omp's skill paths. Every session loads them; there is no withheld arm.
+   - `library::sync_shared_skills`, `library::list_for_match`
+
+9. **Count and decide.** For every finished trace: did the motivating redirect class recur while the entry was loaded, and was there harm? Then the decision rule. After a keep or retire, the reflector writes `EXPERIENCE.md` beside the entry; later proposals read it.
+   - `counters::fold_session`, `counters::decide` — rules: [counters](/rematch/concepts/counters/)
+
+</Steps>
+
+## Why it is built this way
+
+| Choice | Why | Decision |
+|---|---|---|
+| No proposal without a trace | every entry cites the moment (`session_id`, `seq`) it came from; editing a harness without an execution behind it dropped Harness² from 73.4 to 63.2 on code | D1 |
+| At most three model calls, no reruns | one batched classifier call, one editor, one lint retry; the next matched session is the probe | D6, D7 |
+| No composer and no model selector in interactive mode | choosing between untested texts is blind selection, which produced Harness²'s worst regressions | D6 |
+| Kept by use, judged by recurrence | the signal is the recurrence of the redirect class that motivated the entry, not tokens, turns or a judge; unvalidated model-written patches were net negative in Harness-R1 (21 of 39 lowered success) | D8, D10 |
+| Appended, never rewritten | entries are itemized units with their own counters; a model never rewrites the library or the improver prompts; a monolithic rewrite collapsed a context from 18,282 tokens to 122 in ACE | D14, D25 |
+| Only failures are reflected on | the system never grades its own successes | D9 |
+| Modest expectations | published harness gains were 54% overfitting on audit; the deployed-static regime showed low single digits for strong models | D18, D19 |
+
+Evidence for each id: [research decisions](/rematch/background/decisions/).
+
+## Models
+
+- The editor is the strongest configured model; the classifier a fast one. There is no judge role.
+- A reply from a different provider than configured is a failed run, never a fallback.
+- Every entry records the model family it was created under, with a per-family breakdown of its counters. Entries load regardless of family, because gating would make them flicker as you switch models.
+- When counters diverge (harm on one family, clean on another), the entry is split and the harmed family gets its own sibling.
+- A family whose recurrence or harm rises across several entries appears as a review list in the digest, never as automatic retirements.
+
+## Compared with other ways to improve a harness
+
+| | Hand-written skills | compound-forge (SkillOpt / GEPA) | rematch |
+|---|---|---|---|
+| Evidence | your memory of what went wrong | a benchmark suite you maintain | the trace of the session that went wrong |
+| Cost per improvement | your time | dozens to hundreds of rollouts | ≤ 3 model calls, 0 reruns (interactive); 4–10 rollouts with a verifier (batch) |
+| What decides | you | validation score on held-out cases | recurrence of the motivating redirect over later matched sessions; a verifier in batch mode |
+| Activates on its own | everything you write | nothing (proposals are reviewed) | skill text in personal scope; never scripts, hooks, team or fork changes |
+| Exit for a bad change | you notice | regression on the suite | counters retire it; rollback restores the predecessor; `off` stops everything |
+
+The loop design, scoped editors, lint for generalization and the experience library come from Harness² (Xu et al., arXiv 2610.14224); the `improver/` prompts are derived from its Appendix H, not verbatim. rematch adds the zero-rerun interactive mode with a deterministic predicate and raw counters (D10, D12), and a boundary that lets the harness propose without being trusted (D24).
+
+<Aside type="note" title="The cost of no reruns">
+A single user is not blinded, so the counters measure only the recurrence of one redirect class, something you would not fake. Nothing is ever called verified.
+</Aside>
+
+## See also
+
+- Guide: [your first correction](/rematch/start/first-correction/), [correct the classifier](/rematch/guides/correct-the-classifier/).
+- Reference: [trace schema](/rematch/reference/trace-schema/), [lint rules](/rematch/reference/lint/).
+- Contracts: DESIGN §3 (flag), §6 (predicate, triage), §7 (counting), §9 (editor) in the [design contract](/rematch/background/design/).

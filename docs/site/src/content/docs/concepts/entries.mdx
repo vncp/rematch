@@ -1,0 +1,73 @@
+---
+title: Entries and statuses
+description: What an entry is, the statuses it moves through, and where each one loads from.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Diagram from '../../../components/Diagram.astro';
+
+An entry is one item of the library: a skill, rule, script, agent, hook, fact or lesson, with its own trigger, counters and status. Its status decides where it lives and whether it loads.
+
+<Diagram
+	name="lifecycle"
+	alt="Entry statuses. Draft becomes provisional on a task run or --unverified. Provisional becomes kept at zero recurrences over at least four matched sessions with no harm, retired at two recurrences or two harm events, dormant after twelve matched sessions without a decision or thirty days with fewer than three matches, and back from dormant when the predicate hits again. Kept becomes stale when a fact source, the model family or the fork commit changed, or retired at two harm events in thirty days. Stale returns as a new canary or retires. Retired never leaves. Pinned is a flag."
+/>
+
+## Statuses
+
+| Status | Lives in | Loads |
+|---|---|---|
+| `draft` | `~/.rematch/drafts/<name>/` | never |
+| `provisional` | `~/.rematch/staging/<branch>/<name>/` | on predicate match |
+| `kept` | `~/.omp/agent/skills/<name>/` (agents: `~/.omp/agent/agents/<name>.md`) | natively, on every match |
+| `stale` · `dormant` · `retired` | `~/.rematch/archive/<status>/<id>/` | never; never deleted |
+| `pinned` | wherever it is | a flag: never replaced automatically |
+
+- **Pinned** is a flag, not a place. Automatic transitions refuse pinned entries; `disable` and `rollback` are your actions and proceed.
+- **A kept entry replaced by a sibling becomes dormant**, not retired, with its files in `predecessors/<name>/<version>/`. `rollback` must be able to restore it, and retired never leaves.
+- **Declining an approval retires the entry.**
+- **Every kept entry keeps its predecessor**, so `rollback` always has something to restore ([D13](/rematch/background/decisions/)).
+
+When each transition fires: [counters and the kill criterion](/rematch/concepts/counters/). Files inside an entry: [entry layout](/rematch/reference/entry-layout/).
+
+## Where skills load from
+
+One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for every skill that loads. All three harnesses read it.
+
+| It links | Target |
+|---|---|
+| every kept or pinned entry | its directory under `~/.omp/agent/skills/` |
+| every provisional entry whose predicate matched a directory that was synced | its `staging/<branch>/<name>/` |
+
+| Harness | Reads it through | Synced by |
+|---|---|---|
+| omp | `skills.customDirectories`, added by the extension for the process | the extension, at omp start |
+| Claude Code | the plugin's `skills/` link | the plugin's `SessionStart` hook |
+| Codex | `~/.agents/skills/rematch` | `rematch skills sync --harness codex --cwd "$PWD"` |
+
+- **Loading is the union of what you work on.** A sync adds the provisional skills matching its directory and never removes one because this directory does not match. Each extra skill costs one description line in the system prompt.
+- **Counting is not.** A session counts only the entries whose predicate matches its own directory, so a skill loaded in an unrelated repo never moves a counter.
+- **Status changes apply at once.** Keeping re-points the link; retiring, archiving or disabling removes it; `rematch off` removes every link and `rematch on` restores the kept ones. A running session sees the directory as it was at its start.
+- **Every omp profile shares it**, because `~/.rematch` is shared: a skill kept under one profile loads for every profile and harness.
+- `rematch skills sync --cwd <dir>` syncs by hand and prints what it added and pruned. Directories in `~/.rematch/skills/` that are not links are never touched.
+
+## Subagents
+
+When the fix for a correction is "read this big thing and report the one line that matters" (a build log, a long diff, a data dump), the editor may propose a subagent (`kind: agent`) instead of a skill. It runs in its own context and returns text, so the big input never enters your session.
+
+An `AGENT.md` holds `name`, `description` (what the main agent sees when deciding to delegate), optionally `model`, and a body that is the subagent's system prompt.
+
+| Status | Where | Seen |
+|---|---|---|
+| provisional | `staging/<branch>/<name>/`, linked from `~/.rematch/agents/<name>.md` | in **every** omp session (omp reads agents only from fixed places); counted only where the repo matches |
+| kept (after 4 clean sessions) | copied to `~/.omp/agent/agents/<name>.md`; a file of yours with that name is saved first | natively |
+| retired · dormant · stale | link or kept copy removed; entry archived | never |
+
+- A project or user agent with the same name wins over a provisional one.
+- `/rematch off` does not hide provisional agents; `library disable <id>` does.
+- Claude Code gets copies in its plugin's `agents/`, refreshed at each session start. Codex does not load subagents.
+
+## See also
+
+- [Create a skill](/rematch/guides/create-a-skill/), [improve a skill](/rematch/guides/improve-a-skill/), [day to day](/rematch/guides/day-to-day/#manage-the-library).
+- [File locations](/rematch/reference/files/).

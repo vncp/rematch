@@ -1,0 +1,160 @@
+---
+title: Install
+description: Install rematch for omp, Claude Code or Codex, check it, and seed it from the sessions you already have.
+next: false
+---
+
+import { Tabs, TabItem, Steps, Aside, LinkCard } from '@astrojs/starlight/components';
+
+Install the binary and connect it to your harness. It takes one command per harness, plus a check.
+
+One binary, ledger and library serve every harness; an adapter only forwards what its harness exposes. omp is the reference. What each harness can and cannot do: [harness capabilities](/rematch/reference/harnesses/).
+
+## Install
+
+<Tabs syncKey="harness">
+<TabItem label="omp">
+
+You need omp 18.12 and a Rust toolchain, in a checkout of this repo.
+
+<Steps>
+
+1. Build and link:
+
+   ```sh
+   scripts/install.sh
+   ```
+
+   It builds the binary, links the extension into omp, and writes the shim `~/.local/bin/rematch`.
+
+2. Check:
+
+   ```sh
+   rematch doctor --text
+   ```
+
+   The last line reads `ready: true`. Anything else is listed as a `problem:` line saying what to run.
+
+</Steps>
+
+<Aside type="note" title="What install.sh does">
+- `cargo build --release` (`--locked` when `Cargo.lock` exists).
+- Links `extension/agents` → `~/.rematch/agents` (for subagent entries).
+- `omp plugin link extension --scope user`.
+- Writes `~/.local/bin/rematch`, which runs `target/release/rematch` of the checkout.
+- Runs `rematch doctor` and prints the optional model roles.
+</Aside>
+
+</TabItem>
+<TabItem label="Claude Code">
+
+You need Claude Code 2.1.285 or later and the `rematch` binary: `cargo build --release` in this repo, `rematch` on `PATH`, or `REMATCH_BIN` set.
+
+<Steps>
+
+1. Load the plugin in every session:
+
+   ```sh
+   ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
+   ```
+
+   Or for one session only:
+
+   ```sh
+   claude --plugin-dir /path/to/rematch/adapters/claude-code
+   ```
+
+2. Check the load:
+
+   ```sh
+   claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch
+   ```
+
+   Expect 8 hooks; under Skills, the eight commands plus every linked skill; under Agents, the rematch subagents.
+
+</Steps>
+
+<Aside type="caution" title="Use one of the two routes above">
+A marketplace install copies the plugin and drops its `skills/` link. `~/.claude/plugins/` is Claude Code's marketplace cache.
+</Aside>
+
+Reflection makes its model calls through omp (`OMP_BIN`, else `omp` on `PATH`). Without omp, sessions are still traced, flagged and loaded; run `rematch reflect --pending` where omp is installed.
+
+If large sessions end unflagged, raise the 1.5 s `SessionEnd` budget:
+
+```sh
+CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS=5000 claude
+```
+
+</TabItem>
+<TabItem label="Codex">
+
+You need `rematch` on `PATH` (`scripts/install.sh`, or `cargo build --release`). The omp plugin is not required. Nothing runs inside a Codex session; rematch reads its sessions afterwards.
+
+<Steps>
+
+1. Let Codex see rematch's skills (once):
+
+   ```sh
+   mkdir -p ~/.agents/skills
+   ln -s ~/.rematch/skills ~/.agents/skills/rematch
+   ```
+
+2. Before starting Codex in a repo, add the skills that match it:
+
+   ```sh
+   rematch skills sync --harness codex --cwd "$PWD"
+   ```
+
+   To do it on every launch, add this to your shell rc:
+
+   ```sh
+   codex() { rematch skills sync --harness codex --cwd "$PWD" >/dev/null; command codex "$@"; }
+   ```
+
+3. After you worked, import and reflect:
+
+   ```sh
+   rematch import --history --harness codex
+   rematch reflect --history
+   ```
+
+   A session that was never imported never counts.
+
+4. Optional: digest, sync and approvals from inside Codex, each command after your approval:
+
+   ```sh
+   ln -s "$PWD/adapters/codex/skills/rematch-status" ~/.agents/skills/rematch-status
+   ```
+
+</Steps>
+
+</TabItem>
+</Tabs>
+
+## Choose the models (optional)
+
+The editor should be the strongest model you have, the classifier a fast one. Set them in `~/.omp/agent/config.yml`:
+
+```yaml
+modelRoles:
+  rematch-editor: <provider>/<strongest model>      # falls back to slow → default
+  rematch-classifier: <provider>/<fast model>       # falls back to smol → tiny → default
+```
+
+`rematch doctor --text` shows which models it resolved. Per-machine roles: [model roles](/rematch/reference/configuration/model-roles/).
+
+## Seed from your history (optional)
+
+Import the sessions you already have, then reflect on the ones that carried a correction. Import is read-only and makes no model call.
+
+```sh
+rematch import --history
+rematch reflect --history
+```
+
+- `import --history` reads omp (default agent dir and every profile), Claude Code (`~/.claude/projects`) and Codex (`~/.codex/sessions`). Narrow it with `--harness omp|claude-code|codex` or `--skip-profile <name>`.
+- `reflect --history` handles the newest 10 flagged sessions per run (`--limit`, `--since 2026-10-01`). Run it again for the next batch; a session is reflected once.
+- Each reflection follows the same rules as a live one: same rate limits, at most 3 model calls.
+
+<LinkCard title="Next: your first correction" href="/rematch/start/first-correction/" />

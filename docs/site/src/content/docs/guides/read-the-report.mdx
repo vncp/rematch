@@ -1,0 +1,71 @@
+---
+title: Read the report
+description: Compute the kill criterion — did anything earn kept, and did recurrence fall — instead of eyeballing it.
+---
+
+`rematch report` answers the project's kill criterion from your history: has an entry reached kept over at least four matched sessions, and has recurrence fallen on a trigger the library covers?
+
+What the kill criterion is and why it exists: [counters and the kill criterion](/rematch/concepts/counters/#the-kill-criterion).
+
+## Run it
+
+```sh
+rematch report --text                   # the last 6 weeks
+rematch report --window 30d --text      # <n>w, <n>d or <n>h, ending now
+rematch report --since 2026-09-15       # from that UTC day to now
+```
+
+It reads the lake when there is one (every machine's history after `lake import`), else this ledger's journal (`"source": "ledger"`). Without `--text` it prints the JSON envelope.
+
+## Example output
+
+From the seed of `report`'s unit test (one trigger, both arms, after `lake export`; machine name shortened):
+
+```text
+report · source lake (lag 0 journal row(s)) · machines laptop · window 2026-09-15 00:02 UTC → 2026-10-27 00:02 UTC (6w)
+kept run-tests-before-commit: 4 matched session(s) in the window (≥ 4), recurrence 0, harm 0
+domain (none): 2 trigger(s), 1 covered, 1 fell · with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50)
+  trigger run-tests-before-commit [6675c0a0d803] class correction: with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50) · Δ -0.50 fell
+verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit)
+```
+
+## Read it line by line
+
+| Line | Says |
+|---|---|
+| `kept <name>` | an entry whose status at the window's end is kept, with its matched sessions in the window (any machine), recurrence and harm |
+| `domain <d>` | a summary of that domain's triggers; arms add up (a session matching two triggers counts twice) |
+| `trigger <name> [hash]` | one trigger predicate: its two arms, `Δ`, and `fell` when `Δ` is negative |
+| `verdict` | both halves of the kill criterion, with the names behind each `yes` |
+| `profile-kept (not counted on this machine): N` | with a profile, skills kept on another machine (JSON `profile_kept`) |
+
+## The two arms
+
+Each session in the window that matches a trigger's files and terms, and whose domain fits, falls in one arm:
+
+| Arm | The session |
+|---|---|
+| **with** | loaded an entry of that trigger |
+| **before** | loaded none |
+
+- Each arm shows sessions, sessions where the trigger's redirect class recurred, the redirects of that class, and the rate (recurred / sessions).
+- `Δ` = with − before. A trigger is **covered** when its with-arm is not empty.
+- A classless entry's redirect class is any correction or preference.
+- Triggers are grouped by domain; `(none)` holds triggers without one.
+
+## Rules that keep it honest
+
+- Every row is read as the ledger held it at the window's end, so a past report does not change when entries move on.
+- Built-in entries are listed but never count toward the verdict.
+- After a predicate tune, each session is counted against the predicate of the version it loaded, so a wider predicate cannot win by matching more sessions.
+
+## Two domains in one repo
+
+`web/` declared `web.frontend`, `ios/` declared `mobile`, a review skill learned in each, six sessions with the same words:
+
+```text
+domain mobile: 1 trigger(s), 1 covered, 0 fell · with 2/3 recurred (2 redirect(s), rate 0.67) · before no sessions
+  trigger ios-review [60b78f6a0c69] class correction|preference: with 2/3 recurred (2 redirect(s), rate 0.67) · before no sessions
+domain web.frontend: 1 trigger(s), 1 covered, 0 fell · with 1/3 recurred (1 redirect(s), rate 0.33) · before no sessions
+  trigger web-review [6f88fb35eae6] class correction|preference: with 1/3 recurred (1 redirect(s), rate 0.33) · before no sessions
+```

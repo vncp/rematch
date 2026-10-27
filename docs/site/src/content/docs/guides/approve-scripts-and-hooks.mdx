@@ -1,0 +1,76 @@
+---
+title: Approve scripts and hooks
+description: Approve or decline the executable changes rematch proposes, including the three built-in hooks.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Skill text activates on its own; anything executable waits for you. Approve or decline each script and hook from the session-start digest or the terminal.
+
+<Aside type="caution" title="Nothing executable runs without approval">
+A proposed script is staged non-executable (mode 0644). A proposed hook is not installed: until you approve it, nothing of it loads or counts.
+</Aside>
+
+## Approve or decline
+
+<Tabs syncKey="harness">
+<TabItem label="omp">
+At session start the digest asks once per item, with the diff and the hook's pass condition.
+</TabItem>
+<TabItem label="Claude Code">
+There is no dialog. The session-start digest lists each approval with its commands, which only you can run:
+
+```text
+/rematch:rematch-approve <id>
+/rematch:rematch-decline <id>
+```
+</TabItem>
+<TabItem label="Codex">
+Codex runs no hooks. The optional `$rematch-status` skill runs the digest and approvals through `rematch`, each command after your approval.
+</TabItem>
+<TabItem label="Terminal">
+```sh
+rematch library approve <id>
+rematch library decline <id>
+```
+</TabItem>
+</Tabs>
+
+| You | Result |
+|---|---|
+| approve a script | it becomes mode 0755 in place |
+| approve a hook | it is compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` (data only; the extension runs it) |
+| decline | the entry is retired |
+
+## Hook modes
+
+| Mode | What it does |
+|---|---|
+| `block` | blocks a tool call whose input field matches a pattern, with the rule's message |
+| `stuck` | blocks a call identical (same tool, same arguments) to the N calls right before it; any other call in between resets it |
+| `truncate` | in the request sent to the model (never in the session file), tool outputs older than N user turns keep their first K characters, ending `…[rematch: truncated N chars, age K turns]` |
+| `retrieve` | before each request, appends one hidden message with the units of your loaded skills that match what you just asked and the files just touched, within a byte budget |
+
+## Built-in hooks
+
+Three hook entries ship with rematch. They appear as approvals the first time the digest runs; they live in branch `shared` and match every session.
+
+| Entry | Mode | Setting |
+|---|---|---|
+| `context-unit-retrieval` | `retrieve` | ≤ 6000 bytes, units sharing ≥ 2 stems with the request |
+| `tool-output-truncation` | `truncate` | outputs older than 6 user turns keep 1200 characters |
+| `stuck-detector` | `stuck` | the 4th identical call in a row is blocked |
+
+They are ordinary entries under the same counters:
+
+- Once approved, each is counted in every session.
+- Kept after four clean sessions.
+- Retired after two sessions with any classed redirect, or two with harm (error cluster, takeover, disable).
+- Declining retires it for good.
+
+```sh
+rematch builtins ls                   # status of the three
+rematch builtins reinstall [name]     # stage a retired one again
+```
+
+Why executable changes wait: [D4](/rematch/background/decisions/). Hook support per harness: [harness capabilities](/rematch/reference/harnesses/).

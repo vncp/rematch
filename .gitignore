@@ -2,4 +2,5 @@ target/
 node_modules/
 *.log
 extension/agents
-docs/book/book
+docs/site/dist
+docs/site/.astro

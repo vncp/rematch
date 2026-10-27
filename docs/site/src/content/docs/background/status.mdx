@@ -1,0 +1,97 @@
+---
+title: Status and limits
+description: What is built, what has run live, what has not been earned yet, and what each harness cannot do.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Everything below is built and tested; less of it has run against real daily use. The one result that matters, a skill kept from daily use, has not been earned yet.
+
+## Built
+
+| Phase | Built |
+|---|---|
+| 1 | the interactive loop |
+| 1.5 | create and improve, with the mechanical split and the forge import |
+| 2 | batch mode with worktree isolation and the next-run keep rule; context-hook unit retrieval; tool-output truncation and stuck detection as entries under the same counters (three built-in hook entries that wait for your approval) |
+| 3 | team and fork shipping, work-to-home export, stale on drift, split per family, transfer suggestions and `shared` promotion |
+| — | omp profile resolution (`OMP_PROFILE` / `PI_PROFILE` / `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`), multi-profile history import with `--skip-profile` and `policy.json` `skip_profiles` |
+| — | the lake, L1–L4 ([ADR 001](/rematch/background/adr-001-lake/)) |
+| — | the profile: `rematch profile init\|adopt\|sync\|status\|install-launchd` |
+
+## Run live
+
+- **The loop**, against omp 18.12.6 on a scratch repository: rpc-mode sessions with real redirects, gemini-4-argon as editor and classifier, the entry loaded in the next session and counted.
+- **Also against omp:** the forge import and the mechanical split of a 31 KB skill resolved as a package in a live session, one detached batch cycle with a script verifier, one team ship, and `/rematch` in the TUI.
+- **The lake**, on both of the author's machines on 2026-10-26: 1,178 journal rows and 326 session event files exported in 2.9 s, all keys indexed with Bellwether 0.1.0 in 0.8 s, `report` from the lake in 57 ms, `why --asof` giving the pre- and post-transition status of one entry, and the second machine's lake reading this one's history after `lake import` (ADR 001, "Live run").
+- **The profile**, on 2026-10-26 between two Macs over a private GitHub repo ([the profile](/rematch/concepts/profile/)). It is also covered by `crates/rematch/tests/e2e_profile.rs` on two temporary machines sharing a local bare remote.
+- **Claude Code**, with `claude -p --model haiku` (Claude Code 2.1.285) against a temporary root: every trace record, a negation pre-labelled, flagged and counted once; `reflect --pending` started by the next `SessionStart`; a prompt queued during a `Bash` call traced as `interrupt`; the digest with approval commands; a provisional agent copied, listed and counted.
+- **Not yet observed live in Claude Code:** the digest's display in an interactive session, an Esc abort (covered by an end-to-end test on the transcript format), and a session reflected by a real editor model.
+
+## Not yet earned
+
+- **A `kept` skill from daily use.** The three built-in hooks reached kept (9/6/5 matched sessions, 0 recurrence, 0 harm) during the build itself; no skill has yet. This is the [kill criterion](/rematch/concepts/counters/#the-kill-criterion).
+- **The built-in context entries in real use.** All three were approved and fired in one live omp session (a `retrieval` record for a `bellwether-dev` unit; the stuck detector blocking a 4th identical call). Truncation is observable only in the outgoing request and is covered by the extension tests. None has been counted across real sessions yet.
+- **A batch cycle where a candidate beats the reference.** The one live cycle had a reference that already passed, so both editors chose `KEEP_BASE`; the fake-omp tests cover the other branches.
+- **A merged team PR and a `shared` promotion from real branches.** Both are exercised on scratch repositories only.
+- **Linux.** The code is POSIX-portable (`setsid`, process groups, `sh` scripts); every run above was macOS arm64. No Windows.
+- **Embeddings for the related-thing lookup.** Exact signature and MinHash are implemented; embeddings would need credentials the binary does not hold.
+
+Open questions from the spec are at the end of [`docs/SPEC.md`](https://github.com/vncp/rematch/blob/main/docs/SPEC.md#open-questions).
+
+## Claude Code limits
+
+Each limit is structural; the reasons are in DESIGN §18.1, "What Claude Code cannot do".
+
+| Limit | Why |
+|---|---|
+| no `truncate` hooks | no hook rewrites earlier tool results or the outgoing request; `PostToolUse` replaces a result only as it arrives |
+| `retrieve` once per prompt, and its units stay in the conversation | there is no per-request hook (omp re-sends one non-persisted message per request); an unchanged unit set is not injected again |
+| skill loading is not per process | the shared dir serves every session and harness; a concurrent session sees new links only after its next re-scan. Its trace counts only what matched its own cwd. |
+| no per-turn event | `turn_end` records are recovered at `Stop` from the transcript tail, which can lag; model fallbacks inside a run show only as turn-to-turn changes |
+| Esc fires no hook | the abort is read from the transcript at the next prompt, and that prompt is not a takeover |
+| `stuck` sees completed calls only | parallel identical calls in flight are not counted; subagents get `block` rules but no `stuck` detection |
+| no approval dialog, no `rematch` tool for the model | hooks cannot open dialogs; approvals are commands you run |
+| reflection needs omp | the model calls go through omp; without it, run `rematch reflect --pending` from a shell |
+| agent copies refresh at session start only | a status change reaches Claude Code at the next start; omp-only frontmatter is dropped from the copy |
+| a session killed before `SessionEnd` stays unfinished | `count` skips it, the same as an omp crash |
+| imported sessions carry no `loaded_entries` | transcripts do not record what the plugin linked |
+| batch mode is omp-only | the batch worker is omp-typed; the plan for another harness is DESIGN §18.2.4 |
+
+## Codex limits
+
+Post-hoc reflection, post-hoc counting and skills are the whole adapter.
+
+| Limit | Detail |
+|---|---|
+| no live tracing | rematch has no code inside Codex; a session becomes evidence only when you import its rollout |
+| no blocking hooks | `block`/`stuck` verifiers never run; a hook entry's router is listed by Codex but never counted as loaded |
+| no retrieval, no truncation | both need a pre-request handler |
+| no per-session gating | Codex loads every skill under its skill roots in every session; a provisional skill stays visible everywhere until kept or retired, but counts only where its predicate hits |
+| loaded entries are reconstructed | resolved at import from the rollout's skill list and the files as they are then |
+| no subagents | `kind: agent` entries have no Codex form; scripts in a linked skill stay non-executable until approved |
+| no batch mode yet | `rematch run` drives omp; the Codex plan is DESIGN §18.2.4 |
+
+## How it is checked
+
+Every change goes through:
+
+```sh
+cargo test --workspace                        # 119 core · 54 binary · 32 end-to-end (scripted editors, fake omp)
+cargo clippy --workspace --all-targets -- -D warnings
+bun build extension/index.ts --no-bundle --outdir /tmp/rematch-ext-check
+bun test extension                            # hook runtime: mode helpers + the factory against a fake host
+```
+
+The end-to-end tests run the built binary against a temporary root:
+
+- a synthetic trace with a redirect is reflected through a scripted editor, staged, matched, counted through four clean sessions and kept;
+- the lint-fail script exercises exactly one retry; a wrong-model reply fails closed;
+- `import --history` runs against anonymized goldens;
+- `improve` refuses, splits, stages a sibling and refuses a pinned skill;
+- the batch worker completes a `k=1` cycle with a fake omp and keeps the winner on the next run;
+- `ship` creates the branch and commit; `export` refuses at work by default.
+
+<Aside type="caution" title="Gap in the docs: test counts">
+The counts in the comment above are from the README's "Run it" section. The README's architecture table gives other totals (239 cargo tests in all, plus 24 extension tests under `bun test`). The docs do not reconcile them.
+</Aside>

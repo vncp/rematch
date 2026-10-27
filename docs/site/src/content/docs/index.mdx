@@ -1,0 +1,76 @@
+---
+title: rematch
+description: Stop teaching your coding agent the same lesson every session. rematch improves the harness from the sessions you already run and keeps only what later sessions confirm.
+template: splash
+editUrl: false
+tableOfContents: false
+pagefind: false
+hero:
+  title: Stop teaching your coding agent the same lesson every session.
+  tagline: rematch improves the agent's harness from the sessions you were going to run anyway, and keeps only what later sessions confirm. No reruns in interactive use; at most three model calls per reflection.
+  actions:
+    - text: Start in 5 minutes
+      link: /rematch/start/install/
+      variant: primary
+      icon: right-arrow
+    - text: How it decides
+      link: /rematch/concepts/loop/
+      variant: secondary
+---
+
+import { Tabs, TabItem, CardGrid, LinkCard } from '@astrojs/starlight/components';
+import Diagram from '../../components/Diagram.astro';
+
+<div class="rm-landing">
+
+## Install
+
+<Tabs syncKey="harness">
+<TabItem label="omp">
+```sh
+scripts/install.sh
+rematch doctor --text    # ready: true
+```
+</TabItem>
+<TabItem label="Claude Code">
+```sh
+cargo build --release
+ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
+```
+</TabItem>
+<TabItem label="Codex">
+```sh
+ln -s ~/.rematch/skills ~/.agents/skills/rematch
+rematch skills sync --harness codex --cwd "$PWD"
+```
+Run the sync before starting Codex in a repo.
+</TabItem>
+</Tabs>
+
+Then work as usual. After a session with a correction, rematch can propose a change at the next session start.
+
+## The loop
+
+<Diagram
+	name="loop"
+	alt="The rematch loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off."
+/>
+
+<CardGrid>
+	<LinkCard title="Start" description="Install, make your first correction, watch it get counted." href="/rematch/start/install/" />
+	<LinkCard title="How it decides" description="The loop, the evidence boundary, statuses and counters." href="/rematch/concepts/loop/" />
+	<LinkCard title="Day to day" description="Correct, approve, create, improve, share, sync, report." href="/rematch/guides/day-to-day/" />
+	<LinkCard title="Reference" description="Every command, the trace schema, configuration, files." href="/rematch/reference/cli/" />
+</CardGrid>
+
+## What it will never do without you
+
+<ul class="rm-never">
+	<li>Run a script or install a hook. Scripts are staged non-executable; hooks are compiled only after you approve them.</li>
+	<li>Change anything beyond your machine. Team and fork changes are branches and PRs; nothing is merged for you.</li>
+	<li>Write a repo's <code>AGENTS.md</code> on your machine.</li>
+	<li>Call a change verified. A change that survives four matched sessions is <code>kept</code>, and its counts are shown raw.</li>
+	<li>Keep running after <code>rematch off</code> or <code>REMATCH=0</code>.</li>
+</ul>
+
+</div>

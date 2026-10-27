@@ -1,0 +1,107 @@
+---
+title: Query history
+description: Export your sessions to the lake, combine machines, and ask what happened when.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Ask questions the live ledger cannot answer: which sessions ran a command, what an entry's status was when a session ran, what another machine saw. The lake holds that history as Parquet files.
+
+What the lake is and why it is separate: [the lake and bitemporal history](/rematch/concepts/lake/).
+
+## Export
+
+```sh
+rematch lake export            # journal rows since the last export + newly closed sessions (one bounded run)
+rematch lake export --all      # drain everything in one run
+rematch lake doctor --text     # watermarks, export lag, files per table, events exported/missing/pending
+```
+
+- **Export runs by itself** at the end of every `reflect --pending`: at most 50 000 journal rows and 64 sessions per run. A second export with nothing new writes nothing.
+- **After importing years of history**, run `lake export --all`.
+- **Imported sessions are exported too**, rebuilt from the harness's own session file. If that file is gone, the session is recorded as missing; `lake export --all` tries again.
+
+## Query
+
+```sh
+rematch lake query events --key exact:tool_cmd --values 'cargo test'
+rematch lake query events --key text:tool_cmd --has cargo,test
+rematch lake query entries --key temporal2:entry_id --values <id> --valid 2026-10-20T13:05:00Z --known 2026-10-20T13:05:00Z
+rematch lake query outcomes --key list:facets --values mechanism,universe --all
+```
+
+| Query | Answers |
+|---|---|
+| `exact:tool_cmd` | the events of sessions that ran exactly that command |
+| `text:tool_cmd --has` | sessions whose bash commands have every word (finds `cd x && cargo test --workspace`) |
+| `temporal2:entry_id --valid --known` | an entry's status as the ledger held it then, with no lookahead |
+| `list:facets` | outcomes by facet |
+
+`lake query` also takes `--from/--to` windows and `--latest`. It returns the matching rows as JSON.
+
+## Index (optional)
+
+```sh
+rematch lake index
+```
+
+- Asks an external `bellwether` binary (`--bellwether <path>`, else `$REMATCH_BELLWETHER`, else `PATH`) to index each table under `~/.rematch/lake-index/<table>/`.
+- Without a binary or an index, `lake query` reads every file and says `"indexed": false` and why. The rows are the same either way.
+- The first index pins the Bellwether version in `lake/manifest.json`. Another version is refused until `rematch lake index --repin`.
+
+Keys and their adaptations: DESIGN §19.2.
+
+## Combine machines
+
+```sh
+rematch lake import --from /Volumes/laptop/.rematch     # another machine's root or its lake/ dir
+```
+
+- Each machine exports under its own name (`$REMATCH_MACHINE`, else the host name, fixed at first use).
+- `lake import` copies the files you do not have and merges the watermarks; `lake doctor` then lists both machines.
+- The other machine's rows are read-only here: they never enter this ledger.
+
+<Aside type="caution" title="Sync lake/, never lake-index/">
+Copy or sync the whole `lake/` directory freely. `lake-index/` is per machine.
+</Aside>
+
+## Rebuild a ledger
+
+```sh
+rematch lake rebuild --from ~/backup/lake               # into a root that has no ledger
+```
+
+- Replays one machine's journal (yours unless `--machine`) into a fresh ledger; `library ls` and the counters come back exactly.
+- It refuses a ledger that already holds anything. `--force` replaces it and keeps the old file as `ledger.sqlite.pre-rebuild-<ms>`.
+- Traces, staging dirs and skills are files, not ledger rows: copy them with the root when moving machines.
+
+## After upgrading: migrate
+
+```sh
+rematch lake migrate
+```
+
+Fills the identity older entries and sessions lack, once: each entry's content hash, and the repo remote and subpath where the repo is on this machine. Afterwards a worktree or another clone of the same remote loads and counts those entries too.
+
+- It also re-decides each session's domain with the current policy; run it again after `rematch policy domain set`.
+- Reads files only, runs no model and no git. A second run changes nothing.
+
+## Who reads the lake
+
+Historical commands say which source they used (`"source": "lake"` or `"ledger"`):
+
+| Command | Reads |
+|---|---|
+| `reflect --history`, `improve` | a session's records from its events file (falls back to the trace or the transcript) |
+| `create --from sessions` | every machine's `sessions` |
+| `transfer suggest` | every machine's outcome facets |
+| `library why --asof` | `entries` and `redirects` |
+| `report` | the lake alone |
+
+While the lake lags the ledger, the first four read the ledger instead, so an export lag never hides a local write. The session-start digest never reads the lake.
+
+## Built without the lake
+
+The lake needs the cargo feature `lake` (on by default). `cargo build --no-default-features`, or `REMATCH_NO_LAKE=1 scripts/install.sh`, builds without it; every `lake` subcommand except `migrate` then answers `built without the lake feature`.
+
+File layout and columns: DESIGN §19.1.

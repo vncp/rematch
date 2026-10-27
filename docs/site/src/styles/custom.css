@@ -1,0 +1,240 @@
+/* rematch: neutral greys and one indigo accent, the palette of docs/assets/readme/*.svg. */
+
+:root {
+	--sl-font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+	--sl-font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+	--sl-line-height: 1.7;
+	--sl-line-height-headings: 1.25;
+	--sl-content-width: 46rem;
+	--sl-text-h1: 2.25rem;
+	--sl-text-h2: 1.5rem;
+	--sl-text-h3: 1.1875rem;
+	--sl-text-h4: 1rem;
+
+	/* Dark: the -dark diagrams (#0a0a0a / #121212 / #262626 / #9a9a9a / #f2f2f2, accent #6360f0 / #a9abff). */
+	--sl-color-white: #fafafa;
+	--sl-color-gray-1: #ededed;
+	--sl-color-gray-2: #cfcfcf;
+	--sl-color-gray-3: #9a9a9a;
+	--sl-color-gray-4: #6b6b6b;
+	--sl-color-gray-5: #2a2a2a;
+	--sl-color-gray-6: #141414;
+	--sl-color-black: #0a0a0a;
+	--sl-color-accent-low: #1f1d4d;
+	--sl-color-accent: #6360f0;
+	--sl-color-accent-high: #a9abff;
+	--sl-color-bg-nav: #0a0a0a;
+	--sl-color-bg-sidebar: #0a0a0a;
+	--sl-color-bg-inline-code: #1c1c1c;
+	--sl-color-hairline-light: #262626;
+	--sl-color-hairline: #1f1f1f;
+	--rm-surface: #121212;
+	--rm-border: #262626;
+}
+
+:root[data-theme='light'] {
+	/* Light: the -light diagrams (#ffffff / #f7f7f7 / #e5e5e5 / #666666 / #171717, accent #4f46e5). */
+	--sl-color-white: #171717;
+	--sl-color-gray-1: #262626;
+	--sl-color-gray-2: #3d3d3d;
+	--sl-color-gray-3: #666666;
+	--sl-color-gray-4: #8c8c8c;
+	--sl-color-gray-5: #d9d9d9;
+	--sl-color-gray-6: #f2f2f2;
+	--sl-color-gray-7: #f7f7f7;
+	--sl-color-black: #ffffff;
+	--sl-color-accent-low: #e6e5fc;
+	--sl-color-accent: #4f46e5;
+	--sl-color-accent-high: #3a32b8;
+	--sl-color-bg-nav: #ffffff;
+	--sl-color-bg-sidebar: #ffffff;
+	--sl-color-bg-inline-code: #f2f2f2;
+	--sl-color-hairline-light: #e5e5e5;
+	--sl-color-hairline: #ececec;
+	--rm-surface: #f7f7f7;
+	--rm-border: #e5e5e5;
+}
+
+/* Header and sidebar: quiet, no fills. */
+.header {
+	border-bottom: 1px solid var(--sl-color-hairline);
+}
+.site-title img {
+	height: 1.6rem;
+	width: auto;
+}
+.sidebar-pane {
+	border-inline-end: 1px solid var(--sl-color-hairline);
+}
+nav.sidebar .top-level > li > details > summary .group-label > span {
+	font-size: var(--sl-text-2xs);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--sl-color-gray-3);
+}
+nav.sidebar a[aria-current='page'],
+nav.sidebar a[aria-current='page']:hover,
+nav.sidebar a[aria-current='page']:focus {
+	background: var(--sl-color-accent-low);
+	color: var(--sl-color-accent-high);
+	font-weight: 600;
+}
+:root[data-theme='light'] nav.sidebar a[aria-current='page'] {
+	color: var(--sl-color-accent);
+}
+
+/* Prose. */
+.sl-markdown-content {
+	font-size: 1.0625rem;
+}
+.sl-markdown-content :is(h2, h3) {
+	letter-spacing: -0.01em;
+}
+.sl-markdown-content h2 {
+	margin-top: 2.5rem;
+	padding-top: 0.25rem;
+}
+.sl-markdown-content :is(p, li) {
+	text-wrap: pretty;
+}
+.sl-markdown-content a {
+	text-underline-offset: 0.18em;
+	text-decoration-thickness: 1px;
+}
+.sl-markdown-content code:not(pre code) {
+	padding: 0.1em 0.35em;
+	border-radius: 0.3rem;
+	font-size: 0.875em;
+}
+h1#_top {
+	letter-spacing: -0.02em;
+}
+
+/* Tables: hairlines only, compact, scroll on small screens. */
+.sl-markdown-content table {
+	display: table;
+	width: 100%;
+	font-size: var(--sl-text-sm);
+	line-height: 1.55;
+	border-collapse: collapse;
+}
+@media (max-width: 50rem) {
+	.sl-markdown-content table {
+		display: block;
+		overflow-x: auto;
+	}
+}
+.sl-markdown-content :is(th, td) {
+	border: none;
+	border-bottom: 1px solid var(--rm-border);
+	padding: 0.55rem 0.9rem 0.55rem 0;
+	vertical-align: top;
+	background: transparent;
+}
+.sl-markdown-content td code {
+	overflow-wrap: anywhere;
+}
+.sl-markdown-content td:first-child code {
+	white-space: nowrap;
+	overflow-wrap: normal;
+}
+.sl-markdown-content th {
+	font-weight: 600;
+	color: var(--sl-color-white);
+	border-bottom-color: var(--sl-color-gray-4);
+}
+.sl-markdown-content tr:nth-child(2n) {
+	background: transparent;
+}
+
+/* Diagrams. */
+.diagram {
+	margin-block: 1.75rem;
+}
+.diagram img {
+	width: 100%;
+	height: auto;
+	border-radius: 0.75rem;
+}
+.diagram figcaption {
+	margin-top: 0.6rem;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-gray-3);
+	text-align: center;
+}
+
+/* Cards and link cards: flat, hairline. */
+.card,
+.sl-link-card {
+	border: 1px solid var(--rm-border);
+	border-radius: 0.75rem;
+	background: var(--rm-surface);
+	box-shadow: none;
+}
+.sl-link-card:hover {
+	border-color: var(--sl-color-accent);
+	background: var(--rm-surface);
+}
+.card .title {
+	font-size: var(--sl-text-lg);
+}
+
+/* Asides: one accent family, quieter fills. */
+.starlight-aside {
+	border-radius: 0.5rem;
+	border-inline-start-width: 3px;
+}
+.starlight-aside--note {
+	--sl-color-asides-text-accent: var(--sl-color-accent-high);
+	--sl-color-asides-border: var(--sl-color-accent);
+	background-color: var(--sl-color-accent-low);
+}
+:root[data-theme='light'] .starlight-aside--note {
+	--sl-color-asides-text-accent: var(--sl-color-accent);
+}
+
+/* Code frames. */
+.expressive-code .frame {
+	box-shadow: none;
+}
+
+/* Landing. */
+.rm-landing h2 {
+	text-align: start;
+}
+.rm-never {
+	padding-inline-start: 1.1rem;
+}
+
+/* Buttons: the solid accent of the diagrams in both themes. */
+.sl-link-button.primary {
+	background: var(--sl-color-accent);
+	border-color: var(--sl-color-accent);
+	color: #ffffff;
+}
+.sl-link-button.primary:hover {
+	background: color-mix(in srgb, var(--sl-color-accent) 88%, #000000);
+	border-color: transparent;
+	color: #ffffff;
+}
+.sl-link-button.secondary {
+	border-color: var(--sl-color-gray-4);
+	color: var(--sl-color-white);
+}
+
+/* A sub-list inside a step is a quiet footnote (e.g. "enforced by"). */
+.sl-steps > li > ul {
+	list-style: none;
+	padding-inline-start: 0;
+	font-size: var(--sl-text-sm);
+	color: var(--sl-color-gray-3);
+}
+
+/* Narrow screens: tables scroll sideways (above); code in cells never wraps mid-token. */
+@media (max-width: 50rem) {
+	.sl-markdown-content td code {
+		white-space: nowrap;
+		overflow-wrap: normal;
+	}
+}

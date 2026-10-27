@@ -1,0 +1,88 @@
+---
+title: Troubleshooting
+description: Check the install with doctor, then find the fix for the common surprises.
+---
+
+Start with `rematch doctor`. It checks every harness and service and ends with a verdict; each problem line says what to run.
+
+## Run doctor
+
+```sh
+rematch doctor --text
+```
+
+One line per harness, then roles, ledger, paths, every problem, and the verdict:
+
+```text
+omp: ok · /…/omp (omp/18.12.6) · extension @vncp/rematch linked → /…/rematch/extension, loads ./index.ts
+claude-code: ok · ~/.claude/skills/rematch → /…/adapters/claude-code · skills/ → shared dir · claude plugin validate passed
+codex: ok · ~/.agents/skills/rematch → shared dir
+profile: ok · origin git@…/profile.git · 0 ahead, 0 behind (last fetch) · launchd loaded
+lake: ok · lag 0 journal row(s) · index pinned 0.1.0 · bellwether 0.1.0 (/…/bellwether)
+built-ins: ok · context-unit-retrieval provisional, awaiting approval · tool-output-truncation … · stuck-detector …
+role rematch-editor: … (via …)
+…
+ledger: …/ledger.sqlite (schema 2)
+agent_dir: …
+root: … · N sessions (N traced) · N pending · off: false
+ready: true
+```
+
+| You see | Meaning |
+|---|---|
+| `ready: true` | everything that is set up works |
+| `ready: false (N problem(s))` | each problem is a `problem: …` line above, saying what to run |
+| `<harness>: not set up (…)` | that harness is not installed; never a problem |
+| `<harness>: problem` | set up and broken |
+
+Set up and broken includes:
+
+- a dangling plugin link, or a plugin whose `skills/` does not reach `REMATCH_ROOT/skills`;
+- `claude plugin validate` failing, or a Codex link pointing elsewhere;
+- profile conflicts, or a launchd plist written but not loaded;
+- a lake index pinned to another Bellwether, or a built-in never installed;
+- an extension listed in omp's lock but not loadable.
+
+`claude plugin validate` runs when `claude` is on `PATH` (`$CLAUDE_BIN` overrides); otherwise only static checks run, and the line says so. launchd is checked with `launchctl list com.vncp.rematch.profile-sync` once the plist exists (`$LAUNCHCTL_BIN` overrides). In JSON: `ready`, `problems`, and `harnesses.{omp, claude-code, codex, profile, lake, built-ins}`, each with `status` and `problems`.
+
+## Nothing ever gets staged
+
+```sh
+rematch status --text
+```
+
+| If | Then |
+|---|---|
+| no sessions are traced | the extension is not loaded: run `rematch doctor` and `omp plugin doctor` |
+| sessions are traced but never flagged | your redirects are not pre-labelled; run `/rematch mark correction` once to see the loop work, and check `library why` for `prelabel` |
+
+## Staged, but a later session did not load it
+
+```sh
+rematch match --cwd .
+rematch library why <session>
+```
+
+`match` shows the load decision. `why` shows `glob hit · predicate miss` when the task did not resemble the original (different file types, or no overlapping terms). That is by design: the entry counts only where it would have mattered. How matching works: [predicates](/rematch/concepts/predicates-and-domains/#when-it-matches).
+
+## The reflection chose KEEP_BASE
+
+The editor decided no rule would prevent that redirect, usually a scope change. `library why` shows the class. If you disagree, [mark it `correction`](/rematch/guides/correct-the-classifier/).
+
+## A reflection ran with the wrong model
+
+The editor refuses to proceed when any reply's provider or model differs from the configured role. The pending file is kept and retried at the next start (3 attempts). `rematch doctor --text` shows the resolved roles.
+
+## omp is not on PATH for the binary
+
+Under ssh or cron, point the binary at omp:
+
+```sh
+export OMP_BIN=/path/to/omp
+```
+
+## omp profiles (`omp --profile`, `OMP_PROFILE`)
+
+- The agent dir follows omp's profile resolution ([environment variables](/rematch/reference/environment/#omp-profile-resolution)); `~/.rematch` stays shared unless `REMATCH_ROOT` is set.
+- `import --history` imports the default agent dir and every profile, except those in `--skip-profile <name>` or `policy.json` `skip_profiles`.
+- `rematch doctor --text` shows the resolved `agent_dir` and which profiles exist or are skipped.

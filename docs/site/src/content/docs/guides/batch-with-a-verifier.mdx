@@ -1,0 +1,100 @@
+---
+title: Batch with a verifier
+description: Improve the harness on a task that has a mechanical pass/fail, and let the verifier pick.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+For work with a mechanical pass/fail (tests, a check script, a parity file, a receipt), let rematch spend a few rollouts and let the verifier, not a model, pick the winner.
+
+<Aside type="note">
+Batch mode drives omp only. There is no Claude Code or Codex batch run yet (the Codex plan is DESIGN §18.2.4).
+</Aside>
+
+## Run a task
+
+<Steps>
+
+1. Register the task:
+
+   ```sh
+   rematch task add <id> --repo <path> --prompt "…" --verifier "<cmd>" [--max-time 10m]
+   ```
+
+2. Start a run. It returns a job id and runs detached:
+
+   ```sh
+   rematch run --task <id> --verifier "<cmd>" [--width 2]
+   ```
+
+3. Poll it:
+
+   ```sh
+   rematch status <job-id>
+   ```
+
+   The receipt is written to `~/.rematch/runs/<task>/receipt.json`.
+
+</Steps>
+
+The winner's lessons are staged provisional. They become kept only when the **next** run of that task passes with them loaded.
+
+## What a run does
+
+<Steps>
+
+1. A reference rollout with the current harness, in a fresh git worktree that exposes only the candidate skill tree.
+2. One editor proposes an invariant and a domain candidate; each is probed once on the same task under the same seed.
+3. A composer merges them from the behavioural contrasts; the composed harness runs once more.
+4. The verifier picks among reference, candidates and composed. Ties go to the reference.
+5. The winner's lessons enter the library as provisional, flagged to wait for the next run.
+
+</Steps>
+
+| Width `k` | Rollouts `(k+1)² + [k>1]` | Model calls `2k + 1` |
+|---|---|---|
+| 1 (default) | 4 | 3 |
+| 2 | 10 | 5 |
+
+Workspaces are deleted after the receipt is written.
+
+## Register a task
+
+A task is `~/.rematch/tasks/<id>.json`:
+
+| Field | Default |
+|---|---|
+| `id`, `repo` (absolute), `prompt` | required |
+| `verifier` | optional; `run --verifier` overrides it |
+| `max_time_secs` | 600 |
+| `tools` | optional |
+| `seeds` | `[1]`; omp has no sampling seed, so the seed names the workspace and is exported as `REMATCH_SEED` |
+
+## Verifiers
+
+| Spec | Passes when |
+|---|---|
+| `tests` | `Cargo.toml` → `cargo test`; `pyproject`/`pytest.ini`/`setup.*` → `python3 -m pytest -q`; `package.json` + bun lock → `bun test` |
+| `parity:<produced>=<expected file or sha256>` | the produced file matches |
+| `receipt:<path>` | the JSON has `verdict: pass` (optional `score`) |
+| `[script:]<cmd>` | `sh -c` in the worktree exits 0; the last stdout JSON line with `score` supplies the score |
+
+Verifiers run with `REMATCH_TASK`, `REMATCH_WORKTREE` and `REMATCH_REPO` set, capped at max(task cap, 60 s).
+
+## Replacing a kept skill
+
+When a new version would replace a kept skill, rematch first re-runs the kept skill's own task once with the new version loaded. This applies to a sibling from `improve`, a per-family split, or a batch winner with the same name.
+
+| The task's verifier | Result |
+|---|---|
+| passes | the replacement goes ahead; the verdict is recorded in the new version's receipt |
+| fails | the new version retires with `anchor replay failed: …`; the kept skill stays |
+| no such task with a verifier | the new version's own clean sessions are the only check |
+
+The task is the one the kept skill came from, or whose last run staged or loaded it. It is one run, not a test suite. To see what would happen without changing anything:
+
+```sh
+rematch anchor replay <id>     # reports pass/fail; stages, keeps and retires nothing
+```
+
+Why a verifier and not a model picks: [D6, D7](/rematch/background/decisions/).

@@ -1,0 +1,81 @@
+---
+title: Day to day
+description: Use your harness as usual; check, manage and stop rematch when you want to.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Use omp as usual. rematch traces each session, can propose a change after you correct the agent, and keeps only what later sessions confirm. Everything on this page is optional.
+
+In a terminal, add `--text` for readable lines instead of JSON. How `/rematch` commands map to the CLI: [below](#omp-commands-and-the-cli).
+
+## What happens on its own
+
+| When | What rematch does |
+|---|---|
+| During a session | traces it; no model call |
+| You correct the agent (*"no, …"*, *"revert that"*, an interrupt, ≥ 3 tool errors in any 6 consecutive results) | flags the session at exit |
+| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, up to 3 model calls); shows one line if it staged something |
+| Later matching sessions | counts them: 4 clean → kept, 2 recurrences or 2 harms → retired |
+
+The reflection uses the models you configured; `rematch doctor --text` shows which.
+
+## Check on it
+
+| Ask | You get |
+|---|---|
+| `/rematch status` | entries by status, pending flags, whether it is off |
+| `/rematch why` | for the last session: entries loaded, predicate hits, redirects and their class, counters |
+| `/rematch library` | every entry with its raw counts |
+| `/rematch digest` | staged, kept or retired since you last looked; approvals waiting |
+| `rematch doctor --text` | omp version, model roles, plugin linked, ledger state |
+
+Read `why` when something surprises you. It shows exactly why an entry loaded or not (`glob hit · predicate miss`) and what the classifier called your redirect.
+
+## omp commands and the CLI
+
+Most `/rematch <sub>` commands run `rematch <sub>`. These differ:
+
+| In omp | In a terminal |
+|---|---|
+| `/rematch why` | `rematch library why` (defaults to the current session) |
+| `/rematch library` | `rematch library ls` |
+| `/rematch disable\|rollback\|approve\|decline …` | `rematch library disable\|rollback\|approve\|decline …` |
+| `/rematch mark <class>` | `rematch mark --session <current session> --class <class>` |
+| `/rematch digest` | `rematch digest --cwd <current dir>` |
+
+## Manage the library
+
+```sh
+rematch library ls --text
+rematch library pin <id>          # yours: never replaced or retired automatically
+rematch library unpin <id>
+rematch library disable <id>      # retire now (archived with its evidence; never deleted)
+rematch library rollback <name>   # previous kept version back (skill or agent); the current one retires
+```
+
+See what a past session loaded, as it stood then:
+
+```sh
+rematch library why <session> --asof 2026-10-20T13:05
+```
+
+## Turn it off, roll back, uninstall
+
+| Command | Effect |
+|---|---|
+| `/rematch off` · `/rematch on` | stop or resume tracing and reflection immediately |
+| `REMATCH=0 omp` | off for one process |
+| `/rematch disable <id>` | retire one entry now |
+| `/rematch rollback <skill>` | previous version back, immediately |
+| `rematch uninstall` | prints what it would remove |
+| `rematch uninstall --yes` | removes every file rematch wrote and nothing else |
+
+<Aside type="note" title="What uninstall keeps">
+It restores predecessors of kept entries. A profile (`~/.rematch/profile/`, your git repo) stays; only the links into it go.
+</Aside>
+
+## Related
+
+- Share an entry beyond this machine: [share to a team or fork](/rematch/guides/share/).
+- In Claude Code, the same commands are `/rematch:rematch-*` ([harness capabilities](/rematch/reference/harnesses/#commands-per-harness)).

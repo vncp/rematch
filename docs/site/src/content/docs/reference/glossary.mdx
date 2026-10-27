@@ -1,0 +1,33 @@
+---
+title: Glossary
+description: The terms used across this site, in one line each.
+---
+
+| Term | Meaning | More |
+|---|---|---|
+| **entry** | one item of the library (a skill, rule, script, agent, hook, fact or lesson) with its own trigger, counters and status | [entries](/rematch/concepts/entries/) |
+| **draft** | an entry made from a description only; visible, never loaded | [create a skill](/rematch/guides/create-a-skill/) |
+| **provisional** | an entry that hasn't proven itself yet; loads only where its predicate matches, and is counted there | [entries](/rematch/concepts/entries/#statuses) |
+| **kept** | an entry that survived 4 matched sessions with no recurrence and no harm; loads natively. Never called verified | [counters](/rematch/concepts/counters/) |
+| **retired** · **dormant** · **stale** | archived statuses; never loaded, never deleted | [entries](/rematch/concepts/entries/#statuses) |
+| **pinned** | a flag: the entry is never replaced or retired automatically | [day to day](/rematch/guides/day-to-day/#manage-the-library) |
+| **redirect** | a turn in which you steered the agent: a negation, a revert, a reprompt, an interrupt, or a mark | [the loop](/rematch/concepts/loop/#how-a-reflection-works) |
+| **correction** · **preference** · **scope** | the classifier's labels for a redirect: done wrong · not how you like it · you changed your mind | [correct the classifier](/rematch/guides/correct-the-classifier/) |
+| **takeover** | input that reaches the agent while it is still running (an interrupt) | [harness capabilities](/rematch/reference/harnesses/) |
+| **flag** | the mark a session gets at shutdown when it carried a redirect, a tool-error cluster, a takeover or a mark; only flagged sessions are reflected on | [the loop](/rematch/concepts/loop/) |
+| **reflection** | the between-sessions step that classifies, proposes, lints and stages; at most 3 model calls | [the loop](/rematch/concepts/loop/) |
+| **predicate** (trigger) | the deterministic repo, file types and task words that decide where an entry loads and which sessions count | [predicates](/rematch/concepts/predicates-and-domains/) |
+| **matched** | a session in which the entry was loaded and its predicate hit; the denominator of every decision | [counters](/rematch/concepts/counters/) |
+| **recurrence** | the redirect class that motivated an entry happened again while it was loaded | [counters](/rematch/concepts/counters/) |
+| **harm** | a new tool-error cluster, a takeover, or a disable while an entry was loaded | [counters](/rematch/concepts/counters/) |
+| **canary** | a provisional entry still being counted; no new reflection runs for its predicate meanwhile | [counters](/rematch/concepts/counters/#rate-limits) |
+| **branch** | a repo or project; entries are staged per branch. `shared` holds entries kept in two or more | [the evidence boundary](/rematch/concepts/evidence-boundary/#branches-and-shared) |
+| **domain** | a dotted subject path such as `web.frontend`; an entry loads only in sessions of its domain or a sub-domain | [domains](/rematch/concepts/predicates-and-domains/#domains) |
+| **ledger** | `~/.rematch/ledger.sqlite`: current state of sessions, entries, counters, proposals and receipts | [file locations](/rematch/reference/files/) |
+| **journal** | the ledger's append-only record of every write, with the ledger's own clock; what the lake exports | [the lake](/rematch/concepts/lake/) |
+| **lake** | the journal and closed sessions as write-once Parquet files under `~/.rematch/lake/`; history, never read by a session | [the lake](/rematch/concepts/lake/) |
+| **profile** | a git repo at `~/.rematch/profile/` holding your omp setup, linked into every machine that syncs it | [the profile](/rematch/concepts/profile/) |
+| **digest** | the session-start summary of what was staged, kept or retired, plus approvals waiting | [day to day](/rematch/guides/day-to-day/) |
+| **verifier** | a mechanical pass/fail check (tests, script, parity, receipt) that picks winners in batch mode | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#verifiers) |
+| **anchor replay** | one re-run of a kept skill's task with its replacement loaded, before the replacement goes ahead | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#replacing-a-kept-skill) |
+| **surface** | one of the eight parts of a harness rematch can change | [the eight surfaces](/rematch/concepts/surfaces/) |

@@ -1,0 +1,65 @@
+---
+// Splash hero: the wordmark (light/dark pair), the thesis as the page heading, the actions.
+import { LinkButton } from '@astrojs/starlight/components';
+import light from '../../../assets/readme/wordmark-light.svg?url';
+import dark from '../../../assets/readme/wordmark-dark.svg?url';
+
+const PAGE_TITLE_ID = '_top'; // Starlight's page-title anchor (not exported)
+const { data } = Astro.locals.starlightRoute.entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+---
+
+<div class="rm-hero">
+	<img src={light} alt="rematch" class="rm-wordmark dark:sl-hidden" width="420" height="80" />
+	<img src={dark} alt="rematch" class="rm-wordmark light:sl-hidden" width="420" height="80" />
+	<h1 id={PAGE_TITLE_ID} data-page-title set:html={title} />
+	{tagline && <p class="rm-tagline" set:html={tagline} />}
+	{
+		actions.length > 0 && (
+			<div class="rm-actions">
+				{actions.map(({ icon, link: href, text, variant }) => (
+					<LinkButton {href} {variant} icon={icon?.name}>
+						{text}
+					</LinkButton>
+				))}
+			</div>
+		)
+	}
+</div>
+
+<style>
+	.rm-hero {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		text-align: center;
+		gap: 1.25rem;
+		padding-block: clamp(2rem, 1rem + 6vmin, 5rem) 1.5rem;
+	}
+	.rm-wordmark {
+		width: min(16rem, 70%);
+		height: auto;
+	}
+	h1 {
+		max-width: 24ch;
+		font-size: clamp(var(--sl-text-2xl), 1rem + 2.4vw, var(--sl-text-5xl));
+		line-height: 1.15;
+		letter-spacing: -0.02em;
+		font-weight: 650;
+		color: var(--sl-color-white);
+		text-wrap: balance;
+	}
+	.rm-tagline {
+		max-width: 56ch;
+		font-size: var(--sl-text-lg);
+		color: var(--sl-color-gray-3);
+		text-wrap: pretty;
+	}
+	.rm-actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.75rem 1rem;
+		margin-top: 0.5rem;
+	}
+</style>

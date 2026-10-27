@@ -1,0 +1,67 @@
+---
+title: Counters and the kill criterion
+description: The three raw counters behind every keep and retire, the rate limits around them, and the project's own exit rule.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Three raw counters per entry decide every status change. A model never writes them, and they are shown raw.
+
+Tokens and turns are recorded for `why` but never gated on: they vary tenfold with task difficulty.
+
+## The counters
+
+| Counter | Goes up when, in a matched session | Decides |
+|---|---|---|
+| **matched** | the predicate hit while the entry was loaded ([when it matches](/rematch/concepts/predicates-and-domains/#when-it-matches)) | the denominator for every decision |
+| **recurrence** | a redirect of the entry's motivating class happened: the classifier's label, or a `revert`, `negation` or mark when the class is unknown | retire at 2 |
+| **harm** | a new tool-error cluster, an interrupt (takeover), or you disabled the entry | retire at 2 |
+
+Each counter also keeps a per-model-family breakdown ([models](/rematch/concepts/loop/#models)).
+
+## The decision rule
+
+Checked after every counted session:
+
+| Condition | Decision |
+|---|---|
+| matched ≥ 4, recurrence 0, harm 0 | **keep** |
+| recurrence ≥ 2, or harm ≥ 2 | **retire** |
+| matched ≥ 12 | **dormant** |
+| provisional for 30 days with matched < 3 | **dormant** |
+| kept, and harm ≥ 2 within 30 days | **retire** |
+| anything else | continue |
+
+- **Split by family.** If one model family shows harm ≥ 1 and another has matched ≥ 2 with no harm or recurrence, the harmed family gets a sibling proposal.
+- **Kept, never verified.** Four matched sessions without recurrence are evidence that the entry did its one job, nothing more ([D8](/rematch/background/decisions/)).
+
+## Rate limits
+
+A bad entry cannot cascade: every unbounded library in the literature peaked and then declined ([D13](/rematch/background/decisions/)).
+
+| Limit | Value |
+|---|---|
+| Admissions per trigger predicate | ≤ 1 per UTC day |
+| New reflection while a provisional entry with the same predicate exists | none (the canary is pending) |
+| Provisional entries per branch | ≤ 10 |
+| Kept entries before a new candidate must merge or revise | 5 general + 5 per branch |
+| Kept entries per top-level domain, all branches on this machine | ≤ 8 (`rematch policy caps set kept_per_domain <n>`) |
+| Model calls per reflection | ≤ 3 (classifier batch, editor, one lint retry) |
+
+A near-duplicate (simhash Hamming distance ≤ 6 on the normalized text, or an identical script body) appends its evidence to the existing entry instead of becoming a new one. The archive is never deleted.
+
+## The kill criterion
+
+The project has an exit rule. After six weeks of daily use, if no entry reached kept over at least four matched sessions, and recurrence has not fallen on any trigger, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
+
+`rematch report` computes it instead of leaving it to be eyeballed: [read the report](/rematch/guides/read-the-report/). Where it stands today: [status and limits](/rematch/background/status/).
+
+<Aside type="note" title="What the counters cannot measure">
+A single user is not blinded, so the counters measure only the recurrence of one redirect class. Published harness gains were 54% overfitting on audit; expectations here are modest by design ([D18, D19](/rematch/background/decisions/)).
+</Aside>
+
+## See also
+
+- [Entries and statuses](/rematch/concepts/entries/): where each status lives.
+- [What happens next](/rematch/start/what-happens-next/): the counters on one example.
+- DESIGN §7 (counters) and §8 (rate limits) in the [design contract](/rematch/background/design/).

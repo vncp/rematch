@@ -1,0 +1,48 @@
+---
+title: Correct the classifier
+description: Tell rematch what your redirect was when it guessed wrong or missed it.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+When rematch misread a redirect, or missed one, label it yourself. Your label overrides the classifier, flags the session, and the next reflection uses it.
+
+## Label the last turn
+
+<Tabs syncKey="harness">
+<TabItem label="omp">
+```text
+/rematch mark correction      # or preference | scope
+```
+</TabItem>
+<TabItem label="Claude Code">
+```text
+/rematch:rematch-mark correction      # or preference | scope
+```
+Only you can run it; Claude cannot invoke it.
+</TabItem>
+<TabItem label="Codex">
+Codex has no `/rematch` command. Write `/rematch mark correction` as a message in the session: the importer reads it from the rollout, if your Codex front end sends the text instead of rejecting the unknown slash command. Otherwise, label it afterwards (below).
+</TabItem>
+</Tabs>
+
+## Label a past session
+
+Find the session id, then mark it:
+
+```sh
+rematch library why --text                              # ids of recent sessions
+rematch mark --session <id> --class correction
+```
+
+Imported Codex sessions have ids `codex:<rollout id>`; Claude Code sessions `cc:<uuid>`.
+
+## Which label to use
+
+| Label | Meaning | Produces a proposal |
+|---|---|---|
+| `correction` | the agent did it wrong | yes |
+| `preference` | fine, but not how you like it | yes |
+| `scope` | you changed your mind | no |
+
+A mark is never overridden by the classifier. How classification fits into a reflection: [the loop](/rematch/concepts/loop/#how-a-reflection-works). Pre-label and flag rules: [trace schema](/rematch/reference/trace-schema/).

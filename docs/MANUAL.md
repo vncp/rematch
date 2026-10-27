@@ -1,6 +1,6 @@
 # rematch manual
 
-The manual is the documentation site, **<https://vncp.github.io/rematch/>**, built from [`docs/book/`](book/src/SUMMARY.md) (`mdbook build docs/book`). Its guides hold everything this file used to; below is a quick reference.
+The manual is the documentation site, **<https://vncp.github.io/rematch/>**, built from [`docs/site/`](site/) (`cd docs/site && bun install && bun run build`). Its guides hold everything this file used to; below is a quick reference.
 
 **Use omp as usual.** rematch traces each session, proposes when you correct the agent, and keeps only what later sessions confirm. Every `/rematch …` command in omp is `rematch …` in a terminal; add `--text` there for readable output instead of JSON.
 
@@ -34,8 +34,8 @@ rematch uninstall                           # prints the plan; --yes removes
 
 | For | Read |
 |---|---|
-| install (omp, Claude Code, Codex), the first session | [Get started](https://vncp.github.io/rematch/get-started/install.html) |
-| the loop, statuses, predicates, domains, counters | [Concepts](https://vncp.github.io/rematch/concepts/loop.html) |
-| day to day, correcting, approving, create, improve, batch, sharing, profile, report, lake, troubleshooting | [Guides](https://vncp.github.io/rematch/guides/day-to-day.html) |
-| every subcommand's flags, trace schema, entry layout, lint, config, environment, files | [Reference](https://vncp.github.io/rematch/reference/cli.html) |
-| what is built and what is not | [Status and limits](https://vncp.github.io/rematch/status.html) |
+| install (omp, Claude Code, Codex), the first correction | [Start](https://vncp.github.io/rematch/start/install/) |
+| the loop, statuses, predicates, domains, counters | [Concepts](https://vncp.github.io/rematch/concepts/loop/) |
+| day to day, correcting, approving, create, improve, batch, sharing, profile, report, lake, troubleshooting | [Guides](https://vncp.github.io/rematch/guides/day-to-day/) |
+| every subcommand's flags, trace schema, entry layout, lint, config, environment, files, glossary | [Reference](https://vncp.github.io/rematch/reference/cli/) |
+| what is built and what is not | [Status and limits](https://vncp.github.io/rematch/background/status/) |

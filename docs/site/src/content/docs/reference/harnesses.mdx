@@ -1,0 +1,59 @@
+---
+title: Harness capabilities
+description: What works in omp, Claude Code and Codex, and the commands each harness offers.
+---
+
+The binary, ledger, lint, counters and entries are the same for every harness; an adapter forwards only what its harness exposes. omp is the reference; Claude Code runs the loop live through a plugin of hooks; Codex is read after the fact.
+
+Session ids carry the harness, so one ledger holds all of them: omp's are bare, Claude Code's `cc:<uuid>`, Codex's `codex:<id>`. No model call ever runs inside a Claude Code or Codex session.
+
+## Capability matrix
+
+| Capability | omp | Claude Code | Codex |
+|---|---|---|---|
+| Trace: inputs, tool results, errors, turns, model | ✓ | ✓ (turns and model read from the transcript at `Stop`) | partial (after the fact, from `~/.codex/sessions` at import) |
+| Redirect pre-labels + `mark` | ✓ | ✓ (`/rematch:rematch-mark`) | partial (at import; `rematch mark --session codex:<id>`) |
+| Takeover (input while the agent runs) | ✓ | ✓ (a prompt delivered into the running turn; an Esc abort read from the transcript) | partial (at import: steers, prompts after an aborted turn) |
+| Flag + pending reflection | ✓ | ✓ (at `SessionEnd`, 1.5 s budget) | partial (`reflect --history`) |
+| Provisional skill loading | ✓ | ✓ (plugin `skills/` → the shared dir, synced at `SessionStart`) | partial (shared dir; `skills sync` by hand; visible in every session) |
+| Kept skill loading | ✓ | ✓ | ✓ |
+| Loaded entries for counting | ✓ | ✓ | partial (reconstructed at import from the rollout's skill list) |
+| Subagent entries | ✓ | ✓ (copied into the plugin's `agents/` at `SessionStart`) | — |
+| `block` hooks | ✓ | ✓ (`PreToolUse`, exit 2) | — |
+| `stuck` hooks | ✓ | partial (completed calls only; not in subagents) | — |
+| `retrieve` (unit retrieval) | ✓ (before every request) | partial (once per prompt, when the units change) | — |
+| `truncate` (tool-output truncation) | ✓ | — (no hook rewrites earlier tool results) | — |
+| Digest + one-tap approvals | ✓ | partial (digest at `SessionStart`; approve with `/rematch:rematch-approve <id>`, no dialog) | partial (`$rematch-status` skill) |
+| `/rematch` commands | ✓ (all, plus the `rematch` tool) | partial (status, why, mark, library, approve, decline, off, on; create/improve in a shell) | partial (`$rematch-status` skill) |
+| Reflection trigger (`reflect --pending`) | ✓ (spawned at session start) | ✓ (spawned detached at `SessionStart`; needs omp for the model calls) | — (`rematch reflect --history`) |
+| Batch mode (`run`) | ✓ | — | — (plan: DESIGN §18.2.4) |
+| History import | ✓ | ✓ | ✓ |
+
+Why each gap exists: [status and limits](/rematch/background/status/#claude-code-limits).
+
+## Commands per harness
+
+| In Claude Code | Same as |
+|---|---|
+| `/rematch:rematch-status` | `rematch status` + the skills and agents synced for this directory |
+| `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
+| `/rematch:rematch-library` | every entry with its raw counters |
+| `/rematch:rematch-mark correction` | overrides the classifier for the last turn of this session |
+| `/rematch:rematch-approve <id>` · `/rematch:rematch-decline <id>` | the digest's approve/decline dialog in omp |
+| `/rematch:rematch-off` · `/rematch:rematch-on` | `/rematch off` · `/rematch on` (`on` also re-links the skills for this directory) |
+
+- Only you can run `mark`, `approve`, `decline`, `off` and `on`; Claude cannot invoke them.
+- Everything else (`create`, `improve`, `run`, `disable`, `rollback`, …) is the `rematch` CLI in a terminal.
+- Codex has no `/rematch` command. The optional `$rematch-status` skill runs the sync, digest and approvals, each command after your approval.
+- In omp, most `/rematch <sub>` commands run `rematch <sub>`; `why`, `library`, `disable`, `rollback`, `approve`, `decline`, `mark` and `digest` differ ([the mapping](/rematch/guides/day-to-day/#omp-commands-and-the-cli)). Approving and uninstalling are reserved to you, never the `rematch` tool.
+
+## How each adapter is wired
+
+| | Claude Code | Codex |
+|---|---|---|
+| Lives in | `adapters/claude-code/` (a plugin) | `adapters/codex/` (a skill and setup notes) |
+| Input | each hook payload, unchanged, piped to `rematch trace-event` / `hook-check` | session rollouts `~/.codex/sessions/**/rollout-*.jsonl`, at import |
+| Skills | plugin `skills/` → `~/.rematch/skills` (made at the first `SessionStart`) | `~/.agents/skills/rematch` → `~/.rematch/skills` |
+| Fails | never fails a hook except by an intentional block | nothing runs in the session |
+
+Hook-by-hook mapping and files: [`adapters/claude-code/README.md`](https://github.com/vncp/rematch/blob/main/adapters/claude-code/README.md), [`adapters/codex/README.md`](https://github.com/vncp/rematch/blob/main/adapters/codex/README.md). Contracts: DESIGN §18.

@@ -1,0 +1,29 @@
+---
+// One diagram from docs/assets/readme as a light/dark pair that follows the site theme.
+const files = import.meta.glob<string>('../../../assets/readme/*.svg', {
+	eager: true,
+	query: '?url',
+	import: 'default',
+});
+
+interface Props {
+	name: 'loop' | 'lifecycle' | 'architecture' | 'reflect' | 'why';
+	alt: string;
+	caption?: string;
+}
+
+const { name, alt, caption } = Astro.props;
+const light = files[`../../../assets/readme/${name}-light.svg`];
+const dark = files[`../../../assets/readme/${name}-dark.svg`];
+if (!light || !dark) throw new Error(`Diagram: docs/assets/readme/${name}-{light,dark}.svg not found`);
+---
+
+<figure class="diagram not-content">
+	<a href={light} class="dark:sl-hidden" title="Open full size">
+		<img src={light} alt={alt} loading="lazy" decoding="async" />
+	</a>
+	<a href={dark} class="light:sl-hidden" title="Open full size">
+		<img src={dark} alt={alt} loading="lazy" decoding="async" />
+	</a>
+	{caption && <figcaption set:html={caption} />}
+</figure>

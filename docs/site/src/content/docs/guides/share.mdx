@@ -1,0 +1,79 @@
+---
+title: Share to a team or fork
+description: Ship an entry to a repo's team, an omp fork, or your home library. Every route opens a branch or a diff.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Share an entry beyond your machine: to a repo's team, to an omp fork, or from work to home. Every route opens a branch or a diff for review.
+
+<Aside type="caution" title="Nothing is merged for you">
+`ship` creates a branch and a commit; `--push --pr` opens the PR. Merging is yours.
+</Aside>
+
+## Pick the route
+
+| To | Command | How |
+|---|---|---|
+| a repo's team | `ship --scope team` | [to a repo's team](#to-a-repos-team) |
+| an omp fork | `ship --scope fork` | [to an omp fork](#to-an-omp-fork) |
+| your home library (from work) | `library export` | [from work to home](#from-work-to-home) |
+| another branch on this machine | `transfer suggest` / `transfer apply` | [across branches](#across-branches) |
+
+Which scope needs what approval: [scope and who merges](/rematch/concepts/evidence-boundary/#scope-and-who-merges).
+
+## To a repo's team
+
+```sh
+rematch ship --scope team [--entry <id>…] [--push --pr]
+```
+
+The branch adds:
+
+- the skill under `.omp/skills/<name>/` (subagents: `.omp/agents/<name>.md`);
+- a section `## rematch: <name>` in `AGENTS.md` (created if the repo has none), when the entry carries an `AGENTS.fragment.md`;
+- an evidence commit.
+
+Shipping a newer version replaces that `AGENTS.md` section in place.
+
+<Aside type="note" title="AGENTS.md only through a team branch">
+`AGENTS.md` is in context for everyone in the repo, so rematch never writes it on your machine. Fragment headings start at `###`; a fragment counts toward the 8 KB always-on budget like skill text.
+</Aside>
+
+## To an omp fork
+
+Per-model prompt text, tool descriptions and compaction defaults live in the omp source. They ship to a fork checkout as a branch.
+
+1. Point the entry at the file it replaces, once:
+
+   ```sh
+   rematch library set-fork-path <id> src/prompts/tools/bash.md --repo ~/src/omp-fork
+   ```
+
+2. Ship:
+
+   ```sh
+   rematch ship --scope fork --entry <id>      # --repo defaults to the one recorded above
+   ```
+
+- The text shipped is `fork/<file name>` in the entry if it has one, else its `SKILL.md` body.
+- The PR body carries the built fingerprint and the before/after counters.
+- `library ls --text` shows `fork:<path>` for such entries.
+- The editor may propose the path itself (`fork_path`); it must be relative to the fork, without `..`.
+
+## From work to home
+
+```sh
+rematch library export
+```
+
+Exports invariant entries to `~/.rematch/export`, each after your approval of its diff. It is off by default at work (`policy.json` `environment` and `export_enabled`, see [policy.json](/rematch/reference/configuration/policy-json/)).
+
+## Across branches
+
+```sh
+rematch transfer suggest
+rematch transfer apply <id> --branch <b>
+```
+
+`suggest` lists kept invariant lessons not yet tried in a branch whose facets overlap on two or more keys. A transfer is applied as provisional and earns its place through that branch's counters. Facets: [domain.yml](/rematch/reference/configuration/domain-yml/).

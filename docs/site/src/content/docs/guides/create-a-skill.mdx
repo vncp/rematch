@@ -1,0 +1,74 @@
+---
+title: Create a skill
+description: Create a new skill from past sessions, from one run of a task, or from a description.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Create a skill on purpose instead of waiting for a correction. Pick the source by what you have: matching past sessions, a task you can run, or only a description.
+
+## Choose the source
+
+| You have | Source | Result |
+|---|---|---|
+| ≥ 3 past sessions that match the name or description | [sessions](#from-sessions), no rollout | provisional |
+| a registered task | [task](#from-a-task), one rollout | provisional |
+| only a description | [description](#from-a-description), no rollout | draft |
+
+In omp, each command below also runs as `/rematch create …`.
+
+## From sessions
+
+```sh
+rematch create <name> --from sessions
+```
+
+It searches imported history and traces for sessions whose features match the request; with a lake, every machine's sessions. With three or more, the skill is distilled from what worked and what was redirected.
+
+To pick references by the commands they ran:
+
+```sh
+rematch create cargo-test-gate --from sessions --ran cargo,test
+```
+
+- Takes sessions whose bash commands contain every word (case-folded, whole words).
+- `cd x && cargo test --workspace` matches; `cargo build` does not.
+- Best overlap with the name or description first. It still needs 3 sessions.
+
+## From a task
+
+```sh
+rematch create <name> --from task --task <task-id>
+```
+
+Runs the task once in batch mode (one rollout, no candidates) to obtain a trace, then proposes. This is the only create that costs a rollout. Registering a task: [batch with a verifier](/rematch/guides/batch-with-a-verifier/#register-a-task).
+
+## From a description
+
+```sh
+rematch create <name> --from description --description "…" [--files path …]
+```
+
+The result is a **draft**: visible in the library, never loaded. Activate it when you are willing to test it:
+
+```sh
+rematch activate <name> --task <task-id>    # runs the task once with it, then provisional
+rematch activate <name> --unverified        # provisional on your say-so
+```
+
+<Aside type="note" title="Why a description alone is not enough">
+No proposal exists without an execution behind it. Editing a harness without one degraded results in the research behind rematch: [D1](/rematch/background/decisions/).
+</Aside>
+
+## What you get
+
+A skill package:
+
+| Part | Holds |
+|---|---|
+| `SKILL.md` | the router: trigger line and checkable laws |
+| `units/` | procedures and pitfalls |
+| `facts/` | measured values, each with `as_of` |
+| `scripts/` | anything deterministic (non-executable until approved) |
+
+Below about 8 KB the package collapses to one file. Layout: [entry layout](/rematch/reference/entry-layout/).

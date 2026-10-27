@@ -1,0 +1,60 @@
+---
+title: Model roles
+description: Which model rematch uses for each role, where it reads them, and how it falls back.
+---
+
+rematch makes model calls through omp, under named roles. It reads them from the profile's `config/roles.yml` first, then from omp's `config.yml`.
+
+## Roles
+
+| Role | Used for | Falls back to |
+|---|---|---|
+| `rematch-editor` | proposals, and the reflector | `slow` → `default` |
+| `rematch-classifier` | labelling redirects | `smol` → `tiny` → `default` |
+| `rematch-solver` | batch rollouts | `default` |
+
+There is no judge role. A reply from a different provider or model than the role names is a failed run, never a fallback (DESIGN §9).
+
+## In omp's `config.yml`
+
+`~/.omp/agent/config.yml` (the agent dir's), with `<repo>/.omp/config.yml` as overlay:
+
+```yaml
+modelRoles:
+  rematch-editor: <provider>/<strongest model>
+  rematch-classifier: <provider>/<fast model>
+```
+
+## Per machine: `roles.yml`
+
+With a [profile](/rematch/concepts/profile/), `profile/config/roles.yml` is read before `config.yml`:
+
+```yaml
+editor:                       # rematch-editor; also classifier, solver, or any modelRoles key
+  default: anthropic/claude-opus-5-5
+  Vincent-M5M.local: openai/gpt-5     # this hostname only
+classifier: fakeprov/small-model      # every machine
+```
+
+The shape is `{<role>: <selector> | {default: <selector>, <hostname>: <selector>}}`.
+
+## Check what resolved
+
+```sh
+rematch doctor --text           # role rematch-editor: … (via profile:rematch-editor)
+rematch profile status --text   # this machine's roles
+```
+
+## Improver files
+
+The prompts and tables the binary uses are files you may edit too:
+
+| | |
+|---|---|
+| Files | `editor.md`, `composer.md`, `reflector.md`, `classifier.md`, `lint.toml`, `domain_rules.toml`, `omp-no-tools.yml` |
+| Shipped in | the binary; written to `~/.rematch/improver/` on first run |
+| On upgrade | refreshed only if the installed copy still matches the previously shipped hash (`.shipped/<name>`) |
+| Override | `REMATCH_IMPROVER=<dir>` takes them from that directory instead |
+| With a profile | an edited file syncs through `profile/improver/` |
+
+The system never amends them ([D25](/rematch/background/decisions/)).

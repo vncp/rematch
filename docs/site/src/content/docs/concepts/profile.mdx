@@ -1,0 +1,66 @@
+---
+title: The profile
+description: One git repo of your omp setup, linked into every machine; counters and history stay per machine.
+---
+
+import { FileTree, Aside } from '@astrojs/starlight/components';
+
+What rematch keeps on one machine should load on the next. The profile is a git repo at `~/.rematch/profile/` holding your omp setup, with every piece linked back where omp and rematch read it.
+
+<Aside type="note" title="Live-verified 2026-10-26">
+Between two Macs over a private GitHub repo: hand-written subagent prompts adopted on both (identical copies became links), a skill added on one machine appeared on the other at the next sync, a deletion propagated back, and launchd synced every 5 minutes on each.
+</Aside>
+
+## What it holds
+
+<FileTree>
+- profile/
+  - skills/
+    - \<name\>/ kept skills and adopted hand-written skills
+  - agents/
+    - \<name\>.md kept and adopted agents
+  - fragments/
+    - \<name\>.md AGENTS.fragment.md of kept agents
+  - hooks/
+    - \<id\>.ts approved hooks
+  - config/
+    - policy.json
+    - roles.yml the model behind each role, per machine
+    - domains/
+      - \<branch\>.yml each branch's domain.yml
+  - improver/
+    - \<edited file\> improver prompts you edited
+  - profile.json
+</FileTree>
+
+Hand-written skills and agents enter as **pinned** entries: measured like any entry, never moved, replaced or retired by the loop.
+
+## What stays per machine
+
+| Stays | Why |
+|---|---|
+| the ledger, its journal and counters | counts belong to the machine that observed the sessions |
+| the lake and its indexes | history travels through the lake, not the profile |
+| `staging/`, `drafts/`, `archive/`, `predecessors/` | provisional and retired state |
+| traces, pending files, jobs | per-session data |
+| credentials and omp's own `config.yml` | model choices travel only through `roles.yml` |
+| `rematch.json` and `EXPERIENCE.md` inside each skill | written from this machine's ledger (absolute paths, its state) |
+
+## Kept elsewhere, loaded here
+
+Every `profile/skills/<name>/` with a `SKILL.md` is linked into `~/.rematch/skills/` when no ledger entry holds that name. So a skill kept on another machine loads here like this machine's kept entries.
+
+- It is counted only by the machine whose ledger holds the entry.
+- A hook linked from another machine runs only where its entry is known.
+- Built-in entries have per-machine ids and are approved per machine.
+
+## How it syncs
+
+- Each omp process syncs in the background at its first session start: commit, pull with rebase, relink, push. It is bounded, and offline is fine.
+- Keeps land in the profile; `rematch profile install-launchd` adds a timer.
+- A file changed on two machines stops the sync with the tree clean, and a digest line names the file.
+
+## See also
+
+- Guide: [sync machines](/rematch/guides/sync-machines/).
+- Reference: [model roles](/rematch/reference/configuration/model-roles/), DESIGN §20 in the [design contract](/rematch/background/design/).

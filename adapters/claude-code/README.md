@@ -4,7 +4,7 @@ A Claude Code plugin that gives Claude Code sessions the same rematch loop omp h
 
 ## Install
 
-Nothing is installed for you. Requirements: Claude Code 2.1.285 or later; the `rematch` binary, found as `$REMATCH_BIN`, else `target/release/rematch` / `target/debug/rematch` of this checkout (`cargo build --release` at the repo root), else `rematch` on `PATH`. Reflection makes its model calls through omp (`$OMP_BIN`, else `omp` on `PATH`, with the roles of the main [README](../../README.md#models)); without omp, sessions are still traced, flagged and loaded, and reflection waits for a `rematch reflect --pending` run where omp exists.
+Nothing is installed for you. Requirements: Claude Code 2.1.285 or later; the `rematch` binary, found as `$REMATCH_BIN`, else `target/release/rematch` / `target/debug/rematch` of this checkout (`cargo build --release` at the repo root), else `rematch` on `PATH`. Reflection makes its model calls through omp (`$OMP_BIN`, else `omp` on `PATH`, with the [model roles](https://vncp.github.io/rematch/reference/configuration/model-roles/)); without omp, sessions are still traced, flagged and loaded, and reflection waits for a `rematch reflect --pending` run where omp exists.
 
 One session:
 
@@ -20,7 +20,7 @@ ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
 
 `~/.claude/plugins/` is Claude Code's marketplace cache and settings only list `enabledPlugins` by `name@marketplace`; a marketplace install would copy the plugin and drop the `skills/` symlink, so use one of the two routes above. A `--plugin-dir` copy named `rematch` takes precedence over the `skills-dir` one for that session. Check the load with `claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch`: 8 hooks, under Skills the eight commands plus every linked skill, under Agents the rematch subagents.
 
-Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [Where skills load from](https://vncp.github.io/rematch/concepts/entries.html#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`. Subagents are copied into the plugin's `agents/` (below).
+Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [Where skills load from](https://vncp.github.io/rematch/concepts/entries/#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`. Subagents are copied into the plugin's `agents/` (below).
 
 Upgrading from a version that used `~/.rematch/claude-skills/`: the first `SessionStart` re-points `skills/` here to `~/.rematch/skills` and deletes `~/.rematch/claude-skills/` (only links lived there).
 

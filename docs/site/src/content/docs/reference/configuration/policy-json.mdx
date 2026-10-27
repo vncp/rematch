@@ -1,0 +1,66 @@
+---
+title: policy.json
+description: Declared domains, caps, skipped profiles and the export policy, in ~/.rematch/policy.json.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`~/.rematch/policy.json` holds declared domains, caps, the omp profiles to skip on import, and the work/home export policy. An absent file means the defaults.
+
+- `rematch policy` writes it: an atomic replace that keeps the other keys.
+- With a profile, it is a link to `profile/config/policy.json`.
+
+## Keys
+
+| Key | Shape | Meaning | Written by |
+|---|---|---|---|
+| `domains` | `[{"match": {"repo_remote": "...", "subpath": "..."}, "domain": "..."}]` | declared domains, first match wins; kept most specific first (with a subpath, then an exact remote, then globs) | `rematch policy domain set\|unset` |
+| `caps` | `{"kept_per_domain": <n>}` | kept entries per top-level domain across branches (default 8) | `rematch policy caps set kept_per_domain <n>` |
+| `skip_profiles` | `["<profile>", …]` | omp profiles `import --history` skips, merged with `--skip-profile` | — |
+| `environment` | `"work"` or `"home"` | missing ⇒ home; `library export` refuses at work unless `export_enabled` | — |
+| `export_enabled` | bool | allows `library export` at work | — |
+
+<Aside type="caution" title="Gap in the docs">
+No `rematch policy` subcommand sets `skip_profiles`, `environment` or `export_enabled` (`rematch policy --help` lists `show`, `domain` and `caps`). The docs do not say how those keys are meant to be written.
+</Aside>
+
+## Example
+
+On an empty root:
+
+```sh
+rematch policy domain set github.com/acme/web web.frontend
+rematch policy caps set kept_per_domain 6
+```
+
+leaves:
+
+```json
+{
+  "caps": {
+    "kept_per_domain": 6
+  },
+  "domains": [
+    {
+      "domain": "web.frontend",
+      "match": {
+        "repo_remote": "github.com/acme/web"
+      }
+    }
+  ]
+}
+```
+
+On a root without the file:
+
+```sh
+rematch policy show --text
+```
+
+```text
+policy <root>/policy.json (absent)
+domains: none declared
+caps: kept_per_domain 8
+```
+
+How declared domains are used: [domains](/rematch/concepts/predicates-and-domains/#domains).

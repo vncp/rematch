@@ -1,0 +1,50 @@
+---
+title: Improve a skill
+description: Improve a skill you already have from the sessions that used it.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Improve an existing skill from its own history: the redirects and errors that happened while it was loaded. The new version is staged beside the old one, and the counters decide.
+
+## Improve
+
+```sh
+rematch improve <skill>                # e.g. forge-portfolio-weighting
+rematch improve <skill> --split-only   # just the mechanical split, no model
+```
+
+In omp: `/rematch improve <skill>`.
+
+## What it does
+
+The skill is registered as a provisional entry in place (its file is never moved), and the sessions that read it are audited. Then one of three things happens:
+
+| Situation | Result |
+|---|---|
+| fewer than 5 traced sessions used it | refuses with the count and offers the split |
+| over 8 KB | split mechanically, no model: router `SKILL.md` + `units/` by heading + `facts/`, staged beside the original |
+| otherwise | one editor call proposes unit-level edits from the clustered redirects and tool-error clusters; same lint; staged beside |
+
+- Imported sessions count too: their excerpt is rebuilt from omp's session files.
+- The split also moves long tables and rejected-hypothesis lists into a ledger-notes unit.
+- Until the counters decide, omp shows the new version under the bare name and the original under its namespaced name.
+
+<Aside type="caution" title="Pinned skills are refused">
+A pinned skill is never replaced. Unpin it first: `rematch library unpin <id>`.
+</Aside>
+
+Before a new version replaces a kept one, its originating task is replayed once if it has a verifier: [replacing a kept skill](/rematch/guides/batch-with-a-verifier/#replacing-a-kept-skill).
+
+## Import compound-forge skills
+
+```sh
+rematch import --forge <path>
+rematch import --forge <path> --migrate
+```
+
+- Registers compound-forge's skills as entries, with predicates from their trigger text.
+- Registers its `learnings/*.md` as lessons with their evidence hash.
+- `--migrate` copies the skill trees into `staging/forge/` (scripts non-executable), so the forge plugin and checkout can be removed. The forge's own meta-skill stays behind.
+
+This is how compound-forge was retired on both of the author's machines.

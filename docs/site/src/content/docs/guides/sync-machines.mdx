@@ -1,0 +1,114 @@
+---
+title: Sync machines
+description: Keep one omp setup on every machine with a git-backed profile.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Put your omp setup in a private git repo, and every machine that syncs it loads the same skills, agents, hooks and settings. This is rematch's profile, not omp's `--profile`.
+
+What it holds and what stays per machine: [the profile](/rematch/concepts/profile/).
+
+## Set up
+
+<Steps>
+
+1. Create a private, empty git repo anywhere (GitHub, a server, a USB disk).
+
+2. On the first machine, create the profile and bring your setup in:
+
+   ```sh
+   rematch profile init --remote git@github.com:you/omp-profile.git --adopt --text
+   ```
+
+   `--adopt` moves kept entries and your hand-written skills and agents into the profile, and leaves a link where each was. omp loads them as before.
+
+3. On every other machine:
+
+   ```sh
+   rematch profile init --remote git@github.com:you/omp-profile.git --text
+   ```
+
+   It clones, links every skill, agent and hook into `~/.omp/agent/` and `~/.rematch/skills/`, and adds the machine's name to `profile.json`. Add `--adopt` to bring that machine's own skills in too.
+
+</Steps>
+
+- Hand-written skills become **pinned** entries: measured like any entry, never moved, replaced or retired by the loop.
+- Without `--remote` the profile stays local. Add one later: `git -C ~/.rematch/profile remote add origin <url>`.
+
+## Add one more skill or agent
+
+```sh
+rematch profile adopt ~/.agents/skills/scratch
+rematch profile adopt ~/.omp/agent/agents/reviewer.md
+```
+
+<Aside type="caution" title="omp skills and agents only">
+`adopt` takes an omp skill (a dir with `SKILL.md`) or agent (`.md`). It refuses anything under `~/.claude`, `~/.codex` or `~/.agents`, and `CLAUDE.md`, `AGENTS.md` or `settings.json` anywhere. Copy a skill to `~/.omp/agent/skills/<name>` first. Claude Code and Codex still load every kept skill through `~/.rematch/skills`.
+</Aside>
+
+## Sync
+
+Syncing happens on its own: each omp process runs `rematch profile sync` in the background at its first session start. It is bounded to 8 s; offline, the session simply goes on. What it pulls loads in your next session.
+
+A sync commits local changes as `<machine> <time>`, pulls with rebase, relinks, and pushes. By hand:
+
+```sh
+rematch profile sync --text            # --no-push to only pull; --timeout <s> for the network part (default 10)
+```
+
+To also sync on a timer (macOS):
+
+```sh
+rematch profile install-launchd --interval 300 --text
+launchctl load -w ~/Library/LaunchAgents/com.vncp.rematch.profile-sync.plist
+```
+
+The first command writes the plist and prints the `launchctl load` line; it never loads it for you. Output goes to `~/.rematch/profile-sync.log`.
+
+## Pick models per machine
+
+`profile/config/roles.yml` is read before `~/.omp/agent/config.yml`. Format: [model roles](/rematch/reference/configuration/model-roles/#per-machine-rolesyml).
+
+```sh
+rematch profile status --text          # lists this machine's roles
+```
+
+## Resolve a conflict
+
+When two machines changed the same file, the sync stops the rebase, leaves the repo clean at your local commit, and does not push. The digest says which files until you resolve it:
+
+```text
+profile: 1 conflict(s) not synced (skills/hand-notes/SKILL.md); resolve with git -C ~/.rematch/profile pull --rebase, then rematch profile sync
+```
+
+<Steps>
+
+1. `git -C ~/.rematch/profile pull --rebase`
+2. Edit the file, then `git add` it.
+3. `git rebase --continue`
+4. `rematch profile sync`
+
+</Steps>
+
+## Check status
+
+```sh
+rematch profile status --text
+```
+
+Shows branch, remote, ahead/behind as of the last fetch, uncommitted changes and conflicts.
+
+Skills kept on another machine appear in `library ls`, loaded here but not counted:
+
+```text
+kept (profile, from machine-a) skill  run-tests-before-commit [profile] not counted on this machine
+```
+
+## Leave
+
+```sh
+rematch uninstall --yes
+```
+
+Keeps `~/.rematch/profile/` (it is your repo), removes the links into it, and puts your hand-written skills and agents back in `~/.omp/agent/` as plain files.
