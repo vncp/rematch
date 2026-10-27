@@ -1,7 +1,11 @@
 //! Detached jobs (DESIGN §14): the binary re-executes itself in a new session
-//! (`setsid`), stdio → `jobs/<id>.log`, state in `jobs/<id>.json` mirrored to the ledger.
+//! (`setsid`; Windows: detached, new process group), stdio → `jobs/<id>.log`, state in
+//! `jobs/<id>.json` mirrored to the ledger.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -66,6 +70,7 @@ pub fn spawn_detached(ctx: &AppCtx, kind: &str, argv: &[String], payload: &Value
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -73,6 +78,12 @@ pub fn spawn_detached(ctx: &AppCtx, kind: &str, argv: &[String], payload: &Value
             }
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let child = cmd.spawn().context("spawn detached job")?;
     let pid = child.id();
@@ -111,12 +122,30 @@ pub fn update(ctx: &AppCtx, id: &str, status: &str, patch: &Value) -> Result<Val
     Ok(v)
 }
 
+#[cfg(unix)]
 pub fn pid_alive(pid: i64) -> bool {
     if pid <= 0 {
         return false;
     }
     let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `tasklist` lists the pid only while the process exists (CSV row starts with the image name).
+#[cfg(windows)]
+pub fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
 }
 
 const LIVE: &[&str] = &["starting", "running"];
@@ -234,9 +263,9 @@ mod tests {
         let p = t.path().join(".lock");
         let a = LockFile::acquire(p.clone()).unwrap().expect("first holder");
         assert!(p.exists());
-        // A live foreign holder: pid 1 (launchd/init) is always alive.
+        // A live foreign holder: pid 1 (launchd/init), on Windows pid 4 (System), is always alive.
         drop(a);
-        std::fs::write(&p, "1\n").unwrap();
+        std::fs::write(&p, if cfg!(windows) { "4\n" } else { "1\n" }).unwrap();
         assert!(LockFile::acquire(p.clone()).unwrap().is_none(), "live holder blocks");
         // A dead holder's lock is taken over.
         std::fs::write(&p, "999999999\n").unwrap();

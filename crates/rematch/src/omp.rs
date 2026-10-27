@@ -23,13 +23,32 @@ pub fn omp_bin() -> PathBuf {
     which("omp").unwrap_or_else(|| PathBuf::from("omp"))
 }
 
-/// First executable `name` on `$PATH`.
+/// First executable `name` on `$PATH` (Windows: `name` + each `%PATHEXT%` extension).
 pub fn which(name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| {
-        std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
-    })
+    std::env::split_paths(&path).find_map(|d| candidates(&d, name).into_iter().find(|p| is_executable(p)))
+}
+
+#[cfg(unix)]
+fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    vec![dir.join(name)]
+}
+
+#[cfg(windows)]
+fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    exts.split(';').filter(|e| !e.is_empty()).map(|e| dir.join(format!("{name}{}", e.to_lowercase()))).collect()
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 pub fn selector(m: &ModelRef) -> String {

@@ -34,7 +34,8 @@ Everything below is built and tested; less of it has run against real daily use.
 - **The built-in context entries in real use.** All three were approved and fired in one live omp session (a `retrieval` record for a `bellwether-dev` unit; the stuck detector blocking a 4th identical call). Truncation is observable only in the outgoing request and is covered by the extension tests. None has been counted across real sessions yet.
 - **A batch cycle where a candidate beats the reference.** The one live cycle had a reference that already passed, so both editors chose `KEEP_BASE`; the fake-omp tests cover the other branches.
 - **A merged team PR and a `shared` promotion from real branches.** Both are exercised on scratch repositories only.
-- **Linux.** The code is POSIX-portable (`setsid`, process groups, `sh` scripts); every run above was macOS arm64. No Windows.
+- **Linux.** The code is POSIX-portable (`setsid`, process groups, `sh` scripts); every run above was macOS arm64.
+- **Windows in daily use.** The omp path builds, installs (`scripts/install.ps1`, Developer Mode for symlinks) and passes `cargo test` except the tests that drive POSIX `sh` fixtures (scripted editors, fake omp), which run on Unix only. Scripted `--editor` commands still run through `sh` (Git for Windows provides it). The Claude Code adapter's hook relay is a bash script and is untested there.
 - **Embeddings for the related-thing lookup.** Exact signature and MinHash are implemented; embeddings would need credentials the binary does not hold.
 
 Open questions from the spec are at the end of [`docs/SPEC.md`](https://github.com/vncp/rematch/blob/main/docs/SPEC.md#open-questions).

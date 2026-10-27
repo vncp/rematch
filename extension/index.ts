@@ -36,16 +36,19 @@ function extensionDir(): string {
 	}
 }
 
+/** The binary's file name: `rematch.exe` on Windows. */
+const BIN_NAME = process.platform === "win32" ? "rematch.exe" : "rematch";
+
 /** `$REMATCH_BIN` → `<ext>/../target/release` → `<ext>/../target/debug` → PATH. */
 export function resolveBinary(env: NodeJS.ProcessEnv = process.env, extDir = extensionDir()): string | null {
 	if (env.REMATCH_BIN) return isExecutable(env.REMATCH_BIN) ? env.REMATCH_BIN : null;
 	for (const profile of ["release", "debug"]) {
-		const candidate = path.normalize(path.join(extDir, "..", "target", profile, "rematch"));
+		const candidate = path.normalize(path.join(extDir, "..", "target", profile, BIN_NAME));
 		if (isExecutable(candidate)) return candidate;
 	}
 	for (const dir of (env.PATH ?? "").split(path.delimiter)) {
 		if (!dir) continue;
-		const candidate = path.join(dir, "rematch");
+		const candidate = path.join(dir, BIN_NAME);
 		if (isExecutable(candidate)) return candidate;
 	}
 	return null;

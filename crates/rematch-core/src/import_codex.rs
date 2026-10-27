@@ -152,7 +152,7 @@ pub fn default_sessions_dir() -> Option<PathBuf> {
     if let Some(h) = std::env::var_os("CODEX_HOME").filter(|h| !h.is_empty()) {
         return Some(PathBuf::from(h).join("sessions"));
     }
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".codex").join("sessions"))
+    crate::paths::home_dir().map(|h| h.join(".codex").join("sessions"))
 }
 
 /// Every `rollout-*.jsonl` under `dir` (recursively), sorted by path (= by start time).
@@ -964,6 +964,7 @@ fn content_text_blocks(content: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
     use super::*;
 
     fn line(ts: &str, kind: &str, payload: Value) -> String {
@@ -1042,7 +1043,7 @@ mod tests {
 
     fn repo() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().canonicalize().unwrap().join("payments");
+        let repo = crate::paths::canonicalize(tmp.path()).unwrap().join("payments");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         (tmp, repo)
     }
@@ -1058,6 +1059,8 @@ mod tests {
             .collect()
     }
 
+    // POSIX-only: the fixture writes `file://` URLs from native paths.
+    #[cfg(unix)]
     #[test]
     fn items_rollout_maps_to_the_trace_schema() {
         let (_t, repo) = repo();
@@ -1271,6 +1274,7 @@ mod tests {
     /// skills dir to a provisional (staging) and a kept entry dir, each with `rematch.json`, and
     /// neither a foreign skill, a hook's router (Codex never runs it) nor an entry created after
     /// the session started.
+    #[cfg(unix)]
     #[test]
     fn loaded_entries_from_the_offered_skill_list() {
         let (_t, repo) = repo();

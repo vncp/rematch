@@ -326,7 +326,7 @@ fn prune_dangling(dir: &Path, under: &Path, label: &str, out: &mut Views) -> Res
     for (name, p) in names {
         let Ok(t) = std::fs::read_link(&p) else { continue };
         if t.starts_with(under) && !p.exists() {
-            std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
+            crate::library::unlink(&p).with_context(|| format!("remove {}", p.display()))?;
             out.pruned.push(format!("{label}/{name}"));
         }
     }
@@ -512,7 +512,7 @@ mod tests {
 
     fn env() -> (tempfile::TempDir, RematchPaths) {
         let t = tempfile::tempdir().unwrap();
-        let root = t.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize(t.path()).unwrap();
         let paths = RematchPaths::with_roots(root.join("rematch"), root.join("agent"));
         paths.ensure_dirs().unwrap();
         std::fs::create_dir_all(dir(&paths).join(".git")).unwrap();

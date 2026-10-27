@@ -48,7 +48,7 @@ impl RematchPaths {
     /// Resolve from an arbitrary environment lookup (`None` = unset, `Some("")` = set empty).
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> RematchPaths {
         let non_empty = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        let home = non_empty("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+        let home = home_from(&get).unwrap_or_else(|| PathBuf::from("/"));
         let root = non_empty("REMATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".rematch"));
@@ -192,6 +192,32 @@ impl RematchPaths {
     pub fn staging_branch(&self, branch: &str) -> PathBuf {
         self.staging.join(branch)
     }
+}
+
+/// The user's home: `$HOME`, else (Windows, where it is usually unset) `%USERPROFILE%`.
+pub fn home_dir() -> Option<PathBuf> {
+    home_from(|k| std::env::var(k).ok())
+}
+
+fn home_from(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let non_empty = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let home = non_empty("HOME");
+    #[cfg(windows)]
+    let home = home.or_else(|| non_empty("USERPROFILE"));
+    home.map(PathBuf::from)
+}
+
+/// `std::fs::canonicalize` without Windows' verbatim `\\?\` prefix, which git, globs,
+/// link targets and user-written paths never carry (UNC shares keep theirs).
+pub fn canonicalize(p: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    if let Some(rest) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        if !rest.starts_with(r"UNC\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(c)
 }
 
 /// Normalize and validate an omp profile name (`@oh-my-pi/pi-utils/src/dirs.ts`

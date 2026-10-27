@@ -67,7 +67,7 @@ fn resolve_source(src: &str, base: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     if let Some(rest) = src.strip_prefix("~/") {
-        return std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest));
+        return rematch_core::paths::home_dir().map(|h| h.join(rest));
     }
     let p = PathBuf::from(src);
     if p.is_absolute() {

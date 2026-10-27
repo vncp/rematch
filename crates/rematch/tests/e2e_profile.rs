@@ -1,3 +1,5 @@
+// POSIX-only: sh fixtures, Unix file modes and unprivileged symlinks.
+#![cfg(unix)]
 //! End-to-end for the profile (DESIGN §20): two machines (two REMATCH_ROOTs and agent dirs)
 //! share a local bare git remote. A adopts its kept entry and hand-written skill/agent into the
 //! profile; B clones it and sees them linked; B's keep lands in the profile and reaches A; a
@@ -57,7 +59,7 @@ fn two_machines_share_one_profile() {
     let a = Env::new();
     let b = Env::new();
     let remote_tmp = tempfile::tempdir().unwrap();
-    let remote = remote_tmp.path().canonicalize().unwrap().join("profile.git");
+    let remote = rematch_core::paths::canonicalize(remote_tmp.path()).unwrap().join("profile.git");
     let out = Command::new("git").args(["init", "--bare", "-q"]).arg(&remote).output().unwrap();
     assert!(out.status.success());
     let remote_s = remote.to_str().unwrap();

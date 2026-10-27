@@ -41,7 +41,7 @@ pub struct ImproveArgs {
 }
 
 fn plugins_node_modules() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let home = rematch_core::paths::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     std::env::var_os("OMP_PLUGINS_DIR").map(PathBuf::from).unwrap_or_else(|| home.join(".omp").join("plugins")).join("node_modules")
 }
 
@@ -66,13 +66,13 @@ pub fn locate_skill(ctx: &AppCtx, name: &str) -> Result<Option<PathBuf>> {
     for rel in [".omp/skills", ".agents/skills", ".agent/skills", ".claude/skills", ".codex/skills", ".opencode/skills", ".github/skills"] {
         cands.push(base.join(rel).join(name));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = rematch_core::paths::home_dir() {
         for rel in [".agents/skills", ".agent/skills", ".claude/skills", ".codex/skills", ".config/opencode/skills"] {
             cands.push(home.join(rel).join(name));
         }
     }
     if let Some(found) = cands.into_iter().find(|d| d.join("SKILL.md").is_file()) {
-        return Ok(Some(std::fs::canonicalize(&found).unwrap_or(found)));
+        return Ok(Some(rematch_core::paths::canonicalize(&found).unwrap_or(found)));
     }
     Ok(ctx
         .ledger
@@ -93,7 +93,7 @@ fn common_repo(sessions: &[SessionRecord]) -> Option<String> {
 /// `profile adopt`, which then pins it).
 pub(crate) fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], branch: &str) -> Result<(Entry, bool)> {
     for e in ctx.ledger.list_entries(&EntryFilter { name: Some(name.into()), ..Default::default() })? {
-        let same_dir = std::fs::canonicalize(&e.path).map(|p| p == dir).unwrap_or(e.path == dir);
+        let same_dir = rematch_core::paths::canonicalize(&e.path).map(|p| p == dir).unwrap_or(e.path == dir);
         if same_dir && !matches!(e.status, Status::Retired) {
             return Ok((e, false));
         }

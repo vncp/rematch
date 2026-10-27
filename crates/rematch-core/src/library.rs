@@ -208,7 +208,7 @@ fn predecessor_root(paths: &RematchPaths, kind: Kind, name: &str) -> PathBuf {
 
 fn remove_link(p: &Path) -> Result<()> {
     if std::fs::symlink_metadata(p).is_ok() {
-        std::fs::remove_file(p).with_context(|| format!("remove {}", p.display()))?;
+        unlink(p).with_context(|| format!("remove {}", p.display()))?;
     }
     Ok(())
 }
@@ -229,11 +229,10 @@ fn symlink_file(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).with_context(|| format!("link {}", link.display()))
 }
 
-/// Without symlinks the staged AGENT.md is copied (re-copied on every stage).
-#[cfg(not(unix))]
+/// Windows: needs Developer Mode (or admin) like every other rematch link.
+#[cfg(windows)]
 fn symlink_file(target: &Path, link: &Path) -> Result<()> {
-    std::fs::copy(target, link).with_context(|| format!("copy {}", link.display()))?;
-    Ok(())
+    std::os::windows::fs::symlink_file(target, link).with_context(|| format!("link {}", link.display()))
 }
 
 fn link_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
@@ -1124,9 +1123,29 @@ pub fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
 }
 
+/// Windows distinguishes file and directory symlinks; a file target (an agent `.md`) gets a
+/// file symlink.
 #[cfg(windows)]
 pub fn symlink_dir(target: &Path, link: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_dir(target, link).with_context(|| format!("link {} → {}", link.display(), target.display()))
+    let r = if target.is_file() {
+        std::os::windows::fs::symlink_file(target, link)
+    } else {
+        std::os::windows::fs::symlink_dir(target, link)
+    };
+    r.with_context(|| format!("link {} → {}", link.display(), target.display()))
+}
+
+/// Remove a link (or file) without following it. Windows removes a directory symlink with
+/// `RemoveDirectory`, so `remove_file` alone fails on one.
+pub fn unlink(p: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if std::fs::symlink_metadata(p)?.file_type().is_symlink_dir() {
+            return std::fs::remove_dir(p);
+        }
+    }
+    std::fs::remove_file(p)
 }
 
 /// Atomic per link: a hidden temporary symlink renamed over `link`, so a reader sees the old
@@ -1137,7 +1156,7 @@ pub fn relink(target: &Path, link: &Path) -> Result<()> {
     let tmp = link.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
     symlink_dir(target, &tmp)?;
     std::fs::rename(&tmp, link).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = unlink(&tmp);
         anyhow!(err).context(format!("rename {} → {}", tmp.display(), link.display()))
     })
 }
@@ -1338,7 +1357,7 @@ pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<Uninstall
 fn remove_path(p: &Path) -> Result<()> {
     match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p)?,
-        Ok(_) => std::fs::remove_file(p)?,
+        Ok(_) => unlink(p)?,
         Err(_) => {}
     }
     Ok(())
@@ -1556,6 +1575,7 @@ mod tests {
         let plan = uninstall_plan(&x.paths, &x.ledger).unwrap();
         assert!(plan.restore.contains(&(home.clone(), user_dir.clone())), "{plan:?}");
         assert!(plan.remove.iter().all(|p| !p.starts_with(&profile) && p != &x.paths.root), "{plan:?}");
+        drop(x.ledger);
         apply_uninstall(&plan).unwrap();
         assert!(profile.join(".git").is_dir() && home.join("SKILL.md").is_file());
         assert!(std::fs::symlink_metadata(&user_dir).unwrap().is_dir());
@@ -1658,6 +1678,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode(&e.path.join("scripts/run.sh")), 0o755);
         // approved mode survives a status move
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let dm = set_status(&x.ledger, &x.paths, "s1", Status::Dormant, None).unwrap();
         #[cfg(unix)]
         assert_eq!(mode(&dm.path.join("scripts/run.sh")), 0o755);
@@ -1879,6 +1900,7 @@ mod tests {
         e
     }
 
+    #[cfg(unix)]
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap()
     }

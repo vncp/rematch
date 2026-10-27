@@ -495,7 +495,7 @@ pub fn locate_session_file(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Pat
 fn cwd_slugs(cwd: &str) -> Vec<String> {
     let cwd = Path::new(cwd);
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = rematch_core::paths::home_dir() {
         if let Ok(rel) = cwd.strip_prefix(&home) {
             out.push(format!("-{}", rel.to_string_lossy().replace('/', "-")));
         }

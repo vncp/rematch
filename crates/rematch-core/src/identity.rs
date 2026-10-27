@@ -71,7 +71,7 @@ fn file_remote(path: &str) -> Option<String> {
 
 /// Identity of a repo without a remote: `local:<sha256 of the toplevel path>`.
 pub fn local_identity(toplevel: &Path) -> String {
-    let p = std::fs::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
+    let p = crate::paths::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
     format!("{LOCAL_PREFIX}{}", sha256_hex(p.to_string_lossy().as_bytes()))
 }
 
@@ -137,7 +137,7 @@ pub fn repo_remote_of(toplevel: &Path) -> Option<String> {
             return Some(n);
         }
     }
-    let common = std::fs::canonicalize(&common).unwrap_or(common);
+    let common = crate::paths::canonicalize(&common).unwrap_or(common);
     let main = match (common.file_name(), common.parent()) {
         (Some(n), Some(parent)) if n == ".git" => parent.to_path_buf(),
         _ => toplevel.to_path_buf(),
@@ -181,8 +181,8 @@ pub fn subpath_of(toplevel: &Path, cwd: &Path) -> Option<String> {
             .map(|r| r.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))
     };
     rel(toplevel, cwd).or_else(|| {
-        let top = std::fs::canonicalize(toplevel).ok()?;
-        let c = std::fs::canonicalize(cwd).ok()?;
+        let top = crate::paths::canonicalize(toplevel).ok()?;
+        let c = crate::paths::canonicalize(cwd).ok()?;
         rel(&top, &c)
     })
 }

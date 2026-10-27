@@ -2,7 +2,10 @@
 //! editor/classifier channel, batch rollouts and verifiers.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -62,13 +65,13 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
     let start = Instant::now();
     // A detached job's id must not leak into tools it runs (they would report into it).
     cmd.env_remove(crate::jobs::JOB_ID_ENV);
-    cmd.process_group(0)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+    isolate(&mut cmd);
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let program = format!("{:?}", cmd.get_program());
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    let pgid = child.id() as libc::pid_t;
+    let pgid = child.id();
 
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let readers = [
@@ -144,8 +147,8 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 match stage {
                     // Clean-up kill, not a timeout: `killed` stays the leader's outcome.
-                    0 => unsafe { libc::killpg(pgid, libc::SIGTERM) },
-                    1 => unsafe { libc::killpg(pgid, libc::SIGKILL) },
+                    0 => signal_group(pgid, false),
+                    1 => signal_group(pgid, true),
                     _ => break,
                 };
                 stage += 1;
@@ -154,7 +157,7 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
         }
     }
     if killed {
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        signal_group(pgid, true);
     }
     out.code = status.and_then(|s| s.code());
     out.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -164,8 +167,45 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
     Ok(out)
 }
 
-fn kill_group(pgid: libc::pid_t, child: &mut std::process::Child, status: &mut Option<std::process::ExitStatus>) {
-    unsafe { libc::killpg(pgid, libc::SIGTERM) };
+/// New process group: `process_group(0)` on Unix; on Windows a new group without a console
+/// window, so the tree can be torn down via `taskkill /T`.
+fn isolate(cmd: &mut Command) {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+}
+
+/// SIGTERM (`force = false`) or SIGKILL to the group led by `pgid`. Windows: `taskkill /T`
+/// on the tree rooted at `pgid` (`/F` when forced; unforced only reaches windowed processes).
+fn signal_group(pgid: u32, force: bool) {
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pgid as libc::pid_t, if force { libc::SIGKILL } else { libc::SIGTERM });
+    }
+    #[cfg(windows)]
+    {
+        let pid = pgid.to_string();
+        let mut args = vec!["/T", "/PID", pid.as_str()];
+        if force {
+            args.push("/F");
+        }
+        let _ = Command::new("taskkill")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+}
+
+fn kill_group(pgid: u32, child: &mut std::process::Child, status: &mut Option<std::process::ExitStatus>) {
+    signal_group(pgid, false);
     let until = Instant::now() + KILL_GRACE;
     while Instant::now() < until {
         if let Ok(Some(s)) = child.try_wait() {
@@ -174,7 +214,7 @@ fn kill_group(pgid: libc::pid_t, child: &mut std::process::Child, status: &mut O
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    signal_group(pgid, true);
     if status.is_none() {
         *status = child.wait().ok();
     }
@@ -182,6 +222,7 @@ fn kill_group(pgid: libc::pid_t, child: &mut std::process::Child, status: &mut O
 
 #[cfg(test)]
 mod tests {
+    #![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
     use super::*;
 
     #[test]
@@ -214,6 +255,7 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
     }
 
+    #[cfg(unix)] // POSIX sh fixtures
     #[test]
     fn leader_exit_with_lingering_grandchild_is_bounded() {
         let mut c = Command::new("sh");

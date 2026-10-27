@@ -30,7 +30,7 @@ pub struct Env {
 impl Env {
     pub fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path().canonicalize().unwrap();
+        let t = rematch_core::paths::canonicalize(tmp.path()).unwrap();
         let repo = t.join("work").join("payments");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();

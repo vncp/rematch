@@ -142,7 +142,7 @@ pub fn matches_repo(p: &Predicate, repo_or_cwd: &str) -> bool {
     // Symlinked roots (`/tmp` → `/private/tmp` on macOS): a glob derived from the git toplevel
     // (realpath) must still match a cwd given in its symlinked spelling, and vice versa.
     let mut candidates = vec![PathBuf::from(target)];
-    if let Ok(real) = std::fs::canonicalize(target) {
+    if let Ok(real) = crate::paths::canonicalize(target) {
         if real != candidates[0] {
             candidates.push(real);
         }

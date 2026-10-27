@@ -15,7 +15,7 @@ Every variable below is named in the docs or read by the code; the last column s
 | `OMP_BIN` | `omp` on `PATH` | the omp the binary calls for the editor, classifier and batch rollouts; also gates the Claude Code plugin's reflection | DESIGN §14 |
 | `REMATCH_MACHINE` | the host name | this machine's name in the lake and the profile; fixed in the ledger at first use | DESIGN §13, §20 |
 | `REMATCH_BELLWETHER` | `bellwether` on `PATH` | the Bellwether binary for `lake index` / `lake query` (`--bellwether` wins) | DESIGN §19.2 |
-| `REMATCH_NO_LAKE` | `0` | `1`: `scripts/install.sh` builds with `--no-default-features` (no lake) | `scripts/install.sh` |
+| `REMATCH_NO_LAKE` | `0` | `1`: `scripts/install.sh` (or `install.ps1`) builds with `--no-default-features` (no lake) | `scripts/install.sh` |
 | `REMATCH_IMPROVER` | embedded files | a directory to take the improver files from | DESIGN §14 |
 | `REMATCH_EDITOR_TIMEOUT` | 180 s | seconds per model call | not in the docs: `crates/rematch/src/editor.rs` (default: DESIGN §9) |
 | `CLAUDE_BIN` | `claude` on `PATH` | the Claude Code binary `doctor` runs `claude plugin validate` with | DESIGN §2 |

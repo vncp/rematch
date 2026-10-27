@@ -38,8 +38,10 @@ pub trait EventSource {
     fn records(&self, session: &SessionRecord) -> Result<Option<Vec<TraceRecord>>>;
 }
 
+/// Lake-relative path with `/` separators on every platform (the lake layout is shared).
 fn rel(lake: &Path, p: &Path) -> String {
-    p.strip_prefix(lake).unwrap_or(p).to_string_lossy().into_owned()
+    let r = p.strip_prefix(lake).unwrap_or(p);
+    r.iter().map(|c| c.to_string_lossy()).collect::<Vec<_>>().join("/")
 }
 
 fn today() -> String {
@@ -340,7 +342,7 @@ fn export_events(
 /// watermarks per machine. Never touches `lake-index/` (it is outside every lake).
 pub fn import(lake: &Path, from: &Path) -> Result<Value> {
     let src = resolve_lake(from)?;
-    if src.canonicalize().ok() == lake.canonicalize().ok() {
+    if rematch_core::paths::canonicalize(&src).ok() == rematch_core::paths::canonicalize(lake).ok() {
         bail!("--from {} is this lake", from.display());
     }
     let theirs = Manifest::load(&src)?;

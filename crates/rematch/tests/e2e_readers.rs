@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! ADR 001 L4 through the binary: `reflect --history` and `improve` read a session's records
 //! from the lake's `events/` by path, and `rematch report` reads the lake when there is one;
 //! each agrees with today's path on the same seed and names its source.
@@ -37,6 +38,7 @@ fn reflect_history(lake: bool) -> (Env, Value, String) {
     (env, r, trace)
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn reflect_history_reads_the_lake_events_and_agrees_with_the_transcript() {
     let (_a, ledger, trace_a) = reflect_history(false);
@@ -99,6 +101,7 @@ fn improve(lake: bool) -> (Env, Value, Value) {
     (env, u, input)
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn improve_excerpt_reads_the_lake_events_and_agrees_with_the_transcripts() {
     let (a, ledger, in_a) = improve(false);

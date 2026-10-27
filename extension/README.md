@@ -5,7 +5,7 @@ Install: `omp plugin link <repo>/extension` (see `scripts/install.sh`). Contract
 
 What it does:
 
-- **Factory**: resolves the binary (`$REMATCH_BIN` → `../target/release/rematch` → `../target/debug/rematch` → `PATH`),
+- **Factory**: resolves the binary (`$REMATCH_BIN` → `../target/release/rematch` → `../target/debug/rematch` → `PATH`; `rematch.exe` on Windows),
   runs `rematch match --cwd <cwd>` and `rematch skills sync --cwd <cwd> --harness omp` in parallel (5 s each), adds the
   sync's `dirs` (the shared `<root>/skills`, DESIGN §16 "Shared skills") to `skills.customDirectories` (runtime
   override, `[...configured, ...dirs]`), and imports the hook modules `match` returns. Any failure is logged through
