@@ -18,6 +18,15 @@ pub fn script(name: &str) -> String {
     scripts().join(name).to_string_lossy().into_owned()
 }
 
+/// `--editor` is a POSIX shell command, not an executable path. Quote the fixture so
+/// backslashes/spaces cannot be parsed as shell syntax; Git for Windows accepts C:/ paths.
+pub fn editor_script(name: &str) -> String {
+    let p = script(name);
+    #[cfg(windows)]
+    let p = p.replace('\\', "/");
+    format!("'{}'", p.replace('\'', "'\\''"))
+}
+
 pub struct Env {
     pub _tmp: tempfile::TempDir,
     pub root: PathBuf,

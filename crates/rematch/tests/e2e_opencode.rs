@@ -74,7 +74,7 @@ fn evs(recs: &[Value]) -> Vec<&str> {
 
 /// The pid of a process that has exited.
 fn dead_pid() -> u32 {
-    let mut c = std::process::Command::new("true").spawn().unwrap();
+    let mut c = std::process::Command::new(BIN).arg("--version").stdout(Stdio::null()).spawn().unwrap();
     let pid = c.id();
     c.wait().unwrap();
     pid
@@ -114,7 +114,7 @@ fn live_runs_segments_and_finalization() {
     assert_eq!(recs[5]["path"], file.as_str());
     assert_eq!(recs[7]["text_head"], "Added the reconcile command.");
     assert_eq!((recs[8]["turns"].as_u64(), recs[8]["yielded"].as_bool()), (Some(2), Some(true)));
-    let owner = env.root.join("opencode/open/oc:ses_main1.json");
+    let owner = env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_main1")));
     assert!(owner.is_file(), "the process owns the open segment");
 
     // Replayed payloads (a plugin restart, a duplicate bus event) write nothing.
@@ -199,7 +199,7 @@ fn reconcile_settles_dead_and_quiet_segments() {
     // A process that died mid-run (no dispose): the next start finalizes its segment.
     let gone = dead_pid();
     send(&env, gone, vec![prompt("ses_dead", 1_000, "Refactor the ledger module"), tool("ses_dead", "d1", "edit", "completed", json!({"filePath": "src/ledger.rs"}), "ok", None)]);
-    assert!(env.root.join("opencode/open/oc:ses_dead.json").is_file());
+    assert!(env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_dead"))).is_file());
     // A live owner that has been quiet for longer than the threshold, with no run going.
     let repo = env.repo.to_string_lossy();
     env.write_records(
@@ -211,7 +211,8 @@ fn reconcile_settles_dead_and_quiet_segments() {
             json!({"seq":3,"t":1_003,"ev":"agent_end","turns":1,"is_terminal":true,"yielded":true}),
         ],
     );
-    std::fs::write(env.root.join("opencode/open/oc:ses_quiet.json"), json!({"session": "ses_quiet", "pids": [me]}).to_string()).unwrap();
+    let quiet_owner = env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_quiet")));
+    std::fs::write(quiet_owner, json!({"session": "ses_quiet", "pids": [me]}).to_string()).unwrap();
     // A live owner, recently active: left open.
     send(&env, me, vec![prompt("ses_live", 1_000, "Keep working on the ledger")]);
 
@@ -223,7 +224,7 @@ fn reconcile_settles_dead_and_quiet_segments() {
     let dead = trace(&env, "oc:ses_dead");
     assert_eq!(&evs(&dead)[dead.len() - 2..], ["agent_end", "session_shutdown"]);
     assert_eq!(dead[dead.len() - 2]["yielded"], false, "the run never finished");
-    assert!(env.root.join("opencode/open/oc:ses_live.json").is_file());
+    assert!(env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_live"))).is_file());
     assert!(!evs(&trace(&env, "oc:ses_live")).contains(&"session_shutdown"));
     // The quiet session's next event opens its second segment.
     let r = send(&env, me, vec![prompt("ses_quiet", 50_000, "Back to the reconcile flag")]);
@@ -361,7 +362,7 @@ fn opencode_history_imports_and_reflects() {
     assert_eq!(sub["redirects"], json!([]), "{sub}");
 
     // reflect --history reads the session back from the store.
-    let editor = script("editor-ok.sh");
+    let editor = editor_script("editor-ok.sh");
     let r = env.run(&["reflect", "--history", "--editor", &editor]);
     let hist = &r["history"];
     assert_eq!(hist["handed"], json!([sid]), "{r}");
@@ -378,7 +379,7 @@ fn opencode_history_imports_and_reflects() {
 fn approved_retrieve_hook_adds_system_context_with_attribution() {
     let env = Env::new();
     let me = std::process::id();
-    let d = env.run(&["create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", &script("editor-ok.sh")]);
+    let d = env.run(&["create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", &editor_script("editor-ok.sh")]);
     let pkg = d["id"].as_str().unwrap().to_string();
     env.run(&["activate", "ledger-test-gate", "--unverified"]);
     let unit = env.root.join("staging/payments/ledger-test-gate/units/reconcile.md");

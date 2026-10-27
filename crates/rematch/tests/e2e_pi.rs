@@ -18,7 +18,7 @@ const ID: &str = "019a1f00-1111-7222-8333-944455556666";
 /// chained by `parentId`, one second apart from `t0`.
 fn write_pi_session(agent: &Path, cwd: &Path, id: &str, t0: chrono::DateTime<chrono::Utc>, entries: &[Value]) -> PathBuf {
     let ts = |s: i64| (t0 + chrono::Duration::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let slug = format!("--{}--", cwd.to_string_lossy().trim_start_matches('/').replace('/', "-"));
+    let slug = format!("--{}--", cwd.to_string_lossy().trim_start_matches(['/', '\\']).replace(['/', '\\', ':'], "-"));
     let dir = agent.join("sessions").join(slug);
     std::fs::create_dir_all(&dir).unwrap();
     let mut lines = vec![json!({"type": "session", "version": 3, "id": id, "timestamp": ts(0), "cwd": cwd})];
@@ -100,7 +100,7 @@ fn pi_history_reflects_syncs_and_counts() {
     assert_eq!((again["new"].clone(), again["updated"].clone()), (json!(0), json!(1)), "{again}");
 
     // reflect --history reads the Pi file back by its `pi:` id and stages an entry.
-    let editor = script("editor-ok.sh");
+    let editor = editor_script("editor-ok.sh");
     let r = env.run(&["reflect", "--history", "--editor", &editor]);
     assert_eq!(r["history"]["handed"], json!([sid]), "{r}");
     let staged = r["history"]["sessions"].as_array().unwrap().iter().find(|x| x["session"] == sid).cloned().unwrap_or(Value::Null);
