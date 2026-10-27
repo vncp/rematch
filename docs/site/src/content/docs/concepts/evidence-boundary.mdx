@@ -29,7 +29,7 @@ No proposal exists without a trace ([D1](/rematch/background/decisions/)). The b
 - **It carries no score field.** Scoring belongs to the counters, never to the model that wrote the text.
 - **Nothing activates without a lint report.** Anything executable also needs a receipt ([D24](/rematch/background/decisions/)).
 - **Skill text activates on its own,** in your personal scope, as provisional.
-- **Scripts and hooks wait for you.** Scripts are staged non-executable; hooks are compiled only after approval ([D4](/rematch/background/decisions/)).
+- **Scripts, hooks, subagents and system-prompt text wait for you.** Scripts are staged non-executable; hooks are compiled only after approval ([D4](/rematch/background/decisions/)); a provisional subagent is linked nowhere and a fragment is added to no prompt until you approve it.
 - **Anything beyond your machine waits for a merged PR** (team `.omp/`, your fork).
 
 <Aside type="note" title="Why executable changes wait">
@@ -44,7 +44,7 @@ Every staged entry passes static lint ([D15](/rematch/background/decisions/)):
 - no string-match on the user's words;
 - a trigger predicate and a trigger line on every entry;
 - no URLs, network calls or destructive git;
-- always-on text within 8 KB per branch;
+- always-on text within 8 KB per branch: skill descriptions and bodies, subagent descriptions and prompt fragments;
 - facts carry `as_of`.
 
 HarnessCompass's generalization gate alone recovered most of its gain. Full rule set: [lint rules](/rematch/reference/lint/).
@@ -53,9 +53,10 @@ HarnessCompass's generalization gate alone recovered most of its gain. Full rule
 
 | Scope | Activation | Examples |
 |---|---|---|
-| Personal, text | automatic, as provisional | skill text, laws, facts, lessons, subagents |
+| Personal, text | automatic, as provisional | skill text, laws, facts, lessons |
+| Personal, subagents and prompt | one tap in the session-start digest, with the text; bound to the file's hash, so an edit asks again | provisional subagents; `AGENTS.fragment.md`, appended to your system prompt where the entry loads (your `AGENTS.md` is never written) |
 | Personal, executable or blocking | one tap in the session-start digest, with the diff | scripts (0644 → 0755), compiled `tool_call` verifiers |
-| Team (`<repo>/.omp/`, `<repo>/AGENTS.md`) | `ship --scope team`: a branch with the entry and an evidence commit; `--push --pr` opens the PR, never merges | entries whose predicate recurred across two or more repos, or that you list; the only way text reaches `AGENTS.md` |
+| Team (`<repo>/.omp/`, `<repo>/AGENTS.md`) | `ship --scope team`: a branch with the entry and an evidence commit; `--push --pr` opens the PR, never merges | entries whose predicate recurred across two or more repos, or that you list; the only way text reaches a repo's `AGENTS.md` |
 | Fork | `ship --scope fork`: the entry's `fork_path`, the built fingerprint and before/after counters in the PR body | per-model prompt text, tool descriptions, compaction defaults |
 | Work → home | `library export`, per-entry approval with the diff; off by default at work | invariant entries only; lint with `transfer: true` blocks domain and workspace facts |
 

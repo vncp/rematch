@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
 use rematch_core::ledger::{enum_str, redirect_key, EntryFilter, JournalRow, SessionFilter};
-use rematch_core::library::{self, Approval};
+use rematch_core::library;
 use rematch_core::predicate;
 use rematch_core::redirect;
-use rematch_core::types::{Entry, Kind, SessionRecord, Status};
+use rematch_core::types::{Entry, SessionRecord, Status};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
@@ -40,7 +40,9 @@ pub enum LibraryCmd {
     Rollback { skill: String },
     Pin { id: String },
     Unpin { id: String },
-    /// One-tap approval of an entry's scripts or hook (or an `export:<id>` item).
+    /// One-tap approval of everything of an entry that waits for it — scripts, hook,
+    /// provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an
+    /// `export:<id>` item.
     Approve { id: String },
     /// Decline an approval (retires the entry; `export:<id>` only suppresses the offer).
     Decline { id: String },
@@ -107,8 +109,19 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
             if is_foreign(ctx, &e) {
                 bail!("{} is not a rematch-owned entry; nothing to approve", e.name);
             }
-            let r = library::approve(&ctx.ledger, &ctx.paths, &e.id, approval_for(&e))?;
-            Ok(json!({"receipt": r, "lines": [format!("approved {} of {}", enum_str(&approval_for(&e)), e.name)]}))
+            let parts = library::pending_parts(&ctx.paths, &e);
+            if parts.is_empty() {
+                if !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
+                    bail!("{} is {}; only loadable entries can be approved", e.name, enum_str(&e.status));
+                }
+                bail!("nothing of {} waits for approval", e.name);
+            }
+            let receipts = parts.iter().map(|p| library::approve(&ctx.ledger, &ctx.paths, &e.id, *p)).collect::<Result<Vec<_>>>()?;
+            Ok(json!({
+                "receipts": receipts,
+                "approved": parts,
+                "lines": [format!("approved {} of {}", library::parts_label(&parts), e.name)],
+            }))
         }
         LibraryCmd::Decline { id } => {
             if id.starts_with("export:") {
@@ -118,7 +131,7 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
             if is_foreign(ctx, &e) {
                 bail!("{} is not a rematch-owned entry; nothing to decline", e.name);
             }
-            let r = library::decline(&ctx.ledger, &ctx.paths, &e.id, approval_for(&e))?;
+            let r = library::decline(&ctx.ledger, &ctx.paths, &e.id, &library::pending_parts(&ctx.paths, &e))?;
             Ok(json!({"entry": r, "lines": [format!("declined {}; entry retired", e.name)]}))
         }
         LibraryCmd::SetForkPath { id, path, repo } => set_fork_path(ctx, &id, &path, repo.as_deref()),
@@ -148,14 +161,6 @@ fn set_pinned(ctx: &AppCtx, id: &str, pinned: bool) -> Result<Entry> {
     Ok(e)
 }
 
-fn approval_for(e: &Entry) -> Approval {
-    if e.kind == Kind::Hook {
-        Approval::Hook
-    } else {
-        Approval::Scripts
-    }
-}
-
 /// `fork_path` (+ `fork_repo`) into the ledger and the entry's `rematch.json`. A changed
 /// target clears `fork_commit`: the drift baseline belonged to the old one.
 fn set_fork_path(ctx: &AppCtx, id: &str, path: &str, repo: Option<&std::path::Path>) -> Result<Value> {
@@ -176,13 +181,44 @@ fn set_fork_path(ctx: &AppCtx, id: &str, path: &str, repo: Option<&std::path::Pa
     Ok(json!({"entry": e, "lines": [format!("{} ships to {path}{to} with `ship --scope fork`", e.name)]}))
 }
 
+/// Every entry with raw counters, plus what its approvals and ship state are: `pending`
+/// (parts waiting for `library approve`, [`library::pending_parts`]), `has_fragment` (an
+/// `AGENTS.fragment.md`), `prompt_active` (that fragment approved, so a loadable entry adds it
+/// to the system prompt of main sessions it matches), `fork_path` and `ship_ready` (scopes
+/// `ship` would take it to, `scope::ship::ready`).
 fn ls(ctx: &AppCtx) -> Result<Value> {
     let mut entries = Vec::new();
     let mut lines = Vec::new();
+    let mut ready: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    for r in crate::scope::ship::ready(ctx)? {
+        ready.entry(r.id).or_default().push(r.scope);
+    }
     for e in ctx.ledger.list_entries(&EntryFilter::default())? {
         let c = ctx.ledger.counters(&e.id)?;
+        let pending = library::pending_parts(&ctx.paths, &e);
+        let has_fragment = e.path.join(library::AGENTS_FRAGMENT).is_file();
+        let prompt_active = has_fragment
+            && library::fragment_approved(&e)
+            && matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned);
+        let ship_ready = ready.remove(&e.id).unwrap_or_default();
+        let mut tags = String::new();
+        if e.pinned {
+            tags.push_str(" · pinned");
+        }
+        if let Some(p) = &e.fork_path {
+            tags.push_str(&format!(" · fork:{p}"));
+        }
+        if !pending.is_empty() {
+            tags.push_str(&format!(" · awaits approval: {}", library::parts_label(&pending)));
+        }
+        if prompt_active {
+            tags.push_str(" · in system prompt");
+        }
+        if !ship_ready.is_empty() {
+            tags.push_str(&format!(" · ship-ready: {}", ship_ready.join(", ")));
+        }
         lines.push(format!(
-            "{:<11} {:<6} {} [{}] matched {} · recurrence {} · harm {}{}{}",
+            "{:<11} {:<6} {} [{}] matched {} · recurrence {} · harm {}{tags}",
             enum_str(&e.status),
             enum_str(&e.kind),
             e.name,
@@ -190,14 +226,13 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
             c.matched,
             c.recurrence,
             c.harm,
-            if e.pinned { " · pinned" } else { "" },
-            e.fork_path.as_deref().map(|p| format!(" · fork:{p}")).unwrap_or_default()
         ));
         entries.push(json!({
             "id": e.id, "name": e.name, "kind": e.kind, "status": e.status, "branch": e.branch, "family": e.family,
             "pinned": e.pinned, "origin": e.origin, "trigger_line": e.trigger_line, "path": e.path,
             "predicate": e.predicate, "counters": c, "evidence": e.evidence.len(), "version": e.version,
             "fork_path": e.fork_path, "fork_repo": e.fork_repo,
+            "pending": pending, "has_fragment": has_fragment, "prompt_active": prompt_active, "ship_ready": ship_ready,
         }));
     }
     // Kept on another machine (or adopted there): linked here, counted only there.

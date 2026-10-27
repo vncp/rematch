@@ -117,6 +117,8 @@ fn portable(e: &Entry) -> Entry {
         path: PathBuf::new(),
         pinned: false,
         approved_scripts: vec![],
+        approved_fragment: None,
+        approved_agent: None,
         predecessor: None,
         sibling_of: None,
         status_since: None,

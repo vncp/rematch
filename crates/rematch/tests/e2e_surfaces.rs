@@ -1,14 +1,16 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
-//! Harness surfaces beyond skills, through the binary: subagent entries (staging link →
-//! kept copy in the agent dir → retire), `AGENTS.md` fragments through the team branch,
-//! and the fork tool-guidance path set with `library set-fork-path`.
+//! Harness surfaces beyond skills, through the binary: subagent entries (approval → staging
+//! link → kept copy in the agent dir → retire), `AGENTS.md` fragments through the team branch
+//! and, once approved, as personal system-prompt text (`match` `prompt_fragments`), and the
+//! fork tool-guidance path set with `library set-fork-path` (a kept entry's is announced once
+//! by the digest as a ship candidate).
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{script, Env};
+use common::{editor_script as script, Env};
 use rematch_core::package::SkillDoc;
 use serde_json::{json, Value};
 
@@ -74,8 +76,23 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     let dir = env.root.join("staging/payments/log-triage");
     assert!(dir.join("AGENT.md").is_file() && !dir.join("SKILL.md").exists(), "an agent is AGENT.md + rematch.json");
 
-    // provisional: <root>/agents/<name>.md → the staged AGENT.md (extension/agents links to <root>/agents)
+    // provisional, not approved yet: no staging link, not in match; the digest offers it
+    let cwd = env.repo.to_str().unwrap();
     let link = env.root.join("agents/log-triage.md");
+    assert!(std::fs::symlink_metadata(&link).is_err(), "a provisional agent loads only once approved");
+    let m = env.run(&["match", "--cwd", cwd]);
+    assert!(m["entries"].as_array().unwrap().iter().all(|e| e["id"] != id.as_str()), "{m}");
+    let g = env.run(&["digest", "--cwd", cwd]);
+    let a = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id.as_str()).cloned().expect("agent offered");
+    assert_eq!(a["kind"], "agent");
+    let diff = a["diff"].as_str().unwrap();
+    assert!(diff.starts_with("+++ AGENT.md\n---\n") && diff.contains("first failing step"), "{a}");
+    assert_eq!(env.entry(&id)["pending"], json!(["agent"]));
+    let r = env.run(&["library", "approve", &id]);
+    assert_eq!((r["approved"].clone(), r["receipts"][0]["entry"].clone()), (json!(["agent"]), json!(id)), "{r}");
+    assert_eq!(env.entry(&id)["pending"], json!([]));
+
+    // approved: <root>/agents/<name>.md → the staged AGENT.md (extension/agents links to <root>/agents)
     assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("AGENT.md"));
     let d = doc(&link);
     assert_eq!(d.get_str("name"), Some("log-triage"), "omp requires name");
@@ -111,6 +128,7 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     // retire a provisional agent: the staging link goes with it
     let other = staged(&env, "other-triage", "triage long build logs elsewhere", "editor-agent.sh");
     let link2 = env.root.join("agents/other-triage.md");
+    env.run(&["library", "approve", &other]);
     assert_eq!(doc(&link2).get_str("name"), Some("other-triage"), "the user's name wins in AGENT.md too");
     env.run(&["library", "disable", &other]);
     assert!(std::fs::symlink_metadata(&link2).is_err(), "retired agents unload");
@@ -146,6 +164,76 @@ fn team_ship_appends_the_agents_md_fragment_and_keeps_it_out_of_the_skill_dir() 
 
 #[cfg(unix)] // POSIX sh fixtures
 #[test]
+fn an_approved_fragment_joins_the_match_until_it_changes() {
+    let env = Env::new();
+    let cwd = env.repo.to_str().unwrap();
+    let id = staged(&env, "crate-tests-first", "run crate tests before committing", "editor-fragment.sh");
+    let file = env.root.join("staging/payments/crate-tests-first/AGENTS.fragment.md");
+    let fragment = std::fs::read_to_string(&file).unwrap();
+    let offered = || -> Option<Value> {
+        env.run(&["digest", "--cwd", cwd])["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id.as_str()).cloned()
+    };
+    let state = || {
+        let e = env.entry(&id);
+        (e["pending"].clone(), e["has_fragment"].clone(), e["prompt_active"].clone())
+    };
+
+    // offered as personal system-prompt text; nothing reaches a session before the approval
+    let a = offered().expect("fragment offered");
+    assert_eq!((a["kind"].as_str(), a["diff"].as_str()), (Some("prompt"), Some(format!("+++ AGENTS.fragment.md\n{fragment}\n").as_str())));
+    assert_eq!(env.run(&["match", "--cwd", cwd])["prompt_fragments"], json!([]));
+    assert_eq!(state(), (json!(["prompt"]), json!(true), json!(false)));
+
+    let r = env.run(&["library", "approve", &id]);
+    assert_eq!(r["approved"], json!(["prompt"]), "{r}");
+    let m = env.run(&["match", "--cwd", cwd]);
+    assert_eq!(m["prompt_fragments"], json!([{"id": id, "name": "crate-tests-first", "text": fragment.trim()}]), "{m}");
+    assert!(offered().is_none());
+    assert_eq!(state(), (json!([]), json!(true), json!(true)));
+    let elsewhere = env.root.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    assert_eq!(env.run(&["match", "--cwd", elsewhere.to_str().unwrap()])["prompt_fragments"], json!([]), "no predicate hit");
+
+    // an edit after the approval is pending again and leaves the prompt
+    std::fs::write(&file, format!("{fragment}\nAlso run clippy.\n")).unwrap();
+    assert_eq!(offered().expect("pending again")["kind"], "prompt");
+    assert_eq!(env.run(&["match", "--cwd", cwd])["prompt_fragments"], json!([]));
+    assert_eq!(state(), (json!(["prompt"]), json!(true), json!(false)));
+    assert!(!env.repo.join("AGENTS.md").exists(), "the user's AGENTS.md is never written");
+}
+
+#[cfg(unix)] // file modes
+#[test]
+fn one_approve_grants_the_scripts_and_the_fragment() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let cwd = env.repo.to_str().unwrap();
+    let id = staged(&env, "crate-tests-first", "run crate tests before committing", "editor-fragment.sh");
+    let script_path = env.root.join("staging/payments/crate-tests-first/scripts/check.sh");
+    std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+    std::fs::write(&script_path, "#!/bin/sh\ncargo test\n").unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let g = env.run(&["digest", "--cwd", cwd]);
+    let a = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id.as_str()).cloned().expect("one item per entry");
+    assert_eq!(a["kind"], "scripts+prompt");
+    let diff = a["diff"].as_str().unwrap();
+    let (s, f) = (diff.find("+++ scripts/check.sh\n").expect("scripts"), diff.find("+++ AGENTS.fragment.md\n").expect("fragment"));
+    assert!(s < f && diff.contains("cargo test"), "scripts first: {diff}");
+
+    let r = env.run(&["library", "approve", &id]);
+    assert_eq!(r["approved"], json!(["scripts", "prompt"]), "{r}");
+    assert_eq!(r["receipts"].as_array().unwrap().len(), 2, "one receipt per part");
+    assert_eq!(std::fs::metadata(&script_path).unwrap().permissions().mode() & 0o777, 0o755);
+    assert_eq!(env.entry(&id)["pending"], json!([]));
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert!(g["approvals"].as_array().unwrap().iter().all(|a| a["id"] != id.as_str()), "{g}");
+    assert_eq!(env.run(&["match", "--cwd", cwd])["prompt_fragments"][0]["id"], json!(id));
+    let (v, code) = env.run_cmd(env.cmd(&["library", "approve", &id]));
+    assert_eq!(code, 1, "nothing left to approve: {v}");
+}
+
+#[test]
 fn set_fork_path_then_ship_fork_writes_the_file() {
     let env = Env::new();
     let fork: PathBuf = env.root.parent().unwrap().join("omp-fork");
@@ -171,5 +259,38 @@ fn set_fork_path_then_ship_fork_writes_the_file() {
     let file = git(&fork, &["show", &format!("{branch}:src/prompts/system.md")]);
     assert!(file.starts_with("Use when committing changes to a Rust crate."), "SKILL.md body: {file}");
     assert!(!file.contains("name: crate-tests-first"), "frontmatter stripped");
-    assert_eq!(env.entry(&id)["fork_repo"], json!(fork));
+    let recorded = env.entry(&id)["fork_repo"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::canonicalize(recorded).unwrap(), std::fs::canonicalize(&fork).unwrap());
+}
+
+#[test]
+fn digest_announces_a_kept_fork_candidate_once_until_shipped() {
+    let env = Env::new();
+    let fork: PathBuf = env.root.parent().unwrap().join("omp-fork");
+    init_repo(&fork, &[]);
+    let id = staged(&env, "crate-tests-first", "run crate tests before committing", "editor-fragment.sh");
+    env.run(&["library", "set-fork-path", &id, "src/prompts/system.md", "--repo", fork.to_str().unwrap()]);
+    let cwd = env.repo.to_str().unwrap();
+    let ship_lines = |g: &Value| -> Vec<String> {
+        g["lines"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|l| l.starts_with("ship ")).map(str::to_string).collect()
+    };
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert_eq!(g["ship_ready"], json!([]), "provisional entries are not ship candidates: {g}");
+
+    keep_by_counters(&env, &id, "Run the crate tests before committing changes to the crate.");
+    let want = json!([{"id": id, "name": "crate-tests-first", "scope": "fork", "detail": "src/prompts/system.md",
+                       "command": format!("/rematch ship --scope fork --entry {id}")}]);
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert_eq!(g["ship_ready"], want, "one repo: fork only, no team: {g}");
+    assert_eq!(ship_lines(&g), vec![format!("ship fork crate-tests-first: src/prompts/system.md → /rematch ship --scope fork --entry {id}")]);
+
+    // announced once; the JSON keeps listing it
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert!(ship_lines(&g).is_empty(), "{g}");
+    assert_eq!(g["ship_ready"], want, "{g}");
+
+    // shipped (the recorded fork_repo is the target): no longer a candidate
+    env.run(&["ship", "--scope", "fork", "--entry", &id]);
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert_eq!(g["ship_ready"], json!([]), "{g}");
 }

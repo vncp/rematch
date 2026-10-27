@@ -9,14 +9,15 @@
 // `chat.message`, `command.execute.before`, `tool.execute.before` (approved block/stuck rules
 // via `rematch hook-check`, and the guard that keeps approvals the user's), `tool` (the
 // read-only `rematch` tool), `experimental.chat.messages.transform` (approved `truncate`
-// rules, outgoing request only), `experimental.chat.system.transform` (approved `retrieve`
-// units, per request, not stored), `dispose`. Every failure of the bridge is logged and
+// rules, outgoing request only), `experimental.chat.system.transform` (the approved personal
+// prompt fragments of `match`, and approved `retrieve` units; per request, not stored),
+// `dispose`. Every failure of the bridge is logged and
 // swallowed: only an approved, intentional block throws.
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
-import { decode, type Envelope, errorText, isRecord, rematchRoot, resolveBinary, truncationMarker } from "../../extension/index.ts";
+import { decode, type Envelope, errorText, isRecord, type PromptFragment, promptFragmentsOf, rematchRoot, renderPromptFragments, resolveBinary, truncationMarker } from "../../extension/index.ts";
 
 type Json = Record<string, unknown>;
 type SessionInfo = { parent: string | null; directory: string | null; version: string | null };
@@ -195,7 +196,7 @@ export function commands(bin: string): Record<string, { template: string; descri
 		"rematch-approve": cmd(
 			"approve",
 			`!\`${b} --text library approve $ARGUMENTS\`\n\n${show("rematch library approve")}`,
-			"rematch approve <id>: approve an entry's scripts or hook (yours only)",
+			"rematch approve <id>: approve an entry's scripts, hook, subagent and prompt fragment (yours only)",
 		),
 		"rematch-decline": cmd(
 			"decline",
@@ -273,6 +274,14 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	/** `retrieve` context per session for the current prompt (null: no units); dropped on new input and on every hook reload. */
 	const retrieved = new Map<string, string | null>();
 	let skillsPaths: string[] = [];
+	/** Approved personal prompt fragments of the entries `match` loads for this directory. */
+	let promptFragments: PromptFragment[] = [];
+
+	/** `match` for this directory: the fragments to append to main sessions' system prompts; a failed match keeps the previous ones. */
+	async function loadFragments() {
+		const env = await call(["match", "--cwd", input.directory], null, 5000);
+		if (env.ok && isRecord(env.data)) promptFragments = env.data.off === true ? [] : promptFragmentsOf(env.data);
+	}
 
 	function adopt(load: unknown) {
 		if (!isRecord(load) || !Array.isArray(load.hooks)) return;
@@ -307,6 +316,8 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		const [load] = await control([{ kind: "load" }], 5000);
 		if (load && !load.error && !load.off) adopt(load);
 		else if (load?.off) adopt({ hooks: [] });
+		if (load?.off || isOff()) promptFragments = [];
+		else await loadFragments();
 	}
 
 	// The shared dir is linked for this directory before OpenCode scans skills (lazily, after
@@ -314,6 +325,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	if (!isOff()) {
 		const results = await control([{ kind: "load" }, { kind: "reconcile" }], 8000);
 		adopt(results.find(r => r.kind === "load"));
+		await loadFragments();
 		// Reflection makes its model calls through omp; detached, one run at a time (the
 		// binary's pending/.lock), never inside the OpenCode process.
 		if (process.env.OMP_BIN || which("omp")) {
@@ -543,17 +555,22 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 			}
 		},
 
-		// `retrieve`: OpenCode calls this before every model request with the session id and
-		// sends `system` as that request's system prompt; nothing here is stored in the session.
-		// The binary ranks the loaded packages' units against the trace's last prompt and tool
-		// paths and records `retrieval` when the unit set changes (attribution). Bounded (3 s),
+		// Main sessions only: the approved personal prompt fragments (`## rematch: <name>` blocks) go
+		// first as one string, then `retrieve` below. OpenCode calls this before every model request
+		// with the session id and sends `system` as that request's system prompt; nothing here is
+		// stored in the session.
+		// `retrieve`: the binary ranks the loaded packages' units against the trace's last prompt and
+		// tool paths and records `retrieval` when the unit set changes (attribution). Bounded (3 s),
 		// cached until the next prompt or tool result, fails open.
 		"experimental.chat.system.transform": async (inp, out) => {
 			try {
 				const sid = inp.sessionID;
-				if (!retrieves || !sid || isOff()) return;
+				if (!sid || isOff() || (!retrieves && promptFragments.length === 0)) return;
 				const info = await sessionInfo(sid);
 				if (info.parent) return;
+				const block = renderPromptFragments(promptFragments);
+				if (block) out.system.push(block);
+				if (!retrieves) return;
 				let context = retrieved.get(sid);
 				if (context === undefined) {
 					// The prompt's `chat.message` was enqueued before this request was prepared: draining
@@ -566,7 +583,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 				}
 				if (context) out.system.push(context);
 			} catch (error) {
-				log("warn", `retrieve failed open: ${errorText(error)}`);
+				log("warn", `system prompt additions failed open: ${errorText(error)}`);
 			}
 		},
 

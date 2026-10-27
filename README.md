@@ -139,9 +139,13 @@ See [create](https://vncp.github.io/rematch/guides/create-a-skill/),
 
 ## Scope and approvals
 
-- **Personal text** can activate automatically as provisional skills or subagent instructions.
-- **Scripts and runtime hooks** wait for your approval. Review the diff in the digest;
-  omp offers a dialog, while Claude Code uses explicit approval commands.
+- **Skill and rule text, and facts** activate automatically as provisional.
+- **Subagents, scripts, runtime hooks and system-prompt text** wait for your approval,
+  one item per entry in the digest. omp offers a dialog; Claude Code uses explicit
+  approval commands. An approved `AGENTS.fragment.md` is appended to the system prompt
+  of main sessions where its entry loads (omp, Pi, OpenCode, Claude Code; not Codex);
+  your own `AGENTS.md` is never written, and editing an approved fragment or subagent
+  asks again.
 - **Team and fork changes** use an explicit shipping workflow that prepares a branch
   and can open a PR; it does not merge it for you.
 

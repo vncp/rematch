@@ -32,6 +32,8 @@ Checked after every counted session:
 | kept, and harm ≥ 2 within 30 days | **retire** |
 | anything else | continue |
 
+An entry that never matched has no counter rows, so the table never sees it; a separate sweep covers it. A provisional, unpinned, non-built-in entry with no counter rows goes dormant after 30 days only once at least 12 counted sessions in its scope (its branch; every branch for `shared`) have finished since then, with fewer than 3 matches. Idle time alone never retires an entry; built-ins are exempt.
+
 - **Split by family.** If one model family shows harm ≥ 1 and another has matched ≥ 2 with no harm or recurrence, the harmed family gets a sibling proposal.
 - **Kept, never verified.** Four matched sessions without recurrence are evidence that the entry did its one job, nothing more ([D8](/rematch/background/decisions/)).
 

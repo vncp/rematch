@@ -46,7 +46,7 @@ pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}
 skills/<name>                     symlink → staging/<branch>/<name>/ or the kept dir, one per loadable entry: the one skill dir omp, Claude Code and Codex load (§16 "Shared skills")
 ledger.sqlite  blobs/<sha256>     ledger (schema §5) + content-addressed blobs
 staging/<branch>/<name>/          provisional entries (loaded through skills/ once a synced cwd matched them; agents via agents/)
-agents/<name>.md                  symlink → staging/<branch>/<name>/AGENT.md per provisional agent; `extension/agents` links to this dir, so omp discovers them from the plugin root
+agents/<name>.md                  symlink → staging/<branch>/<name>/AGENT.md per approved provisional agent (`library approve`); `extension/agents` links to this dir, so omp discovers them from the plugin root
 kept-agents/<name>/               entry dir of a kept agent (AGENT.md, rematch.json, EXPERIENCE.md); omp loads the copy ~/.omp/agent/agents/<name>.md
 drafts/<name>/                    draft entries (never loaded)
 archive/<status>/<id>/            retired|dormant|stale entries (never loaded, never deleted)

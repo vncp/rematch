@@ -1,8 +1,8 @@
 //! `reflect --pending` (SPEC §loop 1–8): first `count` (fold finished traces → counters →
-//! decide → EXPERIENCE.md), then one bounded reflection per pending file: triage → moment →
-//! predicate → rate limits → editor → lint (one retry) → dedup → stage. `reflect --history`
-//! first hands flagged imported sessions to that loop through synthesized traces. Also
-//! `count`, `mark` and `record`.
+//! decide, plus the idle dormancy sweep → EXPERIENCE.md), then one bounded reflection per
+//! pending file: triage → moment → predicate → rate limits → editor → lint (one retry) →
+//! dedup → stage. `reflect --history` first hands flagged imported sessions to that loop
+//! through synthesized traces. Also `count`, `mark` and `record`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -275,7 +275,8 @@ fn disabled_during(ctx: &AppCtx, s: &SessionRecord) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Fold every finished, uncounted trace (DESIGN §2 `count`).
+/// Fold every finished, uncounted trace (DESIGN §2 `count`), decide for every entry that got
+/// a counter row, then sweep the provisional rest for idle dormancy (`idle_dormant_entries`).
 pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>) -> Result<CountSummary> {
     let mut sum = CountSummary::default();
     let mut sessions: Vec<SessionRecord> = Vec::new();
@@ -349,9 +350,9 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
         sum.folded.push(s.id.clone());
     }
 
-    for id in affected {
-        let Some(e) = ctx.ledger.get_entry(&id)? else { continue };
-        let c = ctx.ledger.counters(&id)?;
+    for id in &affected {
+        let Some(e) = ctx.ledger.get_entry(id)? else { continue };
+        let c = ctx.ledger.counters(id)?;
         if let Some((harmed, clean)) = counters::family_divergence(&c) {
             sum.divergence.push(json!({"entry": id, "name": e.name, "harmed": harmed, "clean": clean}));
         }
@@ -359,16 +360,10 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
         if d == Decision::Continue {
             continue;
         }
-        match apply_decision(ctx, &e, d, &c, editor_cmd) {
-            Ok(v) => {
-                sum.lines.push(format!("{} {}: {}", enum_str(&d), e.name, experience::counters_line(&c).lines().next().unwrap_or("")));
-                sum.decisions.push(v);
-            }
-            Err(err) => {
-                eprintln!("rematch count: decision {d:?} for {} failed: {err:#}", e.id);
-                sum.decisions.push(json!({"entry": id, "decision": d, "error": format!("{err:#}")}));
-            }
-        }
+        record_decision(ctx, &mut sum, &e, d, &c, editor_cmd);
+    }
+    for (e, c) in idle_dormant_entries(ctx, &affected)? {
+        record_decision(ctx, &mut sum, &e, Decision::Dormant, &c, editor_cmd);
     }
     if !sum.folded.is_empty() {
         sum.tune = match crate::tune::pass(ctx, &mut sum.lines) {
@@ -381,6 +376,47 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
         sum.lines.insert(0, format!("counted {} session(s), {} counter row(s)", sum.folded.len(), sum.rows));
     }
     Ok(sum)
+}
+
+/// Apply one decision; its line and result (or its error) go into the summary.
+fn record_decision(ctx: &AppCtx, sum: &mut CountSummary, e: &Entry, d: Decision, c: &Counters, editor_cmd: Option<&str>) {
+    match apply_decision(ctx, e, d, c, editor_cmd) {
+        Ok(v) => {
+            sum.lines.push(format!("{} {}: {}", enum_str(&d), e.name, experience::counters_line(c).lines().next().unwrap_or("")));
+            sum.decisions.push(v);
+        }
+        Err(err) => {
+            eprintln!("rematch count: decision {d:?} for {} failed: {err:#}", e.id);
+            sum.decisions.push(json!({"entry": e.id, "decision": d, "error": format!("{err:#}")}));
+        }
+    }
+}
+
+/// The idle dormancy sweep ([`counters::idle_dormant`]): provisional entries `decide` did
+/// not see this run (`seen`) because they got no counter row — an entry whose predicate
+/// never hits gets none at all — that have sat 30 days with matched < 3 while at least 12
+/// counted sessions ran in their scope ([`counters::in_idle_scope`]).
+fn idle_dormant_entries(ctx: &AppCtx, seen: &BTreeSet<String>) -> Result<Vec<(Entry, Counters)>> {
+    let mut idle = Vec::new();
+    for e in ctx.ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })? {
+        if seen.contains(&e.id) {
+            continue;
+        }
+        let c = ctx.ledger.counters(&e.id)?;
+        // Every condition but the session count first: sessions are read only when needed.
+        if counters::idle_dormant(&e, &c, usize::MAX, ctx.now) {
+            idle.push((e, c));
+        }
+    }
+    let Some(since) = idle.iter().map(|(e, _)| e.status_since.unwrap_or(e.created_at)).min() else {
+        return Ok(idle);
+    };
+    let sessions = ctx.ledger.list_sessions(&SessionFilter { counted: Some(true), since: Some(since), ..Default::default() })?;
+    idle.retain(|(e, c)| {
+        let in_scope = sessions.iter().filter(|s| counters::in_idle_scope(e, s)).count();
+        counters::idle_dormant(e, c, in_scope, ctx.now)
+    });
+    Ok(idle)
 }
 
 /// Scope slice passes (idempotent). A failing pass is reported, never fatal to counting.
@@ -423,27 +459,15 @@ fn scope_passes(ctx: &AppCtx, lines: &mut Vec<String>) -> Value {
     Value::Object(out)
 }
 
-/// Whether rematch owns the entry's directory: it lives under REMATCH_ROOT, or it is a
-/// kept copy whose SKILL.md carries this entry's `rematch:` block. Hand-written skills
-/// registered by `improve`/`import --forge` (even under `~/.omp/agent/skills`) are not.
-pub fn owns_dir(ctx: &AppCtx, e: &Entry) -> bool {
-    if e.path.starts_with(&ctx.paths.root) {
-        return true;
-    }
-    std::fs::read_to_string(e.path.join("SKILL.md"))
-        .ok()
-        .and_then(|t| rematch_core::package::SkillDoc::parse(&t).ok())
-        .and_then(|d| d.rematch())
-        .is_some_and(|b| b.id == e.id)
-}
-
-/// Entries whose files are user/forge-owned (or lessons, which are library records):
-/// status changes are recorded in the ledger only and never move files.
+/// Entries whose files are user/forge-owned ([`library::owns_dir`]) or lessons (library
+/// records): status changes are recorded in the ledger only and never move files.
 pub fn is_foreign(ctx: &AppCtx, e: &Entry) -> bool {
-    e.kind == Kind::Lesson || !owns_dir(ctx, e)
+    e.kind == Kind::Lesson || !library::owns_dir(&ctx.paths, e)
 }
 
-/// Ledger(+rematch.json)-only status change for foreign entries and lessons.
+/// Ledger(+rematch.json)-only status change for foreign entries and lessons. Their files
+/// stay, but leaving the loadable statuses removes a compiled hook as [`library::set_status`]
+/// does: nothing of a retired, dormant or stale entry runs.
 pub fn record_status(ctx: &AppCtx, e: &Entry, to: Status, note: &str) -> Result<Entry> {
     if e.pinned {
         bail!("entry {} is pinned (human-owned)", e.id);
@@ -460,6 +484,9 @@ pub fn record_status(ctx: &AppCtx, e: &Entry, to: Status, note: &str) -> Result<
         n.content_sha256 = Some(library::content_sha256(&n.path)?);
     }
     ctx.ledger.upsert_entry(&n)?;
+    if matches!(to, Status::Retired | Status::Dormant | Status::Stale) {
+        library::remove_hook(&ctx.paths, &n.id)?;
+    }
     if n.path.starts_with(&ctx.paths.root) && n.path.join(REMATCH_JSON).is_file() {
         // Keep extra keys (evidence_sha256, source_path) of imported lessons.
         let mut v: Value = serde_json::from_str(&std::fs::read_to_string(n.path.join(REMATCH_JSON))?)?;
@@ -472,7 +499,7 @@ pub fn record_status(ctx: &AppCtx, e: &Entry, to: Status, note: &str) -> Result<
 }
 
 fn experience_dir(ctx: &AppCtx, e: &Entry) -> PathBuf {
-    if owns_dir(ctx, e) {
+    if library::owns_dir(&ctx.paths, e) {
         e.path.clone()
     } else {
         ctx.paths.root.join("brownfield").join(&e.id)
@@ -680,7 +707,7 @@ pub fn lint_rules() -> Value {
         {"rule": "executable_risk", "summary": "no URLs, network calls, curl|sh, or destructive git unless the manifest explains it and approval is requested"},
         {"rule": "trigger", "summary": "non-empty repo glob, ≤10 stems, ≤8 extensions, a trigger line in SKILL.md, non-empty description; kind=agent: AGENT.md frontmatter name (= entry name, not main/sub) and description"},
         {"rule": "scripts", "summary": "every referenced scripts/<path> is shipped; scripts are non-executable until approved"},
-        {"rule": "always_on", "summary": "SKILL.md bodies, agent descriptions and AGENTS.fragment.md within 8192 bytes per branch; pay for new text by deletion"},
+        {"rule": "always_on", "summary": "SKILL.md descriptions and bodies, agent descriptions and AGENTS.fragment.md within 8192 bytes per branch; pay for new text by deletion"},
         {"rule": "fragment", "summary": "AGENTS.fragment.md is non-empty and uses ### or deeper headings (it is appended under `## rematch: <name>`)"},
         {"rule": "fork_path", "summary": "entry.fork_path is a repo-relative file path without `..`"},
         {"rule": "form_order", "summary": "trigger line, then laws, procedure, pitfalls, facts"},
@@ -946,7 +973,7 @@ pub fn append_evidence(ctx: &AppCtx, id: &str, m: &Moment) -> Result<Entry> {
     e.updated_at = ctx.now;
     ctx.ledger.upsert_entry(&e)?;
     let ej = e.path.join(REMATCH_JSON);
-    if ej.is_file() && owns_dir(ctx, &e) {
+    if ej.is_file() && library::owns_dir(&ctx.paths, &e) {
         let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&ej)?)?;
         v["evidence"] = serde_json::to_value(&e.evidence)?;
         v["updated_at"] = json!(e.updated_at);
@@ -1459,5 +1486,54 @@ pub fn cmd_record(ctx: &AppCtx, a: RecordArgs) -> Result<Value> {
             other
         ))
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::testutil::{entry, env, session, stage};
+    use rematch_core::counters::{DORMANT_MATCHED, WINDOW_MS};
+
+    fn status(ctx: &AppCtx, id: &str) -> Status {
+        ctx.ledger.get_entry(id).unwrap().unwrap().status
+    }
+
+    fn counted(ctx: &AppCtx, id: &str, branch: &str, started_at: i64) {
+        ctx.ledger.upsert_session(&session(id, branch, None, "anthropic/claude-opus", started_at)).unwrap();
+    }
+
+    #[test]
+    fn never_matching_provisional_goes_dormant_after_sessions_in_scope() {
+        let mut x = env();
+        let quiet = stage(&x.ctx, &entry("e1", "quiet-skill", "payments"), &[]);
+        stage(&x.ctx, &entry("e2", "other-skill", "billing"), &[]);
+        let since = quiet.status_since.unwrap();
+        // Both staged a moment ago; a minute past 30 days for either.
+        x.ctx.now = since + WINDOW_MS + 60_000;
+
+        // 30 days with no session in scope (user away): idle time alone never makes it dormant.
+        let sum = count_finished(&x.ctx, None, None).unwrap();
+        assert!(sum.decisions.is_empty(), "{:?}", sum.decisions);
+        assert_eq!(status(&x.ctx, "e1"), Status::Provisional);
+
+        // 11 counted sessions in its branch since it was staged (no counter rows: it never
+        // matched); a session in another branch and one before staging are out of scope.
+        for i in 0..DORMANT_MATCHED as i64 - 1 {
+            counted(&x.ctx, &format!("p{i}"), "payments", since + 1 + i);
+        }
+        counted(&x.ctx, "b0", "billing", since + 1);
+        counted(&x.ctx, "old", "payments", since - 1);
+        let sum = count_finished(&x.ctx, None, None).unwrap();
+        assert!(sum.decisions.is_empty(), "{:?}", sum.decisions);
+        assert_eq!(status(&x.ctx, "e1"), Status::Provisional, "11 sessions in scope");
+
+        counted(&x.ctx, "p11", "payments", since + 100);
+        let sum = count_finished(&x.ctx, None, None).unwrap();
+        assert_eq!(status(&x.ctx, "e1"), Status::Dormant, "12 sessions in scope, 30 days, matched 0");
+        assert_eq!(status(&x.ctx, "e2"), Status::Provisional, "one session in its branch");
+        assert_eq!(sum.decisions.len(), 1, "{:?}", sum.decisions);
+        assert_eq!(sum.decisions[0]["decision"], "dormant");
+        assert!(sum.lines.iter().any(|l| l.starts_with("dormant quiet-skill:")), "{:?}", sum.lines);
     }
 }

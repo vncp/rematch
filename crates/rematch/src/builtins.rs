@@ -291,7 +291,7 @@ mod tests {
 
         // a declined built-in stays retired; reinstall stages v2 on request only
         let stuck = first.iter().find(|e| e.name == "stuck-detector").unwrap();
-        library::decline(&c.ledger, &c.paths, &stuck.id, library::Approval::Hook).unwrap();
+        library::decline(&c.ledger, &c.paths, &stuck.id, &[library::Approval::Hook]).unwrap();
         std::fs::remove_file(c.paths.root.join("builtins.version")).unwrap();
         ensure(&c).unwrap();
         assert_eq!(builtins(&c).iter().filter(|e| e.status == Status::Provisional).count(), 2);

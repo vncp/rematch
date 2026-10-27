@@ -1,7 +1,9 @@
 //! `match --cwd` (load-time payload for the extension factory: entries, predicate hits, hook
-//! modules) and `digest --cwd` (session-start lines, one-tap approvals, capability-floor
-//! review, transfers). Skill delivery is `skills sync` (`skills_cmd`).
+//! modules, approved prompt fragments) and `digest --cwd` (session-start lines, one-tap
+//! approvals, capability-floor review, transfers, ship candidates). Skill delivery is
+//! `skills sync` (`skills_cmd`).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -9,12 +11,13 @@ use clap::Args;
 use rematch_core::features::{exts_of, stems_of_session};
 use rematch_core::ledger::{enum_str, EntryFilter};
 use rematch_core::domain;
-use rematch_core::library;
+use rematch_core::library::{self, Approval, AGENTS_FRAGMENT, AGENT_MD};
 use rematch_core::predicate;
 use rematch_core::types::{Entry, Kind, Status};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
+use crate::scope::ship::ShipReady;
 
 /// Max bytes of file content shown per approval.
 pub const APPROVAL_DIFF_BYTES: usize = 4096;
@@ -30,7 +33,9 @@ pub struct MatchArgs {
 /// `match --cwd`: the load-time payload. `domain` is the place's declared domain
 /// (`policy.json`, else the branch's `domain.yml`); with `--inputs` the session's exts and
 /// stems are known too, so the full rule (`domain::domain_of`, inference included) decides
-/// it and gates `predicate_hit` like `count` will.
+/// it and gates `predicate_hit` like `count` will. `prompt_fragments` (`[{id, name, text}]`,
+/// [`library::prompt_fragments`]) are the approved `AGENTS.fragment.md` texts of the listed
+/// entries that hit, which harnesses append to a main session's system prompt.
 pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     let repo = rematch_core::import::repo_of(&ctx.cwd);
     let m = library::list_for_match(&ctx.ledger, &ctx.paths, repo.as_deref(), &ctx.cwd)?;
@@ -54,6 +59,7 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
         _ => m.domain.clone(),
     };
     let mut entries = Vec::new();
+    let mut hits = Vec::new();
     for me in &m.entries {
         let e = ctx.ledger.get_entry(&me.id)?;
         // Lessons are library records, not loaded artifacts.
@@ -66,6 +72,9 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
                 && predicate::count_hit(&e.predicate, exts, stems)
                 && domain::domain_matches(e.predicate.domain.as_deref(), domain.as_deref());
         }
+        if hit {
+            hits.push(library::MatchedEntry { predicate_hit: true, ..me.clone() });
+        }
         entries.push(json!({
             "id": me.id, "name": me.name, "kind": me.kind, "status": me.status, "predicate_hit": hit,
             "version": me.version, "sha": me.sha,
@@ -75,11 +84,21 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     let mut out = serde_json::to_value(&m)?;
     out["entries"] = Value::Array(entries);
     out["domain"] = json!(domain);
+    out["prompt_fragments"] = serde_json::to_value(library::prompt_fragments(&ctx.ledger, &ctx.paths, &hits)?)?;
     Ok(out)
 }
 
 fn last_path(ctx: &AppCtx) -> PathBuf {
     ctx.paths.root.join("digest.last")
+}
+
+/// `<id>:<scope>` keys of the ship candidates a digest already announced (one per line).
+fn ship_shown_path(ctx: &AppCtx) -> PathBuf {
+    ctx.paths.root.join("digest.ship")
+}
+
+fn ship_key(r: &ShipReady) -> String {
+    format!("{}:{}", r.id, r.scope)
 }
 
 fn status_line(e: &Entry, c: &rematch_core::types::Counters) -> String {
@@ -107,68 +126,53 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}\n…[+{} bytes]", &s[..end], s.len() - end)
 }
 
-/// Provisional/kept entries whose scripts or hook await the one-tap approval.
+/// Provisional, kept and pinned entries with parts awaiting the one-tap approval
+/// ([`library::pending_parts`]): one item per entry whose `kind` is its parts joined with `+`
+/// (`scripts+prompt`) and whose `diff` holds each part in that order — the unapproved script
+/// files, the compiled hook module, `AGENT.md`, `AGENTS.fragment.md` — truncated to
+/// [`APPROVAL_DIFF_BYTES`]. `library approve` grants every part at once.
 pub fn pending_approvals(ctx: &AppCtx) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for st in [Status::Provisional, Status::Kept, Status::Pinned] {
         for e in ctx.ledger.list_entries(&EntryFilter { status: Some(st), ..Default::default() })? {
-            let reason = e
+            let parts = library::pending_parts(&ctx.paths, &e);
+            if parts.is_empty() {
+                continue;
+            }
+            let mut reason = e
                 .manifest
                 .as_ref()
                 .map(|m| format!("{} Predicted fix: {}", m.rationale, m.predicted_fix).trim().to_string())
                 .unwrap_or_else(|| e.trigger_line.clone());
-            if e.kind == Kind::Hook {
-                if !library::hook_active(&ctx.paths, &e) {
-                    let diff = match library::hook_module(&e) {
-                        Ok(m) => m,
-                        Err(err) => format!("(hook does not compile: {err:#})"),
-                    };
-                    let reason = match &e.hook {
-                        Some(h) => format!("{reason}\n\nPass condition: {}", h.pass_condition.trim()),
-                        None => reason,
-                    };
-                    out.push(json!({"id": e.id, "name": e.name, "kind": "hook", "diff": truncate(&diff, APPROVAL_DIFF_BYTES), "reason": reason}));
-                }
-                continue;
-            }
-            let scripts_dir = e.path.join("scripts");
-            if !scripts_dir.is_dir() || !crate::reflect::owns_dir(ctx, &e) {
-                continue;
-            }
-            let mut files: Vec<PathBuf> = walk(&scripts_dir);
-            files.sort();
-            let unapproved: Vec<(String, PathBuf)> = files
-                .into_iter()
-                .map(|p| (p.strip_prefix(&e.path).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p))
-                .filter(|(rel, _)| !e.approved_scripts.contains(rel))
-                .collect();
-            if unapproved.is_empty() {
-                continue;
-            }
+            let file = |name: &str| format!("+++ {name}\n{}\n", std::fs::read_to_string(e.path.join(name)).unwrap_or_default());
             let mut diff = String::new();
-            for (rel, p) in &unapproved {
-                diff.push_str(&format!("+++ {rel}\n{}\n", std::fs::read_to_string(p).unwrap_or_default()));
+            for part in &parts {
+                match part {
+                    Approval::Scripts => {
+                        for (rel, p) in library::unapproved_scripts(&e) {
+                            diff.push_str(&format!("+++ {rel}\n{}\n", std::fs::read_to_string(p).unwrap_or_default()));
+                        }
+                    }
+                    Approval::Hook => {
+                        diff.push_str(&match library::hook_module(&e) {
+                            Ok(m) => m,
+                            Err(err) => format!("(hook does not compile: {err:#})\n"),
+                        });
+                        if let Some(h) = &e.hook {
+                            reason = format!("{reason}\n\nPass condition: {}", h.pass_condition.trim());
+                        }
+                    }
+                    Approval::Agent => diff.push_str(&file(AGENT_MD)),
+                    Approval::Prompt => diff.push_str(&file(AGENTS_FRAGMENT)),
+                }
             }
-            out.push(json!({"id": e.id, "name": e.name, "kind": "scripts", "diff": truncate(&diff, APPROVAL_DIFF_BYTES), "reason": reason}));
+            out.push(json!({
+                "id": e.id, "name": e.name, "kind": library::parts_label(&parts),
+                "diff": truncate(&diff, APPROVAL_DIFF_BYTES), "reason": reason,
+            }));
         }
     }
     Ok(out)
-}
-
-fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for ent in std::fs::read_dir(&d).into_iter().flatten().flatten() {
-            let p = ent.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    out
 }
 
 pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
@@ -251,6 +255,19 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
             d["command"].as_str().unwrap_or("?"),
         ));
     }
+    // Ship candidates (`ship::ready`, read-only): each line once per `<id>:<scope>`; the
+    // JSON always lists every current one.
+    let ship_ready = crate::scope::ship::ready(ctx)?;
+    let shown: BTreeSet<String> = std::fs::read_to_string(ship_shown_path(ctx))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    for r in ship_ready.iter().filter(|r| !shown.contains(&ship_key(r))) {
+        lines.push(format!("ship {} {}: {} → {}", r.scope, r.name, r.detail, r.command));
+    }
     if !approvals.is_empty() {
         lines.push(format!("{} approval(s) pending", approvals.len()));
     }
@@ -260,11 +277,15 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
         lines.push(crate::profile_cmd::conflict_line(&rematch_core::profile::dir(&ctx.paths), &profile_conflicts));
     }
     std::fs::write(last_path(ctx), seen.to_string())?;
+    // Only current candidates: one that stops being ready and returns is announced again.
+    let keys: BTreeSet<String> = ship_ready.iter().map(ship_key).collect();
+    std::fs::write(ship_shown_path(ctx), keys.into_iter().map(|k| k + "\n").collect::<String>())?;
     Ok(json!({
         "since": last,
         "lines": lines,
         "changed": changed,
         "approvals": approvals,
+        "ship_ready": ship_ready,
         "review": review,
         "stale": stale,
         "transfers": transfers,

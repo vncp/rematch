@@ -12,7 +12,7 @@ Oct 25, 2026 · @Vincent Pham
 2. Verify with what is free: whether the redirect that motivated an entry recurs on later matched sessions, plus tool errors, tokens, and takeovers. Spend rollouts only in batch mode where a verifier exists.
 3. All eight harness surfaces are editable; skills and scripts first, hooks and prompts last.
 4. Provisional by default, kept by use, retired by counters. Nothing grows without an exit, and nothing is ever called "verified" on the strength of a handful of sessions.
-5. Skill text activates in personal scope on its own. Anything executable (scripts, hooks) and anything beyond personal scope waits for a one-tap approval or a merged PR.
+5. Skill text activates in personal scope on its own. Anything executable (scripts, hooks), any subagent, any text added to the system prompt, and anything beyond personal scope waits for a one-tap approval or a merged PR.
 
 ## How you use it
 
@@ -21,7 +21,7 @@ Most of the time you don't. The plugin works from sessions you were going to run
 | Entry point | What you say or do | What happens |
 | --- | --- | --- |
 | Nothing | Work in omp as usual | Every session is traced by the extension into its own trace file. At the start of the next session, pending reflections run detached: a session that ended with a redirect, a tool-error cluster, or a takeover produces one bounded proposal grounded in that trace, staged as `provisional`. Later sessions whose trigger predicate matches load it. Counters decide whether it stays. |
-| Session-start digest | Open omp | One line per entry staged since last time, with a diff on request. Skill text is already active; scripts and hooks show a tap-to-approve. |
+| Session-start digest | Open omp | One line per entry staged since last time, with a diff on request. Skill text is already active; scripts, hooks, subagents and system-prompt fragments show a tap-to-approve, one item per entry (`kind` joins what is pending, e.g. `scripts+prompt`). Entries ready to ship to a team or fork get one `ship …` line, once. |
 | Create a skill | "Use omp-evolve to create a skill for X" or `/evolve create <name> --from <sessions\|task>` | Greenfield: finds matching traced sessions, or runs one reference rollout of the task you name, runs the editor, lints, stages a skill package as `provisional`, reports the trigger predicate it chose. Description with no task and no sessions yields a `draft` that never loads until you activate it. |
 | Improve a skill | "Based on session history, improve \<skill> using omp-evolve" or `/evolve improve <skill>` | Brownfield: registers the skill, audits where it loaded (from imported history and the trace), clusters the redirects and errors that happened with it in context, proposes unit-level edits, lints, stages a new version beside the old one. Refuses with a count if fewer than 5 traced sessions used the skill, and offers the mechanical split instead. |
 | Batch job with a verifier | `/evolve run --task <id> --verifier <cmd>` | Harness² proper: reference rollout, two candidates, probe, compose, re-run; the verifier picks. Runs detached and returns a job id. |
@@ -29,11 +29,11 @@ Most of the time you don't. The plugin works from sessions you were going to run
 | Correct it | `/evolve mark correction\|preference\|scope` | Overrides the redirect classifier for the last turn. Optional. |
 | Stop it | `/evolve off`, `OMP_EVOLVE=0`, `/evolve disable <id>`, `/evolve rollback <skill>`, `omp-evolve uninstall` | Immediate. Uninstall removes every file the plugin wrote and nothing else. |
 
-**What never happens without you:** a script becomes executable, a hook that can block an action is installed, the fork or team `.omp/` changes, a `pinned` skill is replaced, or an entry crosses from work to home. Each arrives as a one-tap approval in the session-start digest or as a PR with the evidence attached.
+**What never happens without you:** a script becomes executable, a hook that can block an action is installed, a provisional subagent becomes visible, a fragment of text is added to your system prompt, the fork or team `.omp/` changes, a `pinned` skill is replaced, or an entry crosses from work to home. Each arrives as a one-tap approval in the session-start digest or as a PR with the evidence attached. An approved fragment is appended to the system prompt of main sessions where its entry loads; your own `AGENTS.md` is never written, and editing an approved fragment or subagent asks again.
 
 **Rate limits.** At most one admission per trigger predicate per day, at most 10 `provisional` entries per branch, and no new reflection on a trigger while a canary for it is pending. A bad entry cannot cause a cascade of more entries.
 
-**What the model sees:** nothing new. Provisional skills are ordinary omp skills contributed from a staging path; the model is not told it is being evaluated. You are not blinded either, and the design does not pretend you are: the counters measure recurrence of a specific redirect class, which you would not fake.
+**What the model sees:** provisional skills are ordinary omp skills contributed from a staging path, and an approved subagent is an ordinary omp agent; the model is not told it is being evaluated. The one addition to its context is the `## rematch: <name>` block of each approved prompt fragment, which you approved with its text in front of you. You are not blinded either, and the design does not pretend you are: the counters measure recurrence of a specific redirect class, which you would not fake.
 
 ## How it extends omp
 
@@ -106,7 +106,7 @@ Budget: 4 rollouts at k=1, 10 at `--width 2`. The job's existing time and turn c
 
 **Learning from the loop.** After every keep or retirement, the reflector writes an `EXPERIENCE.md` beside the entry: situation, lesson, evidence, and what the counters showed. The editor reads matching ones on later proposals, which is Harness²'s library in its simplest form. The editor prompt itself is not amended by the system; a self-amending improver measured by its own admission rate is the evaluator evolution this plan excludes.
 
-**Hard rules.** No proposal without a trace. No activation without lint. No executable content without approval. No `kept` status without later sessions or a verifier run after the one that chose it. No rerun inside an interactive session. At most three model calls per reflection.
+**Hard rules.** No proposal without a trace. No activation without lint. No executable content, subagent or system-prompt text without approval. No `kept` status without later sessions or a verifier run after the one that chose it. No rerun inside an interactive session. At most three model calls per reflection.
 
 ## Starting states
 

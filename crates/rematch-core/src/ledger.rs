@@ -1434,6 +1434,8 @@ pub(crate) mod tests {
             pinned: false,
             hook: None,
             approved_scripts: vec![],
+            approved_fragment: None,
+            approved_agent: None,
             sibling_of: None,
             status_since: None,
             status_note: None,

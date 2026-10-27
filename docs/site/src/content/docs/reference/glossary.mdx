@@ -27,7 +27,7 @@ description: The terms used across this site, in one line each.
 | **journal** | the ledger's append-only record of every write, with the ledger's own clock; what the lake exports | [the lake](/rematch/concepts/lake/) |
 | **lake** | the journal and closed sessions as write-once Parquet files under `~/.rematch/lake/`; history, never read by a session | [the lake](/rematch/concepts/lake/) |
 | **profile** | a git repo at `~/.rematch/profile/` holding your omp setup, linked into every machine that syncs it | [the profile](/rematch/concepts/profile/) |
-| **digest** | the session-start summary of what was staged, kept or retired, plus approvals waiting | [day to day](/rematch/guides/day-to-day/) |
+| **digest** | the session-start summary of what was staged, kept or retired, approvals waiting (one item per entry: scripts, hook, subagent and prompt text), and entries ready to ship | [day to day](/rematch/guides/day-to-day/) |
 | **verifier** | a mechanical pass/fail check (tests, script, parity, receipt) that picks winners in batch mode | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#verifiers) |
 | **anchor replay** | one re-run of a kept skill's task with its replacement loaded, before the replacement goes ahead | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#replacing-a-kept-skill) |
 | **surface** | one of the eight parts of a harness rematch can change | [the eight surfaces](/rematch/concepts/surfaces/) |

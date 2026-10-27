@@ -1,9 +1,9 @@
 //! `doctor`: model roles, ledger schema, improver files, root paths, kill switch, and one
 //! block per harness and service — omp (binary, extension linked and loadable), Claude
 //! Code (plugin link, plugin validates), Codex (skill-root link), profile (remote,
-//! ahead/behind, launchd), lake (export lag, index pin), built-ins — then `ready` with
-//! every problem. A harness that is not set up is reported, never a problem; one that is
-//! set up and broken is.
+//! ahead/behind, launchd), lake (export lag, index pin), built-ins, compiled hook modules
+//! (live / from the profile / orphan) — then `ready` with every problem. A harness that is
+//! not set up is reported, never a problem; one that is set up and broken is.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rematch_core::ledger::{enum_str, EntryFilter, SessionFilter, SCHEMA_VERSION};
+use rematch_core::types::Status;
 use serde_json::{json, Value};
 
 use crate::app::{AppCtx, IMPROVER_FILES};
@@ -182,6 +183,7 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         ("profile", profile_harness(ctx)?),
         ("lake", lake_harness(ctx)?),
         ("built-ins", builtins_harness(ctx)?),
+        ("hooks", hooks_harness(ctx)?),
     ];
     let mut block = serde_json::Map::new();
     let mut harness_lines = Vec::new();
@@ -571,4 +573,46 @@ fn builtins_harness(ctx: &AppCtx) -> Result<Harness> {
         problems,
         set_up: true,
     })
+}
+
+/// The compiled hook modules `<agent_dir>/extensions/rematch-hooks/*.ts`, by id: live (a
+/// local provisional, kept or pinned entry), profile (no live entry here, but
+/// `profile/hooks/` holds it: approved on another machine, inert here; information only)
+/// or orphan (neither: a problem — nothing owns it, so nothing ever removes it).
+fn hooks_harness(ctx: &AppCtx) -> Result<Harness> {
+    let dir = ctx.paths.hooks_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Ok(Harness {
+            line: "hooks: none compiled".into(),
+            json: json!({"dir": dir, "live": [], "profile": [], "orphan": []}),
+            problems: vec![],
+            set_up: false,
+        });
+    };
+    let mut files: Vec<PathBuf> =
+        rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "ts")).collect();
+    files.sort();
+    let profile_hooks = rematch_core::profile::hooks_dir(&ctx.paths);
+    let (mut live, mut profile, mut orphan) = (Vec::new(), Vec::new(), Vec::new());
+    for p in files {
+        let (Some(id), Some(name)) = (p.file_stem().and_then(|s| s.to_str()), p.file_name()) else { continue };
+        let owned = ctx.ledger.get_entry(id)?.is_some_and(|e| matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned));
+        if owned {
+            live.push(id.to_string());
+        } else if profile_hooks.join(name).is_file() {
+            profile.push(id.to_string());
+        } else {
+            orphan.push(p);
+        }
+    }
+    let problems: Vec<String> =
+        orphan.iter().map(|p| format!("orphan hook module {}: no live entry; delete the file", p.display())).collect();
+    let line = format!(
+        "hooks: {} · {} live · {} from profile (inert here) · {} orphan",
+        if problems.is_empty() { "ok" } else { "problem" },
+        live.len(),
+        profile.len(),
+        orphan.len()
+    );
+    Ok(Harness { line, json: json!({"dir": dir, "live": live, "profile": profile, "orphan": orphan}), problems, set_up: true })
 }

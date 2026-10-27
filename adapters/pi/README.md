@@ -24,6 +24,7 @@ One session: `pi -e /path/to/rematch/adapters/pi`. To remove: `pi remove /path/t
 | `tool_call` | approved `block` / `stuck` hooks (fail closed), traced `tool_blocked`; a `bash` command line that plainly invokes `rematch library approve\|decline\|pin\|unpin\|disable\|rollback`, `rematch library export … --approve[-all]` or `rematch off\|on\|uninstall` is refused (a pattern check on `rematch` in command position, flags before or after `library` included — not a sandbox: a shell can reach the binary in ways no pattern sees) |
 | `tool_execution_start` / `_end` | `tool_result` for every finished call, failed ones included (`skill_read` only for a successful read of a `SKILL.md`) |
 | `context` | approved `truncate` and `retrieve` hooks (the first retrieve hook runs and is the one credited in the `retrieval` record); the retrieved units go as one hidden custom message (a user-role message to the provider); `/rematch` output is removed from every request |
+| `before_agent_start` | appends the approved personal prompt fragments of the entries loaded for the cwd (`match.prompt_fragments`) to the system prompt, as `## rematch: <name>` blocks; nothing is stored, a failure leaves the prompt unchanged |
 | `turn_end`, `model_select` | `turn_end` (model, usage, stop reason, text), `model_change` |
 | `agent_settled` | `agent_end` (Pi's `agent_end` is not final: retries and queued work continue the run) |
 | `session_shutdown` | `session_shutdown` and, when flagged, `~/.rematch/pending/<trace id>.json` — except on `/reload`, which continues the trace |

@@ -15,6 +15,10 @@
 //! The branch is built in a temporary worktree from the repo's current HEAD, so the
 //! user's checkout is untouched. `--push` pushes it; `--pr` (requires `--push` and
 //! `gh`) opens a PR. Without them nothing touches the network.
+//!
+//! Readiness ([`ready`], read-only): kept and pinned entries auto-selection would ship and
+//! that have no ship receipt for that scope yet; the session-start digest and `library ls`
+//! announce them with the command to run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,7 +34,7 @@ use rematch_core::library::{load_entry, validate_fork_path, AGENTS_FRAGMENT, AGE
 use rematch_core::lint::{lint_entry, LintContext};
 use rematch_core::package::{RematchBlock, SkillDoc};
 use rematch_core::predicate::{count_hit, count_match, predicate_hash, Place};
-use rematch_core::{Activation, Counters, Entry, Family, FamilyCounters, Kind, Receipt, Status};
+use rematch_core::{Activation, Counters, Entry, Family, FamilyCounters, Kind, Receipt, SessionRecord, Status};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -43,6 +47,23 @@ use crate::envelope::Usage;
 pub enum ShipScope {
     Team,
     Fork,
+}
+
+impl ShipScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShipScope::Team => "team",
+            ShipScope::Fork => "fork",
+        }
+    }
+
+    /// `what` of the certificate a shipped branch records ([`record_receipt`]).
+    fn receipt_what(self) -> &'static str {
+        match self {
+            ShipScope::Team => "ship-team",
+            ShipScope::Fork => "ship-fork",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -87,6 +108,82 @@ struct Skipped {
     entry: String,
     name: String,
     reason: String,
+}
+
+/// An entry `ship` would take now, for one scope. Read-only: the session-start digest and
+/// `library ls` announce it, the user runs `command`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ShipReady {
+    pub id: String,
+    pub name: String,
+    /// `"team"` or `"fork"`.
+    pub scope: &'static str,
+    /// team: `"<n> repos"` (`", AGENTS.md section"` with a fragment); fork: the fork path.
+    pub detail: String,
+    pub command: String,
+}
+
+/// Every ship candidate of the kept and pinned entries (built-ins ship with the binary):
+/// what auto-selection (`select` without `--entry`) would ship and has not shipped to that
+/// scope yet (`shipped_scopes`) — team when the predicate recurred in ≥ 2 repos, fork when
+/// the entry has a `fork_path` (ledger or `rematch.json`).
+pub fn ready(ctx: &AppCtx) -> Result<Vec<ShipReady>> {
+    let mut kept = Vec::new();
+    for status in [Status::Kept, Status::Pinned] {
+        let entries = ctx.ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })?;
+        kept.extend(entries.into_iter().filter(|e| !rematch_core::library::is_builtin(e)));
+    }
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sessions = ctx.ledger.list_sessions(&SessionFilter::default())?;
+    let mut out = Vec::new();
+    for e in &kept {
+        out.extend(entry_readiness(ctx, e, &sessions)?);
+    }
+    Ok(out)
+}
+
+fn entry_readiness(ctx: &AppCtx, e: &Entry, sessions: &[SessionRecord]) -> Result<Vec<ShipReady>> {
+    let shipped = shipped_scopes(ctx, &e.id)?;
+    let mut out = Vec::new();
+    let mut push = |scope: ShipScope, detail: String, extra: &str| {
+        out.push(ShipReady {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            scope: scope.as_str(),
+            detail,
+            command: format!("/rematch ship --scope {} --entry {}{extra}", scope.as_str(), e.id),
+        })
+    };
+    if !shipped.contains(&ShipScope::Team) {
+        let repos = repos_hit(sessions, e).len();
+        if repos >= 2 {
+            let fragment = if e.path.join(AGENTS_FRAGMENT).is_file() { ", AGENTS.md section" } else { "" };
+            push(ShipScope::Team, format!("{repos} repos{fragment}"), "");
+        }
+    }
+    if !shipped.contains(&ShipScope::Fork) {
+        if let Some(fp) = fork_path_of(e) {
+            // `ship` falls back to the ledger's `fork_repo`; without one it needs `--repo`.
+            let extra = if e.fork_repo.is_some() { "" } else { " --repo <fork checkout>" };
+            push(ShipScope::Fork, fp, extra);
+        }
+    }
+    Ok(out)
+}
+
+/// Scopes the entry already shipped to: its `Activation::Pr` receipts, told apart by the
+/// certificate's `what` ([`record_receipt`]).
+fn shipped_scopes(ctx: &AppCtx, id: &str) -> Result<Vec<ShipScope>> {
+    let mut out = Vec::new();
+    for r in ctx.ledger.list_receipts(Some(id))?.into_iter().filter(|r| r.receipt.activation == Activation::Pr) {
+        let cert: Option<Value> =
+            ctx.ledger.get_blob(&r.receipt.certificate).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok());
+        let what = cert.as_ref().and_then(|c| c["what"].as_str());
+        out.extend([ShipScope::Team, ShipScope::Fork].into_iter().filter(|s| what == Some(s.receipt_what())));
+    }
+    Ok(out)
 }
 
 /// Per-family counters as numbers for the PR body.
@@ -164,20 +261,27 @@ fn skip(e: &Entry, reason: &str) -> Skipped {
 /// Distinct repos of ledger sessions whose content matches the entry's predicate
 /// (stems/exts only: the repo glob names one repo by construction).
 pub fn recurrence_repos(ctx: &AppCtx, e: &Entry) -> Result<BTreeSet<String>> {
-    Ok(ctx
-        .ledger
-        .list_sessions(&SessionFilter::default())?
-        .into_iter()
+    Ok(repos_hit(&ctx.ledger.list_sessions(&SessionFilter::default())?, e))
+}
+
+fn repos_hit(sessions: &[SessionRecord], e: &Entry) -> BTreeSet<String> {
+    sessions
+        .iter()
         .filter(|s| count_hit(&e.predicate, &s.exts, &s.stems))
-        .filter_map(|s| s.repo)
-        .collect())
+        .filter_map(|s| s.repo.clone())
+        .collect()
 }
 
 /// `fork_path` is set by `library set-fork-path` (ledger + rematch.json) or by the
-/// editor; a hand edit of the entry's `rematch.json` is adopted into the ledger too.
+/// editor; a hand edit of the entry's `rematch.json` counts too.
+fn fork_path_of(e: &Entry) -> Option<String> {
+    e.fork_path.clone().or_else(|| load_entry(&e.path).ok().and_then(|d| d.fork_path))
+}
+
+/// [`fork_path_of`], adopting a hand-edited `rematch.json` value into the ledger.
 fn adopt_fork_path(ctx: &AppCtx, mut e: Entry) -> Result<Entry> {
     if e.fork_path.is_none() {
-        if let Some(fp) = load_entry(&e.path).ok().and_then(|d| d.fork_path) {
+        if let Some(fp) = fork_path_of(&e) {
             e.fork_path = Some(fp);
             ctx.ledger.upsert_entry(&e)?;
         }
@@ -325,9 +429,11 @@ fn file_hashes(root: &Path, rels: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
-fn record_receipt(ctx: &AppCtx, e: &Entry, what: &str, repo: &Path, branch: &str, commit: &str, files: &[(String, String)]) -> Result<String> {
+/// The `Activation::Pr` receipt of a shipped branch; its certificate's `what` names the
+/// scope ([`ShipScope::receipt_what`], read back by [`shipped_scopes`]).
+fn record_receipt(ctx: &AppCtx, e: &Entry, scope: ShipScope, repo: &Path, branch: &str, commit: &str, files: &[(String, String)]) -> Result<String> {
     let cert = json!({
-        "entry": e.id, "what": what, "repo": repo, "branch": branch, "commit": commit,
+        "entry": e.id, "what": scope.receipt_what(), "repo": repo, "branch": branch, "commit": commit,
         "files": files, "at": ctx.now,
     });
     let certificate = ctx.ledger.put_blob(serde_json::to_string(&cert)?.as_bytes())?;
@@ -472,7 +578,7 @@ fn ship_team(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Sh
     let hashes = file_hashes(&wt.path, &rels)?;
     let top = wt.repo.clone();
     drop(wt);
-    let receipt = record_receipt(ctx, e, "ship-team", &top, &branch, &commit, &hashes)?;
+    let receipt = record_receipt(ctx, e, ShipScope::Team, &top, &branch, &commit, &hashes)?;
     let (pushed, pr_url) = publish(&top, &branch, &message, args)?;
     Ok(Shipped { entry: e.id.clone(), name: e.name.clone(), repo: top, branch, commit, files: rels, pushed, pr_url, receipt })
 }
@@ -554,7 +660,7 @@ fn ship_fork(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Sh
     let commit = git_commit(&wt.path, &message, &[&fork_path])?;
     let top = wt.repo.clone();
     drop(wt);
-    let receipt = record_receipt(ctx, e, "ship-fork", &top, &branch, &commit, &[(fork_path.clone(), file_sha)])?;
+    let receipt = record_receipt(ctx, e, ShipScope::Fork, &top, &branch, &commit, &[(fork_path.clone(), file_sha)])?;
     let mut updated = e.clone();
     updated.fork_repo = Some(top.clone());
     updated.fork_commit = Some(base_head);
@@ -717,6 +823,47 @@ mod tests {
         let saved = ctx.ledger.get_entry(&e.id).unwrap().unwrap();
         assert_eq!(saved.fork_commit.as_deref(), Some(sh(&fork, &["git", "rev-parse", "HEAD"]).as_str()));
         assert!(rematch_core::library::load_entry(&saved.path).unwrap().fork_repo.is_some());
+    }
+
+    #[test]
+    fn readiness_lists_kept_candidates_read_only_until_shipped() {
+        let t = env();
+        let ctx = &t.ctx;
+        let fork = repo(&t.dir.join("fork"));
+        let e = crate::scope::testutil::entry("e-ready-0001", "compaction-default", "fork");
+        let e = stage(ctx, &e, &[("fork/compaction.md", "Keep the last two tool results verbatim.\n")]);
+        let e = keep(ctx, &e.id);
+        assert!(ready(ctx).unwrap().is_empty(), "no fork_path, no cross-repo recurrence");
+
+        // fork_path only in rematch.json (a hand edit): announced, the ledger untouched
+        let mut j = load_entry(&e.path).unwrap();
+        j.fork_path = Some("src/prompts/compaction.md".into());
+        std::fs::write(e.path.join(rematch_core::library::REMATCH_JSON), serde_json::to_string_pretty(&j).unwrap()).unwrap();
+        let fork_ready = ShipReady {
+            id: e.id.clone(),
+            name: "compaction-default".into(),
+            scope: "fork",
+            detail: "src/prompts/compaction.md".into(),
+            // no fork_repo recorded yet: the command has to name the checkout
+            command: "/rematch ship --scope fork --entry e-ready-0001 --repo <fork checkout>".into(),
+        };
+        assert_eq!(ready(ctx).unwrap(), vec![fork_ready]);
+        assert!(ctx.ledger.get_entry(&e.id).unwrap().unwrap().fork_path.is_none(), "read-only: nothing adopted");
+
+        // team: the predicate's content recurred in two repos; a fragment adds the AGENTS.md section
+        for (i, r) in ["/w/alpha", "/w/beta"].into_iter().enumerate() {
+            ctx.ledger.upsert_session(&session(&format!("s{i}"), "fork", Some(r), "anthropic/claude-opus", 1_000 + i as i64)).unwrap();
+        }
+        std::fs::write(e.path.join(AGENTS_FRAGMENT), "### Compaction\n\nKeep tool results.\n").unwrap();
+        let got: Vec<(&str, String)> = ready(ctx).unwrap().into_iter().map(|r| (r.scope, r.detail)).collect();
+        assert_eq!(got, vec![("team", "2 repos, AGENTS.md section".to_string()), ("fork", "src/prompts/compaction.md".to_string())]);
+
+        // shipped to the fork (an `Activation::Pr` receipt, what = ship-fork): team stays a candidate
+        cmd_ship(ctx, args(ShipScope::Fork, Some(fork.clone()), vec![e.id.clone()])).unwrap();
+        // provisional entries are not candidates, even with the same cross-repo recurrence
+        stage(ctx, &crate::scope::testutil::entry("e-ready-0002", "provisional-skill", "fork"), &[]);
+        let got: Vec<(String, &str)> = ready(ctx).unwrap().into_iter().map(|r| (r.id, r.scope)).collect();
+        assert_eq!(got, vec![(e.id.clone(), "team")]);
     }
 
     #[test]

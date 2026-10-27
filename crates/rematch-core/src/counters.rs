@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::ledger::{CounterRow, Ledger};
 use crate::predicate::{count_match, Place};
 use crate::types::{
-    Counters, Decision, Entry, EntryId, Family, RedirectClass, SessionRecord, Status, UnixMs,
+    Counters, Decision, Entry, EntryId, Family, Kind, RedirectClass, SessionRecord, Status, UnixMs,
 };
 
 pub const DAY_MS: UnixMs = 24 * 60 * 60 * 1000;
@@ -128,7 +128,8 @@ fn status_since(e: &Entry) -> UnixMs {
 /// provisional: recurrence ≥ 2 ∨ harm ≥ 2 ⇒ Retire; matched ≥ 4 ∧ recurrence = 0 ∧ harm = 0 ⇒ Keep;
 /// matched ≥ 12 ⇒ Dormant; provisional ≥ 30 days ∧ matched < 3 ⇒ Dormant;
 /// kept: ≥ 2 harm events within the last 30 days (and since it was kept) ⇒ Retire;
-/// otherwise Continue.
+/// otherwise Continue. `decide` runs for entries that got a counter row; the provisional
+/// rest is swept by [`idle_dormant`].
 pub fn decide(e: &Entry, c: &Counters, now: UnixMs) -> Decision {
     if e.pinned || e.status == Status::Pinned {
         return Decision::Continue;
@@ -158,6 +159,28 @@ pub fn decide(e: &Entry, c: &Counters, now: UnixMs) -> Decision {
         }
         _ => Decision::Continue,
     }
+}
+
+/// The idle dormancy rule for a provisional entry that `decide` never sees because it got
+/// no counter row this run (a predicate that never hits gets none at all): Dormant once it
+/// has been provisional ≥ 30 days with matched < 3 **and** at least 12 counted sessions
+/// ran in its scope since then (`sessions_in_scope`: sessions passing [`in_idle_scope`]).
+/// Idle time alone never makes an entry dormant: a user away for a month runs no sessions.
+/// Pinned, built-in and lesson entries (library records, never loaded) are exempt.
+pub fn idle_dormant(e: &Entry, c: &Counters, sessions_in_scope: usize, now: UnixMs) -> bool {
+    e.status == Status::Provisional
+        && !e.pinned
+        && !crate::library::is_builtin(e)
+        && e.kind != Kind::Lesson
+        && now - status_since(e) >= WINDOW_MS
+        && c.matched < DORMANT_IDLE_MATCHED
+        && sessions_in_scope >= DORMANT_MATCHED as usize
+}
+
+/// A session that gave the entry its chance to match ([`idle_dormant`]): counted, started
+/// since the entry's current status, in the entry's branch (any branch for `shared`).
+pub fn in_idle_scope(e: &Entry, s: &SessionRecord) -> bool {
+    s.counted && s.started_at >= status_since(e) && (e.branch == crate::library::SHARED_BRANCH || s.branch == e.branch)
 }
 
 /// Counters diverge by family (Phase 3 split): one family harmed (harm ≥ 1) while
@@ -302,6 +325,59 @@ mod tests {
             let e = entry("e", "n", "b", st);
             assert_eq!(decide(&e, &counters(9, 0, 0), 0), Decision::Continue, "{st:?}");
         }
+    }
+
+    #[test]
+    fn idle_dormant_boundaries() {
+        let n = DORMANT_MATCHED as usize;
+        let mut e = entry("e", "n", "b", Status::Provisional);
+        e.created_at = 0;
+        let c = counters(0, 0, 0);
+        assert!(idle_dormant(&e, &c, n, WINDOW_MS), "30 days, 12 sessions, matched 0");
+        assert!(!idle_dormant(&e, &c, n, WINDOW_MS - 1), "29 days and change");
+        assert!(!idle_dormant(&e, &c, n, 29 * DAY_MS));
+        assert!(!idle_dormant(&e, &c, n - 1, WINDOW_MS), "11 sessions in scope");
+        assert!(!idle_dormant(&e, &c, 0, 365 * DAY_MS), "idle time alone (user away) never");
+        assert!(idle_dormant(&e, &counters(2, 0, 0), n, WINDOW_MS), "matched 2");
+        assert!(!idle_dormant(&e, &counters(3, 0, 0), n, WINDOW_MS), "matched 3");
+        // the clock runs from the current status
+        e.status_since = Some(DAY_MS);
+        assert!(!idle_dormant(&e, &c, n, WINDOW_MS));
+        assert!(idle_dormant(&e, &c, n, WINDOW_MS + DAY_MS));
+
+        let mut pinned = e.clone();
+        pinned.pinned = true;
+        assert!(!idle_dormant(&pinned, &c, n, WINDOW_MS + DAY_MS), "pinned exempt");
+        let mut builtin = e.clone();
+        builtin.origin = crate::types::Origin::Import { source: crate::library::BUILTIN_SOURCE.into() };
+        assert!(!idle_dormant(&builtin, &c, n, WINDOW_MS + DAY_MS), "built-in exempt");
+        let mut lesson = e.clone();
+        lesson.kind = Kind::Lesson;
+        assert!(!idle_dormant(&lesson, &c, n, WINDOW_MS + DAY_MS), "lesson exempt");
+        for st in [Status::Kept, Status::Pinned, Status::Dormant, Status::Draft] {
+            let mut o = e.clone();
+            o.status = st;
+            assert!(!idle_dormant(&o, &c, n, WINDOW_MS + DAY_MS), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn idle_scope_is_counted_sessions_of_the_branch_since_the_status() {
+        let mut e = entry("e", "n", "b", Status::Provisional);
+        e.status_since = Some(100);
+        let mut s = session("s", "b", 100);
+        s.counted = true;
+        assert!(in_idle_scope(&e, &s));
+        s.started_at = 99;
+        assert!(!in_idle_scope(&e, &s), "started before the status");
+        s.started_at = 200;
+        s.counted = false;
+        assert!(!in_idle_scope(&e, &s), "not counted yet");
+        s.counted = true;
+        s.branch = "other".into();
+        assert!(!in_idle_scope(&e, &s), "another branch");
+        e.branch = crate::library::SHARED_BRANCH.into();
+        assert!(in_idle_scope(&e, &s), "shared spans every branch");
     }
 
     #[test]

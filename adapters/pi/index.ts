@@ -11,6 +11,7 @@ import * as path from "node:path";
 import type { ExecResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
 import {
+	appendPromptFragments,
 	argsHash,
 	buildArgv,
 	CallHistory,
@@ -42,6 +43,8 @@ import {
 	type RetrievedUnit,
 	retrievalQuery,
 	retrievedUnits,
+	type PromptFragment,
+	promptFragmentsOf,
 	recordsOf,
 	rematchRoot,
 	resolveBinary,
@@ -416,6 +419,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	// --- what loads: entries, hooks, the shared skills dir --------------------------------------
 	let loadedEntries: LoadedEntry[] = [];
 	let visibleEntries: string[] = [];
+	/** Approved personal prompt fragments of the entries loaded for this cwd. */
+	let promptFragments: PromptFragment[] = [];
 	let skillDirs: string[] = [];
 	let hooks: Hook[] = [];
 	let callHooks: Hook[] = [];
@@ -450,6 +455,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
 			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
+			promptFragments = promptFragmentsOf(data);
 		}
 		if (sync.ok && sync.data?.off !== true) {
 			visibleEntries = stringsOf(sync.data?.visible);
@@ -868,6 +874,21 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			}
 		}
 		return messages ? { messages: messages as typeof event.messages } : undefined;
+	});
+
+	// --- personal prompt fragments: appended to the system prompt, fail open ---------------------
+	// Pi's `systemPrompt` is one string (`{ systemPrompt?: string }` is the result type). A handler may
+	// re-enter, so this one returns the base prompt with the block appended, every time, and keeps no
+	// state.
+	pi.on("before_agent_start", event => {
+		try {
+			if (!enabled) return undefined;
+			const systemPrompt = appendPromptFragments((event as { systemPrompt?: unknown }).systemPrompt, promptFragments);
+			return typeof systemPrompt === "string" ? { systemPrompt } : undefined;
+		} catch (error) {
+			log(`prompt fragments failed: ${errorText(error)}`);
+			return undefined;
+		}
 	});
 
 	/** Event handlers fail open: tracing must never disturb the session. */
