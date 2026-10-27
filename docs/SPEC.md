@@ -1,4 +1,4 @@
-> Historical: this spec was written under the working name omp-evolve; the shipped project is **rematch**. Names in DESIGN.md are current.
+> Historical: this spec was written under the working name omp-evolve; the shipped project is **rematch**. Names and contracts in [`docs/DESIGN.md`](DESIGN.md) are current. Corrective amendments (2026-10-27, D29–D32 in [`docs/research.md`](research.md#2-decisions-and-their-evidence)) are noted in place below without erasing the original v2 text.
 
 # omp-evolve build spec v2
 
@@ -14,6 +14,7 @@ Oct 25, 2026 · @Vincent Pham
 4. Provisional by default, kept by use, retired by counters. Nothing grows without an exit, and nothing is ever called "verified" on the strength of a handful of sessions.
 5. Skill text activates in personal scope on its own. Anything executable (scripts, hooks), any subagent, any text added to the system prompt, and anything beyond personal scope waits for a one-tap approval or a merged PR.
 
+> **Corrective amendment (2026-10-27, D29–D32):** (1) Interactive reflection still never reruns your active session, and uses ≤ 3 editor/classifier model calls; in addition, `reflect --pending` can run a **bounded automatic probe** (2 omp rollouts in detached worktrees, ≤ 300 s each, 1 per reflect pass, 4 per 24 h) when a replayable task is explicitly authorized (D31). (2) Retention distinguishes **accepted-in-use** (≥ 4 clean completed sessions with actual relevant use: skill read/invocation, retrieval, hook evaluation/application, script run, agent call or approved instruction exposure) from **comparative support** (a version/content-bound reference/candidate comparison); catalog-only unread matches are observational safety counters, not helpful credit, and unavailable probes never block accepted-in-use (D31). (3) Personal `AGENTS.fragment.md` proposals target a marked `<!-- rematch:begin ... -->` block in your personal `<agent_dir>/AGENTS.md` after exact-hash approval (`instructions:<id> --sha <hash>`); a repo's `AGENTS.md` is still only touched through optional `ship --scope team` (D29, D32). (4) Pending actions persist across `digest`, `status` and `library ls` independent of `digest.last`, and provisional exposure is scoped per place rather than a global union (D30, D32).
 ## How you use it
 
 Most of the time you don't. The plugin works from sessions you were going to run anyway, and the two asks you named are the only explicit entry points.
@@ -34,6 +35,7 @@ Most of the time you don't. The plugin works from sessions you were going to run
 **Rate limits.** At most one admission per trigger predicate per day, at most 10 `provisional` entries per branch, and no new reflection on a trigger while a canary for it is pending. A bad entry cannot cause a cascade of more entries.
 
 **What the model sees:** provisional skills are ordinary omp skills contributed from a staging path, and an approved subagent is an ordinary omp agent; the model is not told it is being evaluated. The one addition to its context is the `## rematch: <name>` block of each approved prompt fragment, which you approved with its text in front of you. You are not blinded either, and the design does not pretend you are: the counters measure recurrence of a specific redirect class, which you would not fake.
+> **Corrective amendment (2026-10-27, D29, D30, D32):** Approving `instructions:<entry-id> --sha <hash>` writes the approved fragment into a marked `<!-- rematch:begin name=<name> ... -->` block in your personal `<agent_dir>/AGENTS.md` (which omp loads in every session, while preserving all text outside the markers and surfacing conflicts if you edit the block) and enables matched-session runtime insertion in Claude Code, Pi and OpenCode. Declining `instructions:<entry-id>` declines only the prompt text and keeps the entry. Provisional skills and agents are scoped per place (`~/.rematch/views/<key>/`, `task.disabledAgents` in omp, and git-excluded project views in Claude Code/Codex) rather than exposed globally. Pending actions (`actions`) remain visible in `digest`, `status` and `library ls` regardless of `digest.last` until approved or declined (`library inspect <action-id>` shows the full diff).
 
 ## How it extends omp
 
@@ -92,6 +94,7 @@ One loop, two budgets. In interactive mode the real session is the reference rol
 7. *Count.* Per matched session: did the specific redirect class that motivated the entry recur while it was loaded; did a harm event occur (new tool-error cluster, takeover, user disable)? Tokens and turns are recorded, never gated on.
 8. *Decide.* Keep at zero recurrences over at least 4 matched sessions with no harm event. Retire at 2 recurrences or 2 harm events. After 12 matched sessions without a decision, mark `dormant` with the counts shown. One canary per trigger predicate; sessions are paired within one model family.
 
+> **Corrective amendment (2026-10-27, D31):** `matched` alone no longer promotes an entry to `kept`. Automatic keep requires zero recurrences and zero harm across all matched sessions **plus** either `accepted_in_use` (`used_clean >= 4`: at least four completed matched sessions that actually read/invoked/retrieved the skill, evaluated/applied the hook, ran the script, invoked the agent, or exposed the approved personal instruction) or `comparative_support` (an engine-run bounded probe on an authorized task where the candidate beat the baseline and read the entry). A regressed probe retires the entry; ties, cost-worse and incomplete probes decide nothing.
 **Batch mode (per-task recursion, verifier required)**
 
 For `task-run`-style jobs, exercise cycles, and anything launched with `/evolve run`. The verifier is tests, a deterministic check script, a parity check against a known result, or a reconcile receipt; never a model's opinion of its own output.
@@ -195,6 +198,7 @@ The library is the set of entries in personal scope plus the ledger that tracks 
 
 **Lint, in full.** No session ids, task-specific file paths, or user names in the text. No string-match branch on the user's words. Every skill carries a trigger predicate and a trigger line. Every referenced script is shipped, mode 0644, and contains no network call, URL, `curl | sh`, or destructive git (`push -f`, `reset --hard`, `clean -fd`) unless the manifest explains it and approval is requested. Always-on text within 8 KB per branch, new text paid by deletion. Form order respected unless the manifest says why not. Workspace facts carry an `as_of`. A hook has a documented pass condition and cannot block a valid completion.
 
+> **Corrective amendment (2026-10-27, D30, D31):** `kept` requires ≥ 4 clean completed sessions with actual use (`accepted_in_use`) or a bound supporting comparison (`comparative_support`). Lint separates the 8,192 B always-on catalog budget (`always_on_bytes`: raw `name` + `description` catalog lines of kept/pinned/profile entries and overlapping provisional entries/agents, plus applied personal instructions and fragments), a 1,024 B per-description cap (`description_bytes`, plain single-line text via `catalog_text`), and an 8,192 B on-demand `SKILL.md` router body cap (`router_bytes`).
 **Scope and who merges**
 
 | Scope | Activation | Examples |
@@ -309,6 +313,7 @@ Three phases, each usable on its own. Phase 1 is the whole interactive loop; if 
 | 3 · Scope and transfer | 9–11 | `ship` for team and fork PRs; work→home export with approval; `stale` on drift; split-per-family when counters diverge | One team PR merged from evidence; one entry promoted to `shared` through a second branch |
 
 **Kill criterion for the project.** After six weeks of daily use: if no entry has reached `kept` over at least 4 matched sessions, and recurrence has not fallen on any trigger the library covers, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
+> **Corrective amendment (2026-10-27, D31):** `rematch report` evaluates the real-use half of the kill criterion on `used_clean >= 4` (`kept_in_use`: at least four clean completed sessions with actual use in the window, recurrence 0, harm 0), and reports `kept_comparative` separately so a bounded probe win is never counted as a real-use gain.
 
 **What is deliberately not in the plan:** a benchmark harness, a noise-floor suite, statistical margins, evaluator evolution, and an indexing layer beyond simhash dedup and trigger keys. Each is in the v1 tab for the day the loop proves it needs them.
 

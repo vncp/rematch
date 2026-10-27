@@ -262,7 +262,35 @@ pub fn cmd_status(ctx: &AppCtx, job: Option<&str>) -> Result<Value> {
         *by_status.entry(rematch_core::ledger::enum_str(&e.status)).or_default() += 1;
     }
     lines.insert(0, format!("entries: {}", by_status.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")));
-    Ok(json!({"jobs": jobs, "entries": by_status, "off": ctx.paths.is_off(), "lines": lines}))
+    // What waits for the user and what runs as an automatic trial, independent of the digest.
+    let actions = crate::actions::pending(ctx)?;
+    let applied = crate::actions::applied(ctx)?;
+    let trials = crate::actions::trials(ctx)?;
+    let mut head: Vec<String> = actions.iter().map(crate::actions::Action::line).collect();
+    head.extend(crate::actions::applied_line(&applied));
+    if !trials.is_empty() {
+        head.push(format!(
+            "{} automatic trial(s) running: {} (`rematch library ls`; `rematch library disable <id>` stops one)",
+            trials.len(),
+            trials.iter().filter_map(|t| t["name"].as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    // The latest probe outcome per entry (supports, regresses, skipped, awaiting authorization…).
+    let probes = crate::probes::statuses(ctx)?;
+    head.extend(probes.iter().filter_map(|p| p["line"].as_str().map(str::to_string)));
+    // After the `entries:` line, before the jobs.
+    lines.splice(1..1, head);
+    Ok(json!({
+        "jobs": jobs,
+        "entries": by_status,
+        "off": ctx.paths.is_off(),
+        "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied": applied.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "trials": trials,
+        "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
+        "probes": probes,
+        "lines": lines,
+    }))
 }
 
 /// Exclusive OS lock on a lock file (`pending/.lock` for reflect): `flock` on Unix,

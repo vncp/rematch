@@ -125,7 +125,12 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// (a repo-path glob therefore matches any cwd inside that repo). `**` or an empty
 /// glob matches everything.
 pub fn matches_repo(p: &Predicate, repo_or_cwd: &str) -> bool {
-    let glob = p.repo_glob.trim();
+    matches_repo_glob(&p.repo_glob, repo_or_cwd)
+}
+
+/// [`matches_repo`] for a bare glob (a `policy.json` `scopes` path glob).
+pub fn matches_repo_glob(glob: &str, repo_or_cwd: &str) -> bool {
+    let glob = glob.trim();
     if glob.is_empty() || glob == ANY_REPO {
         return true;
     }

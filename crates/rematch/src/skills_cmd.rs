@@ -62,18 +62,19 @@ pub fn cmd_skills(ctx: &AppCtx, cmd: SkillsCmd) -> Result<Value> {
     }
 }
 
-/// The shared sync for `cwd` (matched as its repo, else itself), the removal of staging links
-/// of provisional agents that are not approved (`library::unlink_unapproved_agents`), then the
-/// removal of the per-harness link dirs older versions kept (`claude-skills/`, `codex-skills/`).
-/// Returns the sync and the legacy dirs removed.
-pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<(SkillsSync, Vec<PathBuf>)> {
+/// The sync for a session at `cwd` (matched as its repo, else itself): the kept library
+/// (`library::sync_shared_skills`, which also follows agent approvals and off/on), then the
+/// place's own view (`library::sync_view`: kept links plus this place's provisional entries,
+/// and the approved provisional agents it exposes or withholds), then the removal of the
+/// per-harness link dirs older versions kept (`claude-skills/`, `codex-skills/`). Returns
+/// [`CwdSync`].
+pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<CwdSync> {
     let repo = repo_of(cwd);
+    let branch = library::branch_for(repo.as_deref(), cwd);
     let mut place = rematch_core::predicate::Place::locate(repo.as_deref(), cwd);
-    place.domain = rematch_core::domain::place_domain(&ctx.paths, &place, &library::branch_for(repo.as_deref(), cwd));
-    let s = library::sync_shared_skills(&ctx.ledger, &ctx.paths, Some(&place))?;
-    for name in library::unlink_unapproved_agents(&ctx.ledger, &ctx.paths)? {
-        eprintln!("rematch: provisional agent {name} unlinked: its AGENT.md is not approved");
-    }
+    place.domain = rematch_core::domain::place_domain(&ctx.paths, &place, &branch);
+    let shared = library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
+    let view = library::sync_view(&ctx.ledger, &ctx.paths, &place, &branch, cwd)?;
     let mut removed = Vec::new();
     for name in LEGACY_LINK_DIRS {
         let dir = ctx.paths.root.join(name);
@@ -91,7 +92,27 @@ pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<(SkillsSync, Vec<PathBuf>)> 
             removed.push(dir);
         }
     }
-    Ok((s, removed))
+    Ok(CwdSync { view, shared, removed })
+}
+
+/// What [`sync_cwd`] did for one session's place.
+pub struct CwdSync {
+    /// The place's view: what a host that mounts a per-session dir (omp, Pi, OpenCode) loads.
+    pub view: SkillsSync,
+    /// The kept library `REMATCH_ROOT/skills/`: what a host with one dir for every session
+    /// (Claude Code's plugin, Codex) loads.
+    pub shared: SkillsSync,
+    /// Legacy per-harness link dirs removed.
+    pub removed: Vec<PathBuf>,
+}
+
+/// The skill entry a read of `path` opened: the `rematch.json` of the SKILL.md's directory
+/// (through a view or shared-dir link, a kept copy, or the staging dir itself). `None` for a
+/// skill rematch did not write.
+pub fn entry_of_skill_path(path: &str) -> Option<EntryId> {
+    let p = Path::new(path);
+    let dir = if p.file_name().is_some_and(|n| n == library::SKILL_MD) { p.parent()? } else { p };
+    library::load_entry(dir).ok().map(|e| e.id)
 }
 
 /// `<plugin root>/skills` → `REMATCH_ROOT/skills`, created or re-pointed (the repo cannot
@@ -216,18 +237,19 @@ pub fn claude_agent_file(agent_md: &str) -> Result<String> {
     Ok(SkillDoc { frontmatter: fm, body: doc.body }.render())
 }
 
-/// The agent files Claude Code should load: every approved provisional agent
-/// ([`library::agent_approved`]; omp offers each through `REMATCH_ROOT/agents/` in every
-/// session) and every kept/pinned one, as `<name>.md` → `(id, Claude Code file)`. A
-/// provisional agent wins over a kept one of its name: it is the one being measured.
+/// The agent files Claude Code should load: every kept/pinned agent entry, as `<name>.md` →
+/// `(id, Claude Code file)`; none while rematch is off. Provisional agents are never copied: a
+/// plugin's `agents/` is read by every Claude Code session on the machine and no hook can
+/// scope it to a place, so a trial agent there would reach unrelated repos; trial agents reach a
+/// repo's sessions as repo-local copies instead ([`sync_repo_trials`]).
 fn wanted_agents(ctx: &AppCtx) -> Result<BTreeMap<String, (EntryId, String)>> {
     let mut out = BTreeMap::new();
-    for status in [Status::Kept, Status::Pinned, Status::Provisional] {
+    if ctx.paths.is_off() {
+        return Ok(out);
+    }
+    for status in [Status::Kept, Status::Pinned] {
         for e in ctx.ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })? {
-            if e.kind != Kind::Agent
-                || !library::load_entry(&e.path).is_ok_and(|x| x.id == e.id)
-                || (status == Status::Provisional && !library::agent_approved(&e))
-            {
+            if e.kind != Kind::Agent || !library::load_entry(&e.path).is_ok_and(|x| x.id == e.id) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(e.path.join(AGENT_MD)) else { continue };
@@ -360,15 +382,190 @@ fn codex(ctx: &AppCtx, repo: Option<&Path>) -> Result<(Vec<PathBuf>, Vec<PathBuf
     Ok((reached, migrated))
 }
 
+/// One skill only a place's view carries, for hosts that list it in session context instead of
+/// a per-session skill directory (Claude Code's `SessionStart`): a provisional entry on trial
+/// here, or a kept/pinned entry or profile source whose place scope (`policy.json` `scopes`)
+/// matches here and which the host's global mount therefore lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrialSkill {
+    /// The entry behind the link; `None` for a profile source this machine has no entry for.
+    pub id: Option<EntryId>,
+    pub name: String,
+    /// The catalog line text, only when it passes `package::catalog_text_problem` and the
+    /// description cap (else the entry is withheld and reported, never rewritten).
+    pub description: String,
+    /// `<view>/skills/<name>/SKILL.md`: read on demand.
+    pub path: PathBuf,
+    /// A provisional entry (on trial); `false` for a scoped kept skill.
+    pub trial: bool,
+}
+
+/// `(name, problem)` of a provisional skill withheld from a session's catalog.
+pub type Withheld = (String, String);
+
+/// The view's provisional skills and scoped kept skills ([`SkillsSync::scoped`]) as
+/// [`TrialSkill`]s, plus the [`Withheld`] ones whose metadata is not plain bounded catalog text.
+pub fn trial_skills(ctx: &AppCtx, s: &SkillsSync) -> Result<(Vec<TrialSkill>, Vec<Withheld>)> {
+    let limit = rematch_core::lint::LintConfig::load(&ctx.improver_file("lint.toml")).unwrap_or_default().limits.description_bytes;
+    let (mut ok, mut bad) = (Vec::new(), Vec::new());
+    let Some(dir) = s.dirs.first() else { return Ok((ok, bad)) };
+    let mut items: Vec<(Option<EntryId>, String, PathBuf, bool)> = Vec::new();
+    for id in &s.provisional {
+        if let Some(e) = ctx.ledger.get_entry(id)? {
+            items.push((Some(e.id), e.name, e.path, true));
+        }
+    }
+    for name in &s.scoped {
+        let Some(target) = s.links.get(name) else { continue };
+        let id = library::load_entry(target).ok().map(|e| e.id).filter(|id| s.visible.contains(id));
+        items.push((id, name.clone(), target.clone(), false));
+    }
+    for (id, name, src, trial) in items {
+        let Some(doc) = std::fs::read_to_string(src.join(library::SKILL_MD)).ok().and_then(|t| SkillDoc::parse(&t).ok()) else { continue };
+        let description = doc.get_str("description").unwrap_or("").to_string();
+        let problem = rematch_core::package::catalog_text_problem(&description)
+            .or_else(|| (description.len() > limit).then(|| format!("description {} B > {limit} B", description.len())));
+        match problem {
+            Some(p) => bad.push((name, p)),
+            None => ok.push(TrialSkill { id, path: dir.join(&name).join(library::SKILL_MD), name, description, trial }),
+        }
+    }
+    Ok((ok, bad))
+}
+
+/// What the session's always-on catalog costs (DESIGN §12): every entry behind the view's links
+/// and every exposed provisional agent, by [`rematch_core::lint::entry_cost`] (raw metadata,
+/// an upper bound where a host previews or compresses descriptions), plus the personal
+/// instructions omp applies now; with the problems lint would report on each line. The
+/// on-demand body bytes are listed apart.
+pub fn catalog(ctx: &AppCtx, s: &SkillsSync) -> Result<Value> {
+    let cfg = rematch_core::lint::LintConfig::load(&ctx.improver_file("lint.toml")).unwrap_or_default();
+    let mut items = Vec::new();
+    let (mut catalog_bytes, mut body_bytes) = (0usize, 0usize);
+    let mut push = |id: Option<&str>, name: &str, kind: Kind, dir: &Path| {
+        let c = rematch_core::lint::entry_cost(dir, kind);
+        let doc = std::fs::read_to_string(dir.join(library::primary_doc(kind))).ok().and_then(|t| SkillDoc::parse(&t).ok());
+        let description = doc.as_ref().and_then(|d| d.get_str("description")).unwrap_or("");
+        let problem = rematch_core::package::catalog_text_problem(description)
+            .or_else(|| (c.description > cfg.limits.description_bytes).then(|| format!("description {} B > {} B", c.description, cfg.limits.description_bytes)));
+        catalog_bytes += c.catalog;
+        body_bytes += c.body;
+        items.push(json!({"id": id, "name": name, "kind": kind, "catalog": c.catalog, "body": c.body, "problem": problem}));
+    };
+    for (name, target) in &s.links {
+        let e = s.visible.iter().filter_map(|id| ctx.ledger.get_entry(id).ok().flatten()).find(|e| &e.name == name && &e.path == target);
+        push(e.as_ref().map(|e| e.id.as_str()), name, e.as_ref().map_or(Kind::Skill, |e| e.kind), target);
+    }
+    for name in &s.agents.exposed {
+        let e = ctx
+            .ledger
+            .list_entries(&EntryFilter { status: Some(Status::Provisional), name: Some(name.clone()), ..Default::default() })?
+            .into_iter()
+            .find(|e| e.kind == Kind::Agent);
+        if let Some(e) = e {
+            push(Some(&e.id), name, Kind::Agent, &e.path);
+        }
+    }
+    let instructions = rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?;
+    let instruction_bytes: usize = instructions.exposed.iter().map(|x| x.bytes).sum();
+    Ok(json!({
+        "bytes": catalog_bytes + instruction_bytes,
+        "catalog_bytes": catalog_bytes,
+        "instruction_bytes": instruction_bytes,
+        "limit": cfg.limits.always_on_bytes,
+        "on_demand_body_bytes": body_bytes,
+        "entries": items,
+        "bound": "raw name + description bytes with the host's line syntax: an upper bound where a host previews or compresses descriptions (omp shows <= 100 chars until its compressor answers)",
+    }))
+}
+
+/// Repo-local trial delivery for hosts whose only per-place discovery roots are the repo's own
+/// (`project_views`): Codex's `<repo>/.agents/skills/rematch-trials` link to the repo's trials
+/// (`library::sync_trials`: its provisional skills and the scoped kept skills of this repo),
+/// Claude Code's `<repo>/.claude/agents/<name>.md` copies of the
+/// approved provisional agents that match the repo's top. An agent whose name a native Claude
+/// Code agent holds (the user's `<config>/agents/`, another file of the project's) is withheld:
+/// that definition is what Claude Code would offer. `None` outside a repo. Returns the sync and
+/// the lines to show.
+pub fn sync_repo_trials(ctx: &AppCtx, cwd: &Path, codex: bool, claude: bool) -> Result<Option<(rematch_core::project_views::RepoSync, Vec<String>)>> {
+    let Some(repo) = repo_of(cwd) else { return Ok(None) };
+    let branch = library::branch_for(Some(&repo), &repo);
+    let mut top = rematch_core::predicate::Place::locate(Some(&repo), &repo);
+    top.domain = rematch_core::domain::place_domain(&ctx.paths, &top, &branch);
+    let scopes = rematch_core::domain::load_scopes(&ctx.paths)?;
+    let mut want = rematch_core::project_views::RepoWant::default();
+    let mut lines = Vec::new();
+    if codex {
+        let t = library::sync_trials(&ctx.ledger, &ctx.paths, &top, &branch)?;
+        lines.push(format!(
+            "Codex: {} skill(s) of this repo only (provisional, or scoped here by `policy scope`) through {}",
+            t.linked.len(),
+            repo.join(rematch_core::project_views::CODEX_TRIALS).display()
+        ));
+        if !t.subpath_only.is_empty() {
+            lines.push(format!(
+                "Codex: {} skill(s) scoped to a subdirectory are not offered (a repo root cannot express a subpath): {}",
+                t.subpath_only.len(),
+                t.subpath_only.join(", ")
+            ));
+        }
+        want.trials = Some(t.dir);
+    }
+    if claude {
+        let project_dir = repo.join(rematch_core::project_views::CLAUDE_AGENTS);
+        let names_in = |dir: &Path, skip: &dyn Fn(&str) -> bool| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|f| f.path().extension().is_some_and(|x| x == "md") && !skip(&f.file_name().to_string_lossy()))
+                .filter_map(|f| std::fs::read_to_string(f.path()).ok().and_then(|t| SkillDoc::parse(&t).ok()).and_then(|d| d.get_str("name").map(str::to_string)))
+                .collect()
+        };
+        let provisional = ctx.ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
+        let ours: Vec<String> = provisional.iter().filter(|e| e.kind == Kind::Agent).map(|e| format!("{}.md", e.name)).collect();
+        let mut native = rematch_core::import_claude::config_dir().map(|d| names_in(&d.join("agents"), &|_| false)).unwrap_or_default();
+        native.extend(names_in(&project_dir, &|f| ours.iter().any(|o| o == f)));
+        let mut copies = BTreeMap::new();
+        let here = |e: &&rematch_core::types::Entry| {
+            rematch_core::predicate::matches_place(&e.predicate, &top) && rematch_core::domain::scope_allows(&scopes, &e.name, &top)
+        };
+        for e in provisional.iter().filter(|e| e.kind == Kind::Agent && library::agent_approved(e)).filter(here) {
+            if native.contains(&e.name) {
+                lines.push(format!("Claude Code: provisional agent {} not offered: an agent of that name of yours wins", e.name));
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(e.path.join(AGENT_MD)) else { continue };
+            match claude_agent_file(&text) {
+                Ok(body) => {
+                    copies.insert(format!("{}.md", e.name), (e.id.clone(), body));
+                }
+                Err(err) => lines.push(format!("Claude Code: agent {} not copied: {err:#}", e.name)),
+            }
+        }
+        if !copies.is_empty() {
+            lines.push(format!("Claude Code: {} provisional agent(s) of this repo in {} (from its next session)", copies.len(), project_dir.display()));
+        }
+        want.claude_agents = Some(copies);
+    }
+    let s = rematch_core::project_views::sync_repo(&ctx.paths, &repo, &want)?;
+    for (what, why) in &s.withheld {
+        lines.push(format!("not delivered in this repo: {what} ({why})"));
+    }
+    Ok(Some((s, lines)))
+}
+
 fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
     let repo = repo_of(&ctx.cwd);
-    let (s, mut migrated) = sync_cwd(ctx, &ctx.cwd)?;
+    let synced = sync_cwd(ctx, &ctx.cwd)?;
+    let (s, mut migrated) = (synced.view, synced.removed);
     let dir = &ctx.paths.skills_shared;
     let place = repo.as_deref().unwrap_or(&ctx.cwd).display().to_string();
+    let view = s.dirs.first().map(|d| d.display().to_string()).unwrap_or_default();
     let mut lines = vec![if s.off {
-        format!("rematch is off: {} holds no links", dir.display())
+        "rematch is off: the shared dir, every view and the provisional agent links hold no links".to_string()
     } else {
-        format!("{}: {} skill link(s) after syncing {place}", dir.display(), s.total)
+        format!("{view}: {} skill link(s) for {place} ({} provisional here, kept library in {})", s.total, s.provisional.len(), dir.display())
     }];
     if !s.added.is_empty() {
         lines.push(format!("added: {}", s.added.join(", ")));
@@ -379,11 +576,35 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
     if !s.untouched.is_empty() {
         lines.push(format!("not links, left alone: {}", s.untouched.join(", ")));
     }
+    if !s.scoped.is_empty() {
+        lines.push(format!("scoped to this place by `policy scope` (not in the kept library, not elsewhere): {}", s.scoped.join(", ")));
+    }
+    if !s.agents.exposed.is_empty() {
+        lines.push(format!("provisional agents offered here: {}", s.agents.exposed.join(", ")));
+    }
+    if !s.agents.withheld.is_empty() {
+        lines.push(format!("provisional agents of other places, withheld here: {}", s.agents.withheld.join(", ")));
+    }
+    if !s.agents.shadowed.is_empty() {
+        lines.push(format!("provisional agents not offered here: a user or project agent of the same name wins ({})", s.agents.shadowed.join(", ")));
+    }
     let mut out = serde_json::to_value(&s)?;
     out["cwd"] = json!(ctx.cwd);
     out["repo"] = json!(repo);
+    out["shared_dir"] = json!(dir);
     // Kept skills linked from the profile (this machine's keeps, other machines', adopted ones).
     out["profile_sources"] = json!(rematch_core::profile::kept_sources(&ctx.paths).len());
+    if !s.off {
+        let c = catalog(ctx, &s)?;
+        lines.push(format!(
+            "always-on catalog {} B of {} B (skill/agent lines {} B + personal instructions {} B; raw upper bound); on-demand bodies {} B",
+            c["bytes"], c["limit"], c["catalog_bytes"], c["instruction_bytes"], c["on_demand_body_bytes"]
+        ));
+        for item in c["entries"].as_array().into_iter().flatten().filter(|i| !i["problem"].is_null()) {
+            lines.push(format!("catalog line of {} needs a fix (not rewritten): {}", item["name"].as_str().unwrap_or("?"), item["problem"].as_str().unwrap_or("")));
+        }
+        out["catalog"] = c;
+    }
     match harness {
         Some(SyncHarness::ClaudeCode) => match claude_plugin_root() {
             Some(root) => {
@@ -397,6 +618,11 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
                         }
                     }
                     out["agents"] = serde_json::to_value(&a)?;
+                }
+                lines.push("Claude Code: the plugin's skills/ and agents/ are the kept library (every session); this place's provisional skills and the kept skills scoped to it (`policy scope`) reach a session as SessionStart context naming their SKILL.md, its provisional agents as repo-local copies".into());
+                if let Some((rs, more)) = sync_repo_trials(ctx, &ctx.cwd, false, true)? {
+                    lines.extend(more);
+                    out["repo_trials"] = serde_json::to_value(&rs)?;
                 }
                 lines.push("Claude Code sees links added after its skill scan from its next session (or SessionStart re-scan), and agents copied after its start from its next session".into());
             }
@@ -417,13 +643,21 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
                     user.join("rematch").display()
                 ));
             }
-            lines.push("Codex has no per-session gating: every link is visible in every Codex session; counting still needs a predicate hit".into());
+            match sync_repo_trials(ctx, &ctx.cwd, true, false)? {
+                Some((rs, more)) => {
+                    lines.extend(more);
+                    out["repo_trials"] = serde_json::to_value(&rs)?;
+                }
+                None => lines.push("Codex: not in a git repo, so no repo skill root to scope trials to: provisional skills are not offered here (the kept library is)".into()),
+            }
+            lines.push("Codex has no subagent definitions: provisional agents have no Codex form".into());
             out["reached_from"] = json!(reached);
         }
         Some(SyncHarness::Pi) => lines.push(
-            "Pi loads the shared dir through the rematch Pi package (`resources_discover`), at session start and `/reload`".into(),
+            "Pi loads this place's view through the rematch Pi package (`resources_discover`), at session start and `/reload`; Pi has no subagent definitions".into(),
         ),
-        Some(SyncHarness::Omp | SyncHarness::OpenCode) | None => {}
+        Some(SyncHarness::OpenCode) => lines.push("OpenCode loads this place's view through the rematch plugin (`skills.paths`, per process)".into()),
+        Some(SyncHarness::Omp) | None => {}
     }
     for m in &migrated {
         lines.push(format!("migrated: removed or re-pointed {}", m.display()));
@@ -490,11 +724,17 @@ mod tests {
         std::os::unix::fs::symlink(&e.path, claude.join("ledger-tests")).unwrap();
         std::os::unix::fs::symlink(&e.path, codex.join("ledger-tests")).unwrap();
 
-        let (s, removed) = sync_cwd(&c, &repo).unwrap();
-        assert_eq!(s.added, vec!["ledger-tests".to_string()]);
-        assert_eq!(removed, vec![claude.clone()], "a dir holding more than links stays");
+        let s = sync_cwd(&c, &repo).unwrap();
+        assert_eq!(s.view.added, vec!["ledger-tests".to_string()]);
+        assert_eq!(s.removed, vec![claude.clone()], "a dir holding more than links stays");
         assert!(!claude.exists() && codex.join("kept-by-user").is_dir() && !codex.join("ledger-tests").exists());
-        assert_eq!(std::fs::read_link(c.paths.skills_shared.join("ledger-tests")).unwrap(), e.path);
+        assert_eq!(std::fs::read_link(s.view.dirs[0].join("ledger-tests")).unwrap(), e.path);
+        assert!(std::fs::symlink_metadata(c.paths.skills_shared.join("ledger-tests")).is_err(), "a provisional entry stays out of the shared dir");
+        // another repo's session: its view never lists this repo's trial
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let o = sync_cwd(&ctx(&base, &other), &other).unwrap();
+        assert!(o.view.links.is_empty() && o.view.dirs != s.view.dirs, "{:?}", o.view);
     }
 
     #[test]

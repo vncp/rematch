@@ -409,7 +409,7 @@ fn split(ctx: &AppCtx, a: &ImproveArgs, base: &Entry, dir: &Path, md: &str, bran
         &entry,
         &cfg,
         &LintContext {
-            branch_other_bytes: lint::branch_always_on_bytes(&ctx.paths.staging.join(branch), &entry.path),
+            catalog_other_bytes: library::catalog_other_bytes(&ctx.ledger, &ctx.paths, &entry, &entry.path)?,
             user_names: reflect::user_names(),
             transfer: false,
         },

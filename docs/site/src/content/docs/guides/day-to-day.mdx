@@ -5,7 +5,7 @@ description: Use your harness as usual; check, manage and stop rematch when you 
 
 import { Aside } from '@astrojs/starlight/components';
 
-Use omp as usual. rematch traces each session, can propose a change after you correct the agent, and keeps only what later sessions confirm. Everything on this page is optional.
+Use omp as usual. rematch traces each session, can propose a change after you correct the agent, and keeps what sustained clean use or an authorized probe confirms. Everything on this page is optional.
 
 In a terminal, add `--text` for readable lines instead of JSON. How `/rematch` commands map to the CLI: [below](#omp-commands-and-the-cli).
 
@@ -15,8 +15,8 @@ In a terminal, add `--text` for readable lines instead of JSON. How `/rematch` c
 |---|---|
 | During a session | traces it; no model call |
 | You correct the agent (*"no, …"*, *"revert that"*, an interrupt, ≥ 3 tool errors in any 6 consecutive results) | flags the session at exit |
-| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, up to 3 model calls); shows one line if it staged something |
-| Later matching sessions | counts them: 4 clean → kept, 2 recurrences or 2 harms → retired |
+| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, ≤ 3 editor/classifier calls); news arrives as a toast, and the footer shows `rematch: N waiting · /rematch review` while any action needs your decision |
+| Later matching sessions | exposes provisional trials only in matching places (`views/<key>/`) and counts `matched`, `used`, `used_clean`, `recurrence` and `harm`; a reflect pass can also run 1 authorized automatic probe. ≥ 4 clean actual uses (`accepted_in_use`) or a supporting probe (`comparative_support`) → kept; 2 recurrences, 2 harms or a regressed probe → retired |
 
 The reflection uses the models you configured; `rematch doctor --text` shows which.
 
@@ -24,13 +24,15 @@ The reflection uses the models you configured; `rematch doctor --text` shows whi
 
 | Ask | You get |
 |---|---|
-| `/rematch status` | entries by status, pending flags, whether it is off |
-| `/rematch why` | for the last session: entries loaded, predicate hits, redirects and their class, counters |
-| `/rematch library` | every entry with its raw counts, what is pending approval, whether it carries a fragment that is active in your prompt, its fork path, and whether it is ready to ship (`team` or `fork`) |
-| `/rematch digest` | staged, kept or retired since you last looked; approvals waiting (one item per entry: scripts, hook, subagent, prompt text); entries ready to ship, as `ship <scope> <name>: <detail> → /rematch ship --scope <scope> --entry <id>`, shown once |
+| `/rematch status` | entries by status, waiting `actions`, `applied` personal instruction blocks, active automatic `trials`, personal `instructions` exposure, latest `probes`, detached jobs, and whether rematch is off |
+| `/rematch review` (`alt+e` in omp) | one dialog per waiting action (`Approve` / `Decline` / `Inspect` / `Later`); `Inspect` shows the full diff inside the dialog |
+| `/rematch why` | for the last session: entries loaded, personal instructions loaded from `<agent_dir>/AGENTS.md`, predicate hits, redirects and their class, counters |
+| `/rematch library` | every entry with its raw counts and surfaces, plus waiting `actions`, `applied` blocks, running `trials` and personal `instructions` exposure |
+| `/rematch digest` | status changes since the last digest, plus every waiting action (listed every time until you decide) |
+| `/rematch inspect <action-id>` | one action in full: diff, target, reach, scope and its exact approve and decline commands |
 | `rematch doctor --text` | omp version, model roles, plugin linked, ledger state |
 
-Read `why` when something surprises you. It shows exactly why an entry loaded or not (`glob hit · predicate miss`) and what the classifier called your redirect.
+Read `why` when something surprises you. It shows why an entry loaded or not (`glob hit · predicate miss`), which personal instructions loaded from `<agent_dir>/AGENTS.md`, and what the classifier called your redirect.
 
 ## omp commands and the CLI
 
@@ -38,9 +40,12 @@ Most `/rematch <sub>` commands run `rematch <sub>`. These differ:
 
 | In omp | In a terminal |
 |---|---|
+| `/rematch review` (or `alt+e`) | interactive review of `rematch status` / `rematch library inspect <id>` |
 | `/rematch why` | `rematch library why` (defaults to the current session) |
 | `/rematch library` | `rematch library ls` |
-| `/rematch disable\|rollback\|approve\|decline …` | `rematch library disable\|rollback\|approve\|decline …` |
+| `/rematch inspect <id>` | `rematch library inspect <id>` |
+| `/rematch approve\|decline <id>` (opens the action's dialog, hash included) | `rematch library approve\|decline <id> --sha <hash>` (the command `inspect` prints) |
+| `/rematch disable\|rollback <id>` | `rematch library disable\|rollback <id>` |
 | `/rematch mark <class>` | `rematch mark --session <current session> --class <class>` |
 | `/rematch digest` | `rematch digest --cwd <current dir>` |
 
@@ -64,18 +69,19 @@ rematch library why <session> --asof 2026-10-20T13:05
 
 | Command | Effect |
 |---|---|
-| `/rematch off` · `/rematch on` | stop or resume tracing and reflection immediately |
-| `REMATCH=0 omp` | off for one process |
-| `/rematch disable <id>` | retire one entry now |
+| `/rematch off` · `/rematch on` | stop or resume tracing and reflection immediately; `off` withdraws rematch skill dirs, provisional agents, repo-local trial items and the unchanged blocks in `<agent_dir>/AGENTS.md`, and `on` puts them back (context already sent to a running session stays until a new session starts) |
+| `REMATCH=0 omp` | off for one process (withholds all rematch skills and provisional agents) |
+| `/rematch disable <id>` | retire one entry now (its unchanged personal `AGENTS.md` block goes too) |
 | `/rematch rollback <skill>` | previous version back, immediately |
 | `rematch uninstall` | prints what it would remove |
-| `rematch uninstall --yes` | removes every file rematch wrote and nothing else |
+| `rematch uninstall --yes` | removes every file and unchanged managed block rematch wrote, and nothing else |
 
 <Aside type="note" title="What uninstall keeps">
-It restores predecessors of kept entries. A profile (`~/.rematch/profile/`, your git repo) stays; only the links into it go.
+It restores predecessors of kept entries, preserves all text outside rematch markers in `<agent_dir>/AGENTS.md` (and leaves any block you edited untouched), and leaves `~/.rematch/profile/` (your git repo) in place while removing the links into it.
 </Aside>
 
 ## Related
 
+- Review waiting actions and personal instructions: [approve scripts, hooks and instructions](/rematch/guides/approve-scripts-and-hooks/) and [automatic probes](/rematch/guides/automatic-probes/).
 - Share an entry beyond this machine: [share to a team or fork](/rematch/guides/share/).
 - In Claude Code, the same commands are `/rematch:rematch-*` ([harness capabilities](/rematch/reference/harnesses/#commands-per-harness)).

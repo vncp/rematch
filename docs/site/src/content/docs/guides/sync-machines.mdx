@@ -5,7 +5,7 @@ description: Keep one omp setup on every machine with a git-backed profile.
 
 import { Steps, Aside } from '@astrojs/starlight/components';
 
-Put your omp setup in a private git repo, and every machine that syncs it loads the same skills, agents, hooks and settings. This is rematch's profile, not omp's `--profile`.
+Put your omp setup in a private git repo, and every machine that syncs it loads the same skills, agents, hooks, personal instructions and settings. This is rematch's profile, not omp's `--profile`.
 
 What it holds and what stays per machine: [the profile](/rematch/concepts/profile/).
 
@@ -35,6 +35,7 @@ What it holds and what stays per machine: [the profile](/rematch/concepts/profil
 
 - Hand-written skills become **pinned** entries: measured like any entry, never moved, replaced or retired by the loop.
 - Without `--remote` the profile stays local. Add one later: `git -C ~/.rematch/profile remote add origin <url>`.
+- Personal instructions you approve travel as `profile/instructions/<name>.md` and are written into each machine's own `<agent_dir>/AGENTS.md`. Withdrawing one on any machine withdraws it on all of them ([personal instructions across machines](/rematch/concepts/profile/#personal-instructions-across-machines)).
 
 ## Add one more skill or agent
 

@@ -29,6 +29,8 @@ pub mod package; // SKILL.md frontmatter, package layout, mechanical split (>8 K
 pub mod dedup; // simhash near-duplicate routing
 pub mod experience; // EXPERIENCE.md writer/reader
 pub mod rate; // admissions / caps
+pub mod instructions; // personal `<agent_dir>/AGENTS.md` sections: exact-hash approvals, sync, exposure
+pub mod project_views; // repo-local, ignored trial delivery for hosts without per-session roots (Codex, Claude Code agents)
 pub mod identity; // repo_remote normalization, subpath, HEAD (ADR 001)
 pub mod profile; // REMATCH_ROOT/profile: layout, views linked into omp/rematch, roles.yml (DESIGN §20)
 

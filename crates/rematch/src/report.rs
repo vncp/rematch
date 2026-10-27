@@ -1,5 +1,9 @@
 //! `rematch report` (ADR 001 L4; SPEC §"Kill criterion for the project"). Over a window:
-//! (a) entries that reached `kept` with ≥ 4 matched sessions; (b) per trigger predicate,
+//! (a) kept entries with their evidence: matched sessions (observational), sessions with
+//! actual use, clean actual uses and use unknown (legacy rows, unknown completion), and the
+//! engine's retention reason; an entry is kept in real use with ≥ `KEEP_MIN_USED` clean
+//! actual uses, while a comparative-support keep is reported apart (bounded comparison,
+//! not real-use gain); (b) per trigger predicate,
 //! the recurrence of its redirect class on matched sessions that loaded an entry of the
 //! trigger (with-arm) against matched sessions that loaded none (before-arm), grouped by the
 //! trigger's domain (DESIGN §6 "Domain") with a per-domain summary; a predicate tune's
@@ -15,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Result};
 use clap::Args;
-use rematch_core::counters::{class_recurs, redirect_class_of, DAY_MS, KEEP_MIN_MATCHED};
+use rematch_core::counters::{class_recurs, redirect_class_of, retention_label, DAY_MS, KEEP_MIN_USED};
+use rematch_core::types::RetentionReason;
 use rematch_core::ledger::{redirect_key, CounterRow, JournalRow};
 use rematch_core::library::is_builtin;
 use rematch_core::predicate::{count_match, predicate_hash, Place};
@@ -225,7 +230,7 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
     for (m, e) in data.entries.iter().filter(|(_, e)| e.status == Status::Kept) {
         let mine = lineage_of(m, &e.id);
         let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let (mut recurrence, mut harm) = (0u32, 0u32);
+        let (mut recurrence, mut harm, mut used, mut used_clean, mut unknown) = (0u32, 0u32, 0u32, 0u32, 0u32);
         for (cm, c) in &data.counters {
             let own_machine = cm == m;
             let ours = (own_machine && c.row.entry_id == e.id)
@@ -235,12 +240,25 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
             if ours && c.row.matched > 0 && seen.insert(c.row.session_id.as_str()) {
                 recurrence += c.row.recurrence;
                 harm += c.row.harm;
+                match c.row.used {
+                    Some(u) if u > 0 => {
+                        used += 1;
+                        if c.row.recurrence == 0 && c.row.harm == 0 {
+                            used_clean += 1;
+                        }
+                    }
+                    Some(_) => {}
+                    None => unknown += 1,
+                }
             }
         }
+        let reason = retention_label(e);
         kept.push(json!({
             "machine": m, "id": e.id, "name": e.name, "content_sha256": e.content_sha256, "builtin": is_builtin(e),
-            "matched": seen.len(), "recurrence": recurrence, "harm": harm,
-            "reached": seen.len() as u32 >= KEEP_MIN_MATCHED,
+            "matched": seen.len(), "used": used, "used_clean": used_clean, "use_unknown": unknown,
+            "recurrence": recurrence, "harm": harm, "retention": reason,
+            "in_use": used_clean >= KEEP_MIN_USED && recurrence == 0 && harm == 0,
+            "comparative": reason == Some(RetentionReason::ComparativeSupport),
         }));
     }
 
@@ -391,18 +409,24 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
     }
 
     // (c) the verdict, built-ins aside.
-    let reached: Vec<String> = kept
-        .iter()
-        .filter(|k| k["reached"] == true && k["builtin"] == false)
-        .map(|k| k["name"].as_str().unwrap_or_default().to_string())
-        .collect();
+    let names_where = |key: &str| -> Vec<String> {
+        kept.iter()
+            .filter(|k| k[key] == true && k["builtin"] == false)
+            .map(|k| k["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let in_use = names_where("in_use");
+    let comparative = names_where("comparative");
     let yes = |b: bool| if b { "yes" } else { "no" };
+    let list = |v: &[String]| if v.is_empty() { String::new() } else { format!(" ({})", v.join(", ")) };
     let verdict_line = format!(
-        "verdict: an entry reached kept over ≥ {KEEP_MIN_MATCHED} matched sessions: {}{}; recurrence fell on a covered trigger: {}{}",
-        yes(!reached.is_empty()),
-        if reached.is_empty() { String::new() } else { format!(" ({})", reached.join(", ")) },
+        "verdict: an entry kept in real use (≥ {KEEP_MIN_USED} clean actual uses): {}{}; recurrence fell on a covered trigger: {}{}; kept on comparative support: {}{}",
+        yes(!in_use.is_empty()),
+        list(&in_use),
         yes(!fell_on.is_empty()),
-        if fell_on.is_empty() { String::new() } else { format!(" ({})", fell_on.join(", ")) },
+        list(&fell_on),
+        yes(!comparative.is_empty()),
+        list(&comparative),
     );
 
     let mut lines = Vec::new();
@@ -411,11 +435,14 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
     }
     for k in &kept {
         lines.push(format!(
-            "kept {}{}: {} matched session(s) in the window ({}), recurrence {}, harm {}",
+            "kept {}{} [{}]: {} matched, {} used ({} clean, {} unknown) in the window, recurrence {}, harm {}",
             k["name"].as_str().unwrap_or_default(),
             if k["builtin"] == true { " (built-in)" } else { "" },
+            k["retention"].as_str().unwrap_or("legacy"),
             k["matched"],
-            if k["reached"] == true { format!("≥ {KEEP_MIN_MATCHED}") } else { format!("< {KEEP_MIN_MATCHED}") },
+            k["used"],
+            k["used_clean"],
+            k["use_unknown"],
             k["recurrence"],
             k["harm"],
         ));
@@ -431,8 +458,9 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
         "triggers": triggers,
         "domains": domains,
         "tunes": tunes,
-        "verdict": {"kept_over_min": !reached.is_empty(), "kept_entries": reached,
-                    "recurrence_fell": !fell_on.is_empty(), "fell_on": fell_on},
+        "verdict": {"kept_in_use": !in_use.is_empty(), "kept_entries": in_use,
+                    "recurrence_fell": !fell_on.is_empty(), "fell_on": fell_on,
+                    "kept_comparative": !comparative.is_empty(), "comparative_entries": comparative},
     });
     (out, lines)
 }
@@ -523,6 +551,10 @@ mod tests {
             let mut s = session(&format!("w-{i}"), "payments", Some("/w/payments"), "anthropic/claude-opus", now - (10 - i) * DAY_MS);
             s.loaded_entries = vec![e.id.clone()];
             s.loaded_entry_shas = e.content_sha256.clone().into_iter().collect();
+            // Actual, completed use: the skill was read and the run settled.
+            s.skill_entries = vec![e.id.clone()];
+            s.turns = 2;
+            s.run_completed = Some(true);
             ctx.ledger.upsert_session(&s).unwrap();
             rematch_core::counters::fold_session(&ctx.ledger, &s, std::slice::from_ref(&e), &[]).unwrap();
         }
@@ -540,7 +572,11 @@ mod tests {
 
     fn check(out: &Value) {
         let kept = &out["kept"].as_array().unwrap()[0];
-        assert_eq!((kept["name"].as_str(), kept["matched"].as_u64(), kept["reached"].as_bool()), (Some("run-tests-before-commit"), Some(4), Some(true)), "{out}");
+        assert_eq!(
+            (kept["name"].as_str(), kept["matched"].as_u64(), kept["used_clean"].as_u64(), kept["in_use"].as_bool(), kept["retention"].as_str()),
+            (Some("run-tests-before-commit"), Some(4), Some(4), Some(true), Some("legacy")),
+            "{out}"
+        );
         let t = out["triggers"].as_array().unwrap().iter().find(|t| t["names"] == "run-tests-before-commit").unwrap();
         assert_eq!(t["redirect_class"], "correction");
         assert_eq!(t["with"], json!({"sessions": 4, "recurred": 0, "redirects": 0, "rate": 0.0}), "{t}");
@@ -548,11 +584,12 @@ mod tests {
         assert_eq!((t["delta"].as_f64(), t["fell"].as_bool(), t["covered"].as_bool()), (Some(-0.5), Some(true), Some(true)));
         let doc = out["triggers"].as_array().unwrap().iter().find(|t| t["names"] == "docstring-style").unwrap();
         assert_eq!((doc["with"]["sessions"].as_u64(), doc["before"]["sessions"].as_u64()), (Some(0), Some(0)));
-        assert_eq!(out["verdict"], json!({"kept_over_min": true, "kept_entries": ["run-tests-before-commit"],
-                                           "recurrence_fell": true, "fell_on": ["run-tests-before-commit"]}));
+        assert_eq!(out["verdict"], json!({"kept_in_use": true, "kept_entries": ["run-tests-before-commit"],
+                                           "recurrence_fell": true, "fell_on": ["run-tests-before-commit"],
+                                           "kept_comparative": false, "comparative_entries": []}));
         assert_eq!(
             out["lines"].as_array().unwrap().last().unwrap(),
-            "verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit)"
+            "verdict: an entry kept in real use (≥ 4 clean actual uses): yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit); kept on comparative support: no"
         );
     }
 
@@ -588,7 +625,7 @@ mod tests {
         let tr = short["triggers"].as_array().unwrap().iter().find(|t| t["names"] == "run-tests-before-commit").unwrap().clone();
         assert_eq!((tr["with"]["sessions"].as_u64(), tr["before"]["sessions"].as_u64()), (Some(0), Some(0)), "{short}");
         assert_eq!(short["kept"][0]["matched"], 0);
-        assert!(short["lines"].as_array().unwrap().last().unwrap().as_str().unwrap().ends_with("matched sessions: no; recurrence fell on a covered trigger: no"), "{short}");
+        assert!(short["lines"].as_array().unwrap().last().unwrap().as_str().unwrap().contains("clean actual uses): no; recurrence fell on a covered trigger: no"), "{short}");
         // --since the day before the old session: it joins the before-arm (3 of 5 recurred).
         let since = utc(t.ctx.now - 91 * DAY_MS)[..10].to_string();
         let long = cmd_report(&t.ctx, ReportArgs { window: "6w".into(), since: Some(since) }).unwrap();
@@ -598,8 +635,41 @@ mod tests {
         t.ctx.now = e.status_since.unwrap() - 1;
         let out = report(&t.ctx);
         assert_eq!(out["kept"], json!([]), "{out}");
-        assert_eq!(out["verdict"]["kept_over_min"], false, "{out}");
+        assert_eq!(out["verdict"]["kept_in_use"], false, "{out}");
         assert!(parse_window("6x").is_err() && parse_window("0w").is_err() && parse_day("2026-13-01").is_err());
+    }
+
+    #[test]
+    fn a_comparative_keep_without_real_use_is_reported_apart() {
+        let mut t = env();
+        let mut e = seed(&mut t);
+        // Same counters but none of the matched sessions used it; kept on comparative support.
+        for i in 0..4 {
+            let mut s = t.ctx.ledger.get_session(&format!("w-{i}")).unwrap().unwrap();
+            s.skill_entries.clear();
+            t.ctx.ledger.add_counter(&rematch_core::ledger::CounterRow {
+                used: Some(0),
+                ..t.ctx.ledger.counter_rows(&e.id).unwrap().into_iter().find(|r| r.session_id == s.id).unwrap()
+            })
+            .unwrap();
+        }
+        e.retention = Some(rematch_core::types::Retention {
+            reason: RetentionReason::ComparativeSupport,
+            at: e.status_since.unwrap(),
+            version: e.version,
+            content_sha256: e.content_sha256.clone(),
+            matched: 4,
+            used: 0,
+            used_clean: 0,
+            probe: Some("p".into()),
+            detail: String::new(),
+        });
+        t.ctx.ledger.upsert_entry(&e).unwrap();
+        t.ctx.now = now_ms(); // the window ends after these writes (as-of rule)
+        let out = report(&t.ctx);
+        assert_eq!(out["verdict"]["kept_in_use"], false, "4 unread matches are no real use: {out}");
+        assert_eq!(out["verdict"]["comparative_entries"], json!(["run-tests-before-commit"]));
+        assert!(out["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("[comparative_support]: 4 matched, 0 used")), "{out}");
     }
 
     /// Two domains: a web and a mobile review trigger with identical stems; each counts only

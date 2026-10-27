@@ -65,6 +65,7 @@ fn add_task(e: &Env) {
                 max_time: Some("30s".into()),
                 tools: None,
                 seeds: vec![7],
+                editable: vec![".rematch-marker".into()],
             }),
         },
     )
@@ -146,6 +147,10 @@ fn batch_worker_k1_stages_winner_then_next_run_keeps_it() {
     let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(staged.path.join("rematch.json")).unwrap()).unwrap();
     assert_eq!(on_disk["pending_next_run"], true);
     assert_eq!(e.ctx.ledger.list_receipts(Some(&staged.id)).unwrap().len(), 1);
+    // The run's winner-over-reference comparison, bound to the staged content.
+    let cmp = crate::probes::record_of(&e.ctx, &staged.id).expect("comparison recorded");
+    assert_eq!(cmp.status, crate::probes::ProbeStatus::Supports, "{cmp:#?}");
+    assert_eq!((cmp.source.as_str(), cmp.content_sha256.as_ref()), ("batch", staged.content_sha256.as_ref()));
 
     // Receipt written; workspaces and worktrees removed; event streams kept as blobs.
     let runs = e.ctx.paths.runs.join("demo");

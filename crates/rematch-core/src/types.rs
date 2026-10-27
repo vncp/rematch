@@ -322,6 +322,89 @@ pub struct Entry {
     /// sessions behind it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tune: Option<PredicateTune>,
+    /// Why the engine kept this entry, with the counts and content it was decided on
+    /// (`counters::keep_reason`). Engine-written at a keep; never parsed from model output.
+    /// A kept entry without one predates evidence recording (`counters::retention_label` ⇒
+    /// `legacy`); it is preserved, not re-justified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<Retention>,
+}
+
+/// Evidence class behind a keep (observational acceptance is not causal proof).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionReason {
+    /// Sustained relevant ACTUAL use (skill read/invocation/retrieval, hook evaluated or
+    /// applied, script executed, agent invoked, approved instruction exposed) in clean
+    /// completed sessions. Observational acceptance, not a measured improvement.
+    AcceptedInUse,
+    /// An engine-run, version/content-bound reference/candidate comparison on one task,
+    /// model, seed and base snapshot favored the candidate, with no recorded regression.
+    /// Support under those conditions, not general correctness.
+    ComparativeSupport,
+    /// The user pinned or explicitly adopted it.
+    UserDecision,
+    /// Kept before rematch recorded retention evidence; the evidence is unknown.
+    Legacy,
+}
+
+/// Engine record of one keep decision (`Entry.retention`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    pub reason: RetentionReason,
+    pub at: UnixMs,
+    /// Entry version and content the evidence was bound to.
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<Sha256Hex>,
+    /// Count-time predicate hits (observational safety counter).
+    #[serde(default)]
+    pub matched: u32,
+    /// Matched sessions with actual use.
+    #[serde(default)]
+    pub used: u32,
+    /// Matched sessions with actual use and no recurrence or harm.
+    #[serde(default)]
+    pub used_clean: u32,
+    /// Comparison record behind a `comparative_support` keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// Engine classification of one bounded reference/candidate comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparativeOutcome {
+    /// Candidate passed where the reference failed, or scored strictly higher.
+    Supports,
+    /// Candidate failed where the reference passed, or scored strictly lower.
+    Regresses,
+    /// Same verdict and score: no evidence either way.
+    Tie,
+    /// Same verdict and score at a clearly higher cost (tool errors, tokens).
+    CostWorse,
+    /// A rollout failed, timed out, or drifted model or snapshot: never promotes.
+    Incomplete,
+}
+
+/// The comparison an engine decision may use, bound to the entry content it ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparativeEvidence {
+    pub probe: String,
+    pub outcome: ComparativeOutcome,
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<Sha256Hex>,
+    pub at: UnixMs,
+}
+
+impl ComparativeEvidence {
+    /// The comparison ran this entry's current version and content.
+    pub fn binds(&self, e: &Entry) -> bool {
+        self.version == e.version && self.content_sha256 == e.content_sha256
+    }
 }
 
 /// What a predicate tune changed and why (DESIGN §6 "Predicate tuning"): written on the
@@ -388,6 +471,15 @@ pub struct Counters {
     /// Last 30 days of harm events (unix ms), for the kept→retired rule.
     #[serde(default)]
     pub harm_times: Vec<UnixMs>,
+    /// Matched sessions with actual use of the entry (`counters::actual_use`).
+    #[serde(default)]
+    pub used: u32,
+    /// Used sessions without recurrence or harm.
+    #[serde(default)]
+    pub used_clean: u32,
+    /// Matched rows folded before use was recorded (legacy: use unknown, never credited).
+    #[serde(default)]
+    pub use_unknown: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +740,10 @@ pub struct SessionRecord {
     /// `counters::fold_session` counts an entry only at that version.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loaded_versions: BTreeMap<EntryId, u32>,
+    /// `content_sha256` each loaded entry had when the session started (versioned
+    /// `loaded_entries` with a sha); `counters::fold_session` counts an entry only at it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub loaded_shas: BTreeMap<EntryId, Sha256Hex>,
     /// Entries the shared skills dir exposed at session start (DESIGN §16).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_entries: Vec<EntryId>,
@@ -668,6 +764,58 @@ pub struct SessionRecord {
     /// `(path, sha256)` of the files the session changed, from `session_shutdown`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files_changed: Vec<(String, Sha256Hex)>,
+    // ---- actual-use signals (`counters::actual_use`); loaded or visible alone is no use ----
+    /// Entry ids of skills read whose path the adapter resolved (`tool_result.skill_entry`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_entries: Vec<EntryId>,
+    /// Skill names invoked by the user (`/skill:<name>`, `input.skills_invoked`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills_invoked: Vec<String>,
+    /// The per-place catalog view a scoping adapter mounted (`session_start.exposure_view`).
+    /// Set ⇒ skill use is credited by resolved entry id or by an invoked name the session's
+    /// catalog listed, never by a bare read name (a native skill may share it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_view: Option<String>,
+    /// Whether the session's work settled: `Some(true)` when its last model turn was
+    /// followed by a terminal or yielded `agent_end` and did not stop on a tool call, an
+    /// abort or an error; `Some(false)` when a turn ran after the last settled run or the run
+    /// ended unsettled; `None` when the record carries no run-end evidence (unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_completed: Option<bool>,
+    /// Approved personal instruction fragments a host adapter sent whole (`fragments_sent`:
+    /// Claude Code, Pi, OpenCode runtime insertion), and the fragment sha each carried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fragments_sent: Vec<EntryId>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fragment_shas: BTreeMap<EntryId, Sha256Hex>,
+    /// Approved personal instruction sections the session's AGENTS.md carried (omp).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instructions_exposed: Vec<EntryId>,
+    /// Approved fragment sha256 each exposed instruction carried (exposure binds to it).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instruction_shas: BTreeMap<EntryId, Sha256Hex>,
+    /// `stop_reason` of the session's last model turn (`aborted`/`error` ⇒ the work did not
+    /// complete; `counters::completed_work`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stop_reason: Option<String>,
+    /// Hook entries loaded at session start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks_loaded: Vec<EntryId>,
+    /// Hooks that changed the session: `tool_blocked`, `retrieval.entry_ids`, `hook_applied`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks_applied: Vec<EntryId>,
+    /// Hooks that evaluated a matching call and let it pass (`hook_evaluated`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks_evaluated: Vec<EntryId>,
+    /// Packages a `retrieval` put units of into the context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieved_entries: Vec<EntryId>,
+    /// Distinct shell commands run (heads, ≤ `trace::COMMANDS_MAX` of ≤ `trace::COMMAND_CHARS`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
+    /// Subagent names the session invoked through the task tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents_invoked: Vec<String>,
     #[serde(default)]
     pub flagged: bool,
     #[serde(default)]

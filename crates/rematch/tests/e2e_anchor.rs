@@ -17,7 +17,7 @@ use rematch_core::ledger::{CounterRow, EntryFilter, Ledger};
 use rematch_core::library::{set_status, stage};
 use rematch_core::paths::RematchPaths;
 use rematch_core::predicate::derive;
-use rematch_core::types::{Certificate, Edit, Entry, Status, Verdict};
+use rematch_core::types::{Certificate, Edit, Entry, Retention, RetentionReason, Status, Verdict};
 use serde_json::{json, Value};
 
 const NAME: &str = "run-tests-first";
@@ -146,8 +146,21 @@ fn fixture(verifier: Option<&str>, as_sibling: bool) -> Fixture {
     let mut files = skill("kept");
     files.push(Edit::Write { path: "units/old.md".into(), content: "old unit\n".into() });
     let k = stage(&ledger, &paths, &k, &files).unwrap();
-    let k = set_status(&ledger, &paths, &k.id, Status::Kept, None).unwrap();
+    let mut k = set_status(&ledger, &paths, &k.id, Status::Kept, None).unwrap();
     assert!(k.path.starts_with(paths.skills_dir()));
+    // Kept on recorded evidence (a legacy keep would lend `transfer promote` nothing).
+    k.retention = Some(Retention {
+        reason: RetentionReason::AcceptedInUse,
+        at: 1,
+        version: k.version,
+        content_sha256: k.content_sha256.clone(),
+        matched: 4,
+        used: 4,
+        used_clean: 4,
+        probe: None,
+        detail: "fixture".into(),
+    });
+    ledger.upsert_entry(&k).unwrap();
 
     let extra = if as_sibling { json!({"sibling_of": k.id, "version": 2}) } else { json!({"version": 2}) };
     let s = entry(&env, json!({"kind": "session", "session_id": "0199a000-0000-7000-8000-00000000aaaa"}), extra);
@@ -159,7 +172,7 @@ fn fixture(verifier: Option<&str>, as_sibling: bool) -> Fixture {
 /// Four clean matched sessions with the sibling loaded ⇒ counters decide Keep.
 fn count_four(f: &Fixture, verdict: &str) -> Value {
     for n in 1..=4 {
-        f.env.write_trace(&format!("0199b000-0000-7000-8000-00000000000{n}"), &[&f.sibling], false);
+        f.env.write_trace_using(&format!("0199b000-0000-7000-8000-00000000000{n}"), &[&f.sibling], false, &[&f.sibling]);
     }
     let c = f.run(&["count", "--editor", &script("editor-ok.sh")], verdict);
     assert_eq!(c["folded"].as_array().unwrap().len(), 4, "{c}");
@@ -282,6 +295,7 @@ fn promote_fixture() -> Fixture {
             tokens: 0,
             turns: 0,
             ts: 1_000 + i,
+            used: Some(1),
         })
         .unwrap();
     }
@@ -407,13 +421,21 @@ fn anchor_manual_replay_reports_and_stages_nothing() {
 fn next_run(verdict: &str) -> (Fixture, Value) {
     let f = fixture(Some(VERIFIER), false);
     let repo = f.env.repo.to_string_lossy().to_string();
-    f.env.run(&["task", "add", "demo", "--repo", &repo, "--prompt", "Make the check pass", "--verifier", "true", "--max-time", "30s"]);
+    f.env.run(&["task", "add", "demo", "--repo", &repo, "--prompt", "Make the check pass", "--verifier", "true", "--max-time", "30s", "--editable", ".rematch-marker"]);
     {
         let l = f.ledger();
         let mut s = l.get_entry(&f.sibling).unwrap().unwrap();
         s.origin = rematch_core::types::Origin::Task { task_id: "demo".into() };
         s.pending_next_run = true;
         l.upsert_entry(&s).unwrap();
+        // The comparison the staging run recorded (winner over its reference): the next-run
+        // keep is comparative support of exactly this content.
+        let rec = json!({"id": "batch-fixture", "entry": s.id, "name": s.name, "version": s.version,
+                         "content_sha256": s.content_sha256, "status": "supports", "reason": "fixture",
+                         "source": "batch", "harness": "omp", "at": 1});
+        let dir = f.env.root.join("probes/records");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}.json", rematch_core::paths::id_file_stem(&s.id))), rec.to_string()).unwrap();
     }
     let job = json!({
         "id": "job-anchor", "kind": "run", "status": "running",

@@ -1,6 +1,7 @@
 //! `rematch`: clap dispatch → exactly one JSON envelope on stdout (DESIGN §2).
 //! Exit codes: 0 ok, 1 error, 2 usage, 130 cancelled. Logs go to stderr.
 
+pub mod actions;
 pub mod app;
 pub mod batch;
 pub mod builtins;
@@ -21,6 +22,7 @@ pub mod omp;
 pub mod opencode_event;
 pub mod policy_cmd;
 pub mod profile_cmd;
+pub mod probes;
 pub mod proc;
 pub mod reflect;
 pub mod report;
@@ -88,9 +90,9 @@ enum Cmd {
     /// Internal: detached batch worker.
     #[command(hide = true)]
     RunWorker(batch::worker::RunWorkerArgs),
-    /// Job status (or all jobs + entry counts).
+    /// Job status (or all jobs, entry counts, pending actions and automatic trials).
     Status { job: Option<String> },
-    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export.
+    /// Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export.
     Library {
         #[command(subcommand)]
         cmd: library_cmd::LibraryCmd,
@@ -127,9 +129,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: lake_cmd::LakeCmd,
     },
-    /// The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm.
+    /// The kill criterion (ADR 001 L4): kept entries in real use (≥ 4 clean actual uses), kept on comparative support, and recurrence per trigger, with-entry vs before-arm.
     Report(report::ReportArgs),
-    /// REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain).
+    /// REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain), a skill's place scope (scope set|unset).
     Policy {
         #[command(subcommand)]
         cmd: policy_cmd::PolicyCmd,

@@ -6,47 +6,50 @@ next: false
 
 import { Aside, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-Later sessions decide whether a staged skill stays. You are never asked: three raw counters settle it.
+Later sessions decide whether a staged skill stays. By default you do not have to run a benchmark: raw counters track whether the entry is actually used without corrections, and you can optionally authorize a bounded probe when a task is safely replayable.
 
 ## The counters
 
-Every session in which the skill loaded and its predicate matched is counted. In the example, the next session counted as:
+Every session in which the skill loaded and its predicate matched is counted (`matched` is an observational safety counter). Actual use (`used`) is recorded only when a completed session read, invoked or retrieved the skill:
 
 ```text
-matched 1 · recurrence 0 · harm 0
+matched 1 · used 1 (1 clean) · recurrence 0 · harm 0
 ```
 
 | Counter | Goes up when |
 |---|---|
 | matched | a session's repo, file types and task words matched the skill's trigger |
+| used / used_clean | a completed matched session actually used the entry (and had 0 recurrence, 0 harm) |
 | recurrence | the same kind of correction happened again while the skill was loaded |
 | harm | a new cluster of tool errors, a takeover, or you disabled it, while it was loaded |
 
 ## The outcomes
 
-| After | Status | What it means |
+| Condition | Status | What it means |
 |---|---|---|
-| 4 matched sessions, 0 recurrence, 0 harm | **kept** | copied into `~/.omp/agent/skills/`; loads natively from then on |
-| 2 recurrences or 2 harms | **retired** | archived with its evidence, never deleted, never loaded |
+| ≥ 4 clean actual uses (`used_clean ≥ 4`), or a supporting authorized probe, with 0 recurrence and 0 harm | **kept** | copied into `~/.omp/agent/skills/` (`accepted_in_use` or `comparative_support`); loads everywhere from then on |
+| 2 recurrences, 2 harms, or a regressed probe | **retired** | archived with its evidence, never deleted, never loaded |
 | 12 matched sessions without a decision | **dormant** | archived; returns when its trigger matches again |
 
-So three more sessions like the example keep it. Two more corrections of the same kind retire it. The full rule set: [counters and the kill criterion](/rematch/concepts/counters/).
+Catalog listing or matching alone never keeps an unread skill. Three more clean sessions that actually use the skill keep it (`accepted_in_use`); two recurrences or harms retire it. Full rules: [counters and the kill criterion](/rematch/concepts/counters/) and [automatic probes](/rematch/guides/automatic-probes/).
 
 <Aside type="note" title="Kept, never verified">
-Four clean matched sessions are evidence that the skill did its one job, nothing more. That is why the status is `kept`.
+Four clean sessions of actual use show observational acceptance, and a bounded probe tests one authorized task and seed. Neither is a causal proof of general improvement, which is why the status is `kept`.
 </Aside>
 
 ## Watch it
 
 ```sh
-rematch library ls --text
+rematch status --text
 ```
 
-Every entry with its raw counts:
+Entries by status, the trials running now, every action waiting for you, and the personal instructions in effect:
 
 ```text
-provisional skill foo [repo] matched 2 · recurrence 0 · harm 0
+1 automatic trial(s) running: foo (`rematch library ls`; `rematch library disable <id>` stops one)
 ```
+
+`rematch library ls --text` lists every entry with its raw counts (`provisional skill foo [repo] matched 2 · recurrence 0 · harm 0`), and `rematch library why` shows what one session loaded and used.
 
 The other views, and how to retire an entry, roll it back or turn rematch off, are in [day to day](/rematch/guides/day-to-day/).
 

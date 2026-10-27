@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(m.skill_dirs, vec![c.paths.staging.join("shared")]);
         assert_eq!(m.hooks, vec![c.paths.hooks_dir().join(format!("{id}.ts"))]);
         let hits: Vec<(&str, bool)> = m.entries.iter().map(|e| (e.name.as_str(), e.predicate_hit)).collect();
-        assert_eq!(hits, vec![("context-unit-retrieval", false), ("tool-output-truncation", false), ("stuck-detector", true)]);
+        assert_eq!(hits, vec![("stuck-detector", true)], "unapproved built-ins are in no place's view: they do not load");
         let digest = crate::digest::cmd_digest(&c).unwrap();
         assert_eq!(digest["approvals"].as_array().unwrap().len(), 2, "{digest}");
     }

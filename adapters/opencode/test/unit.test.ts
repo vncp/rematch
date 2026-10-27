@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { commands, isApprovalCommand, retrievalCacheValue, truncateToolOutputs } from "../index.ts";
+import { userOnlyShellReason } from "../../../extension/index.ts";
+import { commands, retrievalCacheValue, truncateToolOutputs } from "../index.ts";
 
 type Msg = { info: Record<string, unknown>; parts: Record<string, unknown>[] };
 
@@ -43,8 +44,8 @@ describe("truncateToolOutputs", () => {
 	});
 });
 
-describe("approval guard", () => {
-	test("refuses shell approvals and the switch", () => {
+describe("approval guard (the shared parser OpenCode's tool.execute.before runs on bash)", () => {
+	test("refuses shell approvals, withdrawals, marks and the switch", () => {
 		for (const c of [
 			"rematch library approve 01a",
 			"/repo/target/release/rematch library decline 01a",
@@ -65,18 +66,23 @@ describe("approval guard", () => {
 			"x=$(rematch library approve 01a)",
 			'sh -c "rematch --text off"',
 			"REMATCH_ROOT=/x sudo rematch on",
+			"rematch --text --cwd /w mark --class correction",
+			"rematch --cwd=/w library export --approve-all",
+			"rematch policy scope set bellwether-dev ~/repos/bellwether",
+			"rematch --text policy scope unset bellwether-dev",
 		]) {
-			expect(isApprovalCommand(c)).toBe(true);
+			expect([c, userOnlyShellReason(c)]).toEqual([c, expect.stringContaining("reserved to the user")]);
 		}
 	});
 	test("lets reads through", () => {
 		for (const c of [
 			"rematch status", "rematch library ls", "rematch library why oc:ses_1", "echo approve on", "rematch digest", "git log --oneline",
 			"rematch --cwd library status", "rematch library export --entry 01a", 'git commit -m "let rematch off the hook"', "echo rematch off",
+			"rematch policy show", "rematch policy domain set github.com/acme/web web",
 		]) {
-			expect(isApprovalCommand(c)).toBe(false);
+			expect([c, userOnlyShellReason(c)]).toEqual([c, null]);
 		}
-		expect(isApprovalCommand(undefined)).toBe(false);
+		expect(userOnlyShellReason(undefined)).toBeNull();
 	});
 });
 
@@ -84,7 +90,7 @@ describe("commands", () => {
 	test("each template is tagged and runs the binary before the model", () => {
 		const c = commands("/opt/it's/rematch");
 		expect(Object.keys(c).sort()).toEqual([
-			"rematch-approve", "rematch-decline", "rematch-digest", "rematch-library", "rematch-mark", "rematch-off", "rematch-on", "rematch-status", "rematch-why",
+			"rematch-approve", "rematch-decline", "rematch-digest", "rematch-inspect", "rematch-library", "rematch-mark", "rematch-off", "rematch-on", "rematch-status", "rematch-why",
 		]);
 		expect(c["rematch-approve"]?.template).toStartWith('<rematch-command name="approve"/>\n!`\'/opt/it\'\\\'\'s/rematch\' --text library approve $ARGUMENTS`');
 		expect(c["rematch-mark"]?.template).toStartWith('<rematch-command name="mark" args="$ARGUMENTS"/>');

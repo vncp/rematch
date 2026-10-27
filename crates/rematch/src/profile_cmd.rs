@@ -1,7 +1,8 @@
 //! `profile init [--remote <url>] [--adopt] | adopt <path> | sync [--no-push] | status |
 //! install-launchd [--interval 300]` (DESIGN §20): `REMATCH_ROOT/profile/` is a git working tree
 //! holding one person's omp setup (kept skills and agents, adopted hand-written ones, approved
-//! hooks, policy, roles, domain files, edited improver prompts), synced across machines through
+//! hooks, approved personal instructions, policy, roles, domain files, edited improver prompts),
+//! synced across machines through
 //! a git remote. The layout, the views linked into omp/rematch and `roles.yml` are
 //! `rematch_core::profile`; this module runs git: local commands unbounded, network commands
 //! (`clone`, `fetch`, `push`) inside one `--timeout` budget that fails open (`offline: true`).
@@ -94,7 +95,7 @@ pub fn cmd_profile(ctx: &AppCtx, cmd: ProfileCmd) -> Result<Value> {
             }
             let adopted = adopt_path(ctx, &p)?;
             let views = profile::link_views(&ctx.paths)?;
-            library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
+            library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
             let line = format!("adopted {} → {}", p.display(), adopted["to"].as_str().unwrap_or("?"));
             Ok(json!({"adopted": adopted, "views": views, "lines": [line]}))
         }
@@ -520,6 +521,9 @@ fn sync(ctx: &AppCtx, no_push: bool, timeout: Duration) -> Result<Value> {
     profile::ensure_layout(&ctx.paths)?;
     let collected = profile::collect(&ctx.paths)?;
     let fragments = collect_fragments(ctx)?;
+    // The approved personal instruction texts (`instructions/<name>.md`), canonical across machines.
+    let instructions = rematch_core::instructions::collect_profile(&ctx.ledger, &ctx.paths)?;
+    let exposed_before = rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?;
     profile::note_machine(&ctx.paths, &machine)?;
     let committed = commit_all(&dir, &machine)?;
     let branch = current_branch(&dir);
@@ -550,7 +554,9 @@ fn sync(ctx: &AppCtx, no_push: bool, timeout: Duration) -> Result<Value> {
         }
     }
     let views = profile::link_views(&ctx.paths)?;
-    let skills = library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
+    // Applies the pulled `instructions/` to this machine's personal AGENTS.md too.
+    let skills = library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
+    let exposed_after = rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?;
     profile::write_index(&ctx.paths, &index_skills(&ctx.paths))?;
     if remote.is_some() && !offline && conflicts.is_empty() && !no_push && has_head(&dir) {
         let ahead = match remote_ref(&dir, &branch) {
@@ -594,9 +600,51 @@ fn sync(ctx: &AppCtx, no_push: bool, timeout: Duration) -> Result<Value> {
     for v in &views.untouched {
         lines.push(format!("not linked (a local file holds the name): {v}"));
     }
+    for v in &views.scoped {
+        lines.push(format!("withdrawn from <agent_dir>/{v}: the name has a place scope (policy.json scopes); sessions already running keep what they loaded"));
+    }
     for v in &collected.kept_local {
         lines.push(format!("kept local (the profile has its own): {v}"));
     }
+    let names = |x: &rematch_core::instructions::Exposure| x.exposed.iter().map(|e| (e.name.clone(), e.sha.clone())).collect::<std::collections::BTreeSet<_>>();
+    let (was, now) = (names(&exposed_before), names(&exposed_after));
+    let applied: Vec<&str> = now.difference(&was).map(|(n, _)| n.as_str()).collect();
+    let removed: Vec<&str> = was.difference(&now).map(|(n, _)| n.as_str()).collect();
+    if !applied.is_empty() || !removed.is_empty() {
+        lines.push(format!(
+            "personal AGENTS.md {}: {}{}{}; new sessions load it, a running session keeps the text it was already sent",
+            exposed_after.target.display(),
+            if applied.is_empty() { String::new() } else { format!("applied {}", applied.join(", ")) },
+            if applied.is_empty() || removed.is_empty() { "" } else { "; " },
+            if removed.is_empty() { String::new() } else { format!("removed {}", removed.join(", ")) },
+        ));
+    }
+    let gone: Vec<&str> = instructions.iter().filter_map(|l| l.strip_suffix(" (withdrawn profile-wide)")).collect();
+    if !gone.is_empty() {
+        lines.push(format!(
+            "profile: withdrew {} (declined or withdrawn here) — profile-wide: every machine and omp profile syncing it drops the text at its next sync, its own approval included, until someone approves those bytes again",
+            gone.join(", ")
+        ));
+    }
+    for c in exposed_after.conflicts.iter().filter(|c| *c != "*") {
+        lines.push(format!("personal AGENTS.md: block {c} was edited by you and left as is (`rematch library inspect instructions-conflict:{c}`)"));
+    }
+    let plan = rematch_core::instructions::plan_sync(&ctx.ledger, &ctx.paths)?;
+    if !plan.over_budget.is_empty() {
+        lines.push(format!(
+            "personal AGENTS.md {}: over the always-on budget, not added: {} (blocked `instructions-applied:<name>` actions in `rematch status`)",
+            plan.target.display(),
+            plan.over_budget.join(", ")
+        ));
+    }
+    if rematch_core::instructions::skipped_profile(&ctx.paths) {
+        lines.push(format!(
+            "omp profile {} is in policy.json skip_profiles: the profile's instructions are not applied to {}, and its approvals stay out of the profile",
+            ctx.paths.profile.as_deref().unwrap_or("?"),
+            plan.target.display()
+        ));
+    }
+    lines.extend(crate::library_cmd::drift_lines(ctx));
     Ok(json!({
         "machine": machine,
         "branch": branch,
@@ -609,6 +657,7 @@ fn sync(ctx: &AppCtx, no_push: bool, timeout: Duration) -> Result<Value> {
         "conflicts": conflicts,
         "collected": collected,
         "fragments": fragments,
+        "instructions": {"collected": instructions, "before": exposed_before, "after": exposed_after},
         "views": views,
         "skills": {"added": skills.added, "pruned": skills.pruned, "total": skills.total},
         "elapsed_ms": started.elapsed().as_millis() as u64,
@@ -714,6 +763,7 @@ pub fn status(ctx: &AppCtx) -> Result<Value> {
     let skills = count(profile::skills_dir(&ctx.paths), None);
     let agents = count(profile::agents_dir(&ctx.paths), Some("md"));
     let hooks = count(profile::hooks_dir(&ctx.paths), Some("ts"));
+    let instructions = count(profile::instructions_dir(&ctx.paths), Some("md"));
     let mut lines = vec![
         format!(
             "profile {} on {branch} at {}{}",
@@ -721,7 +771,7 @@ pub fn status(ctx: &AppCtx) -> Result<Value> {
             head.as_deref().unwrap_or("(no commit)"),
             remote.as_deref().map(|r| format!(", origin {r}")).unwrap_or_else(|| ", no remote".into())
         ),
-        format!("{skills} skill(s), {agents} agent(s), {hooks} hook(s); machines: {}", pj.machines.join(", ")),
+        format!("{skills} skill(s), {agents} agent(s), {hooks} hook(s), {instructions} personal instruction text(s); machines: {}", pj.machines.join(", ")),
     ];
     if let (Some(a), Some(b)) = (ahead, behind) {
         lines.push(format!("{a} ahead, {b} behind origin/{branch} (as of the last fetch)"));
@@ -735,7 +785,7 @@ pub fn status(ctx: &AppCtx) -> Result<Value> {
     Ok(json!({
         "present": true, "dir": dir, "machine": machine, "branch": branch, "remote": remote, "head": head,
         "ahead": ahead, "behind": behind, "dirty": dirty, "conflicts": conflicts, "machines": pj.machines,
-        "skills": skills, "agents": agents, "hooks": hooks, "roles": roles, "lines": lines,
+        "skills": skills, "agents": agents, "hooks": hooks, "instructions": instructions, "roles": roles, "lines": lines,
     }))
 }
 

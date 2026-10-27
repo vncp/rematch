@@ -39,7 +39,7 @@ pub struct Rollout {
 }
 
 /// Behavioral summary recorded in job progress and the receipt.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct RolloutSummary {
     pub label: String,
     pub seed: u64,

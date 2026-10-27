@@ -19,8 +19,16 @@ import rematch, {
 	promptFragmentsOf,
 	renderPromptFragments,
 	RETRIEVAL_TYPE,
+	REVIEW_APPROVE,
+	REVIEW_DECLINE,
+	REVIEW_INSPECT,
+	REVIEW_LATER,
+	reviewChoices,
+	reviewTarget,
 	retrievalMessage,
 	retrievalQuery,
+	sessionSkillDirs,
+	shadowedByCustomDirs,
 	stuckReason,
 	subpathOf,
 	truncateToolResults,
@@ -31,20 +39,23 @@ import rematch, {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rematch-ext-test-"));
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-/** Every `skills.customDirectories` override the factory made: `[settings scope, value]`. */
-const overrides: [unknown, string[]][] = [];
+/** Every runtime override the factory made: `[settings scope, setting id, value]` (a cleared override is not listed). */
+const overrides: [unknown, string, string[]][] = [];
+/** What the user configured, per setting id (the persisted layer the fake registry returns under an override). */
+const persisted: Record<string, string[]> = { "skills.customDirectories": ["/configured/skills"], "task.disabledAgents": ["users-own-off"] };
 mock.module("@oh-my-pi/pi-coding-agent/config/registry", () => ({
 	lookup: (key: string) =>
-		key === "skills.customDirectories"
+		key in persisted
 			? {
-					get: (scope: { custom?: string[] }) => scope.custom ?? ["/configured/skills"],
-					override: (scope: { custom?: string[] }, value: string[]) => {
-						scope.custom = value;
-						overrides.push([scope, value]);
+					get: (scope: Record<string, string[] | undefined>) => scope[key] ?? persisted[key],
+					override: (scope: Record<string, string[] | undefined>, value: string[] | undefined) => {
+						scope[key] = value;
+						if (value !== undefined) overrides.push([scope, key, value]);
 					},
 				}
 			: undefined,
 }));
+const overridesOf = (scope: unknown, key: string) => overrides.filter(([s, k]) => s === scope && k === key).map(([, , v]) => v);
 
 const stuck = (repeats = 3) => hookFromModule({ id: "stuck-1", mode: "stuck", tool: "*", message: "stuck", params: { repeats } }, "x");
 const truncate = (max_age_turns: number, keep_chars: number, tool = "*") =>
@@ -234,6 +245,30 @@ describe("argv and match helpers", () => {
 	});
 });
 
+describe("reviewChoices", () => {
+	const described = (kind: string, approve = true, decline = true) => {
+		const id = `${kind}:x`;
+		const argv = (verb: string) => ["library", verb, id, "--sha", "a".repeat(64)];
+		const a = { id, kind, name: "x", summary: "", state: "pending", blocked: null, reload: null, approve: approve ? argv("approve") : null, decline: decline ? argv("decline") : null };
+		return Object.fromEntries(reviewChoices(a).map(c => [c.label, c.description]));
+	};
+
+	test("a conflict offers restore and keep-mine, each with the bound command behind it", () => {
+		const c = described("instructions_conflict");
+		expect(c[REVIEW_APPROVE]).toBe("restore rematch's text over your edit");
+		expect(c[REVIEW_DECLINE]).toBe("keep your edited text as your own; rematch stops managing it");
+		expect(c[REVIEW_LATER]).toBeDefined();
+	});
+
+	test("Decline says what it does per kind; only entry parts retire the entry", () => {
+		expect(described("instructions_applied", false)[REVIEW_DECLINE]).toContain("withdraws this text");
+		expect(described("instructions")[REVIEW_DECLINE]).toBe("this text is not applied; the entry stays");
+		expect(described("export")[REVIEW_DECLINE]).toContain("the entry stays");
+		expect(described("entry")[REVIEW_DECLINE]).toBe("retires the entry");
+		expect(described("instructions_applied", false)[REVIEW_APPROVE]).toBeUndefined();
+	});
+});
+
 describe("identity and changed files (ADR 001)", () => {
 	test("mutating calls name their files, patch payloads included", () => {
 		expect(changedPaths("write", { path: "src/a.rs:1-5" })).toEqual(["src/a.rs"]);
@@ -269,6 +304,7 @@ describe("identity and changed files (ADR 001)", () => {
 // Factory against a fake host: the binary is answered by `pi.exec`.
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
+type ToolExecute = (id: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<unknown>;
 
 function writeHook(id: string, mode: string, params: object): string {
 	const file = path.join(tmp, `${id}.ts`);
@@ -281,14 +317,24 @@ type HostState = {
 	hooks: string[];
 	dirs?: string[];
 	visible?: string[];
-	approvals?: object[];
+	/** `skills sync` view key, links (`name → dir`) and the agents it withholds; `syncFails` makes it fail. */
+	view?: string;
+	links?: Record<string, string>;
+	withheld?: string[];
+	syncFails?: boolean;
+	/** `digest.actions` (persistent, whatever `digest.last` says). */
+	actions?: object[];
 	onApprove?: () => void;
 	/** `match` reports `profile_present` (REMATCH_ROOT/profile/.git exists). */
 	profilePresent?: boolean;
 	/** `match` reports `prompt_fragments` (approved personal AGENTS.fragment.md of the loaded entries). */
 	fragments?: unknown;
+	/** `match.instructions` (the personal AGENTS.md sections omp loads). */
+	instructions?: unknown;
 	/** Answers for `git rev-parse --show-toplevel --verify -q HEAD` and `git remote get-url origin`. */
 	git?: { top: string; head?: string; remote?: string };
+	/** What each review dialog answers, in order (undefined = Esc). */
+	choices?: (string | undefined)[];
 };
 
 /** The `messages` a `context` handler returned (throws when it changed nothing). */
@@ -314,14 +360,17 @@ async function host(name: string, state: HostState) {
 	process.env.REMATCH_ROOT = root;
 	delete process.env.REMATCH;
 	const execs: string[][] = [];
+	const statuses: (string | undefined)[] = [];
+	const titles: string[] = [];
 	const handlers = new Map<string, Handler>();
 	let command: Handler | null = null;
 	let shortcut: Handler | null = null;
+	let tool: ToolExecute | null = null;
 	const ok = (data: object) => ({ stdout: JSON.stringify({ ok: true, operation: "x", data }), stderr: "", code: 0, killed: false });
 	const z: unknown = new Proxy(() => z, { get: () => z, apply: () => z });
 	const pi = {
 		zod: z,
-		pi: { settings: {} as { custom?: string[] }, VERSION: "test" },
+		pi: { settings: {} as Record<string, string[] | undefined>, VERSION: "test" },
 		logger: { warn() {}, debug() {} },
 		async exec(cmd: string, argv: string[]) {
 			if (cmd === "git" && state.git) {
@@ -333,14 +382,15 @@ async function host(name: string, state: HostState) {
 			execs.push(argv);
 			switch (argv[0]) {
 				case "match":
-					return ok({ entries: state.entries, hooks: state.hooks, profile_present: state.profilePresent === true, prompt_fragments: state.fragments });
+					return ok({ entries: state.entries, hooks: state.hooks, profile_present: state.profilePresent === true, prompt_fragments: state.fragments, instructions: state.instructions });
 				case "skills":
-					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], visible: state.visible ?? [], off: false });
+					if (state.syncFails) return { stdout: JSON.stringify({ ok: false, error: "boom" }), stderr: "", code: 1, killed: false };
+					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], visible: state.visible ?? [], off: false, view: state.view, links: state.links ?? {}, agents: { exposed: [], withheld: state.withheld ?? [], shadowed: [] } });
 				case "library":
 					if (argv[1] === "approve") state.onApprove?.();
-					return ok({});
+					return ok({ lines: [`inspected ${argv[2]}`], action: (state.actions ?? []).find(a => "id" in a && a.id === argv[2]) });
 				case "digest":
-					return ok({ lines: [], approvals: state.approvals ?? [] });
+					return ok({ lines: [], actions: state.actions ?? [] });
 				case "retrieve":
 					return ok({ units: [{ entry_id: "pkg", name: "ledger", path: "units/a.md", title: "A", text: "Unit text." }] });
 				default:
@@ -350,7 +400,9 @@ async function host(name: string, state: HostState) {
 		on(event: string, fn: Handler) {
 			handlers.set(event, fn);
 		},
-		registerTool() {},
+		registerTool(spec: { execute: ToolExecute }) {
+			tool = spec.execute;
+		},
 		registerCommand(_name: string, spec: { handler: Handler }) {
 			command = spec.handler;
 		},
@@ -377,7 +429,19 @@ async function host(name: string, state: HostState) {
 		model: { provider: "p", id: "m" },
 		isIdle: () => true,
 		sessionManager: { getSessionId: () => session },
-		ui: { notify() {}, async confirm() { return true; } },
+		ui: {
+			notify() {},
+			setStatus(_key: string, text: string | undefined) {
+				statuses.push(text);
+			},
+			async select(title: string) {
+				titles.push(title);
+				return (state.choices ?? []).shift();
+			},
+			async confirm() {
+				throw new Error("a review never asks yes/no: Esc must not decline");
+			},
+		},
 	};
 	const fire = (event: string, payload: unknown = {}) => handlers.get(event)?.(payload, ctx);
 	const traceOf = () =>
@@ -392,6 +456,11 @@ async function host(name: string, state: HostState) {
 		fire,
 		traceOf,
 		command: (raw: string) => command?.(raw, ctx),
+		/** The `rematch` tool as the model calls it: its envelope. */
+		async tool(operation: string, args: string[]) {
+			const r = (await tool?.("t", { operation, arguments: args }, undefined, () => {}, ctx)) as { details: { ok: boolean; error?: string } };
+			return r.details;
+		},
 		digest: () => shortcut?.(undefined, ctx),
 		toolCall: (input: object) => blockReasonOf(fire("tool_call", { toolName: "bash", toolCallId: "t", input })),
 		switchTo(id: string) {
@@ -399,6 +468,9 @@ async function host(name: string, state: HostState) {
 		},
 		matches: () => execs.filter(a => a[0] === "match").map(a => a[2]),
 		settings: pi.pi.settings,
+		statuses,
+		titles,
+		root,
 	};
 }
 
@@ -428,11 +500,21 @@ describe("factory", () => {
 	});
 
 	const stuckFile = () => writeHook("hook-stuck", "stuck", { repeats: 3 });
-	const approvable = (): HostState => {
-		const state: HostState = { entries: [], hooks: [], approvals: [{ id: "hook-stuck", name: "stuck-detector", kind: "hook" }] };
+	const approvable = (choices: (string | undefined)[] = []): HostState => {
+		const action = {
+			id: "hook-stuck",
+			name: "stuck-detector",
+			kind: "hook",
+			state: "pending",
+			summary: "approve hook stuck-detector",
+			blocked: null,
+			commands: { approve_argv: ["library", "approve", "hook-stuck", "--sha", "abc123"], decline_argv: ["library", "decline", "hook-stuck"] },
+		};
+		const state: HostState = { entries: [], hooks: [], actions: [action], choices };
 		state.onApprove = () => {
 			state.hooks = [stuckFile()];
 			state.entries = [{ id: "hook-stuck", predicate_hit: true }];
+			state.actions = [];
 		};
 		return state;
 	};
@@ -448,14 +530,46 @@ describe("factory", () => {
 		expect([h.toolCall(same), h.toolCall(same), h.toolCall(same), h.toolCall(same)]).toEqual([undefined, undefined, undefined, "hook-stuck says no"]);
 	});
 
-	test("a hook approved in the digest runs at once", async () => {
-		const h = await host("digest", approvable());
+	test("/rematch approve <id> typed without a hash opens that action's dialog, which carries it", async () => {
+		const h = await host("typed", approvable([REVIEW_APPROVE]));
+		await h.fire("session_start");
+		h.ctx.hasUI = true;
+		await h.command("approve hook-stuck");
+		expect(h.execs.filter(a => a[0] === "library")).toEqual([["library", "inspect", "hook-stuck"], ["library", "approve", "hook-stuck", "--sha", "abc123"]]);
+		expect(h.titles).toHaveLength(1);
+		expect(h.matches()).toHaveLength(2);
+		expect(reviewTarget(["approve", "e1"])).toBe("e1");
+		expect(reviewTarget(["decline", "e1"])).toBe("e1");
+		expect(reviewTarget(["approve", "e1", "--sha", "abc"]), "a typed hash goes to the binary").toBeNull();
+		expect(reviewTarget(["approve", "e1", "--sha=abc"])).toBeNull();
+		expect(reviewTarget(["inspect", "e1"])).toBeNull();
+		expect(reviewTarget(["approve"])).toBeNull();
+	});
+
+	test("a hook approved in the review runs at once, with the exact hash shown", async () => {
+		const h = await host("digest", approvable([REVIEW_APPROVE]));
 		await h.fire("session_start");
 		h.ctx.hasUI = true;
 		await h.digest();
-		expect(h.execs.some(a => a[0] === "library" && a[1] === "approve" && a[2] === "hook-stuck")).toBe(true);
+		expect(h.execs.filter(a => a[0] === "library")).toEqual([["library", "approve", "hook-stuck", "--sha", "abc123"]]);
 		expect(h.matches()).toHaveLength(2);
 		expect([h.toolCall(same), h.toolCall(same), h.toolCall(same), h.toolCall(same)]).toEqual([undefined, undefined, undefined, "hook-stuck says no"]);
+		expect(h.statuses.at(-1), "nothing waits any more").toBeUndefined();
+	});
+
+	test("session start only shows what waits; Esc and Later change nothing, and it stays pending", async () => {
+		const h = await host("later", approvable([undefined, REVIEW_LATER, REVIEW_INSPECT, REVIEW_DECLINE]));
+		h.ctx.hasUI = true;
+		await h.fire("session_start");
+		await h.digest(); // Esc
+		expect(h.titles, "one dialog: the review's, none from the session start").toHaveLength(1);
+		expect(h.statuses.length >= 2 && h.statuses.every(s => s === "rematch: 1 waiting · /rematch review"), "start and digest both show it").toBe(true);
+		await h.command("review"); // Later
+		expect(h.execs.filter(a => a[0] === "library"), "nothing approved or declined").toEqual([]);
+		expect(h.statuses.at(-1), "still pending after the digest cursor moved").toBe("rematch: 1 waiting · /rematch review");
+		await h.command("review"); // Inspect, then Decline
+		expect(h.execs.filter(a => a[0] === "library")).toEqual([["library", "inspect", "hook-stuck"], ["library", "decline", "hook-stuck"]]);
+		expect(h.titles.at(-1)).toContain("inspected hook-stuck");
 	});
 
 	test("a call a block rule rejected never ran: it does not break a stuck run", async () => {
@@ -524,19 +638,116 @@ describe("factory", () => {
 		expect(h.traceOf().at(-1)?.files_changed).toBeUndefined();
 	});
 
-	test("the factory syncs the cwd and adds the shared skills dir to skills.customDirectories", async () => {
-		const shared = path.join(tmp, "rematch", "skills");
-		const h = await host("skills", { entries: [], hooks: [], dirs: [shared] });
+	test("each place mounts its own view, replacing the last: never a cumulative union", async () => {
+		const root = path.join(tmp, "skills");
+		const viewA = path.join(root, "views", "repo-a-0001", "skills");
+		const viewB = path.join(root, "views", "repo-b-0002", "skills");
+		const state: HostState = { entries: [], hooks: [], dirs: [viewA], view: "repo-a-0001" };
+		const h = await host("skills", state);
 		expect(h.execs.filter(a => a[0] === "skills")).toEqual([["skills", "sync", "--cwd", process.cwd(), "--harness", "omp"]]);
-		const mine = overrides.filter(([scope]) => scope === h.settings);
-		expect(mine.map(([, value]) => value)).toEqual([["/configured/skills", shared]]);
-		// A re-match elsewhere syncs that cwd; the same shared dir is never added twice.
+		expect(overridesOf(h.settings, "skills.customDirectories")).toEqual([["/configured/skills", viewA]]);
+		// Another place: its view replaces this one (an older shared-dir entry the user had goes too).
+		state.dirs = [viewB];
+		state.view = "repo-b-0002";
 		h.ctx.cwd = tmp;
 		await h.fire("context", { messages: [user("q")] });
 		expect(h.execs.filter(a => a[0] === "skills").map(a => a[3])).toEqual([process.cwd(), tmp]);
-		expect(overrides.filter(([scope]) => scope === h.settings)).toHaveLength(1);
+		expect(overridesOf(h.settings, "skills.customDirectories").at(-1)).toEqual(["/configured/skills", viewB]);
+		expect(sessionSkillDirs(["/configured/skills", path.join(root, "skills"), viewA], [viewB], root)).toEqual(["/configured/skills", viewB]);
 		await h.fire("session_start");
-		expect(h.traceOf()[0].staging_dirs).toEqual([shared]);
+		expect(h.traceOf()[0]).toMatchObject({ staging_dirs: [viewB], exposure_view: "repo-b-0002" });
+	});
+
+	test("other places' provisional agents are disabled for the process; all of them when the binary cannot say", async () => {
+		const h = await host("agents", { entries: [], hooks: [], withheld: ["other-repo-agent"] });
+		expect(overridesOf(h.settings, "task.disabledAgents")).toEqual([["users-own-off", "other-repo-agent"]]);
+		const root = path.join(tmp, "agents-failsafe");
+		fs.mkdirSync(path.join(root, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(root, "agents", "a-trial.md"), "x");
+		fs.writeFileSync(path.join(root, "agents", "b-trial.md"), "x");
+		const failing = await host("agents-failsafe", { entries: [], hooks: [], syncFails: true });
+		expect(overridesOf(failing.settings, "task.disabledAgents").at(-1)).toEqual(["users-own-off", "a-trial", "b-trial"]);
+		expect(overridesOf(failing.settings, "skills.customDirectories").at(-1), "no rematch skill dir either").toEqual(["/configured/skills"]);
+		// off from the command withdraws them at once
+		await h.command("off");
+		expect(overridesOf(h.settings, "task.disabledAgents").at(-1)).toEqual(["users-own-off"]);
+	});
+
+	test("a read credits the entry the session's view links, never a same-named skill of the user's", async () => {
+		const root = path.join(tmp, "credit");
+		const ours = path.join(root, "staging", "repo", "ledger");
+		fs.mkdirSync(ours, { recursive: true });
+		fs.writeFileSync(path.join(ours, "rematch.json"), JSON.stringify({ id: "e-ledger" }));
+		const h = await host("credit", { entries: [], hooks: [], links: { ledger: ours, notes: path.join(root, "missing") } });
+		await h.fire("session_start");
+		await h.fire("tool_result", { toolName: "read", toolCallId: "r1", input: { path: "skill://ledger/units/a.md:1-5" }, content: [], isError: false });
+		await h.fire("tool_result", { toolName: "read", toolCallId: "r2", input: { path: "skill://ledger" }, content: [], isError: true });
+		await h.fire("tool_result", { toolName: "read", toolCallId: "r3", input: { path: "skill://notes" }, content: [], isError: false });
+		const reads = h.traceOf().filter(r => r.ev === "tool_result").map(r => [r.skill_read, r.skill_entry]);
+		expect(reads).toEqual([["ledger", "e-ledger"], ["ledger", null], ["notes", null]]);
+		const mine = path.join(tmp, "my-skills");
+		fs.mkdirSync(path.join(mine, "ledger"), { recursive: true });
+		fs.writeFileSync(path.join(mine, "ledger", "SKILL.md"), "---\nname: ledger\ndescription: mine\n---\n");
+		expect(shadowedByCustomDirs(new Map([["ledger", "e-ledger"]]), [mine], root), "omp gives the user's custom dir the bare name").toEqual(["ledger"]);
+	});
+
+	test("omp reads personal instructions from its AGENTS.md only: traced, never injected at runtime", async () => {
+		const h = await host("instructions", {
+			entries: [],
+			hooks: [],
+			instructions: { host: "omp", exposed: [{ id: "e1", name: "tests-first", sha: "f1", source: "ledger", bytes: 90 }], conflicts: [] },
+			fragments: [{ id: "e1", name: "tests-first", text: "Run tests." }, { id: "e2", name: "legacy", text: "Legacy runtime text." }],
+		});
+		await h.fire("session_start");
+		expect(h.traceOf()[0].instructions_exposed).toEqual([{ id: "e1", name: "tests-first", sha: "f1" }]);
+		// A legacy runtime approval is not a second channel: it waits for the file approval.
+		expect(await h.fire("before_agent_start", { systemPrompt: "base" })).toBeUndefined();
+	});
+
+	test("the model's rematch tool refuses every user-only control, wherever the global flags stand", async () => {
+		const h = await host("tool-authority", { entries: [], hooks: [] });
+		await h.fire("session_start");
+		const refused: [string, string[]][] = [
+			["library", ["approve", "e1"]],
+			["library", ["--text", "approve", "e1"]],
+			["library", ["--cwd", "/x", "decline", "e1"]],
+			["library", ["--cwd=/x", "disable", "e1"]],
+			["library", ["rollback", "ledger"]],
+			["library", ["pin", "e1"]],
+			["library", ["export", "--approve-all"]],
+			["library", ["--text", "export", "--entry", "e1", "--approve"]],
+			["off", []],
+			["on", ["--text"]],
+			["mark", ["correction"]],
+			["uninstall", ["--yes"]],
+		];
+		for (const [op, args] of refused) {
+			const r = await h.tool(op, args);
+			expect(r.ok, `${op} ${args.join(" ")}`).toBe(false);
+			expect(r.error, `${op} ${args.join(" ")}`).toContain("reserved to the user");
+		}
+		expect(h.execs.filter(a => ["library", "off", "on", "mark", "uninstall"].includes(a[0] ?? "") && a[1] !== "ls"), "none reached the binary").toEqual([]);
+		expect((await h.tool("library", ["--text", "ls"])).ok).toBe(true);
+		expect((await h.tool("library", ["inspect", "e1"])).ok).toBe(true);
+		// The model's shell: the same parser, before any hook, and while rematch is off.
+		expect(h.toolCall({ command: "rematch --text --cwd /w library disable e1" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "cd /w && rematch --cwd=/w library export --approve-all" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch --text mark --class correction" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch policy scope set bellwether-dev ~/repos/bellwether" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch --cwd /w policy scope unset bellwether-dev" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch policy show" })).toBeUndefined();
+		expect(h.toolCall({ command: "rematch --text library ls" })).toBeUndefined();
+		expect(h.traceOf().filter(r => r.ev === "tool_blocked").map(r => r.hook_id)).toEqual(Array(5).fill("rematch:user-only"));
+		await h.command("off");
+		expect(h.toolCall({ command: "sh -c 'rematch --cwd /w on'" })).toContain("reserved to the user");
+	});
+
+	test("hook use is traced once per hook and tool, not on every call", async () => {
+		const h = await host("hook-use", { entries: [], hooks: [stuckFile()] });
+		await h.fire("session_start");
+		h.toolCall(same);
+		h.toolCall(same);
+		expect(h.traceOf().filter(r => r.ev === "hook_evaluated")).toEqual([expect.objectContaining({ hook_ids: ["hook-stuck"], tool: "bash" })]);
 	});
 
 	test("session start runs one profile sync only when match reports a profile", async () => {
@@ -550,44 +761,19 @@ describe("factory", () => {
 		expect(h.execs.filter(a => a[0] === "profile")).toEqual([["profile", "sync", "--timeout", "8"]]);
 	});
 
-	describe("personal prompt fragments", () => {
+	describe("personal prompt fragments (helpers shared with Pi and OpenCode; omp reads its AGENTS.md)", () => {
 		const fragments = [
 			{ id: "a", name: "alpha", text: "\nUse alpha.\n\n" },
 			{ id: "b", name: "beta", text: "Use beta." },
 		];
 		const block = "## rematch: alpha\n\nUse alpha.\n\n## rematch: beta\n\nUse beta.";
-		const systemPromptOf = (r: unknown): unknown => (r && typeof r === "object" && "systemPrompt" in r ? r.systemPrompt : undefined);
 
-		test("appended to an array system prompt as one extra element, and to a string with a blank line", async () => {
+		test("omp never appends fragments to the system prompt, approved at runtime or not", async () => {
 			const h = await host("fragments", { entries: [{ id: "a", predicate_hit: true }], hooks: [], fragments });
 			await h.fire("session_start");
-			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: ["base one", "base two"] }))).toEqual(["base one", "base two", block]);
-			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: "base" }))).toBe(`base\n\n${block}`);
-			// A re-entry sees the same base and answers the same: nothing accumulates.
-			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: ["base one", "base two"] }))).toEqual(["base one", "base two", block]);
+			expect(await h.fire("before_agent_start", { systemPrompt: ["base one", "base two"] })).toBeUndefined();
+			expect(await h.fire("before_agent_start", { systemPrompt: "base" })).toBeUndefined();
 		});
-
-		test("no fragments, a subagent, or a revive leave the prompt alone", async () => {
-			const none = await host("fragments-none", { entries: [], hooks: [] });
-			expect(await none.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
-			const malformed = await host("fragments-malformed", { entries: [], hooks: [], fragments: [{ id: "a", name: "x" }, "nope", { id: "b", name: "y", text: "  " }] });
-			expect(await malformed.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
-
-			const sub = await host("fragments-sub", { entries: [], hooks: [], fragments });
-			sub.ctx.agent = { kind: "sub", name: "worker" };
-			expect(await sub.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
-
-			const revive = await host("fragments-revive", { entries: [], hooks: [], fragments });
-			expect(await revive.fire("before_agent_start", { reason: "revive", systemPrompt: ["base"] })).toBeUndefined();
-		});
-
-		test("a cwd change re-matches before the prompt is built", async () => {
-			const h = await host("fragments-cwd", { entries: [], hooks: [], fragments });
-			h.ctx.cwd = tmp;
-			await h.fire("before_agent_start", { systemPrompt: ["base"] });
-			expect(h.matches()).toEqual([process.cwd(), tmp]);
-		});
-
 		test("helpers keep well-formed fragments, render the ship heading, and reject odd prompts", () => {
 			expect(promptFragmentsOf({ prompt_fragments: [...fragments, { id: 1, name: "n", text: "t" }] })).toEqual(fragments);
 			expect(promptFragmentsOf({})).toEqual([]);

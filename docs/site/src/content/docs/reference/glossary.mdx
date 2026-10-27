@@ -8,7 +8,7 @@ description: The terms used across this site, in one line each.
 | **entry** | one item of the library (a skill, rule, script, agent, hook, fact or lesson) with its own trigger, counters and status | [entries](/rematch/concepts/entries/) |
 | **draft** | an entry made from a description only; visible, never loaded | [create a skill](/rematch/guides/create-a-skill/) |
 | **provisional** | an entry that hasn't proven itself yet; loads only where its predicate matches, and is counted there | [entries](/rematch/concepts/entries/#statuses) |
-| **kept** | an entry that survived 4 matched sessions with no recurrence and no harm; loads natively. Never called verified | [counters](/rematch/concepts/counters/) |
+| **kept** | an entry with evidence to stay: four clean completed sessions that actually used it (`accepted_in_use`) or a supporting bounded comparison (`comparative_support`), with no recurrence and no harm; loads natively. Never called verified | [counters](/rematch/concepts/counters/) |
 | **retired** · **dormant** · **stale** | archived statuses; never loaded, never deleted | [entries](/rematch/concepts/entries/#statuses) |
 | **pinned** | a flag: the entry is never replaced or retired automatically | [day to day](/rematch/guides/day-to-day/#manage-the-library) |
 | **redirect** | a turn in which you steered the agent: a negation, a revert, a reprompt, an interrupt, or a mark | [the loop](/rematch/concepts/loop/#how-a-reflection-works) |
@@ -17,7 +17,9 @@ description: The terms used across this site, in one line each.
 | **flag** | the mark a session gets at shutdown when it carried a redirect, a tool-error cluster, a takeover or a mark; only flagged sessions are reflected on | [the loop](/rematch/concepts/loop/) |
 | **reflection** | the between-sessions step that classifies, proposes, lints and stages; at most 3 model calls | [the loop](/rematch/concepts/loop/) |
 | **predicate** (trigger) | the deterministic repo, file types and task words that decide where an entry loads and which sessions count | [predicates](/rematch/concepts/predicates-and-domains/) |
-| **matched** | a session in which the entry was loaded and its predicate hit; the denominator of every decision | [counters](/rematch/concepts/counters/) |
+| **matched** | a session in which the entry was loaded and its predicate hit; a safety denominator (dormancy, retirement), never enough to keep an entry | [counters](/rematch/concepts/counters/) |
+| **used** · **used_clean** | a matched session that completed and actually used the entry (read, invoked, retrieved, its approved instruction carried, a hook evaluated, a script run, an agent invoked); clean when it also had no recurrence and no harm | [counters](/rematch/concepts/counters/) |
+| **accepted_in_use** · **comparative_support** | the two reasons an entry is kept automatically: sustained clean actual use, or an engine-run comparison on an authorized task. Neither is proof of general improvement | [counters](/rematch/concepts/counters/#retention-reasons-and-the-decision-rule) |
 | **recurrence** | the redirect class that motivated an entry happened again while it was loaded | [counters](/rematch/concepts/counters/) |
 | **harm** | a new tool-error cluster, a takeover, or a disable while an entry was loaded | [counters](/rematch/concepts/counters/) |
 | **canary** | a provisional entry still being counted; no new reflection runs for its predicate meanwhile | [counters](/rematch/concepts/counters/#rate-limits) |
@@ -27,7 +29,10 @@ description: The terms used across this site, in one line each.
 | **journal** | the ledger's append-only record of every write, with the ledger's own clock; what the lake exports | [the lake](/rematch/concepts/lake/) |
 | **lake** | the journal and closed sessions as write-once Parquet files under `~/.rematch/lake/`; history, never read by a session | [the lake](/rematch/concepts/lake/) |
 | **profile** | a git repo at `~/.rematch/profile/` holding your omp setup, linked into every machine that syncs it | [the profile](/rematch/concepts/profile/) |
-| **digest** | the session-start summary of what was staged, kept or retired, approvals waiting (one item per entry: scripts, hook, subagent and prompt text), and entries ready to ship | [day to day](/rematch/guides/day-to-day/) |
+| **digest** | the session-start summary of what was staged, kept or retired, plus every action still waiting for you | [day to day](/rematch/guides/day-to-day/) |
+| **action** | one decision waiting for you (`<entry-id>`, `instructions:<id>`, `probe:<id>`, …), listed until you approve or decline it; both bind the snapshot you inspected with `--sha` | [approvals](/rematch/guides/approve-scripts-and-hooks/) |
+| **personal instructions** | approved `AGENTS.fragment.md` text: a marked block in your `<agent_dir>/AGENTS.md` for omp, runtime insertion in Claude Code, Pi and OpenCode | [approvals](/rematch/guides/approve-scripts-and-hooks/#personal-agentsmd-instructions) |
+| **probe** | an optional, bounded baseline/candidate omp run on a task you authorized | [automatic probes](/rematch/guides/automatic-probes/) |
 | **verifier** | a mechanical pass/fail check (tests, script, parity, receipt) that picks winners in batch mode | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#verifiers) |
 | **anchor replay** | one re-run of a kept skill's task with its replacement loaded, before the replacement goes ahead | [batch with a verifier](/rematch/guides/batch-with-a-verifier/#replacing-a-kept-skill) |
 | **surface** | one of the eight parts of a harness rematch can change | [the eight surfaces](/rematch/concepts/surfaces/) |

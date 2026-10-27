@@ -47,7 +47,7 @@ fn keep(env: &Env, machine: &str, editor: &str, sid_base: &str) -> String {
     let d = on(env, machine, &["reflect", "--pending", "--editor", editor]);
     let id = d["reflections"][0]["id"].as_str().unwrap_or_else(|| panic!("{d}")).to_string();
     for i in 1..=4 {
-        env.write_trace(&format!("{sid_base}{i}"), &[&id], false);
+        env.write_trace_using(&format!("{sid_base}{i}"), &[&id], false, &[&id]);
     }
     let c = on(env, machine, &["count", "--editor", editor]);
     assert_eq!(c["decisions"][0]["decision"], "keep", "{c}");
@@ -113,7 +113,9 @@ fn two_machines_share_one_profile() {
     // An approved hook lands in the profile, linked from rematch-hooks/.
     let builtins = on(&a, A, &["builtins", "ls"]);
     let hook_id = builtins["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
-    on(&a, A, &["library", "approve", &hook_id]);
+    let review = on(&a, A, &["library", "inspect", &hook_id]);
+    let argv: Vec<String> = serde_json::from_value(review["action"]["commands"]["approve_argv"].clone()).unwrap();
+    on(&a, A, &argv.iter().map(String::as_str).collect::<Vec<_>>());
     let hook_file = format!("{hook_id}.ts");
     assert_eq!(link(&a.agent.join("extensions/rematch-hooks").join(&hook_file)), pa.join("hooks").join(&hook_file));
 

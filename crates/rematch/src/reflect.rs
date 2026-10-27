@@ -23,8 +23,9 @@ use rematch_core::rate::{self, RateLimit};
 use rematch_core::redirect;
 use rematch_core::trace::{self, TraceRecord, TriageKind};
 use rematch_core::types::{
-    Counters, Decision, Edit, EditorScope, Entry, Family, Kind, LessonTag, LintReport, Manifest, Moment, Origin,
-    Paired, Predicate, Proposal, Redirect, RedirectClass, SessionRecord, Severity, Status,
+    ComparativeEvidence, ComparativeOutcome, Counters, Decision, Edit, EditorScope, Entry, Family, Kind, LessonTag,
+    LintReport, Manifest, Moment, Origin, Paired, Predicate, Proposal, Redirect, RedirectClass, Retention,
+    RetentionReason, SessionRecord, Severity, Status,
 };
 use serde_json::{json, Value};
 
@@ -132,7 +133,8 @@ pub fn cmd_reflect(ctx: &AppCtx, a: ReflectArgs) -> Result<Value> {
     } else {
         None
     };
-    let count = count_finished(ctx, a.session.as_deref(), a.editor.as_deref())?;
+    let mut count = count_finished(ctx, a.session.as_deref(), a.editor.as_deref())?;
+    probe_and_decide(ctx, &mut count, a.editor.as_deref());
     let classified: BTreeSet<String> =
         count.classified_sessions.iter().cloned().collect();
     let mut reflections = Vec::new();
@@ -206,6 +208,8 @@ pub struct CountSummary {
     /// Predicate tuning after the decisions (`tune::pass`): entries with a proposal and what
     /// became of it. Runs only when sessions were folded.
     pub tune: Value,
+    /// The bounded probe pass of `reflect --pending` (`probes::pass`): per-entry status, caps.
+    pub probes: Value,
     pub lines: Vec<String>,
 }
 
@@ -220,6 +224,7 @@ impl CountSummary {
             "skipped_unfinished": self.skipped_unfinished,
             "scope": self.scope,
             "tune": self.tune,
+            "probes": self.probes,
         })
     }
 }
@@ -356,14 +361,10 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
         if let Some((harmed, clean)) = counters::family_divergence(&c) {
             sum.divergence.push(json!({"entry": id, "name": e.name, "harmed": harmed, "clean": clean}));
         }
-        let d = counters::decide(&e, &c, ctx.now);
-        if d == Decision::Continue {
-            continue;
-        }
-        record_decision(ctx, &mut sum, &e, d, &c, editor_cmd);
+        decide_one(ctx, &mut sum, &e, &c, editor_cmd);
     }
     for (e, c) in idle_dormant_entries(ctx, &affected)? {
-        record_decision(ctx, &mut sum, &e, Decision::Dormant, &c, editor_cmd);
+        record_decision(ctx, &mut sum, &e, Decision::Dormant, &c, None, editor_cmd);
     }
     if !sum.folded.is_empty() {
         sum.tune = match crate::tune::pass(ctx, &mut sum.lines) {
@@ -378,11 +379,51 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
     Ok(sum)
 }
 
+/// `counters::decide` with the entry's bound comparison (`probes::evidence_for`); applies a
+/// non-Continue decision.
+fn decide_one(ctx: &AppCtx, sum: &mut CountSummary, e: &Entry, c: &Counters, editor_cmd: Option<&str>) {
+    let probe = crate::probes::evidence_for(ctx, e);
+    let d = counters::decide(e, c, probe.as_ref(), ctx.now);
+    if d != Decision::Continue {
+        record_decision(ctx, sum, e, d, c, probe.as_ref(), editor_cmd);
+    }
+}
+
+/// The bounded probe pass (`probes::pass`) after counting, then a decision for every entry
+/// whose comparison completed. Runs inside `reflect --pending` (the detached job).
+fn probe_and_decide(ctx: &AppCtx, sum: &mut CountSummary, editor_cmd: Option<&str>) {
+    match crate::probes::pass(ctx, &mut sum.lines) {
+        Ok((ran, report)) => {
+            sum.probes = report;
+            for id in ran {
+                let Ok(Some(e)) = ctx.ledger.get_entry(&id) else { continue };
+                match ctx.ledger.counters(&id) {
+                    Ok(c) => decide_one(ctx, sum, &e, &c, editor_cmd),
+                    Err(err) => sum.decisions.push(json!({"entry": id, "error": format!("{err:#}")})),
+                }
+            }
+        }
+        Err(e) if e.downcast_ref::<crate::envelope::Cancelled>().is_some() => {
+            sum.probes = json!({"cancelled": true});
+        }
+        Err(e) => sum.probes = json!({"error": format!("{e:#}")}),
+    }
+}
+
 /// Apply one decision; its line and result (or its error) go into the summary.
-fn record_decision(ctx: &AppCtx, sum: &mut CountSummary, e: &Entry, d: Decision, c: &Counters, editor_cmd: Option<&str>) {
-    match apply_decision(ctx, e, d, c, editor_cmd) {
+fn record_decision(
+    ctx: &AppCtx,
+    sum: &mut CountSummary,
+    e: &Entry,
+    d: Decision,
+    c: &Counters,
+    probe: Option<&ComparativeEvidence>,
+    editor_cmd: Option<&str>,
+) {
+    match apply_decision(ctx, e, d, c, probe, editor_cmd) {
         Ok(v) => {
-            sum.lines.push(format!("{} {}: {}", enum_str(&d), e.name, experience::counters_line(c).lines().next().unwrap_or("")));
+            let why = v.get("retention").and_then(|r| r.get("reason")).and_then(Value::as_str).map(|r| format!(" [{r}]")).unwrap_or_default();
+            sum.lines.push(format!("{} {}{why}: {}", enum_str(&d), e.name, experience::counters_line(c).lines().next().unwrap_or("")));
             sum.decisions.push(v);
         }
         Err(err) => {
@@ -508,13 +549,30 @@ fn experience_dir(ctx: &AppCtx, e: &Entry) -> PathBuf {
 
 /// Apply a Keep/Retire/Dormant decision and write EXPERIENCE.md for keep/retire.
 /// A Keep that replaces a kept entry first runs its anchor replay (`scope::anchor`): a
-/// failing replay turns it into a Retire with an `anchor replay failed: …` note.
-pub fn apply_decision(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor_cmd: Option<&str>) -> Result<Value> {
+/// failing replay turns it into a Retire with an `anchor replay failed: …` note. A Keep
+/// records its engine evidence (`Entry.retention`, `counters::keep_reason`).
+pub fn apply_decision(
+    ctx: &AppCtx,
+    e: &Entry,
+    d: Decision,
+    c: &Counters,
+    probe: Option<&ComparativeEvidence>,
+    editor_cmd: Option<&str>,
+) -> Result<Value> {
     if d == Decision::Continue {
         return Ok(json!({"entry": e.id, "decision": d}));
     }
     let mut d = d;
     let mut note = format!("counters: {}", experience::counters_line(c).lines().next().unwrap_or(""));
+    let retention = (d == Decision::Keep).then(|| retention_for(e, c, probe, ctx.now)).flatten();
+    if let Some(r) = &retention {
+        note = format!("{}: {}", enum_str(&r.reason), r.detail);
+    } else if d == Decision::Keep {
+        bail!("keep of {} without accepted-in-use or comparative evidence", e.id);
+    }
+    if d == Decision::Retire && probe.is_some_and(|p| p.outcome == ComparativeOutcome::Regresses && p.binds(e)) {
+        note = format!("bounded comparison regressed (probe {})", probe.map(|p| p.probe.as_str()).unwrap_or(""));
+    }
     let mut anchor = None;
     if d == Decision::Keep {
         if let Some(kept) = anchor::replaced_kept(ctx, e)? {
@@ -531,12 +589,17 @@ pub fn apply_decision(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor
         Decision::Retire => Status::Retired,
         _ => Status::Dormant,
     };
-    let moved = if is_foreign(ctx, e) {
+    let mut moved = if is_foreign(ctx, e) {
         record_status(ctx, e, to, &format!("{note} (files left in place)"))?
     } else {
         library::set_status(&ctx.ledger, &ctx.paths, &e.id, to, Some(&note))?
     };
     let mut out = json!({"entry": e.id, "name": e.name, "decision": d, "status": moved.status, "path": moved.path});
+    if let (Decision::Keep, Some(r)) = (d, retention) {
+        moved.retention = Some(r);
+        save_entry(ctx, &moved)?;
+        out["retention"] = json!(moved.retention);
+    }
     if let Some((kept, outcome)) = &anchor {
         out["anchor"] = json!({"kept": kept.id, "replay": outcome});
         if let AnchorOutcome::Replayed { pass: true, receipt } = outcome {
@@ -549,7 +612,7 @@ pub fn apply_decision(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor
             Some(AnchorOutcome::Replayed { receipt, .. }) => Some(&**receipt),
             _ => None,
         };
-        let (situation, lesson, tag, source) = reflector_lesson(ctx, &moved, d, c, replay, editor_cmd);
+        let (situation, lesson, tag, source) = reflector_lesson(ctx, &moved, d, c, probe, replay, editor_cmd);
         let dir = experience_dir(ctx, &moved);
         if dir.starts_with(ctx.paths.root.join("brownfield")) {
             std::fs::create_dir_all(&dir)?;
@@ -561,13 +624,47 @@ pub fn apply_decision(ctx: &AppCtx, e: &Entry, d: Decision, c: &Counters, editor
         if moved.lesson_tag.is_none() || (source == "reflector" && moved.lesson_tag != Some(tag)) {
             let mut t = moved.clone();
             t.lesson_tag = Some(tag);
-            ctx.ledger.upsert_entry(&t)?;
-            if !is_foreign(ctx, &t) && t.path.join(REMATCH_JSON).is_file() {
-                std::fs::write(t.path.join(REMATCH_JSON), serde_json::to_string_pretty(&t)?)?;
-            }
+            save_entry(ctx, &t)?;
         }
     }
     Ok(out)
+}
+
+/// Ledger plus, for a rematch-owned dir, its `rematch.json`.
+pub(crate) fn save_entry(ctx: &AppCtx, e: &Entry) -> Result<()> {
+    ctx.ledger.upsert_entry(e)?;
+    if !is_foreign(ctx, e) && e.path.join(REMATCH_JSON).is_file() {
+        std::fs::write(e.path.join(REMATCH_JSON), serde_json::to_string_pretty(e)?)?;
+    }
+    Ok(())
+}
+
+/// The engine record of a keep: its evidence class (`counters::keep_reason`), the counts
+/// and the content it was decided on. `None` when nothing justifies a keep.
+pub fn retention_for(e: &Entry, c: &Counters, probe: Option<&ComparativeEvidence>, now: i64) -> Option<Retention> {
+    let reason = counters::keep_reason(e, c, probe)?;
+    let detail = match reason {
+        RetentionReason::ComparativeSupport => format!(
+            "a bounded reference/candidate comparison of this version favored it (probe {}); no recurrence or harm recorded over {} matched session(s)",
+            probe.map(|p| p.probe.as_str()).unwrap_or("?"),
+            c.matched
+        ),
+        _ => format!(
+            "{} clean completed session(s) actually used it ({} used, {} matched, no recurrence or harm); observed acceptance, not a measured improvement",
+            c.used_clean, c.used, c.matched
+        ),
+    };
+    Some(Retention {
+        reason,
+        at: now,
+        version: e.version,
+        content_sha256: e.content_sha256.clone(),
+        matched: c.matched,
+        used: c.used,
+        used_clean: c.used_clean,
+        probe: (reason == RetentionReason::ComparativeSupport).then(|| probe.map(|p| p.probe.clone())).flatten(),
+        detail,
+    })
 }
 
 fn entry_files(dir: &Path, cap: usize) -> BTreeMap<String, String> {
@@ -594,12 +691,15 @@ fn entry_files(dir: &Path, cap: usize) -> BTreeMap<String, String> {
 }
 
 /// Reflector call (`improver/reflector.md`); deterministic record when it fails. `replay`
-/// is the anchor replay that preceded a keep (or turned it into a retire).
+/// is the anchor replay that preceded a keep (or turned it into a retire). The input carries
+/// the engine's evidence: the retention reason, actual use against matches, and any bound
+/// comparison (verdicts only: no verifier output, which could carry expected answers).
 fn reflector_lesson(
     ctx: &AppCtx,
     e: &Entry,
     d: Decision,
     c: &Counters,
+    probe: Option<&ComparativeEvidence>,
     replay: Option<&AnchorReceipt>,
     editor_cmd: Option<&str>,
 ) -> (String, String, LessonTag, &'static str) {
@@ -609,8 +709,25 @@ fn reflector_lesson(
         "manifest": e.manifest,
         "files": entry_files(&e.path, 4096),
         "counters": c,
+        "use": {"matched": c.matched, "used": c.used, "used_clean": c.used_clean, "use_unknown": c.use_unknown,
+                "note": "used = clean completed sessions that actually read/invoked/retrieved, evaluated or were exposed to the entry; matched alone is not use"},
+        "retention": e.retention.as_ref().filter(|_| d == Decision::Keep),
         "decision": d,
     });
+    // `decide` already bound `probe` to the decided content (a keep may rewrite the files).
+    if let Some(p) = probe {
+        let r = crate::probes::record_of(ctx, &e.id);
+        input["comparison"] = json!({
+            "outcome": p.outcome,
+            "source": r.as_ref().map(|r| r.source.clone()),
+            "task": r.as_ref().and_then(|r| r.task.clone()),
+            "harness": r.as_ref().map(|r| r.harness.clone()),
+            "model": r.as_ref().and_then(|r| r.model.clone()),
+            "baseline_pass": r.as_ref().and_then(|r| r.baseline.as_ref().map(|s| s.pass)),
+            "candidate_pass": r.as_ref().and_then(|r| r.candidate.as_ref().map(|s| s.pass)),
+            "reason": r.as_ref().map(|r| r.reason.clone()),
+        });
+    }
     if let Some(r) = replay {
         input["anchor_replay"] = json!({
             "task": r.task,
@@ -648,18 +765,28 @@ fn reflector_lesson(
     let class = e.redirect_class.map(redirect::class_name).unwrap_or("error-cluster/takeover");
     let situation = format!("{} ({:?}) was staged for a {class} redirect: {}", e.name, e.kind, e.trigger_line);
     let lesson = match d {
-        Decision::Keep => format!(
-            "Kept: {} matched sessions with no recurrence of the {class} redirect and no harm event.",
-            c.matched
-        ),
+        Decision::Keep => match e.retention.as_ref().map(|r| r.reason) {
+            Some(RetentionReason::ComparativeSupport) => format!(
+                "Kept on comparative support: one bounded reference/candidate comparison of this version favored it, with no recurrence of the {class} redirect or harm over {} matched sessions. Support under that task and model, not general correctness.",
+                c.matched
+            ),
+            _ => format!(
+                "Kept as accepted in use: {} clean completed sessions actually used it ({} matched) with no recurrence of the {class} redirect and no harm. Observed acceptance, not a measured improvement.",
+                c.used_clean, c.matched
+            ),
+        },
         _ => match replay {
             Some(r) => format!(
-                "Retired before replacing a kept entry: {} matched clean sessions, but one replay of task {} with it in place failed the verifier.",
-                c.matched, r.task
+                "Retired before replacing a kept entry: one replay of task {} with it in place failed the verifier ({} used of {} matched sessions).",
+                r.task, c.used, c.matched
+            ),
+            None if probe.is_some_and(|p| p.outcome == ComparativeOutcome::Regresses) => format!(
+                "Retired: one bounded comparison of this version regressed against the baseline ({} used of {} matched sessions).",
+                c.used, c.matched
             ),
             None => format!(
-                "Retired: recurrence {} and harm {} over {} matched sessions; the entry did not prevent the {class} redirect.",
-                c.recurrence, c.harm, c.matched
+                "Retired: recurrence {} and harm {} over {} matched sessions ({} with actual use); the entry did not prevent the {class} redirect.",
+                c.recurrence, c.harm, c.matched, c.used
             ),
         },
     };
@@ -707,7 +834,10 @@ pub fn lint_rules() -> Value {
         {"rule": "executable_risk", "summary": "no URLs, network calls, curl|sh, or destructive git unless the manifest explains it and approval is requested"},
         {"rule": "trigger", "summary": "non-empty repo glob, ≤10 stems, ≤8 extensions, a trigger line in SKILL.md, non-empty description; kind=agent: AGENT.md frontmatter name (= entry name, not main/sub) and description"},
         {"rule": "scripts", "summary": "every referenced scripts/<path> is shipped; scripts are non-executable until approved"},
-        {"rule": "always_on", "summary": "SKILL.md descriptions and bodies, agent descriptions and AGENTS.fragment.md within 8192 bytes per branch; pay for new text by deletion"},
+        {"rule": "description", "summary": "SKILL.md/AGENT.md description ≤ 1024 bytes: it is listed in every session's catalog"},
+        {"rule": "catalog_text", "summary": "name and description are plain one-line text: no markup, backticks, control characters or newlines"},
+        {"rule": "always_on", "summary": "the catalog line (name + description), the entry's own AGENTS.fragment.md and the rest of the catalog within 8192 bytes; pay for new text by deletion"},
+        {"rule": "router", "summary": "SKILL.md body ≤ 8192 bytes (read on demand, not always on)"},
         {"rule": "fragment", "summary": "AGENTS.fragment.md is non-empty and uses ### or deeper headings (it is appended under `## rematch: <name>`)"},
         {"rule": "fork_path", "summary": "entry.fork_path is a repo-relative file path without `..`"},
         {"rule": "form_order", "summary": "trigger line, then laws, procedure, pitfalls, facts"},
@@ -881,7 +1011,7 @@ pub fn build_candidate(ctx: &AppCtx, reply: &EditorReply, spec: &CandidateSpec) 
     }
     let cfg = LintConfig::load(&ctx.improver_file("lint.toml"))?;
     let lctx = LintContext {
-        branch_other_bytes: lint::branch_always_on_bytes(&ctx.paths.staging.join(spec.branch), &entry.path),
+        catalog_other_bytes: library::catalog_other_bytes(&ctx.ledger, &ctx.paths, &entry, &entry.path)?,
         user_names: user_names(),
         transfer: false,
     };
@@ -1241,6 +1371,11 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
             }
             let staged = library::stage(&ctx.ledger, &ctx.paths, &c.entry, &c.edits)?;
             crate::scope::stale::snapshot_sources(&staged.path)?;
+            // A reviewable replay authorization for a bounded probe, when one can be grounded.
+            let probe = match crate::probes::suggest_for(ctx, &staged) {
+                Ok(s) => s.map(|s| json!({"action": format!("{}{}", crate::actions::PROBE, staged.id), "task": s.task.id, "blocked": s.blocked})),
+                Err(e) => Some(json!({"error": format!("{e:#}")})),
+            };
             rate::record_admission(&ctx.ledger, &hash, &staged.id, ctx.now)?;
             let row = ctx.ledger.insert_proposal(Some(&staged.id), Some(sid), &pj, true)?;
             done(
@@ -1249,7 +1384,7 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
                 json!({
                     "outcome": "staged", "id": staged.id, "name": staged.name, "kind": staged.kind, "branch": staged.branch,
                     "path": staged.path, "predicate": staged.predicate, "predicate_hash": hash, "proposal": row.id,
-                    "editor_attempts": attempts, "model_calls": budget.used, "lint": c.report,
+                    "editor_attempts": attempts, "model_calls": budget.used, "lint": c.report, "probe": probe,
                 }),
             )
         }

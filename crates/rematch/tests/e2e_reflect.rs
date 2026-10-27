@@ -201,7 +201,7 @@ fn four_clean_matched_sessions_keep_the_entry() {
     let d = env.run(&["reflect", "--pending", "--editor", &script("editor-ok.sh")]);
     let id = d["reflections"][0]["id"].as_str().unwrap().to_string();
     for i in 1..=4 {
-        env.write_trace(&format!("0192c4a0-0000-7000-8000-0000000000f{i}"), &[&id], false);
+        env.write_trace_using(&format!("0192c4a0-0000-7000-8000-0000000000f{i}"), &[&id], false, &[&id]);
     }
     let c = env.run(&["count", "--editor", &script("editor-ok.sh")]);
     assert_eq!(c["counter_rows"], 4, "{c}");

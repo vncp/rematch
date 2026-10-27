@@ -68,7 +68,9 @@ pub fn parse_spec(spec: &str) -> Result<Box<dyn Verifier>> {
         if Path::new(produced).is_absolute() {
             bail!("parity <produced> must be relative to the worktree");
         }
-        if !is_sha256(expected) && !Path::new(expected).is_file() {
+        // A relative expected file resolves against the task repo at check time (the
+        // active checkout, never a rollout's worktree); an absolute one must exist now.
+        if !is_sha256(expected) && Path::new(expected).is_absolute() && !Path::new(expected).is_file() {
             bail!("parity <expected> {expected:?} is neither a file nor a sha256");
         }
         return Ok(Box::new(ParityVerifier { produced: produced.into(), expected_file: expected.into() }));
@@ -209,13 +211,15 @@ impl Verifier for TestVerifier {
 }
 
 impl Verifier for ParityVerifier {
-    fn check(&self, _task: &Task, worktree: &Path) -> Result<Verdict> {
+    fn check(&self, task: &Task, worktree: &Path) -> Result<Verdict> {
         let expected_text = self.expected_file.to_string_lossy();
         let expected = if is_sha256(&expected_text) {
             expected_text.to_ascii_lowercase()
         } else {
-            let bytes = std::fs::read(&self.expected_file)
-                .with_context(|| format!("read expected {}", self.expected_file.display()))?;
+            // Relative: the file in the task repo itself (clean at HEAD for a probe), never
+            // the caller's cwd or the rollout worktree a candidate could edit.
+            let file = if self.expected_file.is_absolute() { self.expected_file.clone() } else { task.repo.join(&self.expected_file) };
+            let bytes = std::fs::read(&file).with_context(|| format!("read expected {}", file.display()))?;
             sha256_hex(&bytes)
         };
         let produced = worktree.join(&self.produced);
@@ -270,6 +274,8 @@ mod tests {
             tools: None,
             seeds: vec![1],
             created_at: 0,
+            editable: Vec::new(),
+            auto_probe: None,
         }
     }
 

@@ -17,6 +17,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +29,7 @@ const PI_CLI = path.join(ADAPTER, "node_modules", "@earendil-works", "pi-coding-
 const BIN = process.env.REMATCH_BIN || path.join(REPO_ROOT, "target", "debug", "rematch");
 const NODE = process.env.PI_NODE || "node";
 const EDITOR_OK = path.join(REPO_ROOT, "crates", "rematch", "tests", "scripts", "editor-ok.sh");
+const EDITOR_FRAGMENT = path.join(REPO_ROOT, "crates", "rematch", "tests", "scripts", "editor-fragment.sh");
 
 if (!fs.existsSync(BIN)) throw new Error(`rematch binary missing at ${BIN}: cargo build -p rematch (or set REMATCH_BIN)`);
 if (!fs.existsSync(PI_CLI)) throw new Error(`Pi missing at ${PI_CLI}: bun install in adapters/pi`);
@@ -127,6 +129,12 @@ function cli(...args: string[]): Json {
 	return v.data as Json;
 }
 
+/** `rematch library approve` as the user's review runs it: the action's own argv (`--sha` of the reviewed snapshot). */
+function approveAction(id: string): Json {
+	const argv = (cli("library", "inspect", id).action as Json).commands as Json;
+	return cli(...(argv.approve_argv as string[]));
+}
+
 function writeHookEditor(): string {
 	const p = path.join(t, "hook-editor.sh");
 	const reply = {
@@ -155,7 +163,7 @@ function stage(): { skill: string; retrieve: string; hook: string } {
 	fs.writeFileSync(unit, "# Ledger reconciliation\n\nRun the reconciliation migration before the ledger tests.\n");
 	const builtins = (cli("builtins", "ls").builtins as Json[]).find(b => b.name === "context-unit-retrieval")!;
 	const retrieve = builtins.id as string;
-	cli("library", "approve", retrieve);
+	approveAction(retrieve);
 	const hook = cli("create", "no-secrets-read", "--from", "description", "--description", "never read the secrets file", "--editor", writeHookEditor()).id as string;
 	cli("activate", "no-secrets-read", "--unverified");
 	return { skill, retrieve, hook };
@@ -243,6 +251,11 @@ async function rpc(...extra: string[]) {
 			const res = await send({ type: "prompt", message });
 			expect(res).toMatchObject({ success: true, data: { disposition: "handled" } });
 		},
+		/** Answer an `extension_ui_request` dialog (`{ value }`, `{ confirmed }` or `{ cancelled: true }`). */
+		async respond(id: unknown, answer: Json): Promise<void> {
+			proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id, ...answer })}\n`);
+			await proc.stdin.flush();
+		},
 		wait,
 		get settles() {
 			return settles;
@@ -262,12 +275,16 @@ describe("stock Pi over RPC with a scripted model", () => {
 	test("skills, retrieval, tracing, user-only approval, approve → reload → block, steer, mark, flagged shutdown", async () => {
 		const { skill, retrieve, hook } = stage();
 		const hookFile = path.join(home, ".omp", "agent", "extensions", "rematch-hooks", `${hook}.ts`);
-		const skillMd = path.join(root, "skills", "ledger-test-gate", "SKILL.md");
+		// The skill as Pi lists it: under this place's view (`skills sync --harness pi`), not the shared dir.
+		const view = (cli("skills", "sync", "--harness", "pi", "--cwd", repo).dirs as string[])[0]!;
+		const skillMd = path.join(view, "ledger-test-gate", "SKILL.md");
+		expect(fs.existsSync(path.join(root, "skills", "ledger-test-gate")), "a trial is never in the shared dir").toBe(false);
 		model = new FakeModel([
 			{ tool: { name: "read", args: { path: skillMd } } },
 			{ tool: { name: "bash", args: { command: "exit 3" } } },
-			{ tool: { name: "rematch", args: { operation: "library", arguments: ["approve", hook] } } },
-			{ tool: { name: "bash", args: { command: `rematch library approve ${hook}` } } },
+			// The user's decisions, refused with the global flags first (clap accepts them anywhere).
+			{ tool: { name: "rematch", args: { operation: "library", arguments: ["--text", "approve", hook] } } },
+			{ tool: { name: "bash", args: { command: `rematch --cwd ${repo} --text library approve ${hook}` } } },
 			{ text: "Committed after the ledger tests." },
 			{ tool: { name: "read", args: { path: "secrets.txt" } } },
 			{ tool: { name: "bash", args: { command: "sleep 3" } } },
@@ -278,7 +295,12 @@ describe("stock Pi over RPC with a scripted model", () => {
 		try {
 			await pi.prompt("commit the ledger reconciliation migration change to the crate");
 			expect(fs.existsSync(hookFile)).toBe(false); // neither the tool nor bash approved it
-			await pi.command(`/rematch approve ${hook}`);
+			// Typed without a hash: the action's dialog, whose Approve carries the reviewed snapshot.
+			const approving = pi.command(`/rematch approve ${hook}`);
+			const ask = await pi.wait(r => r.type === "extension_ui_request" && r.method === "select");
+			expect(ask.options).toEqual(["Approve", "Decline", "Inspect", "Later"]);
+			await pi.respond(ask.id, { value: "Approve" });
+			await approving;
 			expect(fs.existsSync(hookFile)).toBe(true);
 			const second = pi.prompt("no, read the secrets file first");
 			// Steer while `sleep 3` runs: Pi queues it, the adapter traces a takeover.
@@ -294,8 +316,8 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const out = await pi.close();
 		expect(out.code).toBe(0);
 
-		// One trace: the approval's /reload continued it, adding one session_start that records the
-		// newly loaded hook (and nothing else re-opened it).
+		// One trace: the reviewed approval credited the newly loaded hook at once (one session_start
+		// `pi:approve`), and its /reload continued the trace without re-opening it.
 		const files = traces();
 		expect(files).toHaveLength(1);
 		const sid = files[0]!.replace(/\.jsonl$/, "");
@@ -303,7 +325,7 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const recs = readTrace(files[0]!);
 		expect(recs.map(r => r.seq)).toEqual(recs.map((_, i) => i));
 		const starts = recs.filter(r => r.ev === "session_start");
-		expect(starts.map(r => r.mode)).toEqual(["pi:startup", "pi:reload"]);
+		expect(starts.map(r => r.mode)).toEqual(["pi:startup", "pi:approve"]);
 		expect(starts[1]!.hooks_loaded).toEqual(expect.arrayContaining([retrieve, hook]));
 		expect((starts[1]!.loaded_entries as Json[]).find(e => e.id === hook)).toMatchObject({ version: 1 });
 		expect(recs.findIndex(r => r === starts[1])).toBeLessThan(recs.findIndex(r => r.ev === "tool_blocked" && r.hook_id === hook));
@@ -315,7 +337,9 @@ describe("stock Pi over RPC with a scripted model", () => {
 		expect((start.loaded_entries as Json[]).find(e => e.id === skill)).toMatchObject({ version: 1 });
 		expect((start.loaded_entries as Json[]).map(e => e.id)).not.toContain(retrieve);
 		expect(start.hooks_loaded).toEqual([retrieve]);
-		expect(start.staging_dirs).toEqual([path.join(root, "skills")]);
+		// This place's view (kept library + its provisional entries), never the shared dir of every repo's trials.
+		expect((start.staging_dirs as string[]).map(d => path.relative(root, d).split(path.sep).slice(0, 1).concat(path.basename(d)))).toEqual([["views", "skills"]]);
+		expect(String(start.exposure_view)).toMatch(/^payments-[0-9a-f]{16}$/);
 		expect(start.visible_entries).toContain(skill);
 
 		const evs = recs.map(r => (r.ev === "tool_result" || r.ev === "tool_blocked" ? `${r.ev}:${r.tool}` : r.ev));
@@ -324,8 +348,11 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const retrieval = recs.find(r => r.ev === "retrieval")!;
 		expect(retrieval).toMatchObject({ entry_ids: [retrieve], units: [{ entry_id: skill, path: "units/reconcile.md" }] });
 		const results = recs.filter(r => r.ev === "tool_result");
-		expect(results.map(r => [r.tool, r.is_error, r.skill_read])).toEqual([
+		expect(results.slice(0, 1).map(r => [r.tool, r.is_error, r.skill_read])).toEqual([
 			["read", false, "ledger-test-gate"],
+		]);
+		expect(results[0]!.skill_entry, "the read resolves to the trial's entry").toBe(skill);
+		expect(results.slice(1).map(r => [r.tool, r.is_error, r.skill_read])).toEqual([
 			["bash", true, null],
 			["rematch", true, null],
 			["bash", false, null],
@@ -375,6 +402,37 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const everything = model.requests.map(r => JSON.stringify(r)).join("\n");
 		expect(everything).not.toContain("approved hook of no-secrets-read"); // /rematch output stays out of the provider context
 		expect(model.requests.at(-1)!.messages.map(m => text(m.content)).join("\n")).toContain("stop, use the vault instead");
+	}, 120_000);
+});
+
+describe("stock Pi, approved personal instructions", () => {
+	test("the approved fragment reaches Pi's system prompt and is traced as sent, bound to its approved hash, once", async () => {
+		const id = cli("create", "crate-tests-first", "--from", "description", "--description", "run crate tests before committing", "--editor", EDITOR_FRAGMENT).id as string;
+		cli("activate", "crate-tests-first", "--unverified");
+		const fragmentFile = path.join(root, "staging", "payments", "crate-tests-first", "AGENTS.fragment.md");
+		const sha = createHash("sha256").update(fs.readFileSync(fragmentFile)).digest("hex");
+		model = new FakeModel([{ text: "Not yet." }, { text: "Tests first." }, { text: "Again." }]);
+		writeModels(model);
+		expect((await print("-p", "commit the crate change")).code).toBe(0);
+		expect(systemOf(model.requests[0]!)).not.toContain("## rematch: crate-tests-first"); // not approved
+		approveAction(`instructions:${id}`);
+
+		const pi = await rpc();
+		try {
+			await pi.prompt("commit the crate change");
+			await pi.prompt("and the next crate");
+		} catch (e) {
+			const out = await pi.close();
+			throw new Error(`${e}\nstderr: ${out.stderr}`);
+		}
+		expect((await pi.close()).code).toBe(0);
+		const block = `## rematch: crate-tests-first\n\n${fs.readFileSync(fragmentFile, "utf8").trim()}`;
+		expect(systemOf(model.requests[1]!)).toContain(block);
+		expect(systemOf(model.requests[2]!)).toContain(block);
+		const recs = traces().flatMap(readTrace);
+		const sent = recs.filter(r => r.ev === "fragments_sent");
+		expect(sent).toHaveLength(1);
+		expect(sent[0]).toMatchObject({ host: "pi", fragments: [{ id, name: "crate-tests-first", sha, via: "pi:before_agent_start" }], bytes: Buffer.byteLength(block, "utf8") });
 	}, 120_000);
 });
 

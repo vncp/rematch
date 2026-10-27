@@ -39,6 +39,24 @@ pub struct AgentInfo {
     pub name: String,
 }
 
+/// One approved personal instruction section in the session's context at start. `via`
+/// says how it got there: `agents_md` (omp: the Rematch-managed block of the user's
+/// agent-dir AGENTS.md) or `runtime` (a host adapter's scoped insertion: Claude Code, Pi,
+/// OpenCode). `id` is `None` for a section whose entry is unknown here; `sha` is the
+/// approved fragment's sha256. Exposure alone is no proof a model request ran: counting
+/// credits it only in a session that completed work (`counters::completed_work`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposedInstruction {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub sha: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
+}
+
 /// omp's assistant `usage`, verbatim (camelCase on the wire).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +135,9 @@ impl<'de> Deserialize<'de> for LoadedEntry {
 }
 
 /// One trace line. Field names match DESIGN §3 exactly.
+// `SessionStart` carries the load/exposure snapshot once per trace; boxing it would only
+// reshape every importer for a few hundred bytes per record.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ev", rename_all = "snake_case")]
 pub enum TraceRecord {
@@ -157,6 +178,12 @@ pub enum TraceRecord {
         /// Entry ids the shared skills dir exposed (DESIGN §16).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         visible_entries: Vec<String>,
+        /// Approved personal instruction sections the session's AGENTS.md carried.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        instructions_exposed: Vec<ExposedInstruction>,
+        /// The per-place catalog view the session mounted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exposure_view: Option<String>,
     },
     Input {
         seq: u32,
@@ -199,6 +226,9 @@ pub enum TraceRecord {
         skill_read: Option<String>,
         #[serde(default)]
         path: Option<String>,
+        /// Entry id of the skill read when the adapter resolved the path to one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_entry: Option<String>,
     },
     ToolBlocked {
         seq: u32,
@@ -285,6 +315,44 @@ pub enum TraceRecord {
         #[serde(default)]
         bytes: u64,
     },
+    /// A hook changed the session (`truncate` rewrote messages; `block`/`stuck` also leave
+    /// `tool_blocked`, `retrieve` leaves `retrieval`).
+    HookApplied {
+        seq: u32,
+        #[serde(default)]
+        t: UnixMs,
+        #[serde(default)]
+        hook_id: String,
+        #[serde(default)]
+        mode: String,
+        #[serde(default)]
+        detail: String,
+    },
+    /// `block`/`stuck` hooks evaluated a matching tool call and let it pass (at most once
+    /// per hook and tool per session).
+    HookEvaluated {
+        seq: u32,
+        #[serde(default)]
+        t: UnixMs,
+        #[serde(default)]
+        hook_ids: Vec<String>,
+        #[serde(default)]
+        tool: String,
+    },
+    /// A host adapter (Claude Code, Pi, OpenCode) sent approved personal instruction
+    /// fragments whole in the session's context (after the host's context cap); at most once
+    /// per distinct set. omp exposes them through AGENTS.md instead (`instructions_exposed`).
+    FragmentsSent {
+        seq: u32,
+        #[serde(default)]
+        t: UnixMs,
+        #[serde(default)]
+        host: String,
+        #[serde(default)]
+        fragments: Vec<ExposedInstruction>,
+        #[serde(default)]
+        bytes: u64,
+    },
     /// Unknown `ev`, or a known `ev` whose fields did not parse. Kept verbatim.
     #[serde(untagged)]
     Other(Value),
@@ -309,6 +377,9 @@ impl TraceRecord {
             | Self::ModelChange { seq, .. }
             | Self::Mark { seq, .. }
             | Self::Retrieval { seq, .. }
+            | Self::HookApplied { seq, .. }
+            | Self::HookEvaluated { seq, .. }
+            | Self::FragmentsSent { seq, .. }
             | Self::SessionShutdown { seq, .. } => *seq,
             Self::Other(v) => v.get("seq").and_then(Value::as_u64).unwrap_or(0) as u32,
         }
@@ -325,6 +396,9 @@ impl TraceRecord {
             | Self::ModelChange { t, .. }
             | Self::Mark { t, .. }
             | Self::Retrieval { t, .. }
+            | Self::HookApplied { t, .. }
+            | Self::HookEvaluated { t, .. }
+            | Self::FragmentsSent { t, .. }
             | Self::SessionShutdown { t, .. } => *t,
             Self::Other(v) => v.get("t").and_then(Value::as_i64).unwrap_or(0),
         }
@@ -341,6 +415,9 @@ impl TraceRecord {
             Self::ModelChange { .. } => "model_change",
             Self::Mark { .. } => "mark",
             Self::Retrieval { .. } => "retrieval",
+            Self::HookApplied { .. } => "hook_applied",
+            Self::HookEvaluated { .. } => "hook_evaluated",
+            Self::FragmentsSent { .. } => "fragments_sent",
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::Other(v) => v.get("ev").and_then(Value::as_str).unwrap_or(""),
         }
@@ -519,6 +596,54 @@ pub(crate) fn push_unique(out: &mut Vec<String>, seen: &mut HashSet<String>, ite
     }
 }
 
+fn push_id(out: &mut Vec<String>, id: &str) {
+    if !id.is_empty() && !out.iter().any(|x| x == id) {
+        out.push(id.to_string());
+    }
+}
+
+/// Distinct shell commands kept on a [`SessionRecord`] and the chars kept of each.
+pub const COMMANDS_MAX: usize = 64;
+pub const COMMAND_CHARS: usize = 256;
+
+/// The command of a shell tool call (`bash`, Claude `Bash`, Codex `shell`/`exec_command`).
+pub fn command_of(tool: &str, input: &Value) -> Option<String> {
+    if !matches!(tool.to_ascii_lowercase().as_str(), "bash" | "shell" | "exec_command" | "local_shell") {
+        return None;
+    }
+    let c = match input.get("command").or_else(|| input.get("cmd"))? {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        _ => return None,
+    };
+    let c = c.trim();
+    (!c.is_empty()).then(|| head(c, COMMAND_CHARS))
+}
+
+/// Subagent names a task-tool call invoked (omp `task` `agent`/`tasks[].agent`, Claude
+/// `Task` `subagent_type`).
+pub fn agents_of(tool: &str, input: &Value) -> Vec<String> {
+    if !tool.eq_ignore_ascii_case("task") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut push = |v: Option<&Value>| {
+        if let Some(a) = v.and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()) {
+            if !out.iter().any(|x| x == a) {
+                out.push(a.to_string());
+            }
+        }
+    };
+    push(input.get("agent"));
+    push(input.get("subagent_type"));
+    if let Some(ts) = input.get("tasks").and_then(Value::as_array) {
+        for t in ts {
+            push(t.get("agent"));
+        }
+    }
+    out
+}
+
 /// Seqs at which a tool-error cluster starts: walking results in order, the last
 /// [`ERROR_CLUSTER_WINDOW`] results (fewer at the start) are inspected; entering the
 /// "≥ [`ERROR_CLUSTER_MIN`] errors" state opens a cluster at that result, leaving it allows
@@ -592,6 +717,10 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
     let mut results: Vec<(u32, bool)> = Vec::new();
     let mut last_deliverable = String::new();
     let mut shutdown_flagged = false;
+    // Run-end evidence: the last `agent_end` (terminal or yielded) and whether a model turn
+    // came after it.
+    let mut settled: Option<bool> = None;
+    let mut turn_since_end = false;
 
     for rec in records {
         match rec {
@@ -607,8 +736,14 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 subpath,
                 head_sha,
                 visible_entries,
+                hooks_loaded,
+                instructions_exposed,
+                exposure_view,
                 ..
             } => {
+                if exposure_view.is_some() {
+                    s.exposure_view = exposure_view.clone();
+                }
                 if mode == "import" {
                     s.source = "import".to_string();
                 }
@@ -637,11 +772,25 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                         if !s.loaded_entry_shas.contains(sha) {
                             s.loaded_entry_shas.push(sha.clone());
                         }
+                        s.loaded_shas.insert(e.id.clone(), sha.clone());
                     }
                 }
                 for e in visible_entries {
                     if !e.is_empty() && !s.visible_entries.contains(e) {
                         s.visible_entries.push(e.clone());
+                    }
+                }
+                for h in hooks_loaded {
+                    push_id(&mut s.hooks_loaded, h);
+                }
+                // An exposed approved instruction is loaded: counting attributes to it.
+                for i in instructions_exposed {
+                    if let Some(id) = i.id.as_deref().filter(|id| !id.is_empty()) {
+                        push_id(&mut s.instructions_exposed, id);
+                        push_id(&mut s.loaded_entries, id);
+                        if !i.sha.is_empty() {
+                            s.instruction_shas.insert(id.to_string(), i.sha.clone());
+                        }
                     }
                 }
             }
@@ -655,7 +804,10 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 ..
             } => {
                 inputs.push(text.clone());
+                // A new input opens a new run: the last settlement no longer covers it.
+                turn_since_end = true;
                 for name in skills_invoked.iter().cloned().chain(skills_in_text(text)) {
+                    push_id(&mut s.skills_invoked, &name);
                     push_unique(&mut s.skill_reads, &mut skills_seen, name);
                 }
                 if prelabel == PRELABEL_INTERRUPT {
@@ -684,6 +836,7 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 input,
                 is_error,
                 skill_read,
+                skill_entry,
                 path,
                 ..
             } => {
@@ -692,18 +845,29 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                     s.tool_errors += 1;
                 }
                 results.push((*seq, *is_error));
-                let skill = skill_read.clone().or_else(|| {
-                    (tool == "read" && !*is_error)
-                        .then(|| {
-                            input
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .and_then(skill_from_read_path)
+                // A failed read or skill load loads nothing; a shell command that read a skill
+                // and failed at a later step still read it.
+                let loads = matches!(tool.to_ascii_lowercase().as_str(), "read" | "skill");
+                let skill = (!(*is_error && loads))
+                    .then(|| {
+                        skill_read.clone().or_else(|| {
+                            (tool == "read").then(|| input.get("path").and_then(Value::as_str).and_then(skill_from_read_path)).flatten()
                         })
-                        .flatten()
-                });
+                    })
+                    .flatten();
                 if let Some(name) = skill {
                     push_unique(&mut s.skill_reads, &mut skills_seen, name);
+                }
+                if let Some(id) = skill_entry.as_deref().filter(|_| !*is_error) {
+                    push_id(&mut s.skill_entries, id);
+                }
+                if let Some(c) = command_of(tool, input) {
+                    if s.commands.len() < COMMANDS_MAX && !s.commands.contains(&c) {
+                        s.commands.push(c);
+                    }
+                }
+                for a in agents_of(tool, input) {
+                    push_id(&mut s.agents_invoked, &a);
                 }
                 let mut files = Vec::new();
                 if let Some(p) = path {
@@ -718,6 +882,7 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 model,
                 usage,
                 text_head,
+                stop_reason,
                 ..
             } => {
                 s.turns += 1;
@@ -732,6 +897,8 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                     }
                 }
                 last_deliverable = text_head.clone();
+                s.last_stop_reason = stop_reason.clone().filter(|r| !r.is_empty());
+                turn_since_end = true;
             }
             TraceRecord::Mark { seq, t, class } => {
                 let label = format!("mark:{}", class_name(*class));
@@ -764,10 +931,40 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                         s.loaded_entries.push(e.clone());
                     }
                 }
+                for h in entry_ids {
+                    push_id(&mut s.hooks_applied, h);
+                }
+                for u in units {
+                    push_id(&mut s.retrieved_entries, &u.entry_id);
+                }
             }
-            TraceRecord::ToolBlocked { .. }
-            | TraceRecord::AgentEnd { .. }
-            | TraceRecord::ModelChange { .. } => {}
+            TraceRecord::ToolBlocked { hook_id, .. } | TraceRecord::HookApplied { hook_id, .. } => {
+                push_id(&mut s.hooks_applied, hook_id);
+            }
+            TraceRecord::HookEvaluated { hook_ids, .. } => {
+                for h in hook_ids {
+                    push_id(&mut s.hooks_evaluated, h);
+                }
+            }
+            TraceRecord::FragmentsSent { fragments, .. } => {
+                for f in fragments {
+                    if let Some(id) = f.id.as_deref().filter(|id| !id.is_empty()) {
+                        push_id(&mut s.fragments_sent, id);
+                        push_id(&mut s.loaded_entries, id);
+                        if !f.sha.is_empty() {
+                            s.fragment_shas.insert(id.to_string(), f.sha.clone());
+                        }
+                    }
+                }
+            }
+            // omp writes `is_terminal: !willContinue`, `yielded: last stop == "stop"`; the
+            // Claude, Pi and OpenCode adapters close an open run at shutdown with
+            // `is_terminal: true, yielded: false`. Only both together settle the run.
+            TraceRecord::AgentEnd { is_terminal, yielded, .. } => {
+                settled = Some(*is_terminal && *yielded);
+                turn_since_end = false;
+            }
+            TraceRecord::ModelChange { .. } => {}
             TraceRecord::Other(_) => {}
         }
     }
@@ -775,6 +972,12 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
     if s.branch.is_empty() {
         s.branch = basename(s.repo.as_deref().unwrap_or(&s.cwd));
     }
+    // Importers synthesize `agent_end` at the end of a transcript: no native finish
+    // evidence, so an imported session's completion stays unknown.
+    s.run_completed = settled.filter(|_| s.source != "import").map(|ok| {
+        ok && !turn_since_end
+            && !matches!(s.last_stop_reason.as_deref(), Some("toolUse" | "tool_use" | "aborted" | "error"))
+    });
     s.error_cluster_seqs = error_cluster_seqs(&results);
     s.error_clusters = s.error_cluster_seqs.len() as u32;
     s.exts = exts_of(&s.files_touched);
@@ -1067,11 +1270,11 @@ not json at all
         std::fs::write(repo.join("big.bin"), vec![0u8; (FILES_CHANGED_MAX_BYTES + 1) as usize]).unwrap();
         let a = repo.join("src/a.rs").to_string_lossy().into_owned();
         let recs = vec![
-            TraceRecord::ToolResult { seq: 1, t: 1, tool: "read".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(repo.join("README").to_string_lossy().into_owned()) },
-            TraceRecord::ToolResult { seq: 2, t: 2, tool: "Write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(a.clone()) },
-            TraceRecord::ToolResult { seq: 3, t: 3, tool: "edit".into(), call_id: String::new(), input: serde_json::json!({"input": "[big.bin#ABCD]\n"}), args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: None },
-            TraceRecord::ToolResult { seq: 4, t: 4, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: true, error_class: None, content_head: String::new(), skill_read: None, path: Some("failed.rs".into()) },
-            TraceRecord::ToolResult { seq: 5, t: 5, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some("gone.rs".into()) },
+            TraceRecord::ToolResult { seq: 1, t: 1, tool: "read".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(repo.join("README").to_string_lossy().into_owned()), skill_entry: None },
+            TraceRecord::ToolResult { seq: 2, t: 2, tool: "Write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some(a.clone()), skill_entry: None },
+            TraceRecord::ToolResult { seq: 3, t: 3, tool: "edit".into(), call_id: String::new(), input: serde_json::json!({"input": "[big.bin#ABCD]\n"}), args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: None, skill_entry: None },
+            TraceRecord::ToolResult { seq: 4, t: 4, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: true, error_class: None, content_head: String::new(), skill_read: None, path: Some("failed.rs".into()), skill_entry: None },
+            TraceRecord::ToolResult { seq: 5, t: 5, tool: "write".into(), call_id: String::new(), input: Value::Null, args_hash: String::new(), result_bytes: 0, is_error: false, error_class: None, content_head: String::new(), skill_read: None, path: Some("gone.rs".into()), skill_entry: None },
         ];
         let paths = changed_paths(&recs);
         assert_eq!(paths, vec![a.clone(), "big.bin".to_string(), "gone.rs".to_string()]);

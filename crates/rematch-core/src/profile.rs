@@ -5,6 +5,10 @@
 //! skills/<name>/              kept entries' dirs (the keep writes here) and adopted hand-written skills
 //! agents/<name>.md            kept agents' AGENT.md and adopted hand-written agents
 //! fragments/<name>.md         AGENTS.fragment.md of kept entries whose dir is not under skills/
+//! instructions/<name>.md      personal instructions approved on some machine (exact text); every
+//!                             machine applies them to its own `<agent_dir>/AGENTS.md` (`instructions`)
+//! instructions/<name>.decision the latest profile-wide decision about that text: `approved`, or
+//!                             `declined` (withdrawn on some machine: every machine drops it)
 //! hooks/<id>.ts               approved compiled hooks (rematch-hooks/<id>.ts links here)
 //! config/policy.json          REMATCH_ROOT/policy.json links here
 //! config/roles.yml            logical roles → model selector per machine (`config::resolve_role`)
@@ -74,6 +78,11 @@ pub fn fragments_dir(paths: &RematchPaths) -> PathBuf {
     dir(paths).join("fragments")
 }
 
+/// `instructions/<name>.md`: the canonical approved personal instruction texts (`instructions`).
+pub fn instructions_dir(paths: &RematchPaths) -> PathBuf {
+    dir(paths).join("instructions")
+}
+
 pub fn config_dir(paths: &RematchPaths) -> PathBuf {
     dir(paths).join("config")
 }
@@ -97,7 +106,7 @@ pub fn roles_file(paths: &RematchPaths) -> PathBuf {
 /// Create the layout's directories and make `.gitignore` carry [`GITIGNORE_LINES`] (missing
 /// lines appended; the user's own lines stay).
 pub fn ensure_layout(paths: &RematchPaths) -> Result<()> {
-    for d in [skills_dir(paths), agents_dir(paths), hooks_dir(paths), fragments_dir(paths), domains_dir(paths), improver_dir(paths)] {
+    for d in [skills_dir(paths), agents_dir(paths), hooks_dir(paths), fragments_dir(paths), instructions_dir(paths), domains_dir(paths), improver_dir(paths)] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     let gi = dir(paths).join(".gitignore");
@@ -276,6 +285,10 @@ pub struct Views {
     pub pruned: Vec<String>,
     /// A real file or a foreign link holds the name: left alone, the profile item is not linked there.
     pub untouched: Vec<String>,
+    /// `skills/<name>` links into the profile removed (or not made) because the name has a place
+    /// scope (`policy.json` `scopes`): omp loads `<agent_dir>/skills` in every session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<String>,
 }
 
 /// What [`collect`] moved into the profile.
@@ -372,8 +385,28 @@ fn improver_edited(paths: &RematchPaths, p: &Path, name: &str) -> bool {
     regular && shipped_hash(paths, name).is_some_and(|h| file_hash(p).is_some_and(|c| c != h))
 }
 
+/// `<agent_dir>/skills/<name>` for every name with a place scope (`policy.json` `scopes`) while
+/// it is a link into the profile (what [`link_views`] or a keep made): removed, since omp loads
+/// that dir in every session. A real directory or a link elsewhere is the user's and stays.
+/// Returns the names removed.
+pub fn unlink_scoped(paths: &RematchPaths, scopes: &crate::domain::Scopes) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for name in scopes.keys() {
+        if crate::library::validate_name(name).is_err() {
+            continue;
+        }
+        let link = paths.skills_dir().join(name);
+        if std::fs::read_link(&link).is_ok_and(|t| t.starts_with(dir(paths))) {
+            crate::library::unlink(&link).with_context(|| format!("remove {}", link.display()))?;
+            out.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Link every profile item into the place its reader looks (no-op without a profile): kept
-/// skills into `<agent_dir>/skills/<name>`, agents into `<agent_dir>/agents/<file>`, hooks
+/// skills into `<agent_dir>/skills/<name>` (except names with a place scope, whose link there is
+/// removed: [`unlink_scoped`]), agents into `<agent_dir>/agents/<file>`, hooks
 /// into `rematch-hooks/<id>.ts`, `config/policy.json` to `REMATCH_ROOT/policy.json`,
 /// `config/domains/<b>.yml` to `branches/<b>/domain.yml`, `improver/<file>` over an untouched
 /// shipped copy; links whose profile target is gone are pruned. The shared skills dir is the
@@ -383,7 +416,22 @@ pub fn link_views(paths: &RematchPaths) -> Result<Views> {
     if !present(paths) {
         return Ok(out);
     }
+    let policy = policy_file(paths);
+    let root_policy = paths.root.join(crate::domain::POLICY_FILE);
+    if policy.is_file() {
+        let o = ensure_link(paths, &policy, &root_policy)?;
+        note(&mut out, o, crate::domain::POLICY_FILE.to_string());
+    } else if std::fs::read_link(&root_policy).is_ok_and(|t| t.starts_with(dir(paths))) && !root_policy.exists() {
+        crate::library::unlink(&root_policy)?;
+        out.pruned.push(crate::domain::POLICY_FILE.to_string());
+    }
+    // The scopes of the policy just linked (a pulled `config/policy.json` included).
+    let scopes = crate::domain::load_scopes(paths)?;
+    out.scoped = unlink_scoped(paths, &scopes)?.into_iter().map(|n| format!("skills/{n}")).collect();
     for (name, src) in kept_sources(paths) {
+        if scopes.contains_key(&name) {
+            continue;
+        }
         let o = ensure_link(paths, &src, &paths.skills_dir().join(&name))?;
         note(&mut out, o, format!("skills/{name}"));
     }
@@ -398,15 +446,6 @@ pub fn link_views(paths: &RematchPaths) -> Result<Views> {
         note(&mut out, o, format!("hooks/{name}"));
     }
     prune_dangling(&paths.hooks_dir(), &hooks_dir(paths), "hooks", &mut out)?;
-    let policy = policy_file(paths);
-    let root_policy = paths.root.join(crate::domain::POLICY_FILE);
-    if policy.is_file() {
-        let o = ensure_link(paths, &policy, &root_policy)?;
-        note(&mut out, o, crate::domain::POLICY_FILE.to_string());
-    } else if std::fs::read_link(&root_policy).is_ok_and(|t| t.starts_with(dir(paths))) && !root_policy.exists() {
-        crate::library::unlink(&root_policy)?;
-        out.pruned.push(crate::domain::POLICY_FILE.to_string());
-    }
     for (name, src) in children(&domains_dir(paths), |n, p| n.ends_with(".yml") && p.is_file()) {
         let branch = name.trim_end_matches(".yml");
         if crate::library::validate_name(branch).is_err() {

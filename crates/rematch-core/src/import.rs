@@ -403,6 +403,8 @@ pub fn apply_trace_signals(r: &mut SessionRecord, folded: &SessionRecord) {
     r.error_cluster_seqs = folded.error_cluster_seqs.clone();
     r.error_clusters = folded.error_clusters;
     r.flagged = folded.flagged;
+    r.commands = folded.commands.clone();
+    r.agents_invoked = folded.agents_invoked.clone();
 }
 
 pub fn import_session(path: &Path) -> Result<SessionRecord> {
@@ -714,6 +716,8 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
         subpath,
         head_sha: None,
         visible_entries: Vec::new(),
+        instructions_exposed: Vec::new(),
+        exposure_view: None,
     });
 
     let mut calls: HashMap<&str, &Value> = HashMap::new();
@@ -816,6 +820,7 @@ pub fn trace_records_of(session: &OmpSession) -> Vec<TraceRecord> {
                     error_class: is_error.then(|| "error".to_string()),
                     content_head: head(&content_text(m.get("content")), TRACE_CONTENT_HEAD_CHARS),
                     path: raw_path.map(|p| strip_selector(p).to_string()),
+                    skill_entry: None,
                 });
                 if w.errors.len() == ERROR_CLUSTER_WINDOW {
                     w.errors.pop_front();

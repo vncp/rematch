@@ -3,7 +3,7 @@ title: Read the report
 description: Compute the kill criterion — did anything earn kept, and did recurrence fall — instead of eyeballing it.
 ---
 
-`rematch report` answers the project's kill criterion from your history: has an entry reached kept over at least four matched sessions, and has recurrence fallen on a trigger the library covers?
+`rematch report` answers the project's kill criterion from your history: has an entry been kept in real use (at least four clean completed sessions that actually used it), and has recurrence fallen on a trigger the library covers? Entries kept on comparative support are reported apart and never count as real use.
 
 What the kill criterion is and why it exists: [counters and the kill criterion](/rematch/concepts/counters/#the-kill-criterion).
 
@@ -23,21 +23,27 @@ From the seed of `report`'s unit test (one trigger, both arms, after `lake expor
 
 ```text
 report · source lake (lag 0 journal row(s)) · machines laptop · window 2026-09-15 00:02 UTC → 2026-10-27 00:02 UTC (6w)
-kept run-tests-before-commit: 4 matched session(s) in the window (≥ 4), recurrence 0, harm 0
+kept run-tests-before-commit [legacy]: 4 matched, 4 used (4 clean, 0 unknown) in the window, recurrence 0, harm 0
 domain (none): 2 trigger(s), 1 covered, 1 fell · with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50)
   trigger run-tests-before-commit [6675c0a0d803] class correction: with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50) · Δ -0.50 fell
-verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit)
+verdict: an entry kept in real use (≥ 4 clean actual uses): yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit); kept on comparative support: no
 ```
 
 ## Read it line by line
 
 | Line | Says |
 |---|---|
-| `kept <name>` | an entry whose status at the window's end is kept, with its matched sessions in the window (any machine), recurrence and harm |
+| `kept <name> [<retention>]` | an entry whose status at the window's end is kept, with why it was kept (`accepted_in_use`, `comparative_support`, `user_decision`, or `legacy` for keeps from before reasons were recorded) and, in the window: matched sessions (any machine), sessions that actually used it, how many of those were clean, how many had unknown completion, recurrence and harm |
 | `domain <d>` | a summary of that domain's triggers; arms add up (a session matching two triggers counts twice) |
 | `trigger <name> [hash]` | one trigger predicate: its two arms, `Δ`, and `fell` when `Δ` is negative |
-| `verdict` | both halves of the kill criterion, with the names behind each `yes` |
+| `verdict` | the two halves of the kill criterion, then the comparative keeps, with the names behind each `yes` |
 | `profile-kept (not counted on this machine): N` | with a profile, skills kept on another machine (JSON `profile_kept`) |
+
+In JSON, each `kept[]` item carries `matched`, `used`, `used_clean`, `use_unknown`, `recurrence`, `harm`, `retention`, `in_use` (`used_clean ≥ 4` with zero recurrence and harm in the window) and `comparative` (kept on comparative support). The `verdict` object is `{kept_in_use, kept_entries, recurrence_fell, fell_on, kept_comparative, comparative_entries}`.
+
+- **Real use is clean actual use.** `in_use` needs four clean completed sessions that read, invoked, retrieved or otherwise used the entry. Matched sessions alone, however many, never satisfy it.
+- **Unknown is not clean.** Sessions without native completion evidence (imported transcripts, old rows) are counted in `use_unknown` and never toward `in_use`.
+- **Comparative support is separate.** A keep backed by a bounded probe shows under `comparative_entries`; it is evidence on one authorized task in omp, not a real-use gain.
 
 ## The two arms
 

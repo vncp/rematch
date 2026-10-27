@@ -44,7 +44,7 @@ toast display has not been exercised interactively.
 
 ## Not yet earned
 
-- **A `kept` skill from daily use.** The three built-in hooks reached kept (9/6/5 matched sessions, 0 recurrence, 0 harm) during the build itself; no skill has yet. This is the [kill criterion](/rematch/concepts/counters/#the-kill-criterion).
+- **A `kept` skill from daily use.** The three built-in hooks reached kept (9/6/5 matched sessions, 0 recurrence, 0 harm) during the build itself, under the earlier matched-session rule; they report `legacy`. No entry has yet been kept in real use (≥ 4 clean actual uses). This is the [kill criterion](/rematch/concepts/counters/#the-kill-criterion).
 - **The built-in context entries in real use.** All three were approved and fired in one live omp session (a `retrieval` record for a `bellwether-dev` unit; the stuck detector blocking a 4th identical call). Truncation is observable only in the outgoing request and is covered by the extension tests. None has been counted across real sessions yet.
 - **A batch cycle where a candidate beats the reference.** The one live cycle had a reference that already passed, so both editors chose `KEEP_BASE`; the fake-omp tests cover the other branches.
 - **A merged team PR and a `shared` promotion from real branches.** Both are exercised on scratch repositories only.
@@ -90,9 +90,10 @@ Post-hoc reflection, post-hoc counting and skills are the whole adapter.
 | no live tracing | rematch has no code inside Codex; a session becomes evidence only when you import its rollout |
 | no blocking hooks | `block`/`stuck` verifiers never run; a hook entry's router is listed by Codex but never counted as loaded |
 | no retrieval, no truncation | both need a pre-request handler |
-| no per-session gating | Codex loads every skill under its skill roots in every session; a provisional skill stays visible everywhere until kept or retired, but counts only where its predicate hits |
+| per repo, not per session | kept skills load in every Codex session; a repo's provisional trials load only through its git-excluded `.agents/skills/rematch-trials` link, refreshed by `rematch skills sync --harness codex`; a trial counts only where its predicate hits |
 | loaded entries are reconstructed | resolved at import from the rollout's skill list and the files as they are then |
 | no subagents | `kind: agent` entries have no Codex form; scripts in a linked skill stay non-executable until approved |
+| no personal instructions | approved `AGENTS.fragment.md` text is not delivered to Codex; skills only |
 | no batch mode yet | `rematch run` drives omp; the Codex plan is DESIGN §18.2.4 |
 
 ## Pi and OpenCode limits
@@ -117,7 +118,7 @@ bun test extension                            # hook runtime: mode helpers + the
 
 The end-to-end tests run the built binary against a temporary root:
 
-- a synthetic trace with a redirect is reflected through a scripted editor, staged, matched, counted through four clean sessions and kept;
+- a synthetic trace with a redirect is reflected through a scripted editor, staged, matched, counted through four clean sessions that read the skill, and kept (`accepted_in_use`);
 - the lint-fail script exercises exactly one retry; a wrong-model reply fails closed;
 - `import --history` runs against anonymized goldens;
 - `improve` refuses, splits, stages a sibling and refuses a pinned skill;

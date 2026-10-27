@@ -35,7 +35,7 @@ use rematch_core::domain::domain_matches;
 use rematch_core::features::rank_stems;
 use rematch_core::ledger::{EntryFilter, JournalRow};
 use rematch_core::library::{self, dir_for, is_builtin, REMATCH_JSON};
-use rematch_core::lint::{branch_always_on_bytes, LintContext};
+use rematch_core::lint::LintContext;
 use rematch_core::predicate::{count_hit, count_match, matches_place, predicate_hash, Place, ANY_REPO, MAX_EXTS, MAX_STEMS};
 use rematch_core::rate;
 use rematch_core::trace::TraceRecord;
@@ -500,6 +500,7 @@ pub fn check(ctx: &AppCtx, e: &Entry, p: &TuneProposal) -> Result<Prepared> {
         content_sha256: None,
         last_tune_at: None,
         tune: None,
+        retention: None,
         ..e.clone()
     };
     sib.tune = Some(PredicateTune {
@@ -534,8 +535,7 @@ pub fn check(ctx: &AppCtx, e: &Entry, p: &TuneProposal) -> Result<Prepared> {
         Err(err) => return skip(format!("entry files: {err:#}")),
     };
     rename_skill(&mut files, &e.name)?;
-    let branch_dir = ctx.paths.staging_branch(&e.branch);
-    let lctx = LintContext { branch_other_bytes: branch_always_on_bytes(&branch_dir, &slot), ..Default::default() };
+    let lctx = LintContext { catalog_other_bytes: library::catalog_other_bytes(&ctx.ledger, &ctx.paths, &sib, &slot)?, ..Default::default() };
     let rep = lint_edits(ctx, &sib, &files, &lctx)?;
     if !rep.ok {
         return skip(format!("lint: {}", lint_errors(&rep)));

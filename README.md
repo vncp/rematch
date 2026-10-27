@@ -7,9 +7,9 @@
 
 <p align="center"><b>Stop teaching your coding agent the same lesson every session.</b></p>
 
-rematch turns corrections from your sessions into reusable skills and guardrails,
-then tracks whether the same problems recur in later, matching sessions.
-It changes the agent's instructions and tools—not model weights—and does not guarantee improvement.
+rematch turns corrections from your sessions into reusable skills, personal instructions
+and guardrails, then tracks whether the entries are used cleanly or whether the same
+problems recur. It changes the agent's harness—not model weights—and does not guarantee improvement.
 
 <p align="center">
   <a href="#quick-start">Start</a> ·
@@ -65,11 +65,11 @@ The adapters share one binary, library and counters. Their integration is not id
 
 | Harness | Workflow | Main limitation |
 |---|---|---|
-| **omp** | Extension traces live sessions, syncs skills and starts background reflection. | Reference integration; model access must be configured in omp. |
-| **Claude Code** | Plugin hooks trace sessions, sync skills and start detached reflection through omp. | No output truncation or approval dialog; retrieval is once per prompt, and batch runs still use omp. |
-| **Pi** | Native extension traces sessions, discovers shared skills, and runs approved block, stuck, retrieval and truncation hooks. | Tested with Pi 1.4.0; no native subagent definitions. Reflection still uses omp. |
-| **OpenCode** | Server plugin traces main sessions, exposes shared skills and enforces approved runtime rules; native SQLite history can also be imported. | Tested with OpenCode 1.19.4, not v2. No generated agent profiles or approval dialog; reflection still uses omp. |
-| **Codex** | Import session rollouts, reflect from a shell, then sync skills before launching Codex. | Post-hoc, skills-only integration: no live tracing, runtime hooks or subagent entries. |
+| **omp** | Extension traces live sessions, syncs a per-place skill view and starts background reflection. | Reference integration; model access must be configured in omp. |
+| **Claude Code** | Plugin hooks trace sessions, sync kept skills and trial context, and start detached reflection through omp. | No output truncation or approval dialog; retrieval is once per prompt, and batch runs still use omp. |
+| **Pi** | Native extension traces sessions, discovers the per-place skill view, and runs approved block, stuck, retrieval and truncation hooks. | Tested with Pi 1.4.0; no native subagent definitions. Reflection still uses omp. |
+| **OpenCode** | Server plugin traces main sessions, exposes the per-place skill view and enforces approved runtime rules; native SQLite history can also be imported. | Tested with OpenCode 1.19.4, not v2. No generated agent profiles or approval dialog; reflection still uses omp. |
+| **Codex** | Import session rollouts, reflect from a shell, then sync skills before launching Codex. | Post-hoc, skills-only integration: no live tracing, runtime hooks, personal instructions or subagent entries. |
 
 For one Claude Code session, from this checkout after installing rematch:
 
@@ -89,27 +89,30 @@ and the [full support matrix](https://vncp.github.io/rematch/reference/harnesses
    clusters and takeovers can trigger reflection; clean sessions do not generate
    self-congratulatory proposals. ([D1, D9](docs/research.md#2-decisions-and-their-evidence))
 2. **Propose a small change.** In a detached background process, a scoped editor proposes from the trace.
-   Static lint checks the result before it becomes `provisional`, with a deterministic
-   applicability predicate. Interactive reflection uses at most three model calls and
-   does not rerun your task. ([D5, D6, D12, D15](docs/research.md#2-decisions-and-their-evidence))
-3. **Try it where it applies.** Skills are exposed through the shared library; later
-   sessions count only when the entry's predicate matches. Availability is not evidence
-   of use or benefit. ([D10, D12, D22](docs/research.md#2-decisions-and-their-evidence))
-4. **Keep or retire it.** Raw counters track matching sessions, recurrence of the
-   motivating redirect and harm signals. Entries can become `kept` or leave active use;
-   this is not causal proof that an entry helped. Library changes remain itemized, with
-   retirement and archive rules. ([D8, D10, D13, D14](docs/research.md#2-decisions-and-their-evidence))
+   Static lint checks catalog metadata (`description` ≤ 1 KB, rendered catalog ≤ 8 KB) and on-demand
+   router size (`SKILL.md` body ≤ 8 KB) before staging `provisional` with a deterministic predicate.
+   Interactive reflection uses at most three editor/classifier calls. ([D5, D6, D12, D15, D30](docs/research.md#2-decisions-and-their-evidence))
+3. **Try it where it applies.** Kept entries live in the shared library (`~/.rematch/skills/`);
+   provisional trials are exposed only through the matching place's view (`~/.rematch/views/<key>/`),
+   so one repo's trials do not leak into another. Later sessions count only on a predicate hit,
+   and catalog visibility alone is not evidence of use. ([D10, D12, D22, D30](docs/research.md#2-decisions-and-their-evidence))
+4. **Keep or retire it.** Entries become `kept` through **accepted-in-use** (at least four clean
+   completed sessions with actual relevant use: skill read/invocation, retrieval, hook evaluation/application,
+   script run, agent call or approved instruction exposure) or **comparative support** (a bounded
+   omp reference/candidate probe on an authorized replayable task). Neither is a causal proof of
+   general improvement; two recurrences, two harm events or a regressed probe retire the entry. ([D8, D10, D13, D14, D31](docs/research.md#2-decisions-and-their-evidence))
 
-**Three different things:** a skill can be **available in the shared skill library**
-(`~/.rematch/skills/`) without being **read by the model**. It is **counted on a predicate
-hit**, using the session's recorded entry version—not simply because it was listed or
-read. The directory contains the union of skills exposed by synced repositories, so
-visibility can be broader than applicability. Never read “loaded” as “helped.”
-([D10, D12, D22](docs/research.md#2-decisions-and-their-evidence))
+**Three different things:** a skill can be **listed in the session's catalog** without being
+**used by the model** (read, invoked or retrieved). It is **matched on a predicate hit** at the
+recorded version (`matched` is an observational safety counter), and earns `used_clean` only when
+actually used in a completed session with no recurrence or harm. Never read “listed” or “matched”
+as “helped.” ([D10, D12, D22, D30, D31](docs/research.md#2-decisions-and-their-evidence))
 
-For tasks with a deterministic verifier, [batch mode](https://vncp.github.io/rematch/guides/batch-with-a-verifier/)
-can spend additional rollouts on candidates and composition; the verifier selects,
-not a model's opinion of its own output. ([D6, D7, D17](docs/research.md#2-decisions-and-their-evidence))
+For replayable tasks with a deterministic verifier, you can authorize **bounded automatic probes**
+(one baseline and one candidate omp rollout per candidate version, ≤ 300 s each, 1 per reflect pass,
+4 per 24 h, sealed editable paths) or run full [batch mode](https://vncp.github.io/rematch/guides/batch-with-a-verifier/).
+Unavailable or declined probes never block an entry from qualifying through real use, and the
+fixed verifier—never a model's self-score—decides. ([D6, D7, D17, D26, D31](docs/research.md#2-decisions-and-their-evidence))
 
 ## Everyday commands
 
@@ -117,8 +120,12 @@ Run these in a terminal; `--text` gives readable output instead of JSON.
 In omp, `/rematch why` and `/rematch off` are convenient equivalents.
 
 ```sh
-# Explain the last session here: entries, predicate hits and redirects.
+# Explain the last session here: loaded entries, personal instructions, hits and redirects.
 rematch library why --text
+
+# See what waits for you, then review one action in full (its approve/decline commands included).
+rematch status --text
+rematch library inspect <action-id> --text
 
 # Create a skill from at least three matching sessions, guided by your description.
 rematch create public-python-api --from sessions \
@@ -139,26 +146,34 @@ See [create](https://vncp.github.io/rematch/guides/create-a-skill/),
 
 ## Scope and approvals
 
-- **Skill and rule text, and facts** activate automatically as provisional.
-- **Subagents, scripts, runtime hooks and system-prompt text** wait for your approval,
-  one item per entry in the digest. omp offers a dialog; Claude Code uses explicit
-  approval commands. An approved `AGENTS.fragment.md` is appended to the system prompt
-  of main sessions where its entry loads (omp, Pi, OpenCode, Claude Code; not Codex);
-  your own `AGENTS.md` is never written, and editing an approved fragment or subagent
-  asks again.
-- **Team and fork changes** use an explicit shipping workflow that prepares a branch
-  and can open a PR; it does not merge it for you.
+- **Skill, rule and fact text** activate automatically as scoped provisional trials; `status` and
+  `library ls` list the active `trials`.
+- **Personal instructions, subagents, scripts, runtime hooks, probe replays and exports** wait in
+  a persistent action queue (`actions` in `digest`, `status` and `library ls`) until you decide.
+  Inspect an action to see its target, reach and exact diff, then approve or decline it. Each decision
+  is bound to the snapshot you reviewed by its full hash (`--sha`); the omp and Pi review dialog
+  (`/rematch review`, `alt+e` in omp) supplies it, and Claude Code, OpenCode and `library inspect` print
+  the commands with the hash in them. ([D32](docs/research.md#2-decisions-and-their-evidence))
+- **Personal `AGENTS.md`, not a team PR:** an approved instruction is written as a marked block into your
+  own `<agent_dir>/AGENTS.md`, which omp loads natively; Claude Code, Pi and OpenCode insert it at
+  runtime in matching sessions instead. Your text outside the markers is never touched, an edited block
+  becomes a conflict for you to resolve, and the always-on budget is rechecked on approval and on every
+  sync. Applied blocks stay listed and can be withdrawn; with a profile, a withdrawal is profile-wide.
+  Declining a text keeps the skill itself. ([D29, D32](docs/research.md#2-decisions-and-their-evidence))
+- **Team and fork changes** (`ship-team:<id>`, `fork:<id>`) stay optional and prepare a local branch
+  or PR; nothing is written to a repo's `AGENTS.md` by default or merged for you. ([D29, D32](docs/research.md#2-decisions-and-their-evidence))
 
-Approval controls activation, not safe execution. A script's non-executable file mode
-is **not a sandbox**: an interpreter can still run it. Review proposed code as code.
-The boundary and its rationale are in [approvals](https://vncp.github.io/rematch/guides/approve-scripts-and-hooks/)
-and [D3, D4, D24](docs/research.md#2-decisions-and-their-evidence).
+Approval controls activation, not safe execution. Neither a script's non-executable file mode nor
+a probe's fresh git worktree is an **OS sandbox**. Review proposed code and replay tasks before approving.
+See [approvals](https://vncp.github.io/rematch/guides/approve-scripts-and-hooks/),
+[automatic probes](https://vncp.github.io/rematch/guides/automatic-probes/) and
+[D3, D4, D24, D29–D32](docs/research.md#2-decisions-and-their-evidence).
 
 ## Profiles across machines
 
 An optional Git-backed profile makes `~/.rematch/profile/` the canonical home for your
-**omp setup**: kept and adopted skills, agents, approved hooks, policy, model-role
-configuration and edited improver prompts. Use a remote you own and trust; this is
+**omp setup**: kept and adopted skills, agents, approved hooks, approved personal instructions
+(`profile/instructions/<name>.md`), policy, model-role configuration and edited improver prompts. Use a remote you own and trust; this is
 not a hosted sync service or a Claude Code/Codex configuration synchronizer.
 
 Start with `rematch profile init --remote <git-url> --adopt` on the first machine,
@@ -195,8 +210,8 @@ The project's daily-use success criterion is still pending; paper results explai
 the design, not rematch's performance. The prompts are derived from Harness², not
 verbatim copies ([provenance and changes](docs/research.md#5-porting-notes-what-omp-evolve-changes-in-these-prompts-and-why)).
 
-Counters report recurrence and harm, not a controlled estimate of improvement.
-Scratch-repository demonstrations and synthetic tests are not production evidence.
+Counters report matched sessions, actual clean uses, recurrence and harm—not a controlled causal
+estimate of improvement; bounded probes test one authorized task and seed in omp, not general correctness.
 Live model-backed runs documented so far are on macOS arm64. Native CI checks the Windows
 omp path and Linux; POSIX shell fixtures remain Unix-only. Pi/OpenCode host runtime
 compatibility on Windows is not yet certified.

@@ -249,6 +249,7 @@ pub fn cmd_recanary(ctx: &AppCtx, id_or_name: &str) -> Result<Value> {
     e.fork_commit = None;
     e.pinned = false;
     e.pending_next_run = false;
+    e.retention = None;
     let staged = stage(&ctx.ledger, &ctx.paths, &e, &files)?;
     let snapshotted = snapshot_sources(&staged.path)?;
     let retired = change_status(ctx, &old, Status::Retired, &format!("re-canaried as {}", staged.id))?;

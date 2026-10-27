@@ -328,8 +328,12 @@ fn counters_keep_a_registered_skill_without_moving_it() {
                 json!({"seq":0,"t":3_000 + i,"ev":"session_start","session_id":format!("k-{i}"),"cwd":env.repo,"repo":env.repo,
                        "model":{"provider":"anthropic","id":"claude-opus-5-5"},"loaded_entries":[id]}),
                 json!({"seq":1,"t":3_001 + i,"ev":"input","text":"Edit the ledger module rounding helper","idle":true,"prelabel":"none"}),
-                json!({"seq":2,"t":3_002 + i,"ev":"turn_end","usage":{"input":10,"output":5},"stop_reason":"stop","text_head":"Done."}),
-                json!({"seq":3,"t":3_003 + i,"ev":"session_shutdown","reasons":[],"flagged":false}),
+                // Actual use: the skill body is read (a session that only listed it earns nothing).
+                json!({"seq":2,"t":3_002 + i,"ev":"tool_result","tool":"read","call_id":"r","input":{"path":"skill://ledger-helper"},
+                       "is_error":false,"skill_read":"ledger-helper"}),
+                json!({"seq":3,"t":3_002 + i,"ev":"turn_end","usage":{"input":10,"output":5},"stop_reason":"stop","text_head":"Done."}),
+                json!({"seq":4,"t":3_003 + i,"ev":"agent_end","turns":1,"is_terminal":true,"yielded":true}),
+                json!({"seq":5,"t":3_003 + i,"ev":"session_shutdown","reasons":[],"flagged":false}),
             ],
         );
     }
@@ -361,7 +365,7 @@ fn scripts_wait_for_the_one_tap_approval() {
     let a = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id.as_str()).expect("approval offered").clone();
     assert_eq!(a["kind"], "scripts");
     assert!(a["diff"].as_str().unwrap().contains("cargo test"), "{a}");
-    let r = env.run(&["library", "approve", &id]);
+    let r = env.approve(&id);
     assert_eq!((r["receipts"][0]["entry"].as_str(), r["approved"].clone()), (Some(id.as_str()), json!(["scripts"])), "{r}");
     assert_eq!(std::fs::metadata(&script_path).unwrap().permissions().mode() & 0o777, 0o755);
     let g2 = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
@@ -586,7 +590,7 @@ fn doctor_reports_orphan_hook_modules() {
     std::fs::remove_file(hooks.join("gone-entry.ts")).unwrap();
     let g = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
     let stuck = g["approvals"].as_array().unwrap().iter().find(|a| a["name"] == "stuck-detector").expect("built-in offered")["id"].clone();
-    env.run(&["library", "approve", stuck.as_str().unwrap()]);
+    env.approve(stuck.as_str().unwrap());
     let d = env.run(&["doctor"]);
     let h = &d["harnesses"]["hooks"];
     assert_eq!(h["status"], "ok", "{d}");

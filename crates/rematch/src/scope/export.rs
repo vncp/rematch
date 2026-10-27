@@ -21,7 +21,7 @@ use rematch_core::dedup::{entry_content, route_duplicate, EntryContent};
 use rematch_core::domain::POLICY_FILE;
 use rematch_core::ledger::{sha256_hex, EntryFilter, SessionFilter};
 use rematch_core::library::{load_entry, stage, REMATCH_JSON, SHARED_BRANCH};
-use rematch_core::lint::{branch_always_on_bytes, LintContext};
+use rematch_core::lint::LintContext;
 use rematch_core::predicate::derive;
 use rematch_core::{Activation, Edit, EditorScope, Entry, LessonTag, LintReport, Origin, Receipt, Status};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,7 @@ fn portable(e: &Entry) -> Entry {
         families_excluded: vec![],
         last_tune_at: None,
         tune: None,
+        retention: None,
         manifest: e.manifest.clone().map(|mut m| {
             m.evidence.session_id.clear();
             m
@@ -417,7 +418,7 @@ pub fn cmd_import_export(ctx: &AppCtx, args: ImportExportArgs) -> Result<Value> 
         let (e, files, dropped) = super::transfer::copy_for(&src, &branch, place, origin)?;
         let branch_dir = ctx.paths.staging_branch(&branch);
         let lctx = LintContext {
-            branch_other_bytes: branch_always_on_bytes(&branch_dir, &branch_dir.join(&e.name)),
+            catalog_other_bytes: rematch_core::library::catalog_other_bytes(&ctx.ledger, &ctx.paths, &e, &branch_dir.join(&e.name))?,
             transfer: true,
             ..Default::default()
         };

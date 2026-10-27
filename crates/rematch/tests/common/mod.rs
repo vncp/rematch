@@ -93,12 +93,35 @@ impl Env {
         v["data"].clone()
     }
 
+    /// `library approve <id>` as the review UI runs it: the action's own `approve_argv` from
+    /// `library inspect`, which binds the reviewed snapshot (`--sha`).
+    pub fn approve(&self, id: &str) -> Value {
+        self.review(id, "approve_argv")
+    }
+
+    /// [`Env::approve`] for `decline_argv`.
+    pub fn decline(&self, id: &str) -> Value {
+        self.review(id, "decline_argv")
+    }
+
+    fn review(&self, id: &str, which: &str) -> Value {
+        let a = self.run(&["library", "inspect", id]);
+        let argv: Vec<String> = serde_json::from_value(a["action"]["commands"][which].clone()).unwrap_or_else(|_| panic!("{id} has no {which}: {a}"));
+        self.run(&argv.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
     pub fn calls(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log).unwrap_or_default().lines().map(str::to_string).collect()
     }
 
     /// Finished trace: one task input, edits, then a procedural negation redirect.
     pub fn write_trace(&self, sid: &str, loaded: &[&str], redirect: bool) {
+        self.write_trace_using(sid, loaded, redirect, &[]);
+    }
+
+    /// [`Env::write_trace`] whose session also read the skills of the `used` entry ids
+    /// (`tool_result.skill_entry`): actual use, not just a load.
+    pub fn write_trace_using(&self, sid: &str, loaded: &[&str], redirect: bool, used: &[&str]) {
         let repo = self.repo.to_string_lossy();
         let file = format!("{repo}/src/ledger.rs");
         let mut recs = vec![
@@ -132,6 +155,13 @@ impl Env {
             json!({"seq":8,"t":1_008,"ev":"agent_end","turns":2,"is_terminal":true,"yielded":true}),
             json!({"seq":9,"t":1_009,"ev":"session_shutdown","reasons": if redirect { json!(["redirect:negation"]) } else { json!([]) },"flagged":redirect}),
         ]);
+        let shutdown = recs.pop().expect("session_shutdown");
+        for (i, id) in used.iter().enumerate() {
+            recs.push(json!({"seq":20 + i,"t":1_008,"ev":"tool_result","tool":"read","call_id":format!("u{i}"),
+                             "input":{"path":format!("skill://{id}")},"args_hash":"hu","result_bytes":10,"is_error":false,
+                             "error_class":null,"content_head":"","skill_read":null,"path":null,"skill_entry":id}));
+        }
+        recs.push(shutdown);
         let traces = self.root.join("traces");
         std::fs::create_dir_all(&traces).unwrap();
         let body: String = recs.iter().map(|r| format!("{r}\n")).collect();

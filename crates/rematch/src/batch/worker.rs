@@ -34,13 +34,13 @@ use rematch_core::dedup::{entry_content, near_duplicate, route_duplicate};
 use rematch_core::features::{head, rank_stems};
 use rematch_core::ledger::{parse_enum, EntryFilter};
 use rematch_core::library::{branch_for, dir_for, primary_doc, set_status, stage, validate_name};
-use rematch_core::lint::{branch_always_on_bytes, lint_entry, LintConfig, LintContext};
+use rematch_core::lint::{lint_entry, LintConfig, LintContext};
 use rematch_core::package::SkillDoc;
 use rematch_core::predicate::{derive, predicate_hash};
 use rematch_core::trace::TraceRecord;
 use rematch_core::types::{
-    Activation, Certificate, Edit, EditorScope, Entry, Family, Kind, LessonTag, LintReport, Manifest, Moment,
-    Origin, Predicate, Receipt, Scope, Status, Verdict,
+    Activation, Certificate, ComparativeOutcome, Edit, EditorScope, Entry, Family, Kind, LessonTag, LintReport,
+    Manifest, Moment, Origin, Predicate, Receipt, RetentionReason, Scope, Status, Verdict,
 };
 use rematch_core::family::family_of_ref;
 use serde::{Deserialize, Serialize};
@@ -483,9 +483,11 @@ impl Cycle<'_> {
         }))
     }
 
-    /// Pending entries of this task: reference pass ⇒ kept, fail ⇒ retired. A keep that
-    /// replaces a kept entry first runs its anchor replay (`scope::anchor`); a failing
-    /// replay retires the pending entry and the kept one stays.
+    /// Pending entries of this task: reference pass ⇒ kept when the run that staged it
+    /// recorded comparative support for exactly this content (`probes::record_batch_comparison`)
+    /// and no recurrence or harm was counted, else back to the observed-use path; fail ⇒
+    /// retired. A keep that replaces a kept entry first runs its anchor replay
+    /// (`scope::anchor`); a failing replay retires the pending entry and the kept one stays.
     fn resolve_pending(&self, pending: &[Entry], reference: &Rollout) -> Result<(Vec<Value>, Vec<String>)> {
         let ctx = self.ctx;
         let pass = reference.verdict.as_ref().is_some_and(is_pass);
@@ -494,6 +496,22 @@ impl Cycle<'_> {
         for e in pending {
             let mut anchor_json = Value::Null;
             let mut anchor_pass = None;
+            let support = crate::probes::evidence_for(ctx, e).filter(|p| p.outcome == ComparativeOutcome::Supports);
+            let counts = ctx.ledger.counters(&e.id)?;
+            let retention = crate::reflect::retention_for(e, &counts, support.as_ref(), ctx.now)
+                .filter(|r| r.reason == RetentionReason::ComparativeSupport);
+            if pass && retention.is_none() {
+                // A pass alone compares nothing: the entry stays a trial on the observed-use path.
+                let mut e2 = e.clone();
+                e2.pending_next_run = false;
+                e2.status_note = Some(format!(
+                    "batch next run of task {} passed, but no recorded comparison supports this content; observed-use path",
+                    self.task.id
+                ));
+                crate::reflect::save_entry(ctx, &e2)?;
+                out.push(json!({"id": e.id, "name": e.name, "status": e.status, "reason": e2.status_note}));
+                continue;
+            }
             let (to, note) = if pass {
                 let note = format!("batch next run of task {} passed ({})", self.task.id, reference.session.id);
                 match replaced_kept(ctx, e)? {
@@ -534,6 +552,13 @@ impl Cycle<'_> {
                         self.insert_receipt(&moved.id, lint, reference.verdict.clone())?;
                         if let Some(r) = &anchor_pass {
                             anchor_json["certificate"] = json!(certify(ctx, &moved, r, None)?);
+                        }
+                        if let Some(mut r) = retention.clone() {
+                            r.detail = format!("{}; confirmed by the next run of task {} ({})", r.detail, self.task.id, reference.session.id);
+                            let mut kept = moved.clone();
+                            kept.retention = Some(r);
+                            crate::reflect::save_entry(ctx, &kept)?;
+                            row["retention"] = json!(kept.retention);
                         }
                     } else {
                         retired.push(e.id.clone());
@@ -579,7 +604,24 @@ impl Cycle<'_> {
                 _ => None,
             })
             .unwrap_or_default();
-        let detail = reference.verdict.as_ref().map(|v| head(detail_of(v), 1024)).unwrap_or_default();
+        // A parity verifier's expected output is held out: the editor sees the verdict only,
+        // never the expected file's path or digest (it could otherwise write the answer in).
+        let parity = self.spec.verifier.trim_start().starts_with("parity:");
+        let pass = reference.verdict.as_ref().is_some_and(is_pass);
+        let (spec_shown, detail, verdict) = if parity {
+            let produced = self.spec.verifier.trim_start().trim_start_matches("parity:").split('=').next().unwrap_or("").trim().to_string();
+            (
+                format!("parity:{produced}=<held out>"),
+                format!("{produced} {} the held-out expected output", if pass { "matched" } else { "did not match" }),
+                json!({"pass": pass}),
+            )
+        } else {
+            (
+                self.verifier.describe(),
+                reference.verdict.as_ref().map(|v| head(detail_of(v), 1024)).unwrap_or_default(),
+                json!(reference.verdict),
+            )
+        };
         let mut library = Vec::new();
         for b in &base.entries {
             let trigger = match &b.id {
@@ -596,13 +638,13 @@ impl Cycle<'_> {
             "scope": "domain",
             "trace_excerpt": excerpt,
             "deliverable": deliverable,
-            "redirect": {"class": "correction", "text": format!("Verifier {} judged the run: {detail}", self.verifier.describe())},
+            "redirect": {"class": "correction", "text": format!("Verifier {spec_shown} judged the run: {detail}")},
             "current_entry": null,
             "library": library,
             "lint": {"rules": LINT_RULES},
             "retry_findings": null,
             "task": {"prompt": head(&self.task.prompt, 4096)},
-            "verifier": {"spec": self.verifier.describe(), "verdict": reference.verdict},
+            "verifier": {"spec": spec_shown, "verdict": verdict},
         }))
     }
 
@@ -765,7 +807,7 @@ impl Cycle<'_> {
         let mut entry = self.entry_for(lesson, reference)?;
         entry.path = dir.clone();
         let lctx = LintContext {
-            branch_other_bytes: branch_always_on_bytes(&self.ctx.paths.staging_branch(&self.branch), &dir),
+            catalog_other_bytes: rematch_core::library::catalog_other_bytes(&self.ctx.ledger, &self.ctx.paths, &entry, &dir)?,
             user_names: std::env::var("USER").ok().filter(|u| !u.is_empty()).into_iter().collect(),
             transfer: false,
         };
@@ -819,6 +861,7 @@ impl Cycle<'_> {
             content_sha256: None,
             last_tune_at: None,
             tune: None,
+            retention: None,
         })
     }
 
@@ -903,7 +946,11 @@ impl Cycle<'_> {
                 "label": v.label,
                 "scope": v.scope,
                 "entries": v.lessons.iter().map(|l| json!({"name": l.name, "trigger_line": l.editor.trigger_line, "files": l.files})).collect::<Vec<_>>(),
-                "verdict": v.rollout.verdict,
+                "verdict": if self.spec.verifier.trim_start().starts_with("parity:") {
+                    json!({"pass": v.rollout.verdict.as_ref().is_some_and(is_pass)})
+                } else {
+                    json!(v.rollout.verdict)
+                },
             })
         };
         let diff = |r: &Rollout| {
@@ -1031,6 +1078,19 @@ impl Cycle<'_> {
             let staged = stage(&ctx.ledger, &ctx.paths, &entry, &edits)?;
             rematch_core::rate::record_admission(&ctx.ledger, &hash, &staged.id, ctx.now)?;
             let cert = self.insert_receipt(&staged.id, l.lint.clone(), w.rollout.verdict.clone())?;
+            // The winner beat the reference on this task, seed, model and base: comparative
+            // evidence bound to exactly the staged content (its next run confirms or retires it).
+            let comparison = crate::probes::record_batch_comparison(
+                ctx,
+                &staged,
+                &l.name,
+                self.task,
+                &self.spec.verifier,
+                &self.sub.solver,
+                self.spec.seed,
+                reference,
+                &w.rollout,
+            )?;
             out.push(json!({
                 "id": staged.id,
                 "name": staged.name,
@@ -1039,6 +1099,7 @@ impl Cycle<'_> {
                 "path": staged.path,
                 "lesson_tag": staged.lesson_tag,
                 "certificate": cert,
+                "comparison": {"status": comparison.status, "reason": comparison.reason},
             }));
         }
         Ok((out, json!({"admitted": true, "predicate_hash": hash})))
@@ -1229,6 +1290,7 @@ mod unit {
             content_head: String::new(),
             skill_read: None,
             path: None,
+            skill_entry: None,
         };
         let recs = vec![tr(1, true), tr(2, false), tr(3, true), tr(4, true), tr(5, false)];
         assert_eq!(longest_error_stretch(&recs), Some(3));

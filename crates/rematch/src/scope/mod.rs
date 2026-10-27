@@ -368,6 +368,7 @@ pub(crate) mod testutil {
             content_sha256: None,
             last_tune_at: None,
             tune: None,
+            retention: None,
         }
     }
 

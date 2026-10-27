@@ -419,6 +419,8 @@ pub fn trace_records_of(s: &PiSession) -> Vec<TraceRecord> {
         subpath,
         head_sha: None,
         visible_entries: visible,
+        instructions_exposed: Vec::new(),
+        exposure_view: None,
     });
 
     let mut calls: HashMap<&str, &Value> = HashMap::new();
@@ -528,6 +530,7 @@ pub fn trace_records_of(s: &PiSession) -> Vec<TraceRecord> {
                     error_class: is_error.then(|| "error".to_string()),
                     content_head: head(&content_text(m.get("content")), TRACE_CONTENT_HEAD_CHARS),
                     path: raw_path.map(|p| strip_selector(p).to_string()),
+                    skill_entry: None,
                 });
                 // An Esc during a tool ends its result as aborted: the run is over, the next
                 // prompt is no steer.

@@ -1,0 +1,109 @@
+---
+title: Automatic probes
+description: Authorize bounded reference/candidate comparisons in omp when a task is safely replayable, without blocking real-use retention.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+By default, a provisional entry earns `kept` through sustained clean use in your normal sessions (`accepted_in_use`). When a task is safely replayable with a mechanical verifier, you can also authorize a **bounded automatic probe** to compare the baseline library against the candidate in omp (`comparative_support`, [D31](/rematch/background/decisions/)).
+
+Probes are optional: if no probe is available, safe or authorized, the entry stays on the observed-use path and can still reach `kept` after four clean completed uses.
+
+## How a probe works
+
+During detached `reflect --pending`, after `count` folds finished traces, rematch checks provisional entries for probe eligibility:
+
+<Steps>
+
+1. **Offer a replay authorization (`probe:<entry-id>`).**
+   If an eligible entry has no authorized task that covers it, rematch writes a suggestion to `~/.rematch/probes/suggestions/<entry-id>.json` and adds `probe:<entry-id>` to the persistent action queue (`status`, `digest`, `library ls`). The suggestion uses an existing task of the repo, or builds one from the originating trace: task id `probe-<name>-<short entry id>-v<version>`, the prompt before the correction, the last plain test-runner command observed in the session (else detected `tests`) as the verifier, and the files the session changed (minus protected ones) as `--editable`, with tools `read,grep,glob,edit,write`. A session that wrote no files gets a read-only task (`--tools read,grep,glob`, nothing editable). A suggestion with no usable verifier shows as blocked, with the `task add` command that fixes it, and refreshes once you define the task.
+
+2. **Review and authorize the exact task.**
+   Inspect the full specification—repository, prompt, verifier and where it came from, tools, editable paths, time cap, seed and caps—then approve it like any action: Approve in `/rematch review` (omp, Pi), or the approve command `inspect` prints, which carries the reviewed hash:
+
+   ```sh
+   rematch library inspect probe:<entry-id> --text
+   rematch library approve probe:<entry-id> --sha <hash>   # as printed by inspect
+   ```
+
+   The hash covers the whole task definition, the task id, the seal scope, the caps and the harness. If the task changes after you looked, the approval is refused until you inspect it again. Declining (also with the printed `--sha`) records the repository in `~/.rematch/probes/declined-repos.json`; its entries stay on the observed-use path.
+
+3. **Run two isolated rollouts in detached `reflect --pending`.**
+   On the next reflect pass, rematch runs the authorized task twice through omp in fresh detached `HEAD` git worktrees:
+   - **baseline:** your `kept` and `pinned` library for that repo (no other provisional trials);
+   - **candidate:** the same baseline plus the provisional entry.
+
+   Task, prompt, fixed verifier, tools, solver model, first seed and base `HEAD` commit are held identical.
+
+4. **Check the seal, attribute and decide.**
+   After both rollouts finish, rematch checks that the repo's `HEAD` did not move, that neither rollout modified any path outside the task's declared `editable` scope or any protected verifier/test file, and that the candidate rollout actually read the entry. The engine records the result in `~/.rematch/probes/records/<entry-id>.json` and applies the decision rule.
+
+</Steps>
+
+## Eligibility and sealed workspaces
+
+Only entries that the omp rollout substrate actually mounts and reads are probe-eligible:
+
+| Surface / condition | Probe eligibility | Why |
+|---|---|---|
+| `skill`, `rule`, `fact` with `.md` files only | **eligible** | mounted in the rollout's isolated skill directory and read on demand |
+| entry with `scripts/`, `AGENTS.fragment.md`, `hook.json` or `kind: agent` | **skipped** (observed-use path) | rollouts run with `--no-extensions --no-rules`, memory off, and do not test host-specific or executable surfaces |
+| mutating task with `--editable <repo-rel-path>…` | **eligible** | only listed non-protected paths (plus `parity:`/`receipt:` output files) may change; every other tracked or untracked non-ignored path is sealed |
+| read-only review/analysis task with `--tools read,grep,glob` and no `--editable` | **eligible** | every repo path is sealed; any workspace write voids the comparison |
+| empty `--editable` with writable or default tools | **blocked** | the judge cannot be sealed; add `--editable <path>` or `--tools read,grep,glob` |
+| dirty git worktree or no `HEAD` | **skipped** | a detached `HEAD` worktree would not match the working tree |
+
+Even when listed in `--editable`, verifier inputs stay sealed (`Task::is_protected`): files named in the verifier command, `test/`/`tests/`/`spec/`/`__tests__/`/`scripts/` directories, `*_test.*`, `test_*`, `*.test.*`, `*.spec.*`, `*.sh`, and build/test configs (`Cargo.toml`, `Cargo.lock`, `package.json`, `pyproject.toml`, `pytest.ini`, `Makefile`, `build.rs`, `go.mod`, etc.).
+
+<Aside type="caution" title="A git worktree is not an OS sandbox">
+Each rollout runs in a fresh detached `HEAD` worktree so your active checkout is untouched, and `git status --porcelain --untracked-files=all` checks tracked and new repo files afterwards. Git-ignored paths and anything outside the worktree are **not** checked or contained by an OS sandbox. Only authorize tasks and verifiers you trust to run in that repository.
+</Aside>
+
+## Outcomes and how they affect status
+
+| Probe outcome | Meaning | Effect on the provisional entry |
+|---|---|---|
+| `supports` | candidate passed where baseline failed (or scored strictly higher), and the candidate rollout read the entry | **keeps** the entry as `comparative_support` if `recurrence == 0` and `harm == 0` |
+| `regresses` | candidate failed where baseline passed (or scored strictly lower), and the candidate rollout read the entry | **retires** the entry |
+| `tie` | same verdict and score (or the candidate never read the entry, so any difference is unattributable noise) | no decision; the entry continues on the observed-use path |
+| `cost_worse` | tied verdict/score, but the candidate had more tool errors or > 1.5× the tokens | no decision; observational use still decides |
+| `incomplete` | a rollout failed, timed out, drifted model, moved `HEAD`, or touched a sealed path | never promotes; the entry continues on the observed-use path |
+
+## Hard caps
+
+| Cap | Value |
+|---|---|
+| Execution harness | omp only (`rematch-solver` → `default`) |
+| Rollouts per probe | 2 (1 baseline, 1 candidate) |
+| Host `--max-time` per rollout | ≤ 300 s (or the task's `--max-time` when lower), plus a 60 s engine outer deadline margin |
+| Editor model calls | 0 (solver model calls happen only inside the two omp rollouts) |
+| Probes per `reflect --pending` pass | ≤ 1 |
+| Probes per 24 hours | ≤ 4 |
+| Evaluations per `(entry, version, content_sha256)` | 1 |
+| Concurrency locks | global `~/.rematch/probes/.lock` + per-task `~/.rematch/runs/<task>/.lock` |
+
+## Define or update a probe task by hand
+
+If no test command was observed in the session, or a task is blocked because its editable scope is blank, define it explicitly:
+
+```sh
+# Mutating task: seal everything except src/lib.rs
+rematch task add fix-parser --repo . \
+  --prompt "Fix parser edge case for empty headers" \
+  --verifier "cargo test" \
+  --editable src/lib.rs
+
+# Read-only review task: seal every repo path
+rematch task add review-api --repo . \
+  --prompt "Audit src/api.rs for panics and report line numbers" \
+  --verifier "script:./check-report.py" \
+  --tools read,grep,glob
+```
+
+Redefining a task changes its fingerprint and clears any prior `auto_probe` authorization, so the `probe:<entry-id>` action comes back for you to review and approve again.
+
+## See also
+
+- [Counters and the kill criterion](/rematch/concepts/counters/): how `accepted_in_use` and `comparative_support` differ in `rematch report`.
+- [Batch with a verifier](/rematch/guides/batch-with-a-verifier/): multi-candidate Propose–Probe–Compose runs (`rematch run`).
+- [Approve scripts, hooks and instructions](/rematch/guides/approve-scripts-and-hooks/): the persistent action queue.

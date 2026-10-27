@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 640" width="1100" height="640" role="img" aria-labelledby="title desc">
 <title id="title">The rematch loop</title>
-<desc id="desc">In the session the extension traces every event, flags sessions that carried a redirect, a tool-error cluster or a takeover, loads provisional entries whose predicate matches, and runs approved hooks. Between sessions the binary classifies the redirect, triages the failure, runs one editor, lints, stages the entry as provisional, counts later matched sessions and decides keep, retire or dormant. An evidence boundary separates them: no proposal without a trace, no model call inside a session. You approve scripts and hooks with one tap, mark redirects, or turn it off.</desc>
+<desc id="desc">The adapter records session evidence, exposes scoped trials and runs approved policies. A detached worker classifies failures, proposes and lints changes, then observes actual use or runs an authorized bounded reference/candidate comparison. The engine retains accepted-in-use or comparatively supported changes, and withdraws harmful ones. Personal instruction changes and executable policies have a persistent review action; team sharing is optional.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#666666"/></marker><marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#4f46e5"/></marker></defs>
 <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
 <rect x="0.5" y="0.5" width="1099" height="639" rx="16" fill="#f7f7f7" stroke="#e5e5e5"/>
@@ -15,33 +15,33 @@
 <text x="52" y="270.36" font-size="12.5" fill="#666666">redirect, tool-error cluster, takeover, /rematch mark → pending/</text>
 <line x1="52" y1="297.0" x2="428" y2="297.0" stroke="#e5e5e5"/>
 <text x="52" y="332.86" font-size="16" font-weight="600" fill="#171717">load</text>
-<text x="52" y="351.86" font-size="12.5" fill="#666666">staging/&lt;branch&gt;/ joins the skill paths on predicate match</text>
+<text x="52" y="351.86" font-size="12.5" fill="#666666">scoped skill and agent views; catalog and body budgets differ</text>
 <line x1="52" y1="378.5" x2="428" y2="378.5" stroke="#e5e5e5"/>
 <text x="52" y="414.36" font-size="16" font-weight="600" fill="#171717">guard</text>
 <text x="52" y="433.36" font-size="12.5" fill="#666666">approved hooks run on tool_call; block with the rule's message</text>
 <rect x="650" y="56" width="420" height="420" rx="12" fill="#ffffff" stroke="#e5e5e5"/>
-<text x="672" y="92" font-size="12" font-weight="600" letter-spacing="0.12em" fill="#666666">BETWEEN SESSIONS</text>
-<text x="672" y="115" font-size="13" fill="#767676">rematch · Rust · one static binary</text>
+<text x="672" y="92" font-size="12" font-weight="600" letter-spacing="0.12em" fill="#666666">BACKGROUND WORKER</text>
+<text x="672" y="115" font-size="13" fill="#767676">rematch · Rust · bounded execution</text>
 <line x1="672" y1="134" x2="1048" y2="134" stroke="#e5e5e5"/>
-<text x="672" y="157.90666666666667" font-size="16" font-weight="600" fill="#171717">classify</text>
-<text x="672" y="176.90666666666667" font-size="12.5" fill="#666666">correction · preference · scope · none, batched, one call</text>
+<text x="672" y="157.90666666666667" font-size="16" font-weight="600" fill="#171717">classify · triage</text>
+<text x="672" y="176.90666666666667" font-size="12.5" fill="#666666">the failure, its scope and the originating moment</text>
 <line x1="672" y1="188.33333333333334" x2="1048" y2="188.33333333333334" stroke="#e5e5e5"/>
-<text x="672" y="212.24" font-size="16" font-weight="600" fill="#171717">triage</text>
-<text x="672" y="231.24" font-size="12.5" fill="#666666">process vs content; domain vs invariant editor; the moment</text>
+<text x="672" y="212.24" font-size="16" font-weight="600" fill="#171717">propose</text>
+<text x="672" y="231.24" font-size="12.5" fill="#666666">one scoped editor; KEEP_BASE remains valid</text>
 <line x1="672" y1="242.66666666666669" x2="1048" y2="242.66666666666669" stroke="#e5e5e5"/>
-<text x="672" y="266.5733333333334" font-size="16" font-weight="600" fill="#171717">propose</text>
-<text x="672" y="285.5733333333334" font-size="12.5" fill="#666666">one editor, --no-tools, inputs in the prompt; KEEP_BASE valid</text>
+<text x="672" y="266.5733333333334" font-size="16" font-weight="600" fill="#171717">lint · budget</text>
+<text x="672" y="285.5733333333334" font-size="12.5" fill="#666666">safe metadata, scoped exposure, separate body budget</text>
 <line x1="672" y1="297.0" x2="1048" y2="297.0" stroke="#e5e5e5"/>
-<text x="672" y="320.90666666666664" font-size="16" font-weight="600" fill="#171717">lint</text>
-<text x="672" y="339.90666666666664" font-size="12.5" fill="#666666">no ids, URLs, network, destructive git; scripts 0644; 8 KB</text>
+<text x="672" y="320.90666666666664" font-size="16" font-weight="600" fill="#171717">trial · review</text>
+<text x="672" y="339.90666666666664" font-size="12.5" fill="#666666">automatic low-risk trials; persistent approval actions</text>
 <line x1="672" y1="351.3333333333333" x2="1048" y2="351.3333333333333" stroke="#e5e5e5"/>
-<text x="672" y="375.24" font-size="16" font-weight="600" fill="#171717">stage</text>
-<text x="672" y="394.24" font-size="12.5" fill="#666666">provisional, with its trigger predicate and manifest</text>
+<text x="672" y="375.24" font-size="16" font-weight="600" fill="#171717">observe · probe</text>
+<text x="672" y="394.24" font-size="12.5" fill="#666666">relevant use, or authorized reference/candidate runs</text>
 <line x1="672" y1="405.6666666666667" x2="1048" y2="405.6666666666667" stroke="#e5e5e5"/>
-<text x="672" y="429.5733333333334" font-size="16" font-weight="600" fill="#171717">count · decide</text>
-<text x="672" y="448.5733333333334" font-size="12.5" fill="#666666">recurrence, harm, matched → kept · retired · dormant</text>
+<text x="672" y="429.5733333333334" font-size="16" font-weight="600" fill="#171717">decide</text>
+<text x="672" y="448.5733333333334" font-size="12.5" fill="#666666">accepted in use · comparative support · withdraw</text>
 <text x="240" y="506" font-size="13" text-anchor="middle" fill="#767676">runs the model's session · writes only the trace</text>
-<text x="860" y="506" font-size="13" text-anchor="middle" fill="#767676">spawned detached at session start · ≤ 3 model calls per reflection</text>
+<text x="860" y="506" font-size="13" text-anchor="middle" fill="#767676">detached work · bounded probes only when replay is authorized</text>
 <line x1="550" y1="50" x2="550" y2="486" stroke="#4f46e5" stroke-width="2" stroke-dasharray="6 6"/>
 <rect x="458" y="24" width="184" height="24" rx="12" fill="#f7f7f7"/>
 <text x="550" y="41" font-size="12" font-weight="600" letter-spacing="0.12em" text-anchor="middle" fill="#4338ca">EVIDENCE BOUNDARY</text>
@@ -56,7 +56,7 @@
 <text x="550" y="345" font-size="13" text-anchor="middle" fill="#666666">the digest</text>
 <rect x="400" y="546" width="300" height="66" rx="12" fill="#ffffff" stroke="#666666"/>
 <text x="550" y="574" font-size="17" font-weight="600" text-anchor="middle" fill="#171717">You</text>
-<text x="550" y="596" font-size="13" text-anchor="middle" fill="#666666">one-tap approvals · /rematch mark · /rematch off</text>
+<text x="550" y="596" font-size="13" text-anchor="middle" fill="#666666">/rematch review · /rematch mark · /rematch off</text>
 <path d="M370 478 C370 540 384 579 394 579" fill="none" stroke="#666666" stroke-width="1.5" marker-end="url(#arrow)"/>
 <text x="360" y="552" font-size="13" text-anchor="end" fill="#666666">digest</text>
 <path d="M706 579 C716 579 730 540 730 482" fill="none" stroke="#666666" stroke-width="1.5" marker-end="url(#arrow)"/>

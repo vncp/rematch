@@ -346,6 +346,7 @@ pub fn tool_result_record(seq: u32, part: &Value) -> Option<TraceRecord> {
         content_head: head(&text, TRACE_CONTENT_HEAD_CHARS),
         skill_read,
         path: file_path_of(&input).map(|p| strip_selector(p).to_string()),
+        skill_entry: None,
         tool,
     })
 }
@@ -566,6 +567,8 @@ pub fn trace_records_of(s: &OpenCodeSession) -> Vec<TraceRecord> {
         subpath,
         head_sha: None,
         visible_entries: Vec::new(),
+        instructions_exposed: Vec::new(),
+        exposure_view: None,
     });
     let mut last_t = s.created;
     for m in &s.messages {

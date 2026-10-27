@@ -10,7 +10,7 @@ An entry is one item of the library: a skill, rule, script, agent, hook, fact or
 
 <Diagram
 	name="lifecycle"
-	alt="Entry statuses. Draft becomes provisional on a task run or --unverified. Provisional becomes kept at zero recurrences over at least four matched sessions with no harm, retired at two recurrences or two harm events, dormant after twelve matched sessions without a decision or thirty days with fewer than three matches, and back from dormant when the predicate hits again. Kept becomes stale when a fact source, the model family or the fork commit changed, or retired at two harm events in thirty days. Stale returns as a new canary or retires. Retired never leaves. Pinned is a flag."
+	alt="Entry statuses. Draft becomes provisional on a task run or --unverified. Provisional becomes kept on accepted-in-use (at least four clean completed sessions with actual use) or comparative support (an authorized bounded probe), retired at two recurrences, two harm events or a regressed probe, dormant after twelve matched sessions without a decision or thirty days with fewer than three matches, and back from dormant when the predicate hits again. Kept becomes stale when a fact source, the model family or the fork commit changed, or retired at two harm events in thirty days. Stale returns as a new canary or retires. Retired never leaves. Pinned is a flag."
 />
 
 ## Statuses
@@ -18,38 +18,40 @@ An entry is one item of the library: a skill, rule, script, agent, hook, fact or
 | Status | Lives in | Loads |
 |---|---|---|
 | `draft` | `~/.rematch/drafts/<name>/` | never |
-| `provisional` | `~/.rematch/staging/<branch>/<name>/` | on predicate match |
-| `kept` | `~/.omp/agent/skills/<name>/` (agents: `~/.omp/agent/agents/<name>.md`) | natively, on every match |
+| `provisional` | `~/.rematch/staging/<branch>/<name>/` | in the view of places whose predicate matches |
+| `kept` | `~/.omp/agent/skills/<name>/` (agents: `~/.omp/agent/agents/<name>.md`) | natively and through `~/.rematch/skills/` |
 | `stale` · `dormant` · `retired` | `~/.rematch/archive/<status>/<id>/` | never; never deleted |
 | `pinned` | wherever it is | a flag: never replaced automatically |
 
-- **Pinned** is a flag, not a place. Automatic transitions refuse pinned entries; `disable` and `rollback` are your actions and proceed.
+- **Pinned** is a flag (`retention: user_decision`), not a place. Automatic transitions refuse pinned entries; `disable` and `rollback` are your actions and proceed.
 - **A kept entry replaced by a sibling becomes dormant**, not retired, with its files in `predecessors/<name>/<version>/`. `rollback` must be able to restore it, and retired never leaves.
-- **Declining an approval retires the entry.**
+- **Declining an entry's executable/agent approval (`<entry-id>`) retires the entry;** declining its personal instructions (`instructions:<entry-id>`) declines only the prompt text and keeps the entry.
 - **Every kept entry keeps its predecessor**, so `rollback` always has something to restore ([D13](/rematch/background/decisions/)).
 
 When each transition fires: [counters and the kill criterion](/rematch/concepts/counters/). Files inside an entry: [entry layout](/rematch/reference/entry-layout/).
 
-## Where skills load from
+## Where skills load from (scoped exposure)
 
-One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for every skill that loads. All three harnesses read it.
+Storage is shared, while provisional exposure is scoped per place so one repo's trials never leak into another's sessions ([D30](/rematch/background/decisions/)):
 
-| It links | Target |
-|---|---|
-| every kept or pinned entry | its directory under `~/.omp/agent/skills/` |
-| every provisional entry whose predicate matched a directory that was synced | its `staging/<branch>/<name>/` |
-
-| Harness | Reads it through | Synced by |
+| Directory | Holds | Target |
 |---|---|---|
-| omp | `skills.customDirectories`, added by the extension for the process | the extension, at omp start |
-| Claude Code | the plugin's `skills/` link | the plugin's `SessionStart` hook |
-| Codex | `~/.agents/skills/rematch` | `rematch skills sync --harness codex --cwd "$PWD"` |
+| `~/.rematch/skills/` | **kept library only** (kept/pinned entries + `profile/skills/<name>/` kept sources; never unpinned provisional trials, never a name with a [place scope](/rematch/concepts/predicates-and-domains/#place-scopes)) | `~/.omp/agent/skills/<name>/` or `profile/skills/<name>/` |
+| `~/.rematch/views/<key>/skills/` | per-place view (`<branch>-<16hex sha256(path, remote, subpath, domain)>`): kept library links + kept skills scoped to that place + provisional entries matching that place (shadowing a kept entry of the same name in that view only) | `staging/<branch>/<name>/` or the kept dir |
+| `~/.rematch/views/<key>/trials/` | what only a repo's top level gets: provisional entries matching it and kept skills scoped to it | `staging/<branch>/<name>/` or the kept dir |
 
-- **Loading is the union of what you work on.** A sync adds the provisional skills matching its directory and never removes one because this directory does not match. Each extra skill costs one description line in the system prompt.
-- **Counting is not.** A session counts only the entries whose predicate matches its own directory, so a skill loaded in an unrelated repo never moves a counter.
-- **Status changes apply at once.** Keeping re-points the link; retiring, archiving or disabling removes it; `rematch off` removes every link and `rematch on` restores the kept ones. A running session sees the directory as it was at its start.
-- **Every omp profile shares it**, because `~/.rematch` is shared: a skill kept under one profile loads for every profile and harness.
-- `rematch skills sync --cwd <dir>` syncs by hand and prints what it added and pruned. Directories in `~/.rematch/skills/` that are not links are never touched.
+| Harness | Reads kept + provisional trials through | Synced by |
+|---|---|---|
+| **omp** | runtime override of `skills.customDirectories` (user dirs minus any rematch dir + this place's `views/<key>/skills`, replaced on cwd/session change) | the extension, at omp start and on cwd/session change |
+| **Pi** | `resources_discover` returning this place's `views/<key>/skills` | the Pi adapter, at session start |
+| **OpenCode** | config hook setting this process directory's `views/<key>/skills` in in-memory `skills.paths` | the OpenCode plugin |
+| **Claude Code** | plugin `skills/ → ~/.rematch/skills` (kept library) + `SessionStart` `additionalContext` listing this place's provisional skills (`"Skills on trial in this repo…"`) and kept skills scoped to it (`"Skills of this repo (scoped here…"`), with `<view>/skills/<name>/SKILL.md` paths | the plugin's `SessionStart` hook |
+| **Codex** | `~/.agents/skills/rematch → ~/.rematch/skills` (kept library) + git-excluded repo link `<repo>/.agents/skills/rematch-trials → ~/.rematch/views/<repo-top-key>/trials` | `rematch skills sync --harness codex --cwd "$PWD"` |
+
+- **No cross-repo trial leakage.** Each place writes only its own view under `~/.rematch/views/<key>/`; concurrent sessions in other repos never touch it and nothing global is pruned per cwd.
+- **Status changes apply at once.** Keeping re-points the link; retiring, archiving or disabling prunes dead links from `~/.rematch/skills/` and every view; `rematch off` empties `~/.rematch/skills/`, all `views/*` and `~/.rematch/agents/`, removes every repo-local item in `project-links.json`, and takes the unchanged rematch blocks out of `<agent_dir>/AGENTS.md`.
+- **Every omp profile shares `~/.rematch`**, so a skill kept under one profile loads across profiles and harnesses. Personal instruction blocks are the exception: each omp profile has its own `<agent_dir>/AGENTS.md`, and an approval in one never writes another's (the [profile](/rematch/concepts/profile/) can carry them across).
+- `rematch skills sync --cwd <dir>` syncs by hand and prints the view's links, agent exposure, and the always-on catalog vs on-demand body byte report.
 
 ## Subagents
 
@@ -59,14 +61,14 @@ An `AGENT.md` holds `name`, `description` (what the main agent sees when decidin
 
 | Status | Where | Seen |
 |---|---|---|
-| provisional, **approved** | `staging/<branch>/<name>/`, linked from `~/.rematch/agents/<name>.md` | in **every** omp session (omp reads agents only from fixed places); counted only where the repo matches |
-| provisional, not approved | `staging/<branch>/<name>/` only | never: linked and copied nowhere until you approve it (digest kind `agent`) |
-| kept (after 4 clean sessions) | copied to `~/.omp/agent/agents/<name>.md`; a file of yours with that name is saved first | natively |
-| retired · dormant · stale | link or kept copy removed; entry archived | never |
+| provisional, **approved** | `staging/<branch>/<name>/`, linked from `~/.rematch/agents/<name>.md` | in **omp** only where its place matches (other places hide it per process via `task.disabledAgents`; fail-safe hides all rematch agents on error or `off`); in **Claude Code** via a git-excluded copy `<repo>/.claude/agents/<name>.md` in matching git repos |
+| provisional, not approved | `staging/<branch>/<name>/` only | never: linked and copied nowhere until you approve `<entry-id>` |
+| kept (`accepted_in_use`, after 4 clean completed sessions that invoked it) | `~/.rematch/kept-agents/<name>/`, copied to `~/.omp/agent/agents/<name>.md` (and `<claude-plugin>/agents/<name>.md`) | natively in omp and Claude Code |
+| retired · dormant · stale | link or copies removed; entry archived | never |
 
-- Approval is bound to `AGENT.md` without its `rematch:` block: editing the body asks again. A project or user agent with the same name wins over a provisional one.
-- `/rematch off` does not hide provisional agents; `library disable <id>` does.
-- Claude Code gets copies in its plugin's `agents/`, refreshed at each session start. Codex does not load subagents.
+- Approval is bound to `AGENT.md` without its `rematch:` block: editing the body asks again.
+- A native user (`<agent_dir>/agents/*.md`) or project (`.omp/agents/*.md` / `.claude/agents/*.md`) agent of the same name **shadows** the provisional candidate: rematch never disables your native agent by name, and the candidate is neither offered nor credited.
+- `/rematch off` (and `library disable <id>`) immediately removes `~/.rematch/agents/` links, withdraws `<repo>/.claude/agents/<name>.md` copies (tracked in `~/.rematch/project-links.json`), and disables rematch agents for the running omp process. Pi, OpenCode and Codex do not load subagent entries.
 
 ## See also
 

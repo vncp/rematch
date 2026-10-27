@@ -17,7 +17,7 @@ use crate::types::{
     RedirectClass, SessionRecord, Sha256Hex, Status, Subject, UnixMs,
 };
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Ledger tables whose every write is journaled (ADR 001), in backfill order.
 pub const JOURNAL_TABLES: &[&str] =
@@ -100,6 +100,8 @@ CREATE TABLE journal(
   table_name TEXT NOT NULL, row_key TEXT NOT NULL, op TEXT NOT NULL, json TEXT NOT NULL);
 CREATE INDEX journal_row ON journal(table_name, row_key, seq);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"#, r#"
+-- 3: counters.used (NULL = folded before actual use was recorded); see `Ledger::migrate`.
 "#];
 
 pub fn now_ms() -> UnixMs {
@@ -166,6 +168,10 @@ pub struct CounterRow {
     pub turns: u32,
     /// Session time (ended_at or started_at), used for windows.
     pub ts: UnixMs,
+    /// 1 when the session actually used the entry (`counters::actual_use`), 0 when it was
+    /// only matched; `None` for rows folded before use was recorded (legacy: unknown).
+    #[serde(default)]
+    pub used: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +295,9 @@ impl Ledger {
             }
             let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(sql).with_context(|| format!("migration {v}"))?;
+            if v == 3 && !self.has_column("counters", "used")? {
+                tx.execute_batch("ALTER TABLE counters ADD COLUMN used INTEGER;").context("migration 3")?;
+            }
             if v == 2 {
                 self.backfill_journal().context("migration 2: journal backfill")?;
             }
@@ -296,6 +305,12 @@ impl Ledger {
             tx.commit()?;
         }
         Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut st = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(names.iter().any(|n| n == column))
     }
 
     /// Migration 2: one `snapshot` journal row per existing row of every journaled table,
@@ -333,10 +348,12 @@ impl Ledger {
             }
         }
         let counters = {
-            let mut st = self.conn.prepare(
-                "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at FROM counters
-                 ORDER BY created_at, entry_id, session_id",
-            )?;
+            // `used` exists from migration 3 on (a version-1 ledger backfills before it).
+            let used = if self.has_column("counters", "used")? { "used" } else { "NULL AS used" };
+            let mut st = self.conn.prepare(&format!(
+                "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at,{used} FROM counters
+                 ORDER BY created_at, entry_id, session_id"
+            ))?;
             let v = st
                 .query_map([], |r| Ok((counter_row(r)?, r.get::<_, i64>(9)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -824,11 +841,11 @@ impl Ledger {
 
     fn write_counter(&self, row: &CounterRow, created_at: UnixMs) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO counters(entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO counters(entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,created_at,used)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(entry_id,session_id) DO UPDATE SET family=excluded.family, matched=excluded.matched,
                recurrence=excluded.recurrence, harm=excluded.harm, tokens=excluded.tokens,
-               turns=excluded.turns, ts=excluded.ts",
+               turns=excluded.turns, ts=excluded.ts, used=excluded.used",
             params![
                 row.entry_id,
                 row.session_id,
@@ -839,7 +856,8 @@ impl Ledger {
                 row.tokens as i64,
                 row.turns,
                 row.ts,
-                created_at
+                created_at,
+                row.used
             ],
         )?;
         Ok(())
@@ -847,7 +865,7 @@ impl Ledger {
 
     pub fn counter_rows(&self, entry_id: &str) -> Result<Vec<CounterRow>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts FROM counters
+            "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,used FROM counters
              WHERE entry_id=?1 ORDER BY ts, session_id",
         )?;
         let rows = st
@@ -864,7 +882,7 @@ impl Ledger {
     /// Every entry that has counter rows, with its aggregate.
     pub fn list_counters(&self) -> Result<Vec<(EntryId, Counters)>> {
         let mut st = self.conn.prepare(
-            "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts FROM counters
+            "SELECT entry_id,session_id,family,matched,recurrence,harm,tokens,turns,ts,used FROM counters
              ORDER BY entry_id, ts, session_id",
         )?;
         let rows = st.query_map([], counter_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1255,6 +1273,8 @@ fn counter_row(r: &Row<'_>) -> rusqlite::Result<CounterRow> {
         tokens: r.get::<_, i64>(6)? as u64,
         turns: r.get(7)?,
         ts: r.get(8)?,
+        // Absent from pre-migration-3 selects (journal backfill of a version-1 ledger).
+        used: r.get::<_, Option<u32>>("used").ok().flatten(),
     })
 }
 
@@ -1273,6 +1293,18 @@ pub fn aggregate(rows: &[CounterRow]) -> Counters {
         f.harm += r.harm;
         for _ in 0..r.harm {
             c.harm_times.push(r.ts);
+        }
+        if r.matched > 0 {
+            match r.used {
+                Some(u) if u > 0 => {
+                    c.used += 1;
+                    if r.recurrence == 0 && r.harm == 0 {
+                        c.used_clean += 1;
+                    }
+                }
+                Some(_) => {}
+                None => c.use_unknown += 1,
+            }
         }
     }
     c.harm_times.sort_unstable();
@@ -1448,6 +1480,7 @@ pub(crate) mod tests {
             content_sha256: None,
             last_tune_at: None,
             tune: None,
+            retention: None,
         }
     }
 
@@ -1492,6 +1525,7 @@ pub(crate) mod tests {
             tokens: 100,
             turns: 2,
             ts,
+            used: Some(0),
         }
     }
 
@@ -1514,6 +1548,12 @@ pub(crate) mod tests {
         assert_eq!(fam.len(), 2);
         assert!(l.counters_for_family(&Family("b/y".into()), 25).unwrap().is_empty());
         assert_eq!(l.counters("none").unwrap(), Counters::default());
+        // Actual use: used rows count, clean used rows count, legacy rows stay unknown.
+        l.add_counter(&CounterRow { used: Some(1), ..crow("u", "s1", "a/x", 1, 0, 0, 10) }).unwrap();
+        l.add_counter(&CounterRow { used: Some(1), ..crow("u", "s2", "a/x", 1, 0, 1, 11) }).unwrap();
+        l.add_counter(&CounterRow { used: None, ..crow("u", "s3", "a/x", 1, 0, 0, 12) }).unwrap();
+        let c = l.counters("u").unwrap();
+        assert_eq!((c.matched, c.used, c.used_clean, c.use_unknown), (3, 2, 1, 1));
     }
 
     #[test]
@@ -1672,11 +1712,11 @@ pub(crate) mod tests {
         let want = state(&l);
         // Back to a version-1 ledger: no journal, no meta.
         l.conn()
-            .execute_batch("DROP TABLE journal; DROP TABLE meta; DELETE FROM schema_version WHERE version=2;")
+            .execute_batch("DROP TABLE journal; DROP TABLE meta; DELETE FROM schema_version WHERE version>=2;")
             .unwrap();
         drop(l);
         let l = Ledger::open(&p).unwrap();
-        assert_eq!(l.schema_version().unwrap(), 2);
+        assert_eq!(l.schema_version().unwrap(), SCHEMA_VERSION);
         let rows = l.journal_since(0).unwrap();
         assert!(rows.iter().all(|r| r.op == "snapshot"));
         let count = |t: &str| rows.iter().filter(|r| r.table == t).count();
