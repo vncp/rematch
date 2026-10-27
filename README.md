@@ -61,12 +61,14 @@ See [installation](https://vncp.github.io/rematch/start/install/) and
 
 ## Harness support
 
-All three use the same binary, library and counters. Their integration is not identical:
+The adapters share one binary, library and counters. Their integration is not identical:
 
 | Harness | Workflow | Main limitation |
 |---|---|---|
 | **omp** | Extension traces live sessions, syncs skills and starts background reflection. | Reference integration; model access must be configured in omp. |
 | **Claude Code** | Plugin hooks trace sessions, sync skills and start detached reflection through omp. | No output truncation or approval dialog; retrieval is once per prompt, and batch runs still use omp. |
+| **Pi** | Native extension traces sessions, discovers shared skills, and runs approved block, stuck, retrieval and truncation hooks. | Tested with Pi 1.4.0; no native subagent definitions. Reflection still uses omp. |
+| **OpenCode** | Server plugin traces main sessions, exposes shared skills and enforces approved runtime rules; native SQLite history can also be imported. | Tested with OpenCode 1.19.4, not v2. No generated agent profiles or approval dialog; reflection still uses omp. |
 | **Codex** | Import session rollouts, reflect from a shell, then sync skills before launching Codex. | Post-hoc, skills-only integration: no live tracing, runtime hooks or subagent entries. |
 
 For one Claude Code session, from this checkout after installing rematch:
@@ -75,9 +77,11 @@ For one Claude Code session, from this checkout after installing rematch:
 claude --plugin-dir "$PWD/adapters/claude-code"
 ```
 
-For Codex, follow the [adapter setup](adapters/codex/README.md).
-The [full support matrix](https://vncp.github.io/rematch/reference/harnesses/) and
-[Claude Code adapter](adapters/claude-code/README.md) cover installation and remaining gaps.
+For Pi, run `pi install "$PWD/adapters/pi"` from this checkout. For OpenCode,
+add the absolute path to `adapters/opencode` to your config's `plugin` array.
+See the [Pi adapter](adapters/pi/README.md), [OpenCode adapter](adapters/opencode/README.md),
+[Claude Code adapter](adapters/claude-code/README.md), [Codex setup](adapters/codex/README.md),
+and the [full support matrix](https://vncp.github.io/rematch/reference/harnesses/) for installation and limits.
 
 ## The learning loop
 

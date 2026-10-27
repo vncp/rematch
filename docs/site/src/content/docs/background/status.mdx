@@ -28,6 +28,20 @@ Everything below is built and tested; less of it has run against real daily use.
 - **Claude Code**, with `claude -p --model haiku` (Claude Code 2.1.285) against a temporary root: every trace record, a negation pre-labelled, flagged and counted once; `reflect --pending` started by the next `SessionStart`; a prompt queued during a `Bash` call traced as `interrupt`; the digest with approval commands; a provisional agent copied, listed and counted.
 - **Not yet observed live in Claude Code:** the digest's display in an interactive session, an Esc abort (covered by an end-to-end test on the transcript format), and a session reflected by a real editor model.
 
+### Pi and OpenCode runtime checks
+
+Both adapters are exercised inside their **real pinned host binaries** with isolated
+state and a local scripted model. These checks test integration, not cloud inference or
+agent-quality improvements.
+
+| Host | Exercised |
+|---|---|
+| Pi 1.4.0 | Native resource discovery, input/tool/error traces, user approval and approved blocking, resume/reload, off/on, and an ordinary prompt after an abort |
+| OpenCode 1.19.4 | Plugin and native skill loading, success/error traces, approved blocking and retrieval, idle continuation, process disposal/crash recovery, resumed segments and counter idempotence |
+
+OpenCode's truncation policy and stuck-repeat edges have deterministic tests. Its TUI
+toast display has not been exercised interactively.
+
 ## Not yet earned
 
 - **A `kept` skill from daily use.** The three built-in hooks reached kept (9/6/5 matched sessions, 0 recurrence, 0 harm) during the build itself; no skill has yet. This is the [kill criterion](/rematch/concepts/counters/#the-kill-criterion).
@@ -73,12 +87,21 @@ Post-hoc reflection, post-hoc counting and skills are the whole adapter.
 | no subagents | `kind: agent` entries have no Codex form; scripts in a linked skill stay non-executable until approved |
 | no batch mode yet | `rematch run` drives omp; the Codex plan is DESIGN §18.2.4 |
 
+## Pi and OpenCode limits
+
+- **Pi:** no native subagent definitions; Rematch agent entries are not delivered there.
+- **OpenCode:** no generated agent-profile renderer, live tracing of child sessions, or approval dialog. Child sessions can be imported as history.
+- **OpenCode:** retrieval and truncation use experimental request-transform hooks in 1.19.4. OpenCode 2 is not a tested target.
+- **Both:** reflection and batch solver calls still use omp. The adapters are installed from a checkout, not a registry package.
+
+Full lifecycle and API evidence: [Pi adapter](https://github.com/vncp/rematch/blob/main/adapters/pi/API-NOTES.md) and [OpenCode adapter](https://github.com/vncp/rematch/blob/main/adapters/opencode/API-NOTES.md).
+
 ## How it is checked
 
 Every change goes through:
 
 ```sh
-cargo test --workspace                        # 119 core · 54 binary · 32 end-to-end (scripted editors, fake omp)
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 bun build extension/index.ts --no-bundle --outdir /tmp/rematch-ext-check
 bun test extension                            # hook runtime: mode helpers + the factory against a fake host
@@ -93,6 +116,3 @@ The end-to-end tests run the built binary against a temporary root:
 - the batch worker completes a `k=1` cycle with a fake omp and keeps the winner on the next run;
 - `ship` creates the branch and commit; `export` refuses at work by default.
 
-<Aside type="caution" title="Gap in the docs: test counts">
-The counts in the comment above are from the README's "Run it" section. The README's architecture table gives other totals (239 cargo tests in all, plus 24 extension tests under `bun test`). The docs do not reconcile them.
-</Aside>

@@ -1,8 +1,8 @@
-//! `import --history [--harness omp|claude-code|codex|all] [--sessions <dir>]` (session
-//! history → ledger: omp session JSONL, Claude Code and Codex transcripts) and
-//! `import --forge <path>` (compound-forge skills → provisional brownfield entries,
-//! learnings → provisional lessons). Both are idempotent. Also the lookup of a ledger
-//! session's trace records (the lake's events file, else the live trace, else synthesized
+//! `import --history [--harness omp|claude-code|codex|pi|opencode|all] [--sessions <dir>]`
+//! (session history → ledger: omp session JSONL, Claude Code, Codex and Pi transcripts, the
+//! OpenCode session store) and `import --forge <path>` (compound-forge skills → provisional
+//! brownfield entries, learnings → provisional lessons). Both are idempotent. Also the lookup of a
+//! ledger session's trace records (the lake's events file, else the live trace, else synthesized
 //! from its harness transcript) shared by `improve` and `reflect --history`.
 
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use rematch_core::import::{
     trace_records_of,
 };
 use rematch_core::ledger::{EntryFilter, SessionFilter};
-use rematch_core::{import_claude, import_codex};
+use rematch_core::{import_claude, import_codex, import_opencode, import_pi};
 use rematch_core::library::{self, validate_name, REMATCH_JSON};
 use rematch_core::outcome::{minhash, outcome_tokens, MINHASH_K};
 use rematch_core::package::{slug, SkillDoc};
@@ -38,6 +38,11 @@ pub enum HistoryHarness {
     ClaudeCode,
     /// Codex: `~/.codex/sessions` (`$CODEX_HOME/sessions`).
     Codex,
+    /// Pi: `~/.pi/agent/sessions` (`$PI_CODING_AGENT_SESSION_DIR`, `$PI_CODING_AGENT_DIR/sessions`).
+    Pi,
+    /// OpenCode: its session store `opencode.db` (`$OPENCODE_DB`, `$XDG_DATA_HOME/opencode`).
+    #[value(name = "opencode")]
+    OpenCode,
     /// Every harness whose default history dir exists.
     All,
 }
@@ -47,11 +52,12 @@ pub struct ImportArgs {
     /// Import session history into the ledger.
     #[arg(long)]
     pub history: bool,
-    /// Which harness's history: omp, claude-code, codex, or all (default: each harness's
-    /// default dir that exists).
+    /// Which harness's history: omp, claude-code, codex, pi, opencode, or all (default: each
+    /// harness's default dir that exists).
     #[arg(long, value_enum, default_value_t = HistoryHarness::All)]
     pub harness: HistoryHarness,
-    /// Sessions directory of the selected harness (with `--harness all`: an omp sessions dir).
+    /// Sessions directory of the selected harness (OpenCode: its `opencode.db` or the dir
+    /// holding it; with `--harness all`: an omp sessions dir).
     #[arg(long, value_name = "DIR")]
     pub sessions: Option<PathBuf>,
     /// Skip a named profile during `--history` import (repeatable; merged with `policy.json` `skip_profiles`).
@@ -73,19 +79,17 @@ pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
     let mut out = json!({});
     let mut lines = Vec::new();
     if a.history {
-        let (omp, claude, codex) = match a.harness {
-            HistoryHarness::Omp => (true, false, false),
-            HistoryHarness::ClaudeCode => (false, true, false),
-            HistoryHarness::Codex => (false, false, true),
-            HistoryHarness::All => (true, a.sessions.is_none(), a.sessions.is_none()),
-        };
+        let selected = |h: HistoryHarness| a.harness == h || (a.harness == HistoryHarness::All && (h == HistoryHarness::Omp || a.sessions.is_none()));
         let all = a.harness == HistoryHarness::All;
         let mut imported = 0;
-        if omp && (!all || a.sessions.is_some() || omp_history_present(ctx)) {
+        let mut omp_dirs: Vec<PathBuf> = Vec::new();
+        if selected(HistoryHarness::Omp) && (!all || a.sessions.is_some() || omp_history_present(ctx)) {
             let h = match &a.sessions {
                 Some(dir) => import_history(ctx, dir)?,
                 None => import_history_all_profiles(ctx, &a.skip_profiles)?,
             };
+            omp_dirs.extend(h.get("profiles").and_then(Value::as_object).into_iter().flatten().filter_map(|(_, p)| p["dir"].as_str().map(PathBuf::from)));
+            omp_dirs.extend(h["dir"].as_str().map(PathBuf::from));
             lines.push(format!(
                 "history: {} files, {} new, {} updated, {} kept from traces, {} failed; {} sessions with skill reads, {} redirects, {} outcomes",
                 h["files"], h["new"], h["updated"], h["skipped_traced"], h["failed"], h["with_skill_reads"], h["redirects"], h["outcomes"]
@@ -112,32 +116,47 @@ pub fn cmd_import(ctx: &AppCtx, a: ImportArgs) -> Result<Value> {
             out["history"] = h;
             imported += 1;
         }
-        let harnesses: [(bool, &str, &str, Option<PathBuf>); 2] = [
-            (claude, "claude-code", "history_claude_code", rematch_core::import_claude::default_sessions_dir()),
-            (codex, "codex", "history_codex", rematch_core::import_codex::default_sessions_dir()),
+        let harnesses = [
+            (Transcripts::ClaudeCode, "history_claude_code"),
+            (Transcripts::Codex, "history_codex"),
+            (Transcripts::Pi, "history_pi"),
+            (Transcripts::OpenCode, "history_opencode"),
         ];
-        for (selected, name, key, default_dir) in harnesses {
-            if !selected {
+        for (h, key) in harnesses {
+            if !selected(h.history_harness()) {
                 continue;
             }
-            let dir = match (a.sessions.clone().or(default_dir), all) {
-                (Some(d), _) if d.is_dir() => d,
+            let name = h.name();
+            let found = match &a.sessions {
+                Some(d) if h == Transcripts::OpenCode => Some(import_opencode::store_of(d)),
+                Some(d) => Some(d.clone()),
+                None => h.default_dir(ctx),
+            };
+            let exists = |p: &Path| if h == Transcripts::OpenCode { p.is_file() } else { p.is_dir() };
+            let dir = match (found, all) {
+                (Some(d), _) if exists(&d) => d,
                 (_, true) => continue,
                 (d, false) => bail!(
-                    "{name} sessions dir {} does not exist",
+                    "{name} sessions {} does not exist",
                     d.map(|d| d.display().to_string()).unwrap_or_else(|| "(no home directory)".into())
                 ),
             };
-            let h = import_harness_history(ctx, name, &dir)?;
+            // omp reads the same `PI_CODING_AGENT_DIR`: a Pi dir that is an omp sessions dir
+            // imported above would import omp's sessions a second time under `pi:` ids.
+            if all && h == Transcripts::Pi && omp_dirs.iter().any(|o| same_dir(o, &dir)) {
+                lines.push(format!("pi history: {} is an omp sessions dir, skipped", dir.display()));
+                continue;
+            }
+            let hist = import_harness_history(ctx, h, &dir)?;
             lines.push(format!(
                 "{name} history: {} files ({} subagent), {} new, {} updated, {} kept from traces, {} failed; {} sessions with skill reads, {} redirects",
-                h["files"], h["subagent_files"], h["new"], h["updated"], h["skipped_traced"], h["failed"], h["with_skill_reads"], h["redirects"]
+                hist["files"], hist["subagent_files"], hist["new"], hist["updated"], hist["skipped_traced"], hist["failed"], hist["with_skill_reads"], hist["redirects"]
             ));
-            out[key] = h;
+            out[key] = hist;
             imported += 1;
         }
         if imported == 0 {
-            bail!("no session history found (omp sessions, ~/.claude/projects, ~/.codex/sessions)");
+            bail!("no session history found (omp sessions, ~/.claude/projects, ~/.codex/sessions, ~/.pi/agent/sessions, opencode.db)");
         }
     }
     if let Some(forge) = &a.forge {
@@ -346,54 +365,83 @@ fn omp_history_present(ctx: &AppCtx) -> bool {
             .any(|p| rematch_core::paths::RematchPaths::profile_agent_dir(&ctx.paths.config_root, p).join("sessions").is_dir())
 }
 
-/// `import --history` of a Claude Code (`name` = `claude-code`) or Codex sessions dir: each
-/// transcript's trace is synthesized and folded into its ledger row. Outcomes are derived
+/// Whether two paths name the same directory (by real path when both exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// `import --history` of a Claude Code, Codex or Pi sessions dir, or of the OpenCode store:
+/// each transcript's trace is synthesized and folded into its ledger row. Outcomes are derived
 /// from omp tool receipts only, so none are extracted here. A clean main session that loaded
-/// rematch entries (Codex: skills it listed, DESIGN §18.2.2) gets its synthesized trace
-/// written to `traces/<sid>.jsonl`, so `count` folds it into those entries' counters;
-/// flagged ones reach the counters through `reflect --history`, which skips sessions that
-/// already have a trace.
-fn import_harness_history(ctx: &AppCtx, name: &str, dir: &Path) -> Result<Value> {
-    let st = if name == Transcripts::ClaudeCode.name() {
-        import_harness_stats(
+/// rematch entries (Codex and Pi: skills listed to the model, DESIGN §18.2.2, §18.3) gets its
+/// synthesized trace written to `traces/<sid>.jsonl`, so `count` folds it into those entries'
+/// counters; flagged ones reach the counters through `reflect --history`, which skips sessions
+/// that already have a trace.
+fn import_harness_history(ctx: &AppCtx, h: Transcripts, dir: &Path) -> Result<Value> {
+    let path_label = |p: &PathBuf| p.display().to_string();
+    let st = match h {
+        Transcripts::ClaudeCode => import_harness_stats(
             ctx,
             import_claude::scan_sessions_dir(dir)?,
-            import_claude::read_session,
+            path_label,
+            |p: &PathBuf| import_claude::read_session(p),
             import_claude::session_record,
             import_claude::ClaudeSession::is_subagent,
             import_claude::trace_records_of,
-        )?
-    } else {
-        import_harness_stats(
+        )?,
+        Transcripts::Codex => import_harness_stats(
             ctx,
             import_codex::scan_sessions_dir(dir)?,
-            import_codex::read_session,
+            path_label,
+            |p: &PathBuf| import_codex::read_session(p),
             import_codex::session_record,
             import_codex::CodexSession::is_subagent,
             import_codex::trace_records_of,
-        )?
+        )?,
+        Transcripts::Pi => import_harness_stats(
+            ctx,
+            import_pi::scan_sessions_dir(dir)?,
+            path_label,
+            |p: &PathBuf| import_pi::read_session(p),
+            import_pi::session_record,
+            import_pi::PiSession::is_subagent,
+            import_pi::trace_records_of,
+        )?,
+        Transcripts::OpenCode => import_harness_stats(
+            ctx,
+            import_opencode::scan_store(dir)?,
+            |r: &import_opencode::SessionRef| r.to_string(),
+            import_opencode::read_session,
+            import_opencode::session_record,
+            import_opencode::OpenCodeSession::is_subagent,
+            import_opencode::trace_records_of,
+        )?,
     };
-    eprintln!("rematch import: {} {name} session files from {}", st.files, dir.display());
+    eprintln!("rematch import: {} {} sessions from {}", st.files, h.name(), dir.display());
     Ok(st.to_json(dir))
 }
 
-fn import_harness_stats<S>(
+fn import_harness_stats<U, S>(
     ctx: &AppCtx,
-    files: Vec<PathBuf>,
-    read: impl Fn(&Path) -> Result<S>,
+    units: Vec<U>,
+    label: impl Fn(&U) -> String,
+    read: impl Fn(&U) -> Result<S>,
     record: impl Fn(&S) -> SessionRecord,
     is_subagent: impl Fn(&S) -> bool,
     trace: impl Fn(&S) -> Vec<TraceRecord>,
 ) -> Result<HistoryStats> {
-    let mut st = HistoryStats { files: files.len(), ..Default::default() };
+    let mut st = HistoryStats { files: units.len(), ..Default::default() };
     let policy = ctx.domain_policy()?;
-    for f in &files {
+    for f in &units {
         let session = match read(f) {
             Ok(s) => s,
             Err(e) => {
                 st.failed += 1;
                 if st.errors.len() < 10 {
-                    st.errors.push(format!("{}: {e:#}", f.display()));
+                    st.errors.push(format!("{}: {e:#}", label(f)));
                 }
                 continue;
             }
@@ -504,11 +552,14 @@ fn cwd_slugs(cwd: &str) -> Vec<String> {
     out
 }
 
-/// Harnesses whose sessions carry an id prefix (`cc:`, `codex:`); unprefixed ids are omp's.
+/// Harnesses whose sessions carry an id prefix (`cc:`, `codex:`, `pi:`, `oc:`); unprefixed ids
+/// are omp's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transcripts {
     ClaudeCode,
     Codex,
+    Pi,
+    OpenCode,
 }
 
 impl Transcripts {
@@ -517,6 +568,10 @@ impl Transcripts {
             Some(Transcripts::ClaudeCode)
         } else if id.starts_with(import_codex::ID_PREFIX) {
             Some(Transcripts::Codex)
+        } else if id.starts_with(import_pi::ID_PREFIX) {
+            Some(Transcripts::Pi)
+        } else if id.starts_with(import_opencode::ID_PREFIX) {
+            Some(Transcripts::OpenCode)
         } else {
             None
         }
@@ -526,32 +581,49 @@ impl Transcripts {
         match self {
             Transcripts::ClaudeCode => "claude-code",
             Transcripts::Codex => "codex",
+            Transcripts::Pi => "pi",
+            Transcripts::OpenCode => "opencode",
         }
     }
 
-    fn default_dir(self) -> Option<PathBuf> {
+    fn history_harness(self) -> HistoryHarness {
+        match self {
+            Transcripts::ClaudeCode => HistoryHarness::ClaudeCode,
+            Transcripts::Codex => HistoryHarness::Codex,
+            Transcripts::Pi => HistoryHarness::Pi,
+            Transcripts::OpenCode => HistoryHarness::OpenCode,
+        }
+    }
+
+    /// The harness's default history location (OpenCode: its store file).
+    fn default_dir(self, ctx: &AppCtx) -> Option<PathBuf> {
         match self {
             Transcripts::ClaudeCode => import_claude::default_sessions_dir(),
             Transcripts::Codex => import_codex::default_sessions_dir(),
+            Transcripts::Pi => import_pi::default_sessions_dir(&ctx.paths.config_root),
+            Transcripts::OpenCode => import_opencode::default_store(),
         }
     }
 
-    /// The transcript of a ledger session: the path recorded at import, else the harness's
-    /// lookup under its default sessions dir.
-    fn locate(self, s: &SessionRecord) -> Option<PathBuf> {
+    /// The transcript file of a ledger session: the path recorded at import, else the
+    /// harness's lookup under its default sessions dir (not OpenCode: [`import_opencode::locate`]).
+    fn locate(self, ctx: &AppCtx, s: &SessionRecord) -> Option<PathBuf> {
         if let Some(p) = s.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
             return Some(p);
         }
-        let dir = self.default_dir().filter(|d| d.is_dir())?;
+        let dir = self.default_dir(ctx).filter(|d| d.is_dir())?;
         match self {
             Transcripts::ClaudeCode => import_claude::find_session_file(&dir, &s.id),
             Transcripts::Codex => import_codex::find_session_file(&dir, &s.id),
+            Transcripts::Pi => import_pi::find_session_file(&dir, &s.id),
+            Transcripts::OpenCode => None,
         }
     }
 }
 
 /// A ledger session's harness transcript, read back: the trace synthesized from it and
-/// whether it is a subagent's (the adapters trace main sessions only).
+/// whether it is a subagent's (the adapters trace main sessions only). `path` is the session
+/// file (OpenCode: its store).
 pub struct Transcript {
     pub path: PathBuf,
     pub records: Vec<TraceRecord>,
@@ -559,14 +631,20 @@ pub struct Transcript {
 }
 
 /// The transcript of a ledger session from the harness its id names (omp, Claude Code,
-/// Codex). `Ok(None)` when no file is found; `Err` when it is unreadable.
+/// Codex, Pi, OpenCode). `Ok(None)` when none is found; `Err` when it is unreadable. A Pi
+/// segment (`pi:<id>:r<n>`) without its live trace reads the whole Pi session.
 pub fn read_transcript(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Transcript>> {
     let Some(h) = Transcripts::of_id(&s.id) else {
         let Some(path) = locate_session_file(ctx, s)? else { return Ok(None) };
         let omp = read_session(&path)?;
         return Ok(Some(Transcript { subagent: omp.header.parent_session.is_some(), records: trace_records_of(&omp), path }));
     };
-    let Some(path) = h.locate(s) else { return Ok(None) };
+    if h == Transcripts::OpenCode {
+        let Some(r) = import_opencode::locate(s.source_path.as_deref().map(Path::new), &s.id) else { return Ok(None) };
+        let c = import_opencode::read_session(&r)?;
+        return Ok(Some(Transcript { subagent: c.is_subagent(), records: import_opencode::trace_records_of(&c), path: r.db }));
+    }
+    let Some(path) = h.locate(ctx, s) else { return Ok(None) };
     Ok(Some(match h {
         Transcripts::ClaudeCode => {
             let c = import_claude::read_session(&path)?;
@@ -576,6 +654,11 @@ pub fn read_transcript(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Transcr
             let c = import_codex::read_session(&path)?;
             Transcript { subagent: c.is_subagent(), records: import_codex::trace_records_of(&c), path }
         }
+        Transcripts::Pi => {
+            let p = import_pi::read_session(&path)?;
+            Transcript { subagent: false, records: import_pi::trace_records_of(&p), path }
+        }
+        Transcripts::OpenCode => unreachable!("handled above"),
     }))
 }
 

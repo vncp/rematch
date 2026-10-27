@@ -2,7 +2,7 @@
 
 The manual is the documentation site, **<https://vncp.github.io/rematch/>**, built from [`docs/site/`](site/) (`cd docs/site && bun install && bun run build`). Its guides hold everything this file used to; below is a quick reference.
 
-**Use omp as usual.** rematch traces each session, proposes when you correct the agent, and keeps only what later sessions confirm. Every `/rematch …` command in omp is `rematch …` in a terminal; add `--text` there for readable output instead of JSON.
+**Use your connected harness as usual.** The live adapters trace sessions and can propose changes from corrections; Codex is post-hoc. The CLI below works across adapters. Slash-command names vary—see the [harness matrix](https://vncp.github.io/rematch/reference/harnesses/). Add `--text` for readable terminal output.
 
 ```sh
 rematch status --text                       # entries by status, pending flags, off?
@@ -34,7 +34,7 @@ rematch uninstall                           # prints the plan; --yes removes
 
 | For | Read |
 |---|---|
-| install (omp, Claude Code, Codex), the first correction | [Start](https://vncp.github.io/rematch/start/install/) |
+| install (omp, Claude Code, Codex, Pi, OpenCode), the first correction | [Start](https://vncp.github.io/rematch/start/install/) |
 | the loop, statuses, predicates, domains, counters | [Concepts](https://vncp.github.io/rematch/concepts/loop/) |
 | day to day, correcting, approving, create, improve, batch, sharing, profile, report, lake, troubleshooting | [Guides](https://vncp.github.io/rematch/guides/day-to-day/) |
 | every subcommand's flags, trace schema, entry layout, lint, config, environment, files, glossary | [Reference](https://vncp.github.io/rematch/reference/cli/) |

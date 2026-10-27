@@ -44,6 +44,9 @@ const RETRIEVAL_QUERY_PATHS: usize = 10;
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Harness {
     ClaudeCode,
+    /// The OpenCode plugin (`adapters/opencode`, `crate::opencode_event`).
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -65,7 +68,7 @@ fn read_payload() -> Result<Value> {
     serde_json::from_str(&text).context("hook payload is not JSON")
 }
 
-fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(crate) fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
@@ -134,15 +137,15 @@ fn cwd_of(ctx: &AppCtx, payload: &Value) -> PathBuf {
 
 /// The session's trace, locked (advisory `flock`) for the life of the value: hooks of one
 /// session run concurrently (parallel tool calls).
-struct TraceFile {
-    path: PathBuf,
+pub(crate) struct TraceFile {
+    pub(crate) path: PathBuf,
     file: std::fs::File,
-    records: Vec<TraceRecord>,
-    now: i64,
+    pub(crate) records: Vec<TraceRecord>,
+    pub(crate) now: i64,
 }
 
 impl TraceFile {
-    fn open(ctx: &AppCtx, sid: &str) -> Result<TraceFile> {
+    pub(crate) fn open(ctx: &AppCtx, sid: &str) -> Result<TraceFile> {
         std::fs::create_dir_all(&ctx.paths.traces)?;
         let path = ctx.paths.traces.join(format!("{sid}.jsonl"));
         let file = std::fs::OpenOptions::new()
@@ -155,11 +158,11 @@ impl TraceFile {
         Ok(TraceFile { path, file, records, now: ctx.now })
     }
 
-    fn seq(&self) -> u32 {
+    pub(crate) fn seq(&self) -> u32 {
         self.records.iter().map(|r| r.seq() + 1).max().unwrap_or(0)
     }
 
-    fn push(&mut self, rec: TraceRecord) -> Result<()> {
+    pub(crate) fn push(&mut self, rec: TraceRecord) -> Result<()> {
         let mut line = serde_json::to_string(&rec)?;
         line.push('\n');
         self.file.write_all(line.as_bytes()).with_context(|| format!("append to {}", self.path.display()))?;
@@ -167,7 +170,7 @@ impl TraceFile {
         Ok(())
     }
 
-    fn started(&self) -> bool {
+    pub(crate) fn started(&self) -> bool {
         self.records.iter().any(|r| matches!(r, TraceRecord::SessionStart { .. }))
     }
 
@@ -176,16 +179,16 @@ impl TraceFile {
     }
 
     /// Records after the last `agent_end` (the run in progress, if any).
-    fn open_run(&self) -> &[TraceRecord] {
+    pub(crate) fn open_run(&self) -> &[TraceRecord] {
         let from = self.last_index(|r| matches!(r, TraceRecord::AgentEnd { .. })).map_or(0, |i| i + 1);
         &self.records[from..]
     }
 
-    fn run_active(&self) -> bool {
+    pub(crate) fn run_active(&self) -> bool {
         self.open_run().iter().any(|r| matches!(r, TraceRecord::Input { .. } | TraceRecord::ToolResult { .. } | TraceRecord::TurnEnd { .. }))
     }
 
-    fn last_model(&self) -> Option<ModelRef> {
+    pub(crate) fn last_model(&self) -> Option<ModelRef> {
         self.records.iter().rev().find_map(|r| match r {
             TraceRecord::TurnEnd { model: Some(m), .. } | TraceRecord::SessionStart { model: Some(m), .. } => Some(m.clone()),
             TraceRecord::ModelChange { to: Some(m), .. } => Some(m.clone()),
@@ -240,11 +243,11 @@ pub fn parse_hook_module(text: &str) -> Result<HookModule> {
 }
 
 impl HookModule {
-    fn param(&self, key: &str, default: u32) -> u32 {
+    pub(crate) fn param(&self, key: &str, default: u32) -> u32 {
         self.params.get(key).and_then(Value::as_u64).map_or(default, |v| v as u32)
     }
 
-    fn applies_to(&self, tool: &str) -> bool {
+    pub(crate) fn applies_to(&self, tool: &str) -> bool {
         self.tool == "*" || self.tool.eq_ignore_ascii_case(tool)
     }
 }
@@ -293,7 +296,10 @@ pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
 
 pub fn cmd_trace_event(ctx: &AppCtx, a: TraceEventArgs) -> Result<Value> {
     let payload = read_payload()?;
-    trace_event(ctx, &a, &payload)
+    match a.harness {
+        Harness::ClaudeCode => trace_event(ctx, &a, &payload),
+        Harness::OpenCode => crate::opencode_event::trace_event(ctx, &a, &payload),
+    }
 }
 
 pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<Value> {
@@ -407,7 +413,7 @@ const FILES_CHANGED_BUDGET: std::time::Duration = std::time::Duration::from_mill
 
 /// `session_shutdown.files_changed` of a trace: the files its successful mutating tool calls
 /// named, hashed now relative to the repo of its `session_start` (empty when over budget).
-fn files_changed(records: &[TraceRecord]) -> Vec<(String, String)> {
+pub(crate) fn files_changed(records: &[TraceRecord]) -> Vec<(String, String)> {
     let deadline = std::time::Instant::now() + FILES_CHANGED_BUDGET;
     let (cwd, repo) = records
         .iter()
@@ -720,7 +726,10 @@ fn close_run_with(tf: &mut TraceFile, payload: &Value, tail: Option<&import_clau
 
 pub fn cmd_hook_check(ctx: &AppCtx, a: TraceEventArgs) -> Result<Value> {
     let payload = read_payload()?;
-    hook_check(ctx, &a, &payload)
+    match a.harness {
+        Harness::ClaudeCode => hook_check(ctx, &a, &payload),
+        Harness::OpenCode => crate::opencode_event::hook_check(ctx, &a, &payload),
+    }
 }
 
 /// Identical calls (tool + args hash) right before now, newest first: `tool_result`s and the
@@ -743,7 +752,7 @@ pub fn trailing_run(records: &[TraceRecord], tool: &str, hash: &str, stuck_ids: 
 }
 
 /// `input[field]`, with omp's `path` and Claude Code's `file_path` standing in for each other.
-fn field_value<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
+pub(crate) fn field_value<'a>(input: &'a Value, field: &str) -> Option<&'a str> {
     let alias = match field {
         "path" => "file_path",
         "file_path" => "path",

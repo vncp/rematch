@@ -26,15 +26,15 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 | Command | What it does |
 |---|---|
 | [`doctor`](#rematch-doctor) | omp binary + version, roles, extension link, ledger schema, roots, off state |
-| [`import`](#rematch-import) | Import omp session history and/or a compound-forge checkout |
+| [`import`](#rematch-import) | Import session history (omp, Claude Code, Codex, Pi, OpenCode) and/or a compound-forge checkout |
 | [`reflect`](#rematch-reflect) | Count finished traces, then reflect on pending sessions (idempotent) |
 | [`match`](#rematch-match) | Staging dirs, entries and hooks that load for a directory |
 | [`skills`](#rematch-skills) | The shared skill directory every harness loads (REMATCH_ROOT/skills): sync |
 | [`retrieve`](#rematch-retrieve) | Units of the loaded skill packages that match a query (the `retrieve` context hook) |
 | [`digest`](#rematch-digest) | Session-start digest: new statuses, approvals, review list, transfers |
 | [`record`](#rematch-record) | Append an event for a session (marks); the trace file stays the primary input |
-| [`trace-event`](#rematch-trace-event) | Harness hook payload on stdin → DESIGN §3 trace records (Claude Code adapter) |
-| [`hook-check`](#rematch-hook-check) | Harness `PreToolUse` payload on stdin → approved block/stuck hooks verdict (Claude Code adapter) |
+| [`trace-event`](#rematch-trace-event) | Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters) |
+| [`hook-check`](#rematch-hook-check) | Harness pre-tool payload on stdin → approved block/stuck hooks verdict (Claude Code, OpenCode adapters) |
 | [`create`](#rematch-create) | Greenfield: create an entry from sessions, a task, or a description (draft) |
 | [`improve`](#rematch-improve) | Brownfield: register, audit, split or propose a sibling for an existing skill |
 | [`activate`](#rematch-activate) | Draft → provisional |
@@ -62,21 +62,21 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 ## rematch
 
 ```text
-rematch: trace-grounded harness evolution for omp, Claude Code and Codex
+rematch: trace-grounded harness evolution for omp, Claude Code, Codex, Pi and OpenCode
 
 Usage: rematch [OPTIONS] <COMMAND>
 
 Commands:
   doctor       omp binary + version, roles, extension link, ledger schema, roots, off state
-  import       Import omp session history and/or a compound-forge checkout
+  import       Import session history (omp, Claude Code, Codex, Pi, OpenCode) and/or a compound-forge checkout
   reflect      Count finished traces, then reflect on pending sessions (idempotent)
   match        Staging dirs, entries and hooks that load for a directory
   skills       The shared skill directory every harness loads (REMATCH_ROOT/skills): sync
   retrieve     Units of the loaded skill packages that match a query (the `retrieve` context hook)
   digest       Session-start digest: new statuses, approvals, review list, transfers
   record       Append an event for a session (marks); the trace file stays the primary input
-  trace-event  Harness hook payload on stdin → DESIGN §3 trace records (Claude Code adapter)
-  hook-check   Harness `PreToolUse` payload on stdin → approved block/stuck hooks verdict (Claude Code adapter)
+  trace-event  Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters)
+  hook-check   Harness pre-tool payload on stdin → approved block/stuck hooks verdict (Claude Code, OpenCode adapters)
   create       Greenfield: create an entry from sessions, a task, or a description (draft)
   improve      Brownfield: register, audit, split or propose a sibling for an existing skill
   activate     Draft → provisional
@@ -125,7 +125,7 @@ Options:
 ## rematch import
 
 ```text
-Import omp session history and/or a compound-forge checkout
+Import session history (omp, Claude Code, Codex, Pi, OpenCode) and/or a compound-forge checkout
 
 Usage: rematch import [OPTIONS]
 
@@ -140,18 +140,20 @@ Options:
           Directory the command runs against (repo/cwd for match, digest, create, …)
 
       --harness <HARNESS>
-          Which harness's history: omp, claude-code, codex, or all (default: each harness's default dir that exists)
+          Which harness's history: omp, claude-code, codex, pi, opencode, or all (default: each harness's default dir that exists)
 
           Possible values:
           - omp:         omp: `<agent dir>/sessions` plus every profile's sessions dir
           - claude-code: Claude Code: `~/.claude/projects` (`$CLAUDE_CONFIG_DIR/projects`)
           - codex:       Codex: `~/.codex/sessions` (`$CODEX_HOME/sessions`)
+          - pi:          Pi: `~/.pi/agent/sessions` (`$PI_CODING_AGENT_SESSION_DIR`, `$PI_CODING_AGENT_DIR/sessions`)
+          - opencode:    OpenCode: its session store `opencode.db` (`$OPENCODE_DB`, `$XDG_DATA_HOME/opencode`)
           - all:         Every harness whose default history dir exists
           
           [default: all]
 
       --sessions <DIR>
-          Sessions directory of the selected harness (with `--harness all`: an omp sessions dir)
+          Sessions directory of the selected harness (OpenCode: its `opencode.db` or the dir holding it; with `--harness all`: an omp sessions dir)
 
       --skip-profile <NAME>
           Skip a named profile during `--history` import (repeatable; merged with `policy.json` `skip_profiles`)
@@ -225,10 +227,24 @@ Link the skills that load for --cwd into REMATCH_ROOT/skills (adds matching prov
 Usage: rematch skills sync [OPTIONS]
 
 Options:
-      --harness <HARNESS>  The harness asking. `claude-code` also links the plugin's `skills/` and copies the agent entries into its `agents/` (plugin: $CLAUDE_PLUGIN_ROOT, else the `~/.claude/skills/rematch` install); `codex` reports whether Codex reaches the shared dir [possible values: omp, claude-code, codex]
-      --text               Human-readable output instead of the JSON envelope
-      --cwd <DIR>          Directory the command runs against (repo/cwd for match, digest, create, …)
-  -h, --help               Print help
+      --harness <HARNESS>
+          The harness asking. `claude-code` also links the plugin's `skills/` and copies the agent entries into its `agents/` (plugin: $CLAUDE_PLUGIN_ROOT, else the `~/.claude/skills/rematch` install); `codex` reports whether Codex reaches the shared dir
+
+          Possible values:
+          - omp
+          - claude-code
+          - codex
+          - pi:          Pi: the rematch Pi package returns the shared dir from `resources_discover`
+          - opencode:    OpenCode: the shared sync only; the rematch OpenCode plugin delivers the dir
+
+      --text
+          Human-readable output instead of the JSON envelope
+
+      --cwd <DIR>
+          Directory the command runs against (repo/cwd for match, digest, create, …)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## rematch retrieve
@@ -279,33 +295,63 @@ Options:
 ## rematch trace-event
 
 ```text
-Harness hook payload on stdin → DESIGN §3 trace records (Claude Code adapter)
+Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters)
 
 Usage: rematch trace-event [OPTIONS] --harness <HARNESS>
 
 Options:
-      --harness <HARNESS>  Harness whose hook payload arrives on stdin [possible values: claude-code]
-      --text               Human-readable output instead of the JSON envelope
-      --cwd <DIR>          Directory the command runs against (repo/cwd for match, digest, create, …)
-      --session <SESSION>  Session id (default: `cc:<payload session_id>`)
-      --hook-output        Speak the harness hook protocol: hook JSON on stdout, a block reason on stderr with exit 2; any error exits 0. Without it the result is the usual envelope
-  -h, --help               Print help
+      --harness <HARNESS>
+          Harness whose hook payload arrives on stdin
+
+          Possible values:
+          - claude-code
+          - opencode:    The OpenCode plugin (`adapters/opencode`, `crate::opencode_event`)
+
+      --text
+          Human-readable output instead of the JSON envelope
+
+      --cwd <DIR>
+          Directory the command runs against (repo/cwd for match, digest, create, …)
+
+      --session <SESSION>
+          Session id (default: `cc:<payload session_id>`)
+
+      --hook-output
+          Speak the harness hook protocol: hook JSON on stdout, a block reason on stderr with exit 2; any error exits 0. Without it the result is the usual envelope
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## rematch hook-check
 
 ```text
-Harness `PreToolUse` payload on stdin → approved block/stuck hooks verdict (Claude Code adapter)
+Harness pre-tool payload on stdin → approved block/stuck hooks verdict (Claude Code, OpenCode adapters)
 
 Usage: rematch hook-check [OPTIONS] --harness <HARNESS>
 
 Options:
-      --harness <HARNESS>  Harness whose hook payload arrives on stdin [possible values: claude-code]
-      --text               Human-readable output instead of the JSON envelope
-      --cwd <DIR>          Directory the command runs against (repo/cwd for match, digest, create, …)
-      --session <SESSION>  Session id (default: `cc:<payload session_id>`)
-      --hook-output        Speak the harness hook protocol: hook JSON on stdout, a block reason on stderr with exit 2; any error exits 0. Without it the result is the usual envelope
-  -h, --help               Print help
+      --harness <HARNESS>
+          Harness whose hook payload arrives on stdin
+
+          Possible values:
+          - claude-code
+          - opencode:    The OpenCode plugin (`adapters/opencode`, `crate::opencode_event`)
+
+      --text
+          Human-readable output instead of the JSON envelope
+
+      --cwd <DIR>
+          Directory the command runs against (repo/cwd for match, digest, create, …)
+
+      --session <SESSION>
+          Session id (default: `cc:<payload session_id>`)
+
+      --hook-output
+          Speak the harness hook protocol: hook JSON on stdout, a block reason on stderr with exit 2; any error exits 0. Without it the result is the usual envelope
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ## rematch create

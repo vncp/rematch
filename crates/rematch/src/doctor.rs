@@ -174,6 +174,11 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         ("omp", omp_harness),
         ("claude-code", claude_code_harness(ctx)),
         ("codex", codex_harness(ctx)),
+        ("pi", pi_harness(ctx)),
+        ("opencode", {
+            let (line, json, problems, set_up) = crate::opencode_event::doctor_harness(ctx);
+            Harness { line, json, problems, set_up }
+        }),
         ("profile", profile_harness(ctx)?),
         ("lake", lake_harness(ctx)?),
         ("built-ins", builtins_harness(ctx)?),
@@ -385,6 +390,89 @@ fn codex_harness(ctx: &AppCtx) -> Harness {
         json: json!({"link": link, "present": true, "reaches_shared": reaches}),
         problems,
         set_up: true,
+    }
+}
+
+/// Name of the Pi package (`adapters/pi/package.json`).
+pub const PI_PACKAGE_NAME: &str = "@vncp/rematch-pi";
+
+/// The rematch Pi package in Pi's user settings (`<pi agent dir>/settings.json`: a `packages`
+/// source or an `extensions` path whose `package.json` is ours, relative paths from the agent
+/// dir) and the `pi` binary on `PATH` (information only: a machine without Pi is not set up,
+/// never a problem). A listed source that no longer holds the package is a problem.
+fn pi_harness(ctx: &AppCtx) -> Harness {
+    let pi_bin = std::env::var_os("PI_BIN").filter(|v| !v.is_empty()).map(PathBuf::from).or_else(|| omp::which("pi"));
+    let Some(agent) = rematch_core::import_pi::default_agent_dir(&ctx.paths.config_root) else {
+        return Harness { line: "pi: not set up (HOME is not set)".into(), json: json!({"agent_dir": null}), problems: vec![], set_up: false };
+    };
+    let settings_path = agent.join("settings.json");
+    let settings: Option<Value> = std::fs::read_to_string(&settings_path).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let sources: Vec<String> = settings
+        .iter()
+        .flat_map(|s| {
+            let packages = s["packages"].as_array().into_iter().flatten().filter_map(|p| p.as_str().or_else(|| p["source"].as_str()));
+            let extensions = s["extensions"].as_array().into_iter().flatten().filter_map(Value::as_str);
+            packages.chain(extensions).map(str::to_string).collect::<Vec<_>>()
+        })
+        .collect();
+    // Pi resolves a relative source lexically against the settings dir (`path.resolve`), so `..`
+    // pops a name here even where the dir is reached through a symlink (`/tmp` → `/private/tmp`).
+    let resolve = |src: &str| -> Option<PathBuf> {
+        if src.starts_with("npm:") || src.starts_with("git:") || src.contains("://") {
+            return None;
+        }
+        let src = src.trim_start_matches(['+', '-']);
+        let joined = match src.strip_prefix("~/") {
+            Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+            None => agent.join(src),
+        };
+        let mut out = PathBuf::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other),
+            }
+        }
+        Some(out)
+    };
+    let ours = |dir: &Path| {
+        std::fs::read_to_string(dir.join("package.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|p| p["name"] == PI_PACKAGE_NAME)
+    };
+    let mut problems = Vec::new();
+    let mut installed: Option<PathBuf> = None;
+    for (src, dir) in sources.iter().filter_map(|s| resolve(s).map(|d| (s, d))) {
+        if ours(&dir) {
+            installed = Some(dir);
+            break;
+        }
+        if src.contains("adapters/pi") && !dir.is_dir() {
+            problems.push(format!("Pi settings {} list {src}, which no longer exists: pi install <rematch checkout>/adapters/pi", settings_path.display()));
+        }
+    }
+    let bin_note = match &pi_bin {
+        Some(b) => format!("pi at {}", b.display()),
+        None => "pi not on PATH".into(),
+    };
+    let json = json!({"agent_dir": agent, "settings": settings_path, "package": installed, "pi": pi_bin});
+    match &installed {
+        Some(dir) => Harness {
+            line: format!("pi: {} · package {} · {bin_note}", if problems.is_empty() { "ok" } else { "problem" }, dir.display()),
+            json,
+            problems,
+            set_up: true,
+        },
+        None => Harness {
+            line: format!("pi: not set up (pi install <rematch checkout>/adapters/pi; {bin_note})"),
+            json,
+            set_up: !problems.is_empty(),
+            problems,
+        },
     }
 }
 

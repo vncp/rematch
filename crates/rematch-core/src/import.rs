@@ -216,13 +216,13 @@ fn active_branch(body: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn iso_ms(s: &str) -> Option<UnixMs> {
+pub(crate) fn iso_ms(s: &str) -> Option<UnixMs> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.timestamp_millis())
 }
 
-fn entry_ms(e: &Value) -> Option<UnixMs> {
+pub(crate) fn entry_ms(e: &Value) -> Option<UnixMs> {
     e.get("timestamp")
         .and_then(Value::as_str)
         .and_then(iso_ms)
@@ -263,7 +263,7 @@ pub fn content_text(content: Option<&Value>) -> String {
     }
 }
 
-fn message(e: &Value) -> Option<(&str, &Value)> {
+pub(crate) fn message(e: &Value) -> Option<(&str, &Value)> {
     if e.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
@@ -271,7 +271,7 @@ fn message(e: &Value) -> Option<(&str, &Value)> {
     Some((m.get("role").and_then(Value::as_str)?, m))
 }
 
-fn tool_calls(m: &Value) -> impl Iterator<Item = &Value> {
+pub(crate) fn tool_calls(m: &Value) -> impl Iterator<Item = &Value> {
     m.get("content")
         .and_then(Value::as_array)
         .into_iter()
@@ -409,14 +409,14 @@ pub fn import_session(path: &Path) -> Result<SessionRecord> {
     Ok(session_record(&read_session(path)?))
 }
 
-fn start_ms(s: &OmpSession) -> UnixMs {
+pub(crate) fn start_ms(s: &OmpSession) -> UnixMs {
     iso_ms(&s.header.timestamp)
         .or_else(|| s.entries.first().and_then(entry_ms))
         .unwrap_or(0)
 }
 
 /// `{provider, id}` of an assistant message.
-fn model_ref(m: &Value) -> Option<ModelRef> {
+pub(crate) fn model_ref(m: &Value) -> Option<ModelRef> {
     Some(ModelRef {
         provider: m.get("provider")?.as_str()?.to_string(),
         id: m.get("model")?.as_str()?.to_string(),
@@ -533,7 +533,7 @@ pub fn truncate_tool_input(input: &Value, max: usize) -> Value {
 
 /// Bytes of a tool result's content: text blocks as UTF-8, other blocks by their `data`
 /// string length (the extension's `contentBytes`).
-fn content_bytes(content: Option<&Value>) -> u64 {
+pub(crate) fn content_bytes(content: Option<&Value>) -> u64 {
     match content {
         Some(Value::String(s)) => s.len() as u64,
         Some(Value::Array(blocks)) => blocks

@@ -693,7 +693,7 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                 }
                 results.push((*seq, *is_error));
                 let skill = skill_read.clone().or_else(|| {
-                    (tool == "read")
+                    (tool == "read" && !*is_error)
                         .then(|| {
                             input
                                 .get("path")

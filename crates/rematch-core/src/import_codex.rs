@@ -133,7 +133,7 @@ fn skill_list_paths(body: &str, out: &mut Vec<PathBuf>) {
 /// same name) and is not attributed. Returns the entry (id, version, `content_sha256`) and
 /// whether it loads: a hook entry's router `SKILL.md` is offered (visible) too, but Codex never
 /// runs the hook, so it is not a loaded entry.
-fn rematch_entry_of(skill_md: &Path, started: UnixMs) -> Option<(LoadedEntry, bool)> {
+pub(crate) fn rematch_entry_of(skill_md: &Path, started: UnixMs) -> Option<(LoadedEntry, bool)> {
     let dir = skill_md.parent()?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(crate::library::REMATCH_JSON)).ok()?).ok()?;
     let loads = !matches!(v.get("kind").and_then(Value::as_str), Some("hook" | "agent" | "lesson"));
