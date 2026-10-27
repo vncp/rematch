@@ -344,6 +344,7 @@ pub fn tool_result_record(seq: u32, t: UnixMs, raw_tool: &str, call_id: &str, in
         error_class: is_error.then(|| "error".to_string()),
         content_head: head(&result_text(content), TRACE_CONTENT_HEAD_CHARS),
         path: file_path_of(input).map(|p| strip_selector(p).to_string()),
+        skill_entry: None,
         tool,
     }
 }
@@ -645,6 +646,8 @@ pub fn trace_records_of(s: &ClaudeSession) -> Vec<TraceRecord> {
         subpath,
         head_sha: None,
         visible_entries: Vec::new(),
+        instructions_exposed: Vec::new(),
+        exposure_view: None,
     });
 
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();

@@ -80,7 +80,7 @@ You need Claude Code 2.1.285 or later and the `rematch` binary: `cargo build --r
    claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch
    ```
 
-   Expect 8 hooks; under Skills, the eight commands plus every linked skill; under Agents, the rematch subagents.
+   Expect 8 hooks; under Skills, the nine commands plus every kept skill; under Agents, the kept rematch subagents.
 
 </Steps>
 
@@ -130,7 +130,7 @@ Use Pi 1.4.x (`@earendil-works/pi-coding-agent`) and Node 22.19 or newer. Keep t
 
 </Steps>
 
-Pi discovers `~/.rematch/skills` through its native resource-discovery hook. Tracing and approved runtime hooks run in Pi; background reflection still needs omp with configured model access.
+Pi discovers the session place's skill view (`~/.rematch/views/<key>/skills`) through its native resource-discovery hook. Tracing and approved runtime hooks run in Pi; background reflection still needs omp with configured model access.
 
 <Aside type="note" title="Which Pi?">
 This adapter targets the maintained `@earendil-works/pi-coding-agent` package. The older `@mariozechner/pi-coding-agent` package is not the tested target.
@@ -171,7 +171,7 @@ Use OpenCode **1.19.4** and a local Rematch checkout. OpenCode 2 is not a tested
 
 </Steps>
 
-The plugin adds Rematch's shared directory to OpenCode's in-memory skill paths.
+The plugin adds the session place's skill view (`~/.rematch/views/<key>/skills`) to OpenCode's in-memory skill paths.
 It traces main sessions, runs approved hooks, and provides user commands for approvals.
 Reflection still needs omp with configured model access.
 
@@ -198,12 +198,13 @@ You need `rematch` on `PATH` (`scripts/install.sh`, or `cargo build --release`).
    ln -s ~/.rematch/skills ~/.agents/skills/rematch
    ```
 
-2. Before starting Codex in a repo, add the skills that match it:
+2. Before starting Codex in a git repo, sync the skills and repo-scoped trials that match it:
 
    ```sh
    rematch skills sync --harness codex --cwd "$PWD"
    ```
 
+   Kept skills load through `~/.agents/skills/rematch`; the repo's provisional trials load through a git-excluded link `<repo>/.agents/skills/rematch-trials`.
    To do it on every launch, add this to your shell rc:
 
    ```sh

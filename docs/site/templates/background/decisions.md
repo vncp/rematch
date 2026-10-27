@@ -1,6 +1,6 @@
 ---
 title: Research decisions
-description: D1–D28, every design decision with the evidence and paper behind it.
+description: D1–D32, every design decision with the evidence and paper behind it.
 editUrl: https://github.com/vncp/rematch/edit/main/docs/research.md
 tableOfContents: false
 ---

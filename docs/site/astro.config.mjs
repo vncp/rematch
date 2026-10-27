@@ -120,6 +120,7 @@ export default defineConfig({
 						'guides/day-to-day',
 						'guides/correct-the-classifier',
 						'guides/approve-scripts-and-hooks',
+						'guides/automatic-probes',
 						'guides/create-a-skill',
 						'guides/improve-a-skill',
 						'guides/batch-with-a-verifier',

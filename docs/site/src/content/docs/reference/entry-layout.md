@@ -28,7 +28,7 @@ Entry directory layout (`<dir>` = staging/drafts/archive/kept path):
 <dir>/rematch.json        serde of Entry + manifest + predicate (the ledger row mirrors it; rematch.json is authoritative for files, ledger for counters)
 <dir>/units/*.md  facts/*.md (each fact has `as_of:`)  scripts/* (mode 0644 until approved; 0755 after)
 <dir>/hook.json           kind=Hook only: HookRule {mode (block|truncate|stuck|retrieve, default block), tool (`*` = any), field + regex (block), message, pass_condition, max_age_turns + keep_chars (truncate), repeats (stuck), budget_bytes + min_overlap (retrieve)}; unset mode parameters take the defaults 6, 1200, 3, 6000, 2 (`HookRule::params`)
-<dir>/AGENTS.fragment.md  optional: system-prompt text. Personal: loads only after approval (`library approve`, bound to its sha256 in `Entry.approved_fragment`, so an edited file asks again) and is appended as `## rematch: <name>` to the system prompt of main sessions where the entry loads (§16 "System prompt"); never written to the user's AGENTS.md. `<repo>/AGENTS.md` only through `ship --scope team`
+<dir>/AGENTS.fragment.md  optional: system-prompt text. Personal: approved via `library approve instructions:<id> --sha <hash>`, which writes a marked `<!-- rematch:begin name=<name> ... -->` block into the user's personal `<agent_dir>/AGENTS.md` (omp) and enables matched-session runtime insertion in Claude Code, Pi and OpenCode (§16 "System prompt"); `<repo>/AGENTS.md` is never written here (only through `ship --scope team`)
 <dir>/fork/<basename>     optional: the text `ship --scope fork` writes to `<fork>/<fork_path>`
 <dir>/EXPERIENCE.md       written by the reflector after keep/retire (read-only to the system)
 ```

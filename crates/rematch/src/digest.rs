@@ -1,9 +1,8 @@
 //! `match --cwd` (load-time payload for the extension factory: entries, predicate hits, hook
-//! modules, approved prompt fragments) and `digest --cwd` (session-start lines, one-tap
-//! approvals, capability-floor review, transfers, ship candidates). Skill delivery is
+//! modules, approved prompt fragments, personal instructions) and `digest --cwd` (session-start
+//! lines, the pending action queue, capability-floor review, transfers). Skill delivery is
 //! `skills sync` (`skills_cmd`).
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -11,16 +10,12 @@ use clap::Args;
 use rematch_core::features::{exts_of, stems_of_session};
 use rematch_core::ledger::{enum_str, EntryFilter};
 use rematch_core::domain;
-use rematch_core::library::{self, Approval, AGENTS_FRAGMENT, AGENT_MD};
+use rematch_core::library;
 use rematch_core::predicate;
 use rematch_core::types::{Entry, Kind, Status};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
-use crate::scope::ship::ShipReady;
-
-/// Max bytes of file content shown per approval.
-pub const APPROVAL_DIFF_BYTES: usize = 4096;
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct MatchArgs {
@@ -92,15 +87,6 @@ fn last_path(ctx: &AppCtx) -> PathBuf {
     ctx.paths.root.join("digest.last")
 }
 
-/// `<id>:<scope>` keys of the ship candidates a digest already announced (one per line).
-fn ship_shown_path(ctx: &AppCtx) -> PathBuf {
-    ctx.paths.root.join("digest.ship")
-}
-
-fn ship_key(r: &ShipReady) -> String {
-    format!("{}:{}", r.id, r.scope)
-}
-
 fn status_line(e: &Entry, c: &rematch_core::types::Counters) -> String {
     let counts = format!("matched {} · recurrence {} · harm {}", c.matched, c.recurrence, c.harm);
     let kind = enum_str(&e.kind);
@@ -115,64 +101,11 @@ fn status_line(e: &Entry, c: &rematch_core::types::Counters) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n…[+{} bytes]", &s[..end], s.len() - end)
-}
-
-/// Provisional, kept and pinned entries with parts awaiting the one-tap approval
-/// ([`library::pending_parts`]): one item per entry whose `kind` is its parts joined with `+`
-/// (`scripts+prompt`) and whose `diff` holds each part in that order — the unapproved script
-/// files, the compiled hook module, `AGENT.md`, `AGENTS.fragment.md` — truncated to
-/// [`APPROVAL_DIFF_BYTES`]. `library approve` grants every part at once.
+/// The digest's confirm items: every approvable action (`actions::pending`; entry parts,
+/// personal instructions, exports, ship candidates, probe replays), diffs cut to
+/// `actions::DIFF_BYTES`.
 pub fn pending_approvals(ctx: &AppCtx) -> Result<Vec<Value>> {
-    let mut out = Vec::new();
-    for st in [Status::Provisional, Status::Kept, Status::Pinned] {
-        for e in ctx.ledger.list_entries(&EntryFilter { status: Some(st), ..Default::default() })? {
-            let parts = library::pending_parts(&ctx.paths, &e);
-            if parts.is_empty() {
-                continue;
-            }
-            let mut reason = e
-                .manifest
-                .as_ref()
-                .map(|m| format!("{} Predicted fix: {}", m.rationale, m.predicted_fix).trim().to_string())
-                .unwrap_or_else(|| e.trigger_line.clone());
-            let file = |name: &str| format!("+++ {name}\n{}\n", std::fs::read_to_string(e.path.join(name)).unwrap_or_default());
-            let mut diff = String::new();
-            for part in &parts {
-                match part {
-                    Approval::Scripts => {
-                        for (rel, p) in library::unapproved_scripts(&e) {
-                            diff.push_str(&format!("+++ {rel}\n{}\n", std::fs::read_to_string(p).unwrap_or_default()));
-                        }
-                    }
-                    Approval::Hook => {
-                        diff.push_str(&match library::hook_module(&e) {
-                            Ok(m) => m,
-                            Err(err) => format!("(hook does not compile: {err:#})\n"),
-                        });
-                        if let Some(h) = &e.hook {
-                            reason = format!("{reason}\n\nPass condition: {}", h.pass_condition.trim());
-                        }
-                    }
-                    Approval::Agent => diff.push_str(&file(AGENT_MD)),
-                    Approval::Prompt => diff.push_str(&file(AGENTS_FRAGMENT)),
-                }
-            }
-            out.push(json!({
-                "id": e.id, "name": e.name, "kind": library::parts_label(&parts),
-                "diff": truncate(&diff, APPROVAL_DIFF_BYTES), "reason": reason,
-            }));
-        }
-    }
-    Ok(out)
+    Ok(crate::actions::approvals(&crate::actions::pending(ctx)?))
 }
 
 pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
@@ -202,16 +135,10 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
     if registered > 0 {
         lines.push(format!("registered {registered} imported entr{} for measurement (files left in place)", if registered == 1 { "y" } else { "ies" }));
     }
-    let mut approvals = pending_approvals(ctx)?;
-    for x in crate::scope::export::pending(ctx)? {
-        let mut v = serde_json::to_value(&x)?;
-        if let Some(id) = v.get("id").and_then(Value::as_str).map(str::to_string) {
-            if !id.starts_with("export:") {
-                v["id"] = json!(format!("export:{id}"));
-            }
-        }
-        approvals.push(v);
-    }
+    // The action queue is recomputed from the library every time (never from `digest.last`):
+    // whatever waits for the user is shown until approved or declined.
+    let actions = crate::actions::pending(ctx)?;
+    let approvals = crate::actions::approvals(&actions);
     let review: Vec<Value> =
         crate::scope::split::capability_review(ctx, 7)?.into_iter().map(|r| serde_json::to_value(&r)).collect::<Result<_, _>>()?;
     for r in &review {
@@ -255,21 +182,18 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
             d["command"].as_str().unwrap_or("?"),
         ));
     }
-    // Ship candidates (`ship::ready`, read-only): each line once per `<id>:<scope>`; the
-    // JSON always lists every current one.
+    // Ship candidates are actions now (`ship-team:`/`fork:`); `ship_ready` stays as data.
     let ship_ready = crate::scope::ship::ready(ctx)?;
-    let shown: BTreeSet<String> = std::fs::read_to_string(ship_shown_path(ctx))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
-    for r in ship_ready.iter().filter(|r| !shown.contains(&ship_key(r))) {
-        lines.push(format!("ship {} {}: {} → {}", r.scope, r.name, r.detail, r.command));
-    }
-    if !approvals.is_empty() {
-        lines.push(format!("{} approval(s) pending", approvals.len()));
+    lines.extend(actions.iter().map(crate::actions::Action::line));
+    // Probe outcomes recorded since the last digest (`rematch status` lists the latest of each).
+    let probes = crate::probes::statuses(ctx)?;
+    lines.extend(probes.iter().filter(|p| p["at"].as_i64().is_some_and(|t| t > last)).filter_map(|p| p["line"].as_str().map(str::to_string)));
+    if !actions.is_empty() {
+        lines.push(format!(
+            "{} action(s) pending, {} approvable (`rematch status`; `rematch library inspect <id>`)",
+            actions.len(),
+            approvals.len()
+        ));
     }
     // The last `profile sync` stopped at a rebase conflict (DESIGN §20): shown until one syncs.
     let profile_conflicts = rematch_core::profile::read_conflicts(&ctx.paths);
@@ -277,15 +201,19 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
         lines.push(crate::profile_cmd::conflict_line(&rematch_core::profile::dir(&ctx.paths), &profile_conflicts));
     }
     std::fs::write(last_path(ctx), seen.to_string())?;
-    // Only current candidates: one that stops being ready and returns is announced again.
-    let keys: BTreeSet<String> = ship_ready.iter().map(ship_key).collect();
-    std::fs::write(ship_shown_path(ctx), keys.into_iter().map(|k| k + "\n").collect::<String>())?;
+    // The one-time ship notice file of earlier versions: superseded by the action queue.
+    let _ = std::fs::remove_file(ctx.paths.root.join("digest.ship"));
     Ok(json!({
         "since": last,
         "lines": lines,
         "changed": changed,
         "approvals": approvals,
+        "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied": crate::actions::applied(ctx)?.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "trials": crate::actions::trials(ctx)?,
+        "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
         "ship_ready": ship_ready,
+        "probes": probes,
         "review": review,
         "stale": stale,
         "transfers": transfers,

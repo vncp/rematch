@@ -232,8 +232,8 @@ fn matched_but_unread_sessions_narrow_inside_count() {
     assert_eq!(v2.predicate.stems, vec!["ledger", "helper"], "never below two stems");
     assert_eq!(v2.status_note.as_deref(), Some("predicate tune: +[] -[round, audit] from 4 session(s)"));
     assert!(lines(&c).contains("tune: ledger-helper v1: read-but-missed 0 · matched-but-unread 4 · matched-and-read 2 → predicate tune: +[] -[round, audit] from 4 session(s) → staged v2"), "{}", lines(&c));
-    // the parent was kept by the same count (6 clean matched sessions); its slot stays its own
-    assert_eq!(rematch_core::ledger::enum_str(&get(&env, &id).status), "kept");
+    // Only the 2 read sessions are actual use: the parent stays provisional (no keep on matches).
+    assert_eq!(rematch_core::ledger::enum_str(&get(&env, &id).status), "provisional");
 }
 
 #[test]

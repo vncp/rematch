@@ -48,7 +48,7 @@ To remove the plugin, delete the `plugin` entry. `rematch uninstall` removes `~/
 
 If you continue a session after its segment was finalized, the continuation is written to `oc:<id>:r2`, `:r3`, and so on. A finished trace is never appended to, so `count` folds each segment exactly once and loses no resumed events. Subagent (task) sessions are not traced live; `block` rules still apply to their tool calls.
 
-**Approvals are meant to be yours.** The adapter's approval paths are `/rematch-approve <id>` and `/rematch-decline <id>` (commands only you can run), or `rematch library approve|decline` in your own shell. The model's `rematch` tool is read-only and has no approve, decline or on/off operation. A check in `tool.execute.before` also refuses `bash` calls that run your controls directly: `rematch library approve|decline|pin|unpin|disable|rollback`, `library export … --approve`, `rematch on|off|uninstall`. It catches the binary by path or in quotes, in any `;`/`&&`/`|`/`$( )` segment, with `--text`/`--cwd` placed anywhere. That check is a guard against the direct command, not a sandbox: a model allowed to run arbitrary shell commands (a script file, `eval` of a built string, an alias, editing the ledger) can still get around it. Limit OpenCode's `bash` permission if that matters to you.
+**Approvals are meant to be yours.** The adapter's approval paths are `/rematch-approve <id>` and `/rematch-decline <id>` (commands only you can run; give them the `--sha` the digest or `/rematch-inspect <id>` shows, which binds the snapshot you reviewed), or `rematch library approve|decline` in your own shell. The model's `rematch` tool is read-only and has no approve, decline or on/off operation. A check in `tool.execute.before` also refuses `bash` calls that run your controls directly: `rematch library approve|decline|pin|unpin|disable|rollback`, `library export … --approve[-all]`, `rematch mark|on|off|uninstall`. It uses the same flag-aware parser as the omp and Pi tools: it catches the binary by path or in quotes (`rematch`, `rematch.sh`, `rematch.exe`), in any `;`/`&&`/`|`/`$( )` segment or `sh -c` script, with `--text`/`--cwd` placed anywhere. That check is a guard against the direct command, not a sandbox: a model allowed to run arbitrary shell commands (a script file, `eval` of a built string, an alias, editing the ledger) can still get around it. Limit OpenCode's `bash` permission if that matters to you.
 
 **Digest.** In the interactive TUI, your first prompt triggers `rematch digest`, and the result appears as a toast (approvals first, each with its commands). Headless commands (`run`, `serve`, …) skip it, so the digest is never consumed where nobody would see it. `/rematch-digest` shows the full digest at any time.
 
@@ -58,7 +58,8 @@ If you continue a session after its segment was finalized, the continuation is w
 - `/rematch-digest`
 - `/rematch-why [oc:<id>]`
 - `/rematch-library`
-- `/rematch-approve <id>`, `/rematch-decline <id>`
+- `/rematch-inspect <id>` — the whole proposal and its exact approve command (with `--sha`)
+- `/rematch-approve <id> --sha <hash>`, `/rematch-decline <id> --sha <hash>`
 - `/rematch-off`, `/rematch-on` — the kill switch
 - `/rematch-mark correction|preference|scope` — records the mark on this session
 

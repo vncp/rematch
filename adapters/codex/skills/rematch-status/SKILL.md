@@ -12,11 +12,13 @@ in Codex; run them from the session's working directory and pass it as `--cwd`.
    Show the printed lines as they are. Newly linked skills reach Codex in the next session, not this one.
 2. Read the digest: `rematch digest --cwd "$PWD"` prints one JSON line. Show every string in
    `data.lines` as it is, one per line.
-3. For each item in `data.approvals` (`id`, `name`, `kind`, `reason`, `diff`): show the name,
-   the reason and the diff, then ask the user whether to approve it. Run
-   `rematch library approve <id>` only after the user says yes to that item, and
-   `rematch library decline <id>` only after the user says to decline it (declining retires the
-   entry). Without an answer, leave it pending; it comes back in the next digest.
+3. For each item in `data.approvals` (`id`, `name`, `kind`, `reason`, `diff`, `commands`): show the
+   name, the reason and the diff, then ask the user whether to approve it. Run the item's
+   `commands.approve` (it ends with `--sha <hash>`, which binds the approval to what you showed)
+   only after the user says yes to that item, and its `commands.decline` only after the user says
+   to decline it. Never write the hash yourself; a refused hash means the item changed, so show
+   `rematch library inspect <id> --text` again. Without an answer, leave it pending; it stays in
+   every digest and in `rematch status`.
 4. When the user asks why a session behaved as it did: `rematch library why codex:<session id> --text`
    (imported Codex sessions are named `codex:<rollout id>`; `rematch library ls --text` lists entries
    with their counters).

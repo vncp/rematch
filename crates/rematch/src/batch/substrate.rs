@@ -394,6 +394,8 @@ pub fn events_to_trace(events: &[Value], repo: &Path) -> Vec<TraceRecord> {
                     subpath: None,
                     head_sha: None,
                     visible_entries: Vec::new(),
+                    instructions_exposed: Vec::new(),
+                    exposure_view: None,
                 });
             }
             "tool_execution_start" => {
@@ -461,6 +463,7 @@ pub fn events_to_trace(events: &[Value], repo: &Path) -> Vec<TraceRecord> {
                             content_head: head(&text, CONTENT_HEAD),
                             skill_read,
                             path,
+                            skill_entry: None,
                         });
                     }
                     _ => {}

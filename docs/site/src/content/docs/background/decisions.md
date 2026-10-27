@@ -1,6 +1,6 @@
 ---
 title: Research decisions
-description: D1–D28, every design decision with the evidence and paper behind it.
+description: D1–D32, every design decision with the evidence and paper behind it.
 editUrl: https://github.com/vncp/rematch/edit/main/docs/research.md
 tableOfContents: false
 ---
@@ -11,7 +11,7 @@ Every design claim on this site carries a decision id. The `improver/` prompts c
 From `docs/research.md` §2 (region `decisions`) by `docs/site/scripts/gen.ts`. Edit the source, then `bun run gen`.
 :::
 
-| # | Decision in the v2 spec | Evidence | Source |
+| # | Design decision | Evidence | Source |
 | --- | --- | --- | --- |
 | D1 | No proposal without an execution trace | Editing the harness directly, without reference executions or probes, degraded performance: WB-code 73.4 → 63.2, WB-web 69.9 → 65.0 | Harness² §4, Fig. 7 left |
 | D2 | Skills and scripts first; hooks and prompts last (lint form order) | Removing skills from the improved harness cost 5.3 points, scripts 3.7, all prompt text 1.5 (Gemini 3.5 Flash, OpenCode, k=5). Skills and scripts were ~half of all edits | Harness² Table 6, Fig. 10 |
@@ -41,3 +41,15 @@ From `docs/research.md` §2 (region `decisions`) by `docs/site/scripts/gen.ts`. 
 | D26 | Verifiers never evolve by agent score | Verifier selected without anchors collapsed to always-pass while downstream scores still rose; self-evolution without execution-based verification scored 31.79 < blank harness 33.95 | Who Verifies the Verifier? (NeurIPS 2026 WS); VERSE (2610.02616) |
 | D27 | Redirect classification needs recurrence thresholds | DSAT detection agreed with humans at κ = 0.50; 42% of invalid misalignment extractions were "normative prior bias"; users leave text feedback ~2× more when dissatisfied | WildFeedback (2408.15549); How Coding Agents Fail Their Users |
 | D28 | Session outcome records with exact signature, MinHash, facets | Research-log of tested hypotheses prevents retesting; "stop at 6 queries" overfit (95% one batch, 15% next) | Adaptive Auto-Harness |
+| D29 | Personal harness first: prompt fragments target the user's AGENTS.md after exact-diff approval; team/fork shipping is optional | A personal prompt proposal previously had no adoption path except a team PR, contrary to the user's workflow. Preserve authored text and make removal/conflicts explicit. | User direction, 2026-10-27; source audit of `library`, `ship`, and `digest` |
+| D30 | Budget and scope actual exposure, not storage layout | The old lint admitted a 16,166-byte description with a 185-byte body but rejected a 9,210-byte on-demand body. Shared provisional directories also crossed repo boundaries. These are isolated engine reproductions, not performance results. | 2026-10-27 engine/host audit; D12, D13, D22, D24 |
+| D31 | Distinguish accepted-in-use from comparative support; bounded automatic probes when authorized and replayable | Four matching sessions with zero reads previously kept a skill. Relevant actual use without corrections is useful observational evidence, but does not establish causal improvement. Harness² probes candidates and selectively reuses components rather than automatically inheriting every prior harness. | User selection and clarification, 2026-10-27; isolated engine reproduction; Harness² §§2.2–2.3 |
+| D32 | Persistent, actionable adoption review; automatic changes remain inspectable | A one-shot digest cursor hid change notices; instruction fragments had no pending action. Required approval must show the affected surface, target, diff and decision without making the user discover a separate shipping workflow. | User direction, 2026-10-27; source and CLI audit |
+
+**How D29–D32 amend earlier decisions.** These are Rematch design changes made on the user's direction and on source audits, not new paper results.
+
+- **D6, D7 (composer and selector only in batch mode).** Unchanged: interactive reflection still has no composer and no model selector. D31 adds bounded background probes, which compare one staged candidate against the kept library on a task the user authorized, judged by that task's fixed verifier. A probe never selects among untested texts and never runs in the user's active session or worktree.
+- **D8 (provisional by default; kept, never verified).** Unchanged in spirit, stricter in rule: `kept` now needs accepted-in-use (≥ 4 clean completed sessions with actual use) or comparative support (a supporting probe bound to the entry's version and content). Matched sessions alone no longer keep anything. Neither reason is called verified, and neither proves general correctness: accepted-in-use is observational, and a probe covers one task, seed and model in omp.
+- **D10 (counters measure recurrence of the motivating class).** Recurrence and harm remain the retirement signals and the safety condition for every keep. D31 adds `used`/`used_clean` as the positive evidence of acceptance; `matched` stays an observational denominator.
+- **D11 (no on/off withholding arm).** Unchanged: the user's sessions are never split into arms. A probe's baseline rollout runs without the candidate in a separate worktree, not in a user session.
+- **D24 (proposals carry no score).** Extended: retention reasons, probe outcomes and every approval are engine records; each approval binds the full hash of the snapshot the user reviewed.

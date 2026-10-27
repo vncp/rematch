@@ -77,9 +77,11 @@ fn codex_history_reflects_and_syncs() {
     assert_eq!(input["text"], "No, that's wrong: run the tests before you commit; the reconcile tests fail", "ambient block stripped");
     assert_eq!(input["after_deliverable"], "Added the reconcile command and committed it.");
 
-    // Delivery: the provisional entry matches this repo → linked in the shared dir. An older
-    // version's layout is migrated: its `~/.agents/skills/rematch → codex-skills` link is
-    // re-pointed and its marked kept copy removed.
+    // Delivery: the kept library through `~/.agents/skills/rematch → REMATCH_ROOT/skills`; this
+    // repo's trial through the repo's own skill root (an ignored repo-local link to its trials
+    // view), so Codex sessions in other repos never list it. An older version's layout is
+    // migrated: its `~/.agents/skills/rematch → codex-skills` link is re-pointed and its marked
+    // kept copy removed.
     let skills_root = env.home.join(".agents/skills");
     std::fs::create_dir_all(skills_root.join("old-kept")).unwrap();
     std::fs::write(skills_root.join("old-kept/.rematch-codex.json"), "{}").unwrap();
@@ -87,17 +89,25 @@ fn codex_history_reflects_and_syncs() {
     std::fs::create_dir_all(env.root.join("codex-skills")).unwrap();
     std::os::unix::fs::symlink(env.root.join("codex-skills"), skills_root.join("rematch")).unwrap();
     let d = env.run(&["skills", "sync", "--harness", "codex", "--cwd", env.repo.to_str().unwrap()]);
-    let link = env.root.join("skills/run-tests-before-commit");
-    assert_eq!(std::fs::read_link(&link).unwrap(), skill_dir, "{d}");
-    assert_eq!(d["added"], json!(["run-tests-before-commit"]), "{d}");
+    assert!(std::fs::symlink_metadata(env.root.join("skills/run-tests-before-commit")).is_err(), "a trial is not in the kept library: {d}");
     assert_eq!(std::fs::read_link(skills_root.join("rematch")).unwrap(), env.root.join("skills"));
     assert_eq!(d["reached_from"], json!([skills_root.join("rematch")]), "{d}");
-    assert!(skills_root.join("rematch/run-tests-before-commit/SKILL.md").is_file());
+    let repo_root = env.repo.join(".agents/skills");
+    let trial = repo_root.join("rematch-trials/run-tests-before-commit");
+    assert_eq!(rematch_core::paths::canonicalize(&trial).unwrap(), rematch_core::paths::canonicalize(&skill_dir).unwrap(), "{d}");
+    let exclude = std::fs::read_to_string(env.repo.join(".git/info/exclude")).unwrap_or_default();
+    assert!(exclude.contains("/.agents/skills/rematch-trials"), "ignored locally: {exclude}");
     assert!(!skills_root.join("old-kept").exists() && skills_root.join("mine").is_dir() && !env.root.join("codex-skills").exists());
+    let elsewhere = env.home.join("elsewhere");
+    std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
+    env.run(&["skills", "sync", "--harness", "codex", "--cwd", elsewhere.to_str().unwrap()]);
+    assert!(!elsewhere.join(".agents/skills/rematch-trials/run-tests-before-commit").exists(), "another repo never lists it");
 
-    // Counting: a later, clean Codex session in the repo listed the synced skill to the
-    // model (`## Skills`, through ~/.agents/skills/rematch); its import writes the trace and
-    // `count` folds it into the entry's counters.
+    // Counting: a later, clean Codex session in the repo listed the trial to the model
+    // (`## Skills`, through the repo's skill root); its import writes the trace and `count`
+    // folds it into the entry's counters.
+    let user_root = skills_root;
+    let skills_root = repo_root;
     let id2 = "01a15c11-0000-7000-8000-000000000003";
     let clean = clean_rollout(&env.repo, &skills_root, id2);
     let day = codex_home.join("sessions/2026/10/21");
@@ -119,15 +129,12 @@ fn codex_history_reflects_and_syncs() {
         "{e}"
     );
 
-    // Another directory: no predicate hit, the link stays (union); Codex is told how to see
-    // the dir when no link reaches it.
-    let elsewhere = env.home.join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    std::fs::remove_file(skills_root.join("rematch")).unwrap();
+    // No link reaches the kept library: Codex is told how to see it.
+    std::fs::remove_file(user_root.join("rematch")).unwrap();
     let d2 = env.run(&["skills", "sync", "--harness", "codex", "--cwd", elsewhere.to_str().unwrap()]);
-    assert_eq!((d2["added"].clone(), d2["pruned"].clone(), d2["reached_from"].clone()), (json!([]), json!([]), json!([])), "{d2}");
+    assert_eq!(d2["reached_from"], json!([]), "{d2}");
     assert!(d2["lines"].to_string().contains("ln -s"), "{d2}");
-    assert_eq!(std::fs::read_link(&link).unwrap(), skill_dir);
+    assert!(trial.join("SKILL.md").is_file(), "the repo's trial stays for the repo");
 }
 
 /// A clean Codex session started a minute from now (after the entry exists) whose skill list
@@ -137,7 +144,7 @@ fn clean_rollout(repo: &Path, skills_root: &Path, id: &str) -> String {
     let ts = |s: i64| (t0 + chrono::Duration::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let body = format!(
         "## Skills\n### Skill roots\n- `r0` = `{}`\n### Available skills\n\
-         - run-tests-before-commit: Use when committing changes to a Rust crate. (file: r0/rematch/run-tests-before-commit/SKILL.md)\n",
+         - run-tests-before-commit: Use when committing changes to a Rust crate. (file: r0/rematch-trials/run-tests-before-commit/SKILL.md)\n",
         skills_root.display()
     );
     let item = |s: i64, item: Value| json!({"timestamp": ts(s), "type": "event_msg", "payload": {"type": "item_completed", "item": item}});

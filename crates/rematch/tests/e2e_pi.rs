@@ -116,9 +116,11 @@ fn pi_history_reflects_syncs_and_counts() {
     let input = recs.iter().find(|x| x["prelabel"] == "negation").unwrap();
     assert_eq!(input["after_deliverable"], "Added the reconcile command and committed it.");
 
-    // Delivery: the shared dir Pi's package returns from `resources_discover`.
+    // Delivery: this place's view, which Pi's package returns from `resources_discover`.
     let d = env.run(&["skills", "sync", "--harness", "pi", "--cwd", env.repo.to_str().unwrap()]);
-    let link = env.root.join("skills/run-tests-before-commit");
+    let view = std::path::PathBuf::from(d["dirs"][0].as_str().unwrap());
+    assert!(view.starts_with(env.root.join("views")), "{d}");
+    let link = view.join("run-tests-before-commit");
     assert_eq!(std::fs::read_link(&link).unwrap(), env.staged_dir(), "{d}");
     assert_eq!(d["harness"], "pi", "{d}");
     assert!(d["lines"].to_string().contains("resources_discover"), "{d}");

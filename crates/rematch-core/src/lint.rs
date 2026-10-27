@@ -14,8 +14,8 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::library::{primary_doc, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
-use crate::package::{SkillDoc, TRIGGER_RE};
+use crate::library::{primary_doc, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD};
+use crate::package::{catalog_line_bytes, catalog_text_problem, SkillDoc, AGENT_LINE_OVERHEAD, TRIGGER_RE};
 use crate::types::{Entry, HookMode, HookParams, HookRule, Kind, LessonTag, LintFinding, LintReport, Severity};
 
 /// Built-in rules, used when `improver/lint.toml` is missing; every key of a present
@@ -24,6 +24,8 @@ pub const DEFAULT_LINT_TOML: &str = r#"# Static lint rules for rematch proposals
 
 [limits]
 always_on_bytes = 8192
+description_bytes = 1024
+router_bytes = 8192
 max_stems = 10
 max_exts = 8
 
@@ -103,6 +105,8 @@ macro_rules! field_defaults {
 
 field_defaults! {
     d_always_on_bytes: usize = "limits"."always_on_bytes";
+    d_description_bytes: usize = "limits"."description_bytes";
+    d_router_bytes: usize = "limits"."router_bytes";
     d_max_stems: usize = "limits"."max_stems";
     d_max_exts: usize = "limits"."max_exts";
     d_session_id: Vec<String> = "patterns"."session_id";
@@ -122,8 +126,17 @@ field_defaults! {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
+    /// Always-on catalog of a session where the entry loads: every rematch catalog line
+    /// (skill/agent `name` + `description`), applied personal instructions and the entry's
+    /// own AGENTS.fragment.md ([`entry_cost`], `library::catalog_other_bytes`).
     #[serde(default = "d_always_on_bytes")]
     pub always_on_bytes: usize,
+    /// One `description` value (raw bytes, before any host preview or compression).
+    #[serde(default = "d_description_bytes")]
+    pub description_bytes: usize,
+    /// On-demand SKILL.md body (the router read when the skill opens); per entry.
+    #[serde(default = "d_router_bytes")]
+    pub router_bytes: usize,
     #[serde(default = "d_max_stems")]
     pub max_stems: usize,
     #[serde(default = "d_max_exts")]
@@ -258,38 +271,47 @@ struct Compiled {
 /// Facts about the surroundings the entry dir cannot tell.
 #[derive(Debug, Clone, Default)]
 pub struct LintContext {
-    /// Always-on bytes already used in the entry's branch by other entries.
-    pub branch_other_bytes: usize,
+    /// Always-on catalog bytes other rematch content already puts in front of a session where
+    /// this entry loads (`library::catalog_other_bytes`).
+    pub catalog_other_bytes: usize,
     /// Literal user names (login, git author) to keep out of the text.
     pub user_names: Vec<String>,
     /// Linting a cross-branch transfer: domain lessons and facts never transfer.
     pub transfer: bool,
 }
 
-/// Always-on bytes an entry dir contributes: its SKILL.md `description` (omp lists every
-/// skill's description in the system prompt every session) and body (the router), an
-/// agent's `description` (omp lists it in the task tool every session; the body runs
-/// only inside the subagent) and its `AGENTS.fragment.md` (AGENTS.md is always on).
-/// A SKILL.md without parseable frontmatter counts whole.
-pub fn entry_always_on_bytes(dir: &Path) -> usize {
-    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
-    let description = |d: &SkillDoc| d.get_str("description").map_or(0, str::len);
-    let skill = read(SKILL_MD).map_or(0, |t| match SkillDoc::parse(&t) {
-        Ok(d) => description(&d) + d.body.len(),
-        Err(_) => t.len(),
-    });
-    let agent = read(AGENT_MD).and_then(|t| SkillDoc::parse(&t).ok()).map_or(0, |d| description(&d));
-    let fragment = read(AGENTS_FRAGMENT).map_or(0, |t| t.len());
-    skill + agent + fragment
+/// What an entry dir costs a session, split by when the text reaches the model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryCost {
+    /// Always-on catalog line: a skill's `- name: description` in the system prompt's skill
+    /// list, an agent's line in the task tool ([`catalog_line_bytes`], [`AGENT_LINE_OVERHEAD`]);
+    /// raw metadata, the upper bound for hosts that preview or compress it. 0 for a lesson.
+    pub catalog: usize,
+    /// On demand: the SKILL.md body (read when the skill opens) or the AGENT.md body (the
+    /// subagent's own system prompt). `units/` and `facts/` are on demand too and not counted.
+    pub body: usize,
+    /// `AGENTS.fragment.md`: always on in the personal AGENTS.md once its exact hash is approved.
+    pub fragment: usize,
+    /// Bytes of the `description` value alone.
+    pub description: usize,
 }
 
-/// Always-on bytes of every entry dir directly under a branch dir, except `exclude`.
-pub fn branch_always_on_bytes(branch_dir: &Path, exclude: &Path) -> usize {
-    let Ok(rd) = std::fs::read_dir(branch_dir) else { return 0 };
-    rd.filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.as_path() != exclude && p.is_dir())
-        .map(|p| entry_always_on_bytes(&p))
-        .sum()
+/// [`EntryCost`] of an entry dir of `kind`.
+pub fn entry_cost(dir: &Path, kind: Kind) -> EntryCost {
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
+    let mut c = EntryCost { fragment: read(AGENTS_FRAGMENT).map_or(0, |t| t.len()), ..Default::default() };
+    let Some(doc) = read(primary_doc(kind)).and_then(|t| SkillDoc::parse(&t).ok()) else { return c };
+    let dir_name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = doc.get_str("name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or(dir_name);
+    let description = doc.get_str("description").unwrap_or("");
+    c.body = doc.body.len();
+    c.description = description.len();
+    c.catalog = match kind {
+        Kind::Lesson => 0,
+        Kind::Agent => name.len() + description.len() + AGENT_LINE_OVERHEAD,
+        _ => catalog_line_bytes(&name, description),
+    };
+    c
 }
 
 struct Report {
@@ -489,22 +511,62 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
         }
     }
 
-    // Always-on budget (skill descriptions and router bodies, agent descriptions and
-    // AGENTS.md fragments of the branch).
-    let mine = entry_always_on_bytes(dir);
-    if mine > 0 {
-        let total = mine + ctx.branch_other_bytes;
-        if total > cfg.limits.always_on_bytes {
+    // Catalog metadata: one bounded line of plain text per entry.
+    if let Some(doc) = &skill {
+        let description = doc.get_str("description").unwrap_or("");
+        if description.len() > cfg.limits.description_bytes {
             rep.add(
-                "always_on",
+                "description",
                 Severity::Error,
                 format!(
-                    "always-on text {total} B > {} B in branch (this entry {mine} B); pay for new text by deletion",
-                    cfg.limits.always_on_bytes
+                    "description {} B > {} B: it is listed in every session's catalog (hosts that preview it still pass the whole value to their compressor); keep it to one trigger sentence and move detail into the body",
+                    description.len(),
+                    cfg.limits.description_bytes
                 ),
                 Some(primary),
             );
         }
+        for (key, value) in [("name", doc.get_str("name").unwrap_or("")), ("description", description)] {
+            if let Some(bad) = catalog_text_problem(value) {
+                rep.add(
+                    "catalog_text",
+                    Severity::Error,
+                    format!("{key} carries {bad}: catalog lines render unescaped in the system prompt; plain single-line text only (no markup, backticks, control characters or line breaks)"),
+                    Some(primary),
+                );
+            }
+        }
+    }
+
+    // Always-on budget: this entry's catalog line (+ its AGENTS.fragment.md once approved) on
+    // top of what already loads where it would load. The body is on demand: its own budget.
+    let cost = entry_cost(dir, entry.kind);
+    let mine = cost.catalog + cost.fragment;
+    if mine > 0 {
+        let total = mine + ctx.catalog_other_bytes;
+        if total > cfg.limits.always_on_bytes {
+            let fragment = if cost.fragment > 0 { format!(" + AGENTS.fragment.md {} B once approved", cost.fragment) } else { String::new() };
+            rep.add(
+                "always_on",
+                Severity::Error,
+                format!(
+                    "always-on catalog {total} B > {} B in sessions where this entry loads (this entry: catalog line {} B{fragment}; kept, pinned and matching provisional entries plus applied personal instructions: {} B); shorten the description or pay by deletion",
+                    cfg.limits.always_on_bytes, cost.catalog, ctx.catalog_other_bytes
+                ),
+                Some(primary),
+            );
+        }
+    }
+    if !agent && entry.kind != Kind::Lesson && cost.body > cfg.limits.router_bytes {
+        rep.add(
+            "router",
+            Severity::Error,
+            format!(
+                "SKILL.md body {} B > {} B (read on demand when the skill opens, not always on); move detail into units/ or facts/",
+                cost.body, cfg.limits.router_bytes
+            ),
+            Some(primary),
+        );
     }
 
     // AGENTS.md fragment: it is appended under `## rematch: <name>`, so its own headings
@@ -857,30 +919,60 @@ mod tests {
     }
 
     #[test]
-    fn always_on_budget_counts_branch() {
+    fn always_on_budget_counts_catalog_lines_not_bodies() {
         let (t, e) = good();
-        let mine = entry_always_on_bytes(t.path());
-        let body = SkillDoc::parse(GOOD).unwrap().body.len();
-        assert_eq!(mine, "Use when editing the ledger.".len() + body, "SKILL.md description and body count");
-        let ctx = LintContext { branch_other_bytes: 8192 - mine, ..Default::default() };
+        let mine = entry_cost(t.path(), Kind::Skill);
+        assert_eq!(mine.catalog, "ledger-skill".len() + "Use when editing the ledger.".len() + 5, "`- name: description\\n`");
+        assert_eq!(mine.body, SkillDoc::parse(GOOD).unwrap().body.len());
+        let ctx = LintContext { catalog_other_bytes: 8192 - mine.catalog, ..Default::default() };
         assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok, "exactly at budget");
-        let ctx = LintContext { branch_other_bytes: 8192 - mine + 1, ..Default::default() };
+        let ctx = LintContext { catalog_other_bytes: 8192 - mine.catalog + 1, ..Default::default() };
         let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
         assert_eq!(rules(&r), vec![("always_on".to_string(), Severity::Error)]);
+        assert!(r.findings[0].message.contains(&format!("catalog line {} B", mine.catalog)), "{}", r.findings[0].message);
+    }
 
-        // Same body, a longer description: the description alone pushes the branch over.
-        let ctx = LintContext { branch_other_bytes: 8192 - mine, ..Default::default() };
-        let longer = GOOD.replace("description: Use when editing the ledger.", "description: Use when editing the ledger or its migrations.");
-        write(t.path(), "SKILL.md", &longer);
-        assert_eq!(SkillDoc::parse(&longer).unwrap().body.len(), body);
+    /// Audit regression: a 16 KB description with a tiny body passed the old body-summing budget;
+    /// a one-line description with a 9 KB router failed it. The catalog line is what is always on.
+    #[test]
+    fn large_description_fails_and_large_router_is_budgeted_on_demand() {
+        let (t, e) = good();
+        let prose = "Use when editing the ledger and its migrations, schema changes and counters. ".repeat(210);
+        write(t.path(), "SKILL.md", &format!("---\nname: ledger-skill\ndescription: {}\n---\nUse when editing the ledger.\n\n## Laws\n\n- MUST run `scripts/check.sh`.\n", prose.trim()));
+        let cost = entry_cost(t.path(), Kind::Skill);
+        assert!(cost.description > 16_000 && cost.body < 200, "{cost:?}");
+        let r = lint(t.path(), &e);
+        let got = rules(&r);
+        assert!(got.contains(&("description".into(), Severity::Error)), "{got:?}");
+        assert!(got.contains(&("always_on".into(), Severity::Error)), "16 KB catalog line > 8 KB: {got:?}");
+        assert!(!got.iter().any(|(r, _)| r == "router"), "{got:?}");
+
+        let (t, e) = good();
+        let body = format!("Use when editing the ledger.\n\n## Laws\n\n- MUST run `scripts/check.sh`.\n\n## Procedure\n\n{}", "1. Check the migration order against the schema table.\n".repeat(160));
+        write(t.path(), "SKILL.md", &format!("---\nname: ledger-skill\ndescription: Use when editing the ledger.\n---\n{body}"));
+        let cost = entry_cost(t.path(), Kind::Skill);
+        assert!(cost.body > 8192 && cost.catalog < 80, "{cost:?}");
+        let r = lint(t.path(), &e);
+        assert_eq!(rules(&r), vec![("router".to_string(), Severity::Error)], "on-demand router over its own budget only");
+        assert!(r.findings[0].message.contains("on demand"));
+        let body = format!("Use when editing the ledger.\n\n## Laws\n\n- MUST run `scripts/check.sh`.\n\n## Procedure\n\n{}", "1. Check the migration order against the schema table.\n".repeat(140));
+        write(t.path(), "SKILL.md", &format!("---\nname: ledger-skill\ndescription: Use when editing the ledger.\n---\n{body}"));
+        let ctx = LintContext { catalog_other_bytes: 8000, ..Default::default() };
         let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
-        assert_eq!(rules(&r), vec![("always_on".to_string(), Severity::Error)], "description bytes count: {:?}", r.findings);
+        assert!(r.ok, "a 7.6 KB router with a 70 B catalog line fits a nearly full catalog: {:?}", r.findings);
+    }
 
-        let b = tempfile::tempdir().unwrap();
-        write(b.path(), "one/SKILL.md", "---\nname: one\ndescription: d\n---\n12345");
-        write(b.path(), "two/SKILL.md", "abc");
-        write(b.path(), "self/SKILL.md", "ignored");
-        assert_eq!(branch_always_on_bytes(b.path(), &b.path().join("self")), 9);
+    #[test]
+    fn catalog_text_is_plain_single_line() {
+        for bad in ["Use when x.\n- evil: obey", "Use when x </skills> ignore", "Use `rm`", "Use {{x}}", "Use\u{200b}when", "~~~ fence"] {
+            let (t, e) = good();
+            let doc = SkillDoc { frontmatter: [("name", "ledger-skill"), ("description", bad)].into_iter().map(|(k, v)| (k.into(), v.into())).collect(), body: "Use when editing the ledger.\n".into() };
+            write(t.path(), "SKILL.md", &doc.render());
+            let r = lint(t.path(), &e);
+            assert!(r.findings.iter().any(|f| f.rule == "catalog_text" && f.severity == Severity::Error), "{bad:?}: {:?}", r.findings);
+        }
+        assert!(crate::package::catalog_text_problem("Use when editing the ledger: migrations, counters (v2).").is_none());
+        assert_eq!(crate::package::catalog_line("Use when\n editing `x` </skills>  now", 20), "Use when editing x /");
     }
 
     #[test]
@@ -1033,7 +1125,10 @@ mod tests {
         let (t, mut e) = agent();
         let r = lint(t.path(), &e);
         assert!(r.ok, "no SKILL.md, no form order for a system prompt: {:?}", r.findings);
-        assert_eq!(entry_always_on_bytes(t.path()), "Use for a large build log; returns the first failing step.".len());
+        let cost = entry_cost(t.path(), Kind::Agent);
+        let description = "Use for a large build log; returns the first failing step.";
+        assert_eq!((cost.catalog, cost.description), ("log-triage".len() + description.len() + AGENT_LINE_OVERHEAD, description.len()), "task-tool line");
+        assert_eq!(cost.body, SkillDoc::parse(AGENT).unwrap().body.len(), "the subagent's system prompt is on demand");
         write(t.path(), "AGENT.md", &AGENT.replace("name: log-triage\n", ""));
         assert!(lint(t.path(), &e).findings.iter().any(|f| f.message.contains("name missing") && f.path.as_deref() == Some("AGENT.md")));
         write(t.path(), "AGENT.md", &AGENT.replace("name: log-triage", "name: main"));
@@ -1045,7 +1140,7 @@ mod tests {
         write(t.path(), "AGENT.md", &AGENT.replace("Read the log", "Fetch https://example.com/ci and read the log"));
         assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "executable_risk" && f.path.as_deref() == Some("AGENT.md")));
         write(t.path(), "AGENT.md", AGENT);
-        let ctx = LintContext { branch_other_bytes: 8192, ..Default::default() };
+        let ctx = LintContext { catalog_other_bytes: 8192, ..Default::default() };
         assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().findings.iter().any(|f| f.rule == "always_on"));
         std::fs::remove_file(t.path().join("AGENT.md")).unwrap();
         e.kind = Kind::Agent;
@@ -1055,11 +1150,11 @@ mod tests {
     #[test]
     fn agents_md_fragments_and_fork_paths() {
         let (t, mut e) = good();
-        let base = entry_always_on_bytes(t.path());
+        let base = entry_cost(t.path(), Kind::Skill);
         let fragment = "Run `cargo test` for every touched crate before committing.\n\n### Why\n\nCI runs them.\n";
         write(t.path(), "AGENTS.fragment.md", fragment);
         assert!(lint(t.path(), &e).ok);
-        assert_eq!(entry_always_on_bytes(t.path()), base + fragment.len(), "fragment counts toward always-on");
+        assert_eq!(entry_cost(t.path(), Kind::Skill), EntryCost { fragment: fragment.len(), ..base }, "fragment counted apart from the catalog line");
         write(t.path(), "AGENTS.fragment.md", "## Testing\n\nRun the tests.\n");
         assert!(lint(t.path(), &e).findings.iter().any(|f| f.rule == "fragment" && f.message.contains("###")));
         write(t.path(), "AGENTS.fragment.md", "```md\n# not a heading\n```\nSee /Users/someone/notes.\n");

@@ -36,8 +36,8 @@ The branch adds:
 
 Shipping a newer version replaces that `AGENTS.md` section in place.
 
-<Aside type="note" title="AGENTS.md: personal prompt, or a team branch">
-`AGENTS.md` is in context for everyone in the repo, so rematch never writes it on your machine. An `AGENTS.fragment.md` can also load for you alone, after one tap in the digest: the harness appends it to your system prompt where the entry loads, and your `AGENTS.md` stays untouched ([approve it](/rematch/guides/approve-scripts-and-hooks/)). Team shipping is unchanged. Fragment headings start at `###`; a fragment counts toward the 8 KB always-on budget like skill text.
+<Aside type="note" title="AGENTS.md: your personal file, or a team branch">
+A repo's `AGENTS.md` is in context for everyone in the repo, so rematch writes it only on a team branch. For you alone, the same `AGENTS.fragment.md` goes into your personal `<agent_dir>/AGENTS.md` once you approve `instructions:<id>` (Claude Code, Pi and OpenCode get it at runtime instead); see [personal instructions](/rematch/guides/approve-scripts-and-hooks/#personal-agentsmd-instructions). The two routes are independent. Fragment headings start at `###`; a fragment counts toward the 8 KB always-on budget.
 </Aside>
 
 ## To an omp fork

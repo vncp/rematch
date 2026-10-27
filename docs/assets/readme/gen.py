@@ -87,28 +87,27 @@ def loop(theme):
     t = THEMES[theme]
     w, h = 1100, 640
     s = head(w, h, "The rematch loop",
-             "In the session the extension traces every event, flags sessions that carried a redirect, a tool-error "
-             "cluster or a takeover, loads provisional entries whose predicate matches, and runs approved hooks. "
-             "Between sessions the binary classifies the redirect, triages the failure, runs one editor, lints, stages "
-             "the entry as provisional, counts later matched sessions and decides keep, retire or dormant. An evidence "
-             "boundary separates them: no proposal without a trace, no model call inside a session. You approve "
-             "scripts and hooks with one tap, mark redirects, or turn it off.", t)
+             "The adapter records session evidence, exposes scoped trials and runs approved policies. A detached "
+             "worker classifies failures, proposes and lints changes, then observes actual use or runs an authorized "
+             "bounded reference/candidate comparison. The engine retains accepted-in-use or comparatively supported "
+             "changes, and withdraws harmful ones. Personal instruction changes and executable policies have a "
+             "persistent review action; team sharing is optional.", t)
     s += panel(30, 56, 420, 420, t, "IN THE SESSION", "extension · index.ts · no model calls", [
         ("trace", "every input, tool result, turn, model change → traces/"),
         ("flag", "redirect, tool-error cluster, takeover, /rematch mark → pending/"),
-        ("load", "staging/<branch>/ joins the skill paths on predicate match"),
+        ("load", "scoped skill and agent views; catalog and body budgets differ"),
         ("guard", "approved hooks run on tool_call; block with the rule's message"),
     ])
-    s += panel(650, 56, 420, 420, t, "BETWEEN SESSIONS", "rematch · Rust · one static binary", [
-        ("classify", "correction · preference · scope · none, batched, one call"),
-        ("triage", "process vs content; domain vs invariant editor; the moment"),
-        ("propose", "one editor, --no-tools, inputs in the prompt; KEEP_BASE valid"),
-        ("lint", "no ids, URLs, network, destructive git; scripts 0644; 8 KB"),
-        ("stage", "provisional, with its trigger predicate and manifest"),
-        ("count · decide", "recurrence, harm, matched → kept · retired · dormant"),
+    s += panel(650, 56, 420, 420, t, "BACKGROUND WORKER", "rematch · Rust · bounded execution", [
+        ("classify · triage", "the failure, its scope and the originating moment"),
+        ("propose", "one scoped editor; KEEP_BASE remains valid"),
+        ("lint · budget", "safe metadata, scoped exposure, separate body budget"),
+        ("trial · review", "automatic low-risk trials; persistent approval actions"),
+        ("observe · probe", "relevant use, or authorized reference/candidate runs"),
+        ("decide", "accepted in use · comparative support · withdraw"),
     ])
     s += text(240, 506, "runs the model's session · writes only the trace", 13, t["dim"], anchor="middle")
-    s += text(860, 506, "spawned detached at session start · ≤ 3 model calls per reflection", 13, t["dim"], anchor="middle")
+    s += text(860, 506, "detached work · bounded probes only when replay is authorized", 13, t["dim"], anchor="middle")
     # boundary
     s += f'<line x1="550" y1="50" x2="550" y2="486" stroke="{t["accent"]}" stroke-width="2" stroke-dasharray="6 6"/>\n'
     s += f'<rect x="458" y="24" width="184" height="24" rx="12" fill="{t["bg"]}"/>\n'
@@ -126,7 +125,7 @@ def loop(theme):
     # you
     s += f'<rect x="400" y="546" width="300" height="66" rx="12" fill="{t["panel"]}" stroke="{t["mid"]}"/>\n'
     s += text(550, 574, "You", 17, t["ink"], 600, "middle")
-    s += text(550, 596, "one-tap approvals · /rematch mark · /rematch off", 13, t["mid"], anchor="middle")
+    s += text(550, 596, "/rematch review · /rematch mark · /rematch off", 13, t["mid"], anchor="middle")
     s += f'<path d="M370 478 C370 540 384 579 394 579" fill="none" stroke="{t["mid"]}" stroke-width="1.5" marker-end="url(#arrow)"/>\n'
     s += text(360, 552, "digest", 13, t["mid"], anchor="end")
     s += f'<path d="M706 579 C716 579 730 540 730 482" fill="none" stroke="{t["mid"]}" stroke-width="1.5" marker-end="url(#arrow)"/>\n'
@@ -138,10 +137,10 @@ def architecture(theme):
     t = THEMES[theme]
     w, h = 1100, 600
     s = head(w, h, "rematch architecture",
-             "omp emits extension events to the extension, which writes traces and asks the binary which staging "
-             "directories match the working directory. The binary owns the ledger, the library, lint, staging, jobs, "
-             "batch mode and PR output, and calls omp non-interactively for the editor, the classifier and batch "
-             "rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent.", t)
+             "omp emits extension events and discovers scoped skill and agent views. The binary owns the ledger, "
+             "library, lint, adoption actions and bounded probes, and calls omp for editor and solver work. "
+             "Personal AGENTS.md changes require approval and preserve user text. Canonical state lives under "
+             "~/.rematch; sharing to teams or forks is optional.", t)
     s += panel(30, 56, 230, 420, t, "OMP", "stock 18.12, or your fork", [
         ("events", "start · input · tool · turn · shutdown"),
         ("skills", "customDirectories, set before discovery"),
@@ -157,15 +156,15 @@ def architecture(theme):
     ])
     s += panel(570, 56, 270, 420, t, "BINARY", "rematch · Rust · never holds credentials", [
         ("rematch-core", "trace · predicate · lint · library · ledger"),
-        ("reflect · count", "triage → edit → lint → stage → decide"),
-        ("create · improve", "sessions | task | draft · split · unit edits"),
-        ("batch", "worktree, candidates, composer, verifier"),
-        ("scope", "ship · export · stale · split · transfer"),
+        ("reflect · count", "propose → trial → use evidence → decide"),
+        ("personal adoption", "review → approved AGENTS.md section"),
+        ("probes · batch", "worktrees, bounded runs, fixed verifier"),
+        ("optional sharing", "ship · export · stale · split · transfer"),
     ])
     s += panel(880, 56, 190, 420, t, "STATE", "~/.rematch", [
         ("traces/", "the only live input"),
         ("ledger.sqlite", "sessions · entries · counters"),
-        ("staging/<branch>/", "loaded on match"),
+        ("staging/<branch>/", "canonical trial content"),
         ("archive/ · drafts/", "never loaded"),
         ("~/.omp/agent/skills/", "kept entries"),
     ])
@@ -192,12 +191,10 @@ def lifecycle(theme):
     t = THEMES[theme]
     w, h = 1100, 430
     s = head(w, h, "Entry statuses",
-             "Draft becomes provisional when you give it a task or accept it unverified. Provisional becomes kept at "
-             "zero recurrences over at least four matched sessions with no harm, retired at two recurrences or two "
-             "harm events, dormant after twelve matched sessions without a decision or thirty days with fewer than "
-             "three matches. Kept becomes stale on evidence drift and retired at two harm events in thirty days. "
-             "Stale goes back to provisional with a new canary or to retired. Retired never leaves. Pinned is a flag "
-             "you set and unset.", t)
+             "Draft becomes provisional when you give it a task or accept it unverified. Provisional becomes kept "
+             "after sustained relevant clean use or engine-recorded comparative support, not from catalog presence "
+             "alone. Repeated recurrence or harm retires an entry; inactivity may make it dormant. Kept entries "
+             "remain reversible. Stale entries need a new canary; pinned entries remain user-owned.", t)
 
     def box(x, y, label, note, accent=False):
         stroke = t["accent"] if accent else t["line"]
@@ -216,16 +213,16 @@ def lifecycle(theme):
 
     # row 2
     s += box(40, 150, "draft", "visible, never loaded")
-    s += box(300, 150, "provisional", "loaded on predicate match", accent=True)
-    s += box(580, 150, "kept", "copied into ~/.omp/agent")
+    s += box(300, 150, "provisional", "scoped trial", accent=True)
+    s += box(580, 150, "kept", "retained with evidence")
     s += box(860, 150, "stale", "excluded; evidence drifted")
     # row 3
     s += box(130, 308, "dormant", "excluded, kept on disk")
     s += box(720, 308, "retired", "archived with evidence")
 
     s += arrow("M210 182 L298 182") + label(255, 140, "task run, or --unverified")
-    s += arrow("M470 182 L578 182", t["accent"]) + label(524, 124, "0 recurrences · ≥ 4 matched · 0 harm", color=t["accent_ink"])
-    s += label(524, 141, "or a verifier pick, then the next run passes")
+    s += arrow("M470 182 L578 182", t["accent"]) + label(524, 124, "sustained relevant clean use", color=t["accent_ink"])
+    s += label(524, 141, "or bounded comparative support")
     s += arrow("M750 182 L858 182") + label(804, 140, "as_of · family · fork commit changed")
     s += arrow("M945 150 C945 70 360 70 360 148") + label(652, 84, "new canary → provisional, counters from zero")
     s += arrow("M340 214 L270 308") + label(296, 262, "12 matched, no decision · 30 d, < 3 matches", anchor="end")

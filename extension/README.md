@@ -25,7 +25,11 @@ What it does:
   added by the re-sync reach omp's skill list at its next start). Tests: `bun test extension`.
 - **Entry points**: tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`
   (`why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|decline|ship|transfer|digest|doctor|uninstall|builtins|anchor`).
-  Approving entries and uninstalling are reserved to the user (command or digest), never the tool.
+  Approving, declining, pinning, disabling or rolling back entries, approving exports, marking, `off`/`on`,
+  uninstalling and `policy scope set|unset` are reserved to the user (command, digest or shell): the tool refuses them, judged on the argv the binary
+  would run (global `--text`/`--cwd` anywhere), and a `tool_call` guard refuses a `bash` call that runs one directly
+  (same parser; a guard on the direct command, not a sandbox). `/rematch approve|decline <id>` typed without
+  `--sha` opens that action's review dialog, whose Approve/Decline carry the reviewed snapshot hash.
 
 Root is `$REMATCH_ROOT` or `~/.rematch`. Kill switch: `REMATCH=0` (only the tool and `/rematch` register)
 or `<root>/off` (handlers stay registered but inert, so `/rematch on` resumes tracing immediately; skills apply from the

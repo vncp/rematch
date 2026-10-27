@@ -1,7 +1,10 @@
 // rematch extension: traces main sessions into <root>/traces/<session_id>.jsonl (DESIGN §3),
-// loads the shared skills dir (`skills sync` → `skills.customDirectories`), runs approved hooks
+// loads this place's skill view (`skills sync` → `skills.customDirectories`, per process) and
+// withholds other places' provisional agents (`task.disabledAgents`), runs approved hooks
 // (`block`/`stuck` on `tool_call`, `truncate`/`retrieve` on `context`), and exposes the `rematch`
-// tool, the `/rematch` command and the `alt+e` digest shortcut (DESIGN §10).
+// tool, the `/rematch` command and the `alt+e` review shortcut (DESIGN §10). Personal
+// instructions reach omp only through its own `<agent_dir>/AGENTS.md` (the binary's
+// `instructions` sync); nothing is appended to the system prompt at runtime.
 // It parses nothing the binary owns: every decision beyond the cheap prelabels lives in Rust.
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -393,12 +396,97 @@ export type Operation = (typeof OPERATIONS)[number];
 const LONG_OPS: Record<string, true> = { reflect: true, create: true, improve: true, run: true, ship: true, import: true, anchor: true };
 const READ_OPS: Record<string, true> = { doctor: true, status: true, digest: true, match: true, why: true };
 
+/**
+ * The subcommand words of a binary argv, as clap reads them: the global flags (`--text`, `--cwd DIR`,
+ * `--cwd=DIR`) may stand anywhere and are skipped; every other `-…` word is an option of the
+ * subcommand, not a word of its path. `["library", "--cwd", "x", "--text", "approve", "id"]` →
+ * `["library", "approve", "id"]`. Every word after `--` counts (the conservative reading).
+ */
+export function commandWords(argv: readonly string[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i] as string;
+		if (a === "--cwd") {
+			i++;
+			continue;
+		}
+		if (a === "--") {
+			out.push(...argv.slice(i + 1));
+			break;
+		}
+		if (a.startsWith("-")) continue;
+		out.push(a);
+	}
+	return out;
+}
+
+/**
+ * Why the model may not run this binary argv, or null: approving, declining, pinning, disabling,
+ * rolling back, approving exports, marking, switching rematch off or on, uninstalling and setting
+ * or removing a skill's place scope (`policy scope set|unset`) are the user's, wherever global
+ * flags stand. The one check every model-facing entry point (omp's and Pi's `rematch` tool, and
+ * through [`userOnlyShellReason`] the shell guards of omp, Pi and OpenCode) runs on the argv it
+ * would execute.
+ */
+export function userOnlyReason(argv: readonly string[]): string | null {
+	const [cmd, sub, verb] = commandWords(argv);
+	if (cmd === "off" || cmd === "on" || cmd === "uninstall" || cmd === "mark") return `${cmd} is reserved to the user: /rematch ${cmd}`;
+	if (cmd === "library" && sub !== undefined && ["approve", "decline", "pin", "unpin", "disable", "rollback"].includes(sub)) {
+		return `library ${sub} is reserved to the user: /rematch ${sub} <id>, /rematch review or the session-start digest`;
+	}
+	if (cmd === "library" && sub === "export" && argv.some(a => /^--approve(?:-all)?(?:=|$)/.test(a))) {
+		return "approving an export is reserved to the user: rematch library export --approve in a shell, or /rematch review";
+	}
+	if (cmd === "policy" && sub === "scope" && (verb === "set" || verb === "unset")) {
+		return `policy scope ${verb} is reserved to the user: rematch policy scope ${verb} in their own shell`;
+	}
+	return null;
+}
+
+/** Words that may stand before the command itself: runners (`sudo rematch …`, `sh rematch.sh …`). */
+const COMMAND_PREFIX: Record<string, true> = { env: true, exec: true, command: true, sudo: true, nohup: true, time: true, sh: true, bash: true, zsh: true };
+
+/**
+ * Why a model's shell line may not run, or null: a `rematch` / `rematch.sh` / `rematch.exe` /
+ * `rematch.cmd` word, quoted or by path, in command position of any `;`/`&&`/`|`/subshell segment
+ * (after env assignments and runners such as `sudo`, `sh`, or inside the quoted script of
+ * `sh -c`), whose argv [`userOnlyReason`] refuses: the same parser as the `rematch` tool, so global
+ * flags anywhere change nothing. Mentions elsewhere (`git commit -m "… rematch off"`, `echo rematch
+ * on`) pass. A guard against the direct command, not a sandbox: the model's shell has the user's
+ * permissions, and an arbitrary script, `eval` of a built string or an alias still runs.
+ */
+export function userOnlyShellReason(command: unknown): string | null {
+	if (typeof command !== "string") return null;
+	for (const segment of command.split(/&&|\|\||[;&|\n(){}`]|\$\(/)) {
+		const words = (segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(w => w.replace(/["']/g, ""));
+		for (let i = 0; i < words.length; i++) {
+			const word = words[i] as string;
+			const base = (word.split(/[\\/]/).pop() ?? "").toLowerCase();
+			if (/^rematch(?:\.sh|\.exe|\.cmd)?$/.test(base)) {
+				const refused = userOnlyReason(words.slice(i + 1));
+				if (refused) return refused;
+				break;
+			}
+			// The quoted script of `sh -c "…"` is a command line of its own.
+			if (/\s/.test(word) && i > 0) {
+				const refused = userOnlyShellReason(word);
+				if (refused) return refused;
+				break;
+			}
+			if (/^[A-Za-z_]\w*=/.test(word) || word.startsWith("-") || COMMAND_PREFIX[base] === true) continue;
+			break;
+		}
+	}
+	return null;
+}
+
 /** `read` only for operations that cannot mutate state; everything else asks for `exec`. */
 export function approvalFor(operation: string, args: readonly string[] = []): "read" | "exec" {
 	if (READ_OPS[operation]) return "read";
-	if (operation === "library") return args.length === 0 || args[0] === "ls" || args[0] === "why" ? "read" : "exec";
-	if (operation === "transfer") return args.length === 0 || args[0] === "suggest" ? "read" : "exec";
-	if (operation === "builtins") return args[0] === "reinstall" ? "exec" : "read";
+	const [sub] = commandWords(args);
+	if (operation === "library") return sub === undefined || ["ls", "why", "inspect"].includes(sub) ? "read" : "exec";
+	if (operation === "transfer") return sub === undefined || sub === "suggest" ? "read" : "exec";
+	if (operation === "builtins") return sub === "reinstall" ? "exec" : "read";
 	return "exec";
 }
 
@@ -468,20 +556,122 @@ export function changesLoaded(argv: readonly string[]): boolean {
 
 export const COMMANDS = [
 	"why", "status", "library", "create", "improve", "run", "activate", "mark", "off", "on", "disable",
-	"rollback", "approve", "decline", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor",
+	"rollback", "approve", "decline", "inspect", "review", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor",
 ] as const;
 
-/** `/rematch <sub> …` → (operation, arguments). `disable|rollback|approve|decline` live under `library`. */
+/** `/rematch <sub> …` → (operation, arguments). `disable|rollback|approve|decline|inspect` live under `library`; `review` opens the review dialog (handled by the command). */
 export function commandToOperation(words: readonly string[]): { operation: Operation; args: string[] } {
 	const [sub, ...rest] = words;
 	if (!sub) return { operation: "library", args: ["ls"] };
 	if (!(COMMANDS as readonly string[]).includes(sub)) {
 		throw new Error(`unknown /rematch subcommand "${sub}"; one of ${COMMANDS.join("|")}`);
 	}
-	if (sub === "disable" || sub === "rollback" || sub === "approve" || sub === "decline") {
+	if (sub === "disable" || sub === "rollback" || sub === "approve" || sub === "decline" || sub === "inspect") {
 		return { operation: "library", args: [sub, ...rest] };
 	}
+	if (sub === "review") return { operation: "digest", args: rest };
 	return { operation: sub as Operation, args: rest };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review (persistent actions, `digest.actions`): nothing changes without an explicit decision.
+
+export type ReviewAction = {
+	id: string;
+	kind: string;
+	name: string;
+	summary: string;
+	state: string;
+	blocked: string | null;
+	reload: string | null;
+	approve: string[] | null;
+	decline: string[] | null;
+};
+
+/** `digest.actions` as review items (every pending, blocked and conflict action, whatever `digest.last` says). */
+export function reviewActionsOf(data: unknown): ReviewAction[] {
+	const argv = (v: unknown): string[] | null => {
+		const a = stringsOf(v);
+		return a.length > 0 && a[0] === "library" ? a : null;
+	};
+	return (isRecord(data) ? recordsOf(data.actions) : [])
+		.filter(a => typeof a.id === "string")
+		.map(a => {
+			const c = isRecord(a.commands) ? a.commands : {};
+			return {
+				id: a.id as string,
+				kind: typeof a.kind === "string" ? a.kind : "entry",
+				name: typeof a.name === "string" ? a.name : (a.id as string),
+				summary: typeof a.summary === "string" ? a.summary : "",
+				state: typeof a.state === "string" ? a.state : "pending",
+				blocked: typeof a.blocked === "string" ? a.blocked : null,
+				reload: typeof a.reload === "string" ? a.reload : null,
+				approve: argv(c.approve_argv),
+				decline: argv(c.decline_argv),
+			};
+		});
+}
+
+/** Footer status: how many actions wait, and where to review them; undefined when none. */
+export function pendingStatus(actions: readonly ReviewAction[]): string | undefined {
+	if (actions.length === 0) return undefined;
+	return `rematch: ${actions.length} waiting · /rematch review`;
+}
+
+export const REVIEW_APPROVE = "Approve";
+export const REVIEW_DECLINE = "Decline";
+export const REVIEW_INSPECT = "Inspect";
+export const REVIEW_LATER = "Later";
+
+/** What Approve and Decline do for an action kind (the binary's `library approve|decline` dispatch). */
+export function reviewEffects(kind: string): { approve: string | null; decline: string } {
+	switch (kind) {
+		case "instructions":
+			return { approve: null, decline: "this text is not applied; the entry stays" };
+		case "instructions_applied":
+			return { approve: null, decline: "withdraws this text from your personal AGENTS.md (on every synced machine when it came through the profile)" };
+		case "instructions_conflict":
+			return { approve: "restore rematch's text over your edit", decline: "keep your edited text as your own; rematch stops managing it" };
+		case "instructions_unreadable":
+			return { approve: null, decline: "withdraws the runtime approval of this text" };
+		case "export":
+			return { approve: null, decline: "the export is not offered again; the entry stays" };
+		case "probe":
+			return { approve: null, decline: "no replay runs" };
+		default:
+			return { approve: null, decline: "retires the entry" };
+	}
+}
+
+/** The choices of one action: approve/decline only when the binary offers that exact command; Later always (and Esc means Later). */
+export function reviewChoices(a: ReviewAction): { label: string; description?: string }[] {
+	const out: { label: string; description?: string }[] = [];
+	const effects = reviewEffects(a.kind);
+	if (a.approve && !a.blocked) out.push({ label: REVIEW_APPROVE, description: effects.approve ?? a.approve.slice(1).join(" ") });
+	if (a.decline) out.push({ label: REVIEW_DECLINE, description: effects.decline });
+	out.push({ label: REVIEW_INSPECT, description: `rematch library inspect ${a.id}` });
+	out.push({ label: REVIEW_LATER, description: "keep it pending; nothing changes" });
+	return out;
+}
+
+/** The binary argv a choice runs: approve/decline exactly as offered (with the reviewed hash); null for Inspect, Later or a dismissed dialog. */
+export function reviewArgv(a: ReviewAction, choice: string | undefined): string[] | null {
+	if (choice === REVIEW_APPROVE && !a.blocked) return a.approve;
+	if (choice === REVIEW_DECLINE) return a.decline;
+	return null;
+}
+
+/**
+ * `/rematch approve|decline <id>` typed without `--sha`: the id of the one action to review in a
+ * dialog, whose Approve / Decline run the action's own argv (the reviewed hash with it), so a
+ * typed approval needs no copied hash. Null for anything else (a typed `--sha` goes to the binary
+ * as is, which checks it).
+ */
+export function reviewTarget(words: readonly string[]): string | null {
+	const [sub, id, ...rest] = words;
+	if (sub !== "approve" && sub !== "decline") return null;
+	if (!id || id.startsWith("-") || rest.some(a => a === "--sha" || a.startsWith("--sha="))) return null;
+	return id;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -703,14 +893,18 @@ export function loadedEntriesOf(data: unknown, hooks: readonly Hook[]): LoadedEn
 		});
 }
 
-/** One approved personal `AGENTS.fragment.md` the binary reported for this cwd (`match.prompt_fragments`). */
-export type PromptFragment = { id: string; name: string; text: string };
+/** One approved personal `AGENTS.fragment.md` the binary reported for this cwd (`match.prompt_fragments`); `sha` is the approved hash, recorded when a host sends it (`fragments_sent`). */
+export type PromptFragment = { id: string; name: string; text: string; sha?: string };
 
-/** `match.prompt_fragments`, keeping only well-formed items (`{id, name, text}`, all non-empty strings). */
+/** `match.prompt_fragments`, keeping only well-formed items (`{id, name, text}`, all non-empty strings; `sha` kept when present). */
 export function promptFragmentsOf(data: unknown): PromptFragment[] {
 	return (isRecord(data) ? recordsOf(data.prompt_fragments) : [])
 		.filter(f => ["id", "name", "text"].every(k => typeof f[k] === "string" && (f[k] as string).trim() !== ""))
-		.map(f => ({ id: f.id as string, name: f.name as string, text: f.text as string }));
+		.map(f => {
+			const out: PromptFragment = { id: f.id as string, name: f.name as string, text: f.text as string };
+			if (typeof f.sha === "string" && f.sha) out.sha = f.sha;
+			return out;
+		});
 }
 
 /**
@@ -749,15 +943,90 @@ const matchCache = new Map<string, Promise<Matched>>();
 
 type RegistryHandle = { get(scope: unknown): unknown; override(scope: unknown, value: unknown): void };
 
-/** Additively override `skills.customDirectories` for this process (DESIGN §0, §11.1). */
-async function addSkillDirs(pi: ExtensionAPI, dirs: readonly string[]): Promise<void> {
+/** A skills directory rematch mounts: the kept library `<root>/skills` or a place view `<root>/views/<key>/skills`. */
+export function isRematchSkillDir(dir: string, root: string): boolean {
+	const d = path.resolve(dir);
+	return d === path.resolve(root, "skills") || d.startsWith(path.resolve(root, "views") + path.sep);
+}
+
+/** `skills.customDirectories` for this session: what the user configured, minus earlier rematch dirs, plus `dirs` (this place's view). */
+export function sessionSkillDirs(configured: readonly string[], dirs: readonly string[], root: string): string[] {
+	return [...new Set([...configured.filter(d => !isRematchSkillDir(d, root)), ...dirs])];
+}
+
+/** `task.disabledAgents` for this process: the user's list plus the rematch agents this session must not offer. */
+export function sessionDisabledAgents(configured: readonly string[], withheld: readonly string[]): string[] {
+	return [...new Set([...configured, ...withheld])];
+}
+
+/** Names linked under `<root>/agents/` (`<name>.md`): every provisional agent rematch put in omp's reach. */
+export function rematchAgentNames(root: string): string[] {
+	try {
+		return fs
+			.readdirSync(path.join(root, "agents"))
+			.filter(f => f.endsWith(".md") && !f.startsWith("."))
+			.map(f => f.slice(0, -3))
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * The rematch entry a successful `read` opened: `skill://<name>` resolves through this session's
+ * view (`name → entry id`; omp gives a custom-directory skill the bare name over a native one of the
+ * same name), a `…/<name>/SKILL.md` path through the `rematch.json` beside it. Null for a native
+ * skill or any other read: no credit for a same-named skill rematch did not write.
+ */
+export function skillEntryOfRead(rawPath: unknown, view: ReadonlyMap<string, string>, cwd: string): string | null {
+	if (typeof rawPath !== "string" || !rawPath) return null;
+	const clean = stripSelectors(rawPath.trim());
+	if (clean.startsWith("skill://")) {
+		const name = skillFromReadPath(clean);
+		return name ? (view.get(name) ?? null) : null;
+	}
+	if (!/(?:^|[\\/])SKILL\.md$/.test(clean)) return null;
+	return entryOfSkillDir(path.dirname(path.resolve(cwd, clean)));
+}
+
+/** The entry id of a skill dir rematch wrote (its `rematch.json`), else null: a native skill. */
+export function entryOfSkillDir(dir: string): string | null {
+	try {
+		const v: unknown = JSON.parse(fs.readFileSync(path.join(dir, "rematch.json"), "utf8"));
+		return isRecord(v) && typeof v.id === "string" ? v.id : null;
+	} catch {
+		return null;
+	}
+}
+
+/** `sync.data.agents.withheld` of a `skills sync` envelope, or null when the sync did not answer (fail safe: withhold every rematch agent). */
+export function withheldAgentsOf(sync: Envelope): string[] | null {
+	if (!sync.ok) return null;
+	const agents = isRecord(sync.data?.agents) ? sync.data.agents : {};
+	return stringsOf(agents.withheld);
+}
+
+/** Runtime-only override (never persisted) of a list setting: `value(persisted)` for this process. Returns the persisted list. */
+async function overrideList(pi: ExtensionAPI, id: string, value: (persisted: string[]) => string[]): Promise<string[]> {
 	// Dynamic so the module still evaluates (and traces) where the host subpath is unavailable.
 	const registry = await import("@oh-my-pi/pi-coding-agent/config/registry");
-	const handle = registry.lookup("skills.customDirectories") as RegistryHandle | undefined;
-	if (!handle) throw new Error("setting skills.customDirectories not found");
+	const handle = registry.lookup(id) as RegistryHandle | undefined;
+	if (!handle) throw new Error(`setting ${id} not found`);
 	const scope = pi.pi.settings;
-	const configured = stringsOf(handle.get(scope));
-	handle.override(scope, [...new Set([...configured, ...dirs])]);
+	handle.override(scope, undefined);
+	const persisted = stringsOf(handle.get(scope));
+	handle.override(scope, value(persisted));
+	return persisted;
+}
+
+/**
+ * Names of `view` that a user-configured custom skill dir also holds: omp keeps the bare name for
+ * the first custom dir listed (the user's come first), so `skill://<name>` opens the user's skill
+ * and a read is no use of rematch's.
+ */
+export function shadowedByCustomDirs(view: ReadonlyMap<string, string>, customDirs: readonly string[], root: string): string[] {
+	const dirs = customDirs.filter(d => !isRematchSkillDir(d, root));
+	return [...view.keys()].filter(name => dirs.some(d => fs.existsSync(path.join(d.replace(/^~(?=$|[\\/])/, os.homedir()), name, "SKILL.md"))));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -812,28 +1081,53 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	// --- loaded state: skill dirs + hooks matched for `loadedCwd` --------------------------------
 	// Matched at load time for process.cwd(); re-matched when a main session's cwd changes, when the
 	// main session switches or branches, and after the user approves, activates, disables or rolls
-	// back an entry, so approved hooks run at once (skill dirs only ever add, §0). Skills load from
-	// the one shared dir `skills sync` maintains (`dirs`); `match` supplies entries and hooks.
+	// back an entry, so approved hooks run at once. Skills load from this place's view (`skills sync`
+	// `dirs`: the kept library plus this place's provisional entries), mounted for this process only;
+	// omp scans it when a session starts. Provisional agents of other places are disabled for this
+	// process (`task.disabledAgents`), every one of them when the binary cannot say (fail safe).
 	let loadedCwd: string | null = null;
 	let loadedEntries: LoadedEntry[] = [];
 	let visibleEntries: string[] = [];
 	let skillDirs: string[] = [];
+	let exposureView: string | null = null;
+	/** `name → entry id` of the skills this session's view links (what `skill://<name>` opens). */
+	let viewSkills = new Map<string, string>();
 	let hooks: Hook[] = [];
 	let callHooks: Hook[] = [];
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
 	let tracksCalls = false;
-	/** Approved personal prompt fragments of the entries loaded for `loadedCwd`. */
-	let promptFragments: PromptFragment[] = [];
+	/** `match.instructions.exposed`: personal AGENTS.md sections omp loads in this session. */
+	let instructionsExposed: Json[] = [];
 	/** `match` saw `REMATCH_ROOT/profile/.git`: session start runs one `profile sync` (DESIGN §20). */
 	let profilePresent = false;
 	let profileSynced = false;
+
+	/** Mount `dirs` as this process's rematch skill dirs and withhold `withheld` agents (null: all of rematch's). Never throws. */
+	async function applyScope(dirs: readonly string[], withheld: readonly string[] | null): Promise<void> {
+		try {
+			const configured = await overrideList(pi, "skills.customDirectories", persisted => sessionSkillDirs(persisted, dirs, root));
+			skillDirs = [...dirs];
+			for (const name of shadowedByCustomDirs(viewSkills, configured, root)) viewSkills.delete(name);
+		} catch (error) {
+			log("warn", `skill dirs not set: ${errorText(error)}`);
+		}
+		try {
+			const names = withheld ?? rematchAgentNames(root);
+			await overrideList(pi, "task.disabledAgents", configured => sessionDisabledAgents(configured, names));
+		} catch (error) {
+			log("warn", `agent scope not set: ${errorText(error)}`);
+		}
+	}
 
 	/** Match and sync `cwd`, adopt its entries, hooks and skill dirs; `fresh` drops every cached result first. Never throws. */
 	async function loadMatch(cwd: string, fresh: boolean): Promise<void> {
 		if (!fresh && cwd === loadedCwd) return;
 		loadedCwd = cwd;
-		if (!enabled || !bin) return;
+		if (!enabled || !bin) {
+			await applyScope([], null);
+			return;
+		}
 		if (fresh) matchCache.clear();
 		const key = `${bin}\0${cwd}`;
 		let pending = matchCache.get(key);
@@ -851,6 +1145,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			const data = match.data ?? {};
 			if (data.off === true) {
 				enabled = false;
+				await applyScope([], null);
 				return;
 			}
 			profilePresent = data.profile_present === true;
@@ -868,20 +1163,24 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
 			tracksCalls = next.some(h => h.mode === "stuck");
-			promptFragments = promptFragmentsOf(data);
+			instructionsExposed = recordsOf(isRecord(data.instructions) ? data.instructions.exposed : undefined);
 		} catch (error) {
 			log("warn", `match skipped for ${cwd}: ${errorText(error)}`);
 		}
 		try {
 			if (!sync.ok) throw new Error(sync.error ?? "skills sync failed");
 			visibleEntries = stringsOf(sync.data?.visible);
-			const dirs = stringsOf(sync.data?.dirs).filter(d => !skillDirs.includes(d));
-			if (dirs.length > 0) {
-				await addSkillDirs(pi, dirs);
-				skillDirs = [...skillDirs, ...dirs];
+			exposureView = typeof sync.data?.view === "string" ? sync.data.view : null;
+			viewSkills = new Map();
+			const links = isRecord(sync.data?.links) ? sync.data.links : {};
+			for (const [name, dir] of Object.entries(links)) {
+				const id = typeof dir === "string" ? entryOfSkillDir(dir) : null;
+				if (id) viewSkills.set(name, id);
 			}
+			await applyScope(stringsOf(sync.data?.dirs), withheldAgentsOf(sync));
 		} catch (error) {
 			log("warn", `skills skipped for ${cwd}: ${errorText(error)}`);
+			await applyScope([], null);
 		}
 	}
 
@@ -899,6 +1198,10 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let trace: SessionTrace | null = null;
 	let loadedAnnotated = false;
 	const calls = new CallHistory();
+	/** `tool\0hook ids` whose evaluation this session already traced (`hook_evaluated`, once each). */
+	const evaluated = new Set<string>();
+	/** The last traced truncation (`hook_applied`): written again only when what was cut changes. */
+	let lastTruncation = "";
 	let lastRetrieval: { key: string; units: RetrievedUnit[] } | null = null;
 	let lastTracedUnits = "";
 	/** The appended retrieval message, reused while the unit contents are unchanged. */
@@ -1010,6 +1313,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			subpath: repo ? subpathOf(repo, ctx.cwd) : null,
 			head_sha: head,
 			visible_entries: visibleEntries,
+			exposure_view: exposureView,
+			instructions_exposed: instructionsExposed.map(x => ({ id: typeof x.id === "string" ? x.id : null, name: x.name, sha: x.sha })),
 		});
 		if (!loadedAnnotated) {
 			loadedAnnotated = true;
@@ -1044,39 +1349,74 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		trace = null;
 	}
 
-	async function presentDigest(ctx: ExtensionContext, env: Envelope): Promise<void> {
+	/** News as toasts, and the actions waiting as a persistent footer status (never a dialog: the session is not blocked). */
+	function presentDigest(ctx: ExtensionContext, env: Envelope): ReviewAction[] {
 		const lines = stringsOf(env.data?.lines);
 		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
 		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
-		let approved = false;
-		for (const a of recordsOf(env.data?.approvals)) {
-			if (typeof a.id !== "string") continue;
-			const name = typeof a.name === "string" ? a.name : a.id;
-			const kind = typeof a.kind === "string" ? a.kind : "entry";
-			const body = [a.reason, a.diff].filter((x): x is string => typeof x === "string" && x.length > 0).join("\n\n");
-			const yes = await ctx.ui.confirm(`rematch: approve ${kind} ${name}?`, body);
-			const r = await call(["library", yes ? "approve" : "decline", a.id]);
-			if (yes && r.ok) approved = true;
-			ctx.ui.notify(`rematch: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
+		const actions = reviewActionsOf(env.data);
+		try {
+			ctx.ui.setStatus("rematch", pendingStatus(actions));
+		} catch (error) {
+			log("debug", `setStatus failed: ${errorText(error)}`);
 		}
-		// Hook modules the user just approved run now; skill links the sync adds load at the next omp start.
-		if (approved) await reload(ctx.cwd, true);
+		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for you — /rematch review (alt+e); nothing changes until you decide`, "info");
+		return actions;
 	}
 
-	async function showDigest(ctx: ExtensionContext, quietWhenEmpty: boolean): Promise<void> {
-		if (!ctx.hasUI) return;
+	async function showDigest(ctx: ExtensionContext, quietWhenEmpty: boolean): Promise<ReviewAction[]> {
+		if (!ctx.hasUI) return [];
 		const env = await call(["digest", "--cwd", ctx.cwd], { timeout: 10_000 });
 		if (!env.ok) {
 			if (!quietWhenEmpty) ctx.ui.notify(`rematch: digest failed: ${env.error}`, "warning");
-			return;
+			return [];
 		}
-		const empty = stringsOf(env.data?.lines).length === 0 && recordsOf(env.data?.approvals).length === 0;
+		const empty = stringsOf(env.data?.lines).length === 0 && recordsOf(env.data?.actions).length === 0;
 		if (empty && !quietWhenEmpty) ctx.ui.notify("rematch: nothing new", "info");
-		await presentDigest(ctx, env);
+		return presentDigest(ctx, env);
+	}
+
+	/**
+	 * One dialog per waiting action: Approve / Decline run exactly the command the binary offers
+	 * (with the hash shown); Inspect shows the whole text in the dialog (never in the conversation)
+	 * and asks again; Later or Esc leaves it pending. Blocked and conflict actions are shown with
+	 * their reason and commands, no dialog.
+	 */
+	async function review(ctx: ExtensionContext, actions: readonly ReviewAction[]): Promise<void> {
+		if (!ctx.hasUI) return;
+		let changed = false;
+		for (const a of actions) {
+			if (!(a.approve && !a.blocked) && !a.decline) {
+				ctx.ui.notify(`rematch: ${a.kind} ${a.name}: ${a.summary}${a.blocked ? ` — ${a.blocked}` : ""} (rematch library inspect ${a.id})`, "warning");
+				continue;
+			}
+			let title = `rematch: ${a.kind} ${a.name} — ${a.summary}`;
+			let choice: string | undefined;
+			for (;;) {
+				choice = await ctx.ui.select(title, reviewChoices(a));
+				if (choice !== REVIEW_INSPECT) break;
+				const inspected = await call(["library", "inspect", a.id]);
+				const text = inspected.ok ? stringsOf(inspected.data?.lines).join("\n") : (inspected.error ?? "");
+				title = `rematch: ${a.kind} ${a.name}\n\n${text}`;
+			}
+			const argv = reviewArgv(a, choice);
+			if (!argv) continue;
+			const r = await call(argv);
+			if (r.ok) changed = true;
+			const verb = choice === REVIEW_APPROVE ? "approved" : "declined";
+			ctx.ui.notify(`rematch: ${verb} ${a.name}${r.ok ? (a.reload ? ` (${a.reload})` : "") : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
+		}
+		// Hook modules and agent links change now; skills and personal text load from the next session.
+		if (changed) {
+			await reload(ctx.cwd, true);
+			await showDigest(ctx, true);
+		}
 	}
 
 	async function startSession(ctx: ExtensionContext, withDigest: boolean): Promise<void> {
 		calls.clear();
+		evaluated.clear();
+		lastTruncation = "";
 		lastRetrieval = null;
 		lastTracedUnits = "";
 		lastInjected = null;
@@ -1126,7 +1466,13 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			enabled = on;
 			if (on) {
 				env.data = { ...env.data, note: "tracing resumes now; skills apply from the next omp start" };
+				await reload(ctx?.cwd ?? process.cwd(), true);
 				if (!trace && ctx && isMain(ctx)) await startSession(ctx, false);
+			} else {
+				// Withdraw now what this process still offers: rematch agents and skill dirs (the skill
+				// list and any text already sent stay in this session; a new session starts clean).
+				await applyScope([], null);
+				env.data = { ...env.data, note: "rematch agents withdrawn now; skills and personal instructions already in this session stay until you start a new one" };
 			}
 		}
 		return env;
@@ -1150,7 +1496,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			"rematch control plane: traces sessions, stages provisional skills/scripts/hooks grounded in traces, keeps or retires them by counters. " +
 			"operation = binary subcommand (doctor, status, library, why, digest, match, create, improve, activate, run, transfer, ship, mark, off, on, …); " +
 			'arguments = the remaining argv as separate strings, e.g. {"operation":"library","arguments":["ls"]}. Long work returns a job id; poll with status. ' +
-			"Approving an entry's scripts, hook, subagent or prompt fragment, and uninstalling, are reserved to the user (/rematch or the session-start digest).",
+			"Approving, declining, pinning, disabling or rolling back an entry, approving an export, marking a turn, switching rematch off or on, and uninstalling are reserved to the user (/rematch or the session-start digest).",
 		parameters: z.object({ operation: z.enum(OPERATIONS), arguments: z.array(z.string()).optional() }),
 		approval: (params: unknown) => {
 			const p = isRecord(params) ? params : {};
@@ -1162,10 +1508,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			let value: Envelope;
 			try {
 				const args = params.arguments ?? [];
-				if (params.operation === "library" && ["approve", "decline", "pin", "unpin"].includes(args[0])) {
-					throw new Error(`library ${args[0]} is reserved to the user: /rematch ${args[0]} <id> or the session-start digest`);
-				}
-				if (params.operation === "uninstall") throw new Error("uninstall is reserved to the user: /rematch uninstall");
+				// The argv the binary would run, whatever order the global flags come in.
+				const refused = userOnlyReason(buildArgv(params.operation, args, "-", ctx?.cwd ?? process.cwd()));
+				if (refused) throw new Error(refused);
 				value = await runOperation(params.operation, args, ctx, signal);
 			} catch (error) {
 				value = { ok: false, operation: params.operation, error: errorText(error) };
@@ -1179,7 +1524,21 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		handler: async (raw, ctx) => {
 			let value: Envelope;
 			try {
-				const { operation, args } = commandToOperation(shellWords(raw ?? ""));
+				const words = shellWords(raw ?? "");
+				if (words[0] === "review" && ctx.hasUI && enabled) {
+					// The dialog review: Approve / Decline / Inspect / Later per action, nothing on Esc.
+					await review(ctx, await showDigest(ctx, true));
+					return;
+				}
+				const target = reviewTarget(words);
+				if (target && ctx.hasUI) {
+					// A typed approve/decline without a hash: this action's dialog, which carries it.
+					const inspected = await call(["library", "inspect", target]);
+					if (!inspected.ok) throw new Error(inspected.error ?? `no action ${target}`);
+					await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }));
+					return;
+				}
+				const { operation, args } = commandToOperation(words);
 				if (!enabled && !["on", "status", "doctor", "library", "why"].includes(operation)) {
 					throw new Error(hardOff ? "rematch is off (REMATCH=0)" : "rematch is off; /rematch on to enable");
 				}
@@ -1207,18 +1566,24 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	// Registering a shortcut also makes the TUI load this extension eagerly (DESIGN §0).
 	pi.registerShortcut("alt+e", {
-		description: "rematch: show the digest",
+		description: "rematch: digest and review what waits for you",
 		handler: async ctx => {
 			try {
-				await showDigest(ctx, false);
+				await review(ctx, await showDigest(ctx, false));
 			} catch (error) {
 				log("warn", `shortcut failed: ${errorText(error)}`);
 			}
 		},
 	});
 
-	// --- tool_call hooks (block, stuck): fail closed ---------------------------------------------
+	// --- tool_call: the user's controls, then hooks (block, stuck): fail closed -------------------
 	pi.on("tool_call", (event, ctx) => {
+		// On or off: `rematch on` from the model's shell would be the switch the user did not flip.
+		const refused = event.toolName === "bash" && isRecord(event.input) ? userOnlyShellReason(event.input.command) : null;
+		if (refused) {
+			if (isMain(ctx)) write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: "rematch:user-only", reason: refused, args_hash: argsHash(event.input) });
+			return { block: true, reason: refused };
+		}
 		if (!enabled || callHooks.length === 0) return undefined;
 		let key: string | null = null;
 		let blocked: { hook: Hook; reason: string } | null = null;
@@ -1247,7 +1612,16 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				// an unhashable input has nothing to repeat
 			}
 		}
-		if (!blocked) return undefined;
+		if (!blocked) {
+			// The hooks evaluated this call and let it pass: that is use of them, not only loading.
+			const evaluatedBy = callHooks.filter(h => toolMatches(h, event.toolName)).map(h => h.id);
+			const sig = `${event.toolName}\0${evaluatedBy.join("\0")}`;
+			if (evaluatedBy.length > 0 && trace && isMain(ctx) && !evaluated.has(sig)) {
+				evaluated.add(sig);
+				write("hook_evaluated", { hook_ids: evaluatedBy, tool: event.toolName });
+			}
+			return undefined;
+		}
 		if (isMain(ctx)) write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: blocked.hook.id, reason: blocked.reason });
 		return { block: true, reason: blocked.reason };
 	});
@@ -1294,6 +1668,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		let messages: unknown[] | null = null;
 		try {
 			messages = truncateToolResults(event.messages, contextHooks);
+			const cut = messages ? messages.filter((m, i) => m !== event.messages[i]).length : 0;
+			const sig = `${cut}`;
+			if (messages && trace && isMain(ctx) && sig !== lastTruncation) {
+				lastTruncation = sig;
+				for (const h of contextHooks.filter(h => h.mode === "truncate")) {
+					write("hook_applied", { hook_id: h.id, mode: "truncate", detail: `${cut} tool result(s) cut in the outgoing request` });
+				}
+			}
 		} catch (error) {
 			log("warn", `truncate hook failed: ${errorText(error)}`);
 		}
@@ -1304,23 +1686,6 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			log("warn", `retrieve hook failed: ${errorText(error)}`);
 		}
 		return messages ? { messages: messages as typeof event.messages } : undefined;
-	});
-
-	// --- personal prompt fragments: main sessions only, fail open --------------------------------
-	// Handlers chain from the current base system prompt and may re-enter, so this one adds nothing
-	// to the session: it returns the base prompt with the block appended, every time.
-	pi.on("before_agent_start", async (event, ctx) => {
-		try {
-			if (!enabled || !isMain(ctx)) return undefined;
-			const ev = event as { reason?: string; systemPrompt?: unknown };
-			if (ev.reason === "revive") return undefined;
-			if (ctx.cwd !== loadedCwd) await reload(ctx.cwd, false);
-			const systemPrompt = appendPromptFragments(ev.systemPrompt, promptFragments);
-			return systemPrompt ? ({ systemPrompt } as never) : undefined;
-		} catch (error) {
-			log("warn", `prompt fragments failed: ${errorText(error)}`);
-			return undefined;
-		}
 	});
 
 	// --- trace events: fail open -----------------------------------------------------------------
@@ -1401,6 +1766,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				error_class: isError ? "error" : null,
 				content_head: head(textOf(event.content), LIMITS.contentHead),
 				skill_read: event.toolName === "read" ? skillFromReadPath(rawPath) : null,
+				skill_entry: event.toolName === "read" && !isError ? skillEntryOfRead(rawPath, viewSkills, ctx.cwd) : null,
 				path: typeof rawPath === "string" ? stripSelectors(rawPath) : null,
 			});
 			if (trace.errors.push(isError)) trace.reasons.add("tool_error_cluster");

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 430" width="1100" height="430" role="img" aria-labelledby="title desc">
 <title id="title">Entry statuses</title>
-<desc id="desc">Draft becomes provisional when you give it a task or accept it unverified. Provisional becomes kept at zero recurrences over at least four matched sessions with no harm, retired at two recurrences or two harm events, dormant after twelve matched sessions without a decision or thirty days with fewer than three matches. Kept becomes stale on evidence drift and retired at two harm events in thirty days. Stale goes back to provisional with a new canary or to retired. Retired never leaves. Pinned is a flag you set and unset.</desc>
+<desc id="desc">Draft becomes provisional when you give it a task or accept it unverified. Provisional becomes kept after sustained relevant clean use or engine-recorded comparative support, not from catalog presence alone. Repeated recurrence or harm retires an entry; inactivity may make it dormant. Kept entries remain reversible. Stale entries need a new canary; pinned entries remain user-owned.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9a9a9a"/></marker><marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6360f0"/></marker></defs>
 <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
 <rect x="0.5" y="0.5" width="1099" height="429" rx="16" fill="#0a0a0a" stroke="#262626"/>
@@ -9,10 +9,10 @@
 <text x="125" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">visible, never loaded</text>
 <rect x="300" y="150" width="170" height="64" rx="12" fill="#121212" stroke="#6360f0" stroke-width="2"/>
 <text x="385" y="178" font-size="17" font-weight="600" text-anchor="middle" fill="#f2f2f2">provisional</text>
-<text x="385" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">loaded on predicate match</text>
+<text x="385" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">scoped trial</text>
 <rect x="580" y="150" width="170" height="64" rx="12" fill="#121212" stroke="#262626" stroke-width="1"/>
 <text x="665" y="178" font-size="17" font-weight="600" text-anchor="middle" fill="#f2f2f2">kept</text>
-<text x="665" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">copied into ~/.omp/agent</text>
+<text x="665" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">retained with evidence</text>
 <rect x="860" y="150" width="170" height="64" rx="12" fill="#121212" stroke="#262626" stroke-width="1"/>
 <text x="945" y="178" font-size="17" font-weight="600" text-anchor="middle" fill="#f2f2f2">stale</text>
 <text x="945" y="198" font-size="12" text-anchor="middle" fill="#9a9a9a">excluded; evidence drifted</text>
@@ -25,8 +25,8 @@
 <path d="M210 182 L298 182" fill="none" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>
 <text x="255" y="140" font-size="12" text-anchor="middle" fill="#9a9a9a">task run, or --unverified</text>
 <path d="M470 182 L578 182" fill="none" stroke="#6360f0" stroke-width="1.5" marker-end="url(#arrow-accent)"/>
-<text x="524" y="124" font-size="12" text-anchor="middle" fill="#a9abff">0 recurrences · ≥ 4 matched · 0 harm</text>
-<text x="524" y="141" font-size="12" text-anchor="middle" fill="#9a9a9a">or a verifier pick, then the next run passes</text>
+<text x="524" y="124" font-size="12" text-anchor="middle" fill="#a9abff">sustained relevant clean use</text>
+<text x="524" y="141" font-size="12" text-anchor="middle" fill="#9a9a9a">or bounded comparative support</text>
 <path d="M750 182 L858 182" fill="none" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>
 <text x="804" y="140" font-size="12" text-anchor="middle" fill="#9a9a9a">as_of · family · fork commit changed</text>
 <path d="M945 150 C945 70 360 70 360 148" fill="none" stroke="#9a9a9a" stroke-width="1.5" marker-end="url(#arrow)"/>

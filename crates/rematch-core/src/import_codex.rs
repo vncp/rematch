@@ -766,6 +766,7 @@ impl Synth {
             content_head: head(&r.output, TRACE_CONTENT_HEAD_CHARS),
             skill_read: r.skill_read,
             path: r.path,
+            skill_entry: None,
             tool: r.tool,
             call_id: r.call_id,
         });
@@ -881,6 +882,8 @@ pub fn trace_records_of(s: &CodexSession) -> Vec<TraceRecord> {
         subpath,
         head_sha: None,
         visible_entries: visible,
+        instructions_exposed: Vec::new(),
+        exposure_view: None,
     });
 
     let mut calls: HashMap<&str, &Value> = HashMap::new();

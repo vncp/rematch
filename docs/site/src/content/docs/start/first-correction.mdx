@@ -39,9 +39,9 @@ The example is a real run on a scratch repository. It is one session on a toy re
 
 3. **Work on the same kind of task again.**
 
-   The skill is now provisional: a skill that hasn't proven itself yet. It loads only in sessions whose repo, file types and task words match the one that produced it. In this run the agent exported and documented the next function unprompted; that is one session, not a measured gain.
+   The skill is now provisional: a scoped trial that hasn't proven itself yet. It is exposed only in the view of places whose repo and domain match the session that produced it, so unrelated repos never see it. In this run the agent opened the skill and exported and documented the next function; that is one session, not a measured gain.
 
-   Staged is not kept. Later matched sessions can still retire it ([what happens next](/rematch/start/what-happens-next/)).
+   Staged is not kept. Later matched sessions—or an authorized automatic probe—decide whether it stays or retires ([what happens next](/rematch/start/what-happens-next/)).
 
 4. **Ask why.**
 

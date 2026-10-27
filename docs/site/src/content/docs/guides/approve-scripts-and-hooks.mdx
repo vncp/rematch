@@ -1,69 +1,160 @@
 ---
-title: Approve scripts and hooks
-description: Approve or decline the executable changes, subagents and system-prompt text rematch proposes, including the three built-in hooks.
+title: Approve scripts, hooks and instructions
+description: Review the persistent action queue for personal instructions, scripts, hooks, subagents, probe replays, exports and shipping.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Skill text activates on its own; anything executable, every provisional subagent and any text for your system prompt waits for you. Approve or decline each from the session-start digest or the terminal.
+Skill, rule and fact text activate on their own as place-scoped trials (`trials`). Everything else waits in a **persistent action queue** until you decide: personal `AGENTS.md` instructions, scripts, compiled hooks, provisional subagents, automatic probe replays, exports and team or fork branches ([D29, D32](/rematch/background/decisions/)).
 
-<Aside type="caution" title="Nothing executable runs, and nothing reaches your prompt, without approval">
-A proposed script is staged non-executable (mode 0644). A proposed hook is not installed: until you approve it, nothing of it loads or counts. A provisional subagent is linked nowhere until you approve it. An `AGENTS.fragment.md` is not added to any prompt until you approve it.
+<Aside type="caution" title="Nothing waits out of sight">
+A waiting action stays in `actions` of `rematch status`, `rematch digest` and `rematch library ls` until you approve or decline it. The queue is recomputed on every call, so an action never disappears because the digest moved on. Nothing executable runs, and no text reaches your prompt, before you approve it.
 </Aside>
 
-## What waits for you
+## The review flow
 
-The digest shows one item per entry. Its kind joins what is pending with `+`, in this order:
+1. **See what waits.** omp and Pi show `rematch: N waiting · /rematch review` at session start; Claude Code and OpenCode list the waiting actions at session start; `rematch status --text` lists them anywhere.
+2. **Inspect.** `library inspect <id>` shows the whole proposal: what it writes or runs, where (target and per-host reach), its scope, the reason, the full diff, and the exact approve and decline commands.
+3. **Approve or decline.** Both commands carry `--sha <hash>`: the 64-hex hash of the snapshot you just reviewed (`review_sha256`). The review dialog and the listed commands supply it, so you never copy it by hand in omp or Pi.
 
-| Kind | What it is | Shown in the diff |
+The hash covers the action's id, entry and version, content hash, target, scope, reach, state, reason, summary and the exact diff. If any of them changed since you looked, rematch refuses the decision and asks you to inspect again. A missing or shortened hash is refused too.
+
+## What waits in the action queue
+
+Each item has a typed `id` that you pass to `library inspect`, `library approve` and `library decline`:
+
+| Action ID | What approving does | What declining does |
 |---|---|---|
-| `scripts` | files under the entry's `scripts/` | each file |
-| `hook` | a `kind: hook` entry | the compiled module and the pass condition |
-| `agent` | a provisional subagent (`AGENT.md`) | `+++ AGENT.md` and its text |
-| `prompt` | the entry's `AGENTS.fragment.md` | `+++ AGENTS.fragment.md` and its text |
+| `<entry-id>` (kind `scripts`, `hook`, `agent`, joined with `+`) | makes `scripts/*` mode `0755`; compiles the hook to `<agent_dir>/extensions/rematch-hooks/<id>.ts`; links the provisional subagent into `~/.rematch/agents/` (Claude Code: a copy in matching repos' `.claude/agents/`) | **retires** the entry |
+| `instructions:<entry-id>` | writes the fragment as a marked block into your personal `<agent_dir>/AGENTS.md` (omp) and turns on runtime insertion in Claude Code, Pi and OpenCode | declines that text only; **the entry stays** |
+| `instructions-conflict:<name>` | **restores** rematch's block over your edit (or removes it, if no text is approved any more) | **releases** the block: the markers go and your edited text stays as your own |
+| `instructions-sync` | rewrites the personal `AGENTS.md` to what your approvals and on/off say (after a failed write or a fixed permission) | — |
+| `probe:<entry-id>` | authorizes bounded automatic replay of that exact task ([automatic probes](/rematch/guides/automatic-probes/)) | no replay in that repo; its entries stay on the observed-use path |
+| `ship-team:<entry-id>` | builds a local branch `rematch/<name>-…` for the team repo in a temporary worktree; never pushes | stops the offer until the entry changes |
+| `fork:<entry-id>` | builds a local branch in your omp fork checkout; never pushes | stops the offer until the entry changes |
+| `export:<entry-id>` | writes the invariant entry to `~/.rematch/export/` (work → home) | stops the offer until its content changes |
 
-An entry with a script and a fragment shows as `scripts+prompt`. Approving it approves every pending part at once; declining retires the entry. The diff is cut at 4,096 bytes.
+Two more kinds are listed but cannot be approved:
 
-## Approve or decline
+| Action ID | What it is | Declining |
+|---|---|---|
+| `instructions-applied:<name>` | a personal instruction block in effect now (state `applied`), or an approved one that does not fit the budget (state `blocked`) | **withdraws** it (see [withdrawing](#withdraw-an-applied-block)) |
+| `fragment-unreadable:<entry-id>` | an approved fragment Claude Code, Pi and OpenCode cannot read, so they skip it | withdraws that runtime approval; the entry and any `AGENTS.md` block stay |
+
+A `blocked` action names why it cannot be approved and the command that fixes it; it has a decline but no approve command. In `digest`, `status` and `library ls`, diffs are cut at 4,096 bytes; `library inspect` shows them whole.
+
+## Review, inspect, approve or decline
 
 <Tabs syncKey="harness">
 <TabItem label="omp">
-At session start the digest asks once per entry, with the diff and the hook's pass condition. Approving a subagent reloads it at once.
+At session start, news arrives as toasts and the footer shows `rematch: N waiting · /rematch review`. Run `/rematch review` or press `alt+e` for one dialog per waiting action:
+
+- **Approve** / **Decline** run the action's own command, hash included.
+- **Inspect** shows the full `library inspect` output inside the dialog (never in the conversation) and asks again.
+- **Later** (or `Esc`) leaves it waiting.
+
+`/rematch approve <id>` or `/rematch decline <id>` without a hash opens that action's dialog. Blocked actions and edited-block conflicts get no dialog: their reason is shown with `rematch library inspect <id>`, and you run the command that inspect prints.
+</TabItem>
+<TabItem label="Pi">
+The same as omp: `/rematch review` steps through each waiting action with `Approve` / `Decline` / `Inspect` / `Later`, and `/rematch approve|decline <id>` without a hash opens that action's dialog.
 </TabItem>
 <TabItem label="Claude Code">
-There is no dialog. The session-start digest lists each approval with its commands, which only you can run:
+There is no dialog. The session-start message lists every waiting action, every session, with its full commands:
 
 ```text
-/rematch:rematch-approve <id>
-/rematch:rematch-decline <id>
+/rematch:rematch-approve <action-id> --sha <hash>
+/rematch:rematch-decline <action-id> --sha <hash>
+/rematch:rematch-inspect <action-id>
+```
+
+Run them yourself; Claude cannot. Claude's context gets each action's kind, name, summary and commands, never its diff.
+</TabItem>
+<TabItem label="OpenCode">
+A startup toast lists the first waiting actions with their commands; `/rematch-digest` lists them all, and `/rematch-inspect <action-id>` prints one with its exact commands:
+
+```text
+/rematch-approve <action-id> --sha <hash>
+/rematch-decline <action-id> --sha <hash>
 ```
 </TabItem>
-<TabItem label="Codex">
-Codex runs no hooks. The optional `$rematch-status` skill runs the digest and approvals through `rematch`, each command after your approval.
-</TabItem>
-<TabItem label="Terminal">
+<TabItem label="Terminal / Codex">
 ```sh
-rematch library approve <id>
-rematch library decline <id>
+rematch status --text
+rematch library inspect <action-id> --text   # prints the approve and decline commands
+rematch library approve <action-id> --sha <hash>
+rematch library decline <action-id> --sha <hash>
 ```
 </TabItem>
 </Tabs>
 
-| You | Result |
+The model's own `rematch` tool, and shell commands it runs, are refused for every user-only control (approve, decline, pin, unpin, disable, rollback, export approval, mark, on, off, uninstall, `policy scope set|unset`), wherever the global flags sit. That is a control-plane rule, not a sandbox.
+
+## Personal `AGENTS.md` instructions
+
+An entry can carry an `AGENTS.fragment.md`: short text that belongs in the system prompt. Its personal home is your own user-level `AGENTS.md`, never a repo's.
+
+### Where the text goes
+
+| Host | How it gets the approved text |
 |---|---|
-| approve a script | it becomes mode 0755 in place |
-| approve a hook | it is compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` (data only; the extension runs it) |
-| approve a subagent | it is linked into `~/.rematch/agents/` (Claude Code: copied into the plugin's `agents/`), visible in every session and counted where its repo matches |
-| approve a fragment | the harness appends `## rematch: <name>` and the text to the system prompt of main sessions where the entry loads, within the 8 KB always-on budget |
-| decline | the entry is retired |
+| omp | from the file: a marked block in `<agent_dir>/AGENTS.md` (`~/.omp/agent/AGENTS.md` in the default omp profile), which omp loads in every session. Nothing is injected at runtime, so the text never arrives twice. |
+| Claude Code | runtime insertion: session-start context of main sessions where the entry matches |
+| Pi | runtime insertion: appended to the system prompt of matched main sessions |
+| OpenCode | runtime insertion: the system transform of matched main sessions |
+| Codex | not supported; skills only |
 
-## System-prompt text
+The runtime hosts record `fragments_sent` with the approved hash of each block they actually sent (Claude Code only when the context fits its 10,000-character cap); omp records the blocks its file held (`instructions_exposed`). Either counts as use of the entry.
 
-- **Only you can put it there.** rematch never writes your `AGENTS.md`; the harness appends the block to the prompt of each main session.
-- **Bound to the text.** The approval records the file's hash. Edit the fragment (or a subagent's body) and it is pending again.
-- **Disable, decline or retire removes it** from the system prompt.
-- **Where it works.** omp, Pi, OpenCode and Claude Code (through the session-start context). Codex loads skills only.
-- **Team `AGENTS.md`** is unchanged: it still reaches a repo only through [a team branch](/rematch/guides/share/).
+The block looks like this:
+
+```markdown
+<!-- rematch:begin name=<name> sha256=<inner-sha> fragment=<fragment-sha> pad=<n> -->
+## rematch: <name>
+
+<approved fragment text>
+<!-- rematch:end name=<name> -->
+```
+
+### Lifecycle
+
+- **Approve.** `instructions:<entry-id>` shows the exact block diff, the target file and each reach. Approving writes the block and turns on runtime insertion. An approval from the earlier runtime-only flow does not cover the file: rematch asks again and marks that reach as new.
+- **Your text is preserved.** Bytes outside the markers are never touched, and a symlinked `AGENTS.md` is written through and stays a link. If rematch created the file, removing its last block deletes the empty file; a file that was yours stays.
+- **Changes ask again.** A revised fragment waits as a new `instructions:<entry-id>` while the approved text stays in place.
+- **Decline.** Declining `instructions:<entry-id>` declines that text only; the skill keeps running.
+- **Off, disable, retire, uninstall.** `off` removes unchanged blocks and `on` restores them; disabling or retiring the entry removes its block; `uninstall` removes every unchanged block. An edited block is never removed or rewritten.
+- **New sessions only.** A running session keeps the text it was already sent.
+
+### Edited blocks (`instructions-conflict:<name>`)
+
+If you edit inside a block, its inner hash no longer matches and rematch stops managing it. Nothing overwrites it; `instructions-conflict:<name>` appears instead. Its diff shows both sides: the block as you left it and what rematch would write.
+
+- **Approve** restores rematch's text over your edit (or removes the block when nothing is approved any more).
+- **Decline** keeps your edit as your own text: the markers go, and the approved text is withdrawn so it is not added again.
+
+If your edit or rematch's text changes after you inspected it, both are refused until you look again. A file that cannot be read, or whose marker lines do not parse, is left alone and shown as blocked until you fix it by hand.
+
+### Withdraw an applied block
+
+Blocks in effect are listed under `applied` in `status`, `digest` and `library ls`, with a line pointing at `rematch library inspect instructions-applied:<name>`. Declining that action withdraws the text: Claude Code, Pi and OpenCode stop receiving it first, then the block leaves your `AGENTS.md`. A withdrawn text is not offered again for the same bytes by itself.
+
+<Aside type="caution" title="Withdrawal is profile-wide">
+With a [profile](/rematch/concepts/profile/), approved texts travel to your other machines and omp profiles. Withdrawing a text that the profile carries, including one approved on another machine, withdraws it **everywhere**: the next `rematch profile sync` removes it from `profile/instructions/` and records the withdrawal, and every synced machine drops it at its own sync. The inspect output says so before you decide. A later approval of the same bytes brings it back.
+</Aside>
+
+### Budget
+
+All blocks together must fit `limits.always_on_bytes` (8,192 B by default, `improver/lint.toml`). The check runs when you approve, next to everything else rematch keeps always on where the entry loads, and again whenever the file is synced, including texts arriving from the profile:
+
+- An approval that would not fit shows as `blocked` with the numbers and asks you to withdraw another block or shorten the fragment.
+- A text that arrives over the budget (from the profile, or after you lower the limit) is not written. It waits as a blocked `instructions-applied:<name>` action, and the blocks already in the file keep their place.
+
+### When the file cannot be written
+
+A failed write (a read-only file or directory) is recorded, never reported as a removal. `instructions-sync` stays in the queue with the error until a write succeeds; fix the permissions, then approve it.
+
+### Team `AGENTS.md`
+
+A repo's `AGENTS.md` is a separate, optional route. It is written only on a branch, when you approve `ship-team:<id>` or run [`rematch ship --scope team`](/rematch/guides/share/).
 
 ## Hook modes
 
@@ -76,7 +167,7 @@ rematch library decline <id>
 
 ## Built-in hooks
 
-Three hook entries ship with rematch. They appear as approvals the first time the digest runs; they live in branch `shared` and match every session.
+Three hook entries ship with rematch. They appear in the queue the first time the binary runs; they live in branch `shared` and match every session.
 
 | Entry | Mode | Setting |
 |---|---|---|
@@ -86,10 +177,11 @@ Three hook entries ship with rematch. They appear as approvals the first time th
 
 They are ordinary entries under the same counters:
 
-- Once approved, each is counted in every session.
-- Kept after four clean sessions.
-- Retired after two sessions with any classed redirect, or two with harm (error cluster, takeover, disable).
-- Declining retires it for good.
+- Nothing of them loads, runs or counts until you approve them.
+- Once approved, a session counts as use when the hook evaluates or applies (`hook_evaluated`, `hook_applied`).
+- Kept (`accepted_in_use`) after four clean completed sessions of such use.
+- Retired after two sessions with a recurring correction or preference, or two with harm (error cluster, takeover, disable).
+- Declining retires one for good.
 
 ```sh
 rematch builtins ls                   # status of the three

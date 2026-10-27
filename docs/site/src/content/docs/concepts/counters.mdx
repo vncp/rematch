@@ -5,37 +5,51 @@ description: The three raw counters behind every keep and retire, the rate limit
 
 import { Aside } from '@astrojs/starlight/components';
 
-Three raw counters per entry decide every status change. A model never writes them, and they are shown raw.
+Raw counters and engine-owned comparative records decide every status change. A model never writes them, and they are shown raw.
 
 Tokens and turns are recorded for `why` but never gated on: they vary tenfold with task difficulty.
 
 ## The counters
 
-| Counter | Goes up when, in a matched session | Decides |
+| Counter | Goes up when, in a matched session | Role |
 |---|---|---|
-| **matched** | the predicate hit while the entry was loaded ([when it matches](/rematch/concepts/predicates-and-domains/#when-it-matches)) | the denominator for every decision |
-| **recurrence** | a redirect of the entry's motivating class happened: the classifier's label, or a `revert`, `negation` or mark when the class is unknown | retire at 2 |
+| **matched** | the predicate hit while the entry was in `loaded_entries` at its recorded version and `content_sha256` ([when it matches](/rematch/concepts/predicates-and-domains/#when-it-matches)) | observational safety denominator (dormancy; never promotes an unread entry) |
+| **used** | the session **completed model work** (≥ 1 turn and a settled run: the last `agent_end` both terminal and yielded, with no turn or new input after it, not stopped on a tool call, an abort or an error) **and** actually used the entry: read or invoked a skill (by its resolved entry id), retrieved a package unit, carried its approved personal instruction (in omp's `<agent_dir>/AGENTS.md`, or sent whole at runtime by Claude Code, Pi or OpenCode), evaluated or applied a hook, ran a script, or invoked a subagent | tracks real engagement; catalog listing alone is `0` |
+| **used_clean** | `used` in that session, with `recurrence == 0` and `harm == 0` | qualifies for `accepted_in_use` at ≥ 4 |
+| **use_unknown** | completion cannot be told: no run-end evidence (legacy counter rows, adapters that record no `agent_end`) or an imported transcript, whose run end the importer synthesizes rather than reads | reported honestly; never counted as positive |
+| **recurrence** | a redirect of the entry's motivating class happened (`correction` or `preference` when the entry has no specific class; never `scope`) | retire at 2 |
 | **harm** | a new tool-error cluster, an interrupt (takeover), or you disabled the entry | retire at 2 |
 
 Each counter also keeps a per-model-family breakdown ([models](/rematch/concepts/loop/#models)).
 
-## The decision rule
+## Retention reasons and the decision rule
 
-Checked after every counted session:
+Two evidence classes justify an automatic `keep` (`counters::keep_reason`), both requiring `recurrence == 0` and `harm == 0` across all matched sessions ([D31](/rematch/background/decisions/)):
+
+| `retention` | How an entry earns it | What it means |
+|---|---|---|
+| `accepted_in_use` | `used_clean ≥ 4` (`KEEP_MIN_USED`) | sustained relevant actual use in clean completed sessions; observational acceptance, not causal proof of improvement, and never blocked when a probe is unavailable or declined |
+| `comparative_support` | a version- and `content_sha256`-bound automatic probe or batch comparison (`supports`) where the candidate rollout read the entry and beat the baseline | support on that authorized task, model, seed and base commit in omp; not general correctness |
+| `user_decision` | you ran `library pin` or `profile adopt` | human-owned; automatic transitions skip it |
+| `legacy` | kept before rematch recorded `Entry.retention` | preserved in place; `report` evaluates real-use keep separately on `used_clean ≥ 4` |
+
+Checked after every counted session and probe pass (`counters::decide`, in this order):
 
 | Condition | Decision |
 |---|---|
-| matched ≥ 4, recurrence 0, harm 0 | **keep** |
-| recurrence ≥ 2, or harm ≥ 2 | **retire** |
-| matched ≥ 12 | **dormant** |
-| provisional for 30 days with matched < 3 | **dormant** |
-| kept, and harm ≥ 2 within 30 days | **retire** |
-| anything else | continue |
+| `pinned` | **continue** (human-owned) |
+| provisional, and `recurrence ≥ 2` or `harm ≥ 2` | **retire** |
+| provisional, and a bound probe `regresses` | **retire** |
+| provisional, `recurrence == 0`, `harm == 0`, and (`comparative_support` or `used_clean ≥ 4`) | **keep** |
+| provisional, and `matched ≥ 12` | **dormant** |
+| provisional for 30 days with `matched < 3` | **dormant** |
+| kept, and `harm ≥ 2` within 30 days (and since it was kept) | **retire** |
+| anything else (including `tie`, `cost_worse` or `incomplete` probes) | **continue** |
 
-An entry that never matched has no counter rows, so the table never sees it; a separate sweep covers it. A provisional, unpinned, non-built-in entry with no counter rows goes dormant after 30 days only once at least 12 counted sessions in its scope (its branch; every branch for `shared`) have finished since then, with fewer than 3 matches. Idle time alone never retires an entry; built-ins are exempt.
+An entry that never matched has no counter rows, so the table never sees it; a separate sweep (`idle_dormant`) makes a provisional, unpinned, non-built-in entry dormant after 30 days only once at least 12 counted sessions in its scope (its branch; every branch for `shared`) have finished since then, with fewer than 3 matches. Idle time alone never retires an entry; built-ins and lessons are exempt.
 
-- **Split by family.** If one model family shows harm ≥ 1 and another has matched ≥ 2 with no harm or recurrence, the harmed family gets a sibling proposal.
-- **Kept, never verified.** Four matched sessions without recurrence are evidence that the entry did its one job, nothing more ([D8](/rematch/background/decisions/)).
+- **Split by family.** If one model family shows `harm ≥ 1` and another has `matched ≥ 2` with no harm or recurrence, the harmed family gets a sibling proposal.
+- **Kept, never verified.** Neither four clean actual uses nor a single-task probe proves universal improvement ([D8, D31](/rematch/background/decisions/)).
 
 ## Rate limits
 
@@ -54,9 +68,9 @@ A near-duplicate (simhash Hamming distance ≤ 6 on the normalized text, or an i
 
 ## The kill criterion
 
-The project has an exit rule. After six weeks of daily use, if no entry reached kept over at least four matched sessions, and recurrence has not fallen on any trigger, stop at Phase 1 and keep stock omp with hand-written skills. The trace tooling and `why` stay useful either way.
+The project has an exit rule. After six weeks of daily use, if no entry is kept in real use (`used_clean ≥ 4` in the window with zero recurrence and zero harm) and recurrence has not fallen on any covered trigger, stop at Phase 1 and keep stock omp with hand-written skills. A keep from `comparative_support` is reported separately and never satisfies the real-use criterion on its own.
 
-`rematch report` computes it instead of leaving it to be eyeballed: [read the report](/rematch/guides/read-the-report/). Where it stands today: [status and limits](/rematch/background/status/).
+`rematch report` computes both criteria plus comparative keeps: [read the report](/rematch/guides/read-the-report/). Where it stands today: [status and limits](/rematch/background/status/).
 
 <Aside type="note" title="What the counters cannot measure">
 A single user is not blinded, so the counters measure only the recurrence of one redirect class. Published harness gains were 54% overfitting on audit; expectations here are modest by design ([D18, D19](/rematch/background/decisions/)).

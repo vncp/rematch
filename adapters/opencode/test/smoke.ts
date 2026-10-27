@@ -4,6 +4,7 @@
 // cloud inference: every model reply is fixed by SCRIPT below. Run from adapters/opencode
 // after `npm install` and `cargo build -p rematch`: `bun test/smoke.ts` (exit 0 = all checks).
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -16,6 +17,7 @@ const opencodeBin = path.join(adapter, "node_modules/.bin/opencode");
 const rematchBin = process.env.REMATCH_BIN ?? path.join(repoRoot, "target/debug/rematch");
 const editorSkill = path.join(repoRoot, "crates/rematch/tests/scripts/editor-ok.sh");
 const editorHook = path.join(here, "editor-block-hook.sh");
+const editorFragment = path.join(repoRoot, "crates/rematch/tests/scripts/editor-fragment.sh");
 
 const T = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rematch-oc-smoke-")));
 const home = path.join(T, "home");
@@ -67,6 +69,14 @@ function rematch(args: string[], extra: Record<string, string> = {}) {
 	}
 }
 
+/** `rematch library approve` as the user's review runs it: the action's own argv (`--sha` of the reviewed snapshot). */
+function approveAction(id: string) {
+	const inspected = rematch(["library", "inspect", id]);
+	const argv = inspected?.data?.action?.commands?.approve_argv;
+	if (!Array.isArray(argv)) throw new Error(`${id} has no approve_argv: ${JSON.stringify(inspected)}`);
+	return rematch(argv);
+}
+
 const trace = (sid: string): Loose[] => {
 	const p = path.join(root, "traces", `${sid}.jsonl`);
 	return fs.existsSync(p) ? fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l)) : [];
@@ -80,13 +90,13 @@ const skill = rematch(["create", "run-tests-before-commit", "--from", "descripti
 rematch(["activate", "run-tests-before-commit", "--unverified"]);
 const hook = rematch(["create", "no-recursive-delete", "--from", "description", "--description", "Never rm -rf in the shell", "--editor", editorHook]);
 rematch(["activate", "no-recursive-delete", "--unverified"]);
-const approved = rematch(["library", "approve", hook.data.id]);
+const approved = approveAction(hook.data.id);
 check(approved.ok, "block hook approved by the user (CLI)", approved);
 const builtins = rematch(["builtins", "ls"]).data.builtins as Loose[];
 const stuck = builtins.find(b => b.name === "stuck-detector")?.id as string;
 // An approved `retrieve` hook, and a unit in the skill package that matches the first prompt.
 const retrieveHook = builtins.find(b => b.name === "context-unit-retrieval")?.id as string;
-rematch(["library", "approve", retrieveHook]);
+approveAction(retrieveHook);
 const unit = path.join(root, "staging/payments/run-tests-before-commit/units/ledger-migration.md");
 fs.mkdirSync(path.dirname(unit), { recursive: true });
 fs.writeFileSync(unit, "# Ledger migration\n\nRun the ledger migration tests before you commit the crate changes.\n");
@@ -100,7 +110,7 @@ const SCRIPT: Record<string, Record<string, unknown>[]> = {
 		{ tool: "bash", args: { command: "echo migrated", description: "migrate" } },
 		{ tool: "bash", args: { command: "ls /definitely/missing/dir", description: "inspect" } },
 		{ tool: "bash", args: { command: "rm -rf build", description: "clean" } },
-		{ tool: "bash", args: { command: `${rematchBin} library approve ${stuck}`, description: "self-approve" } },
+		{ tool: "bash", args: { command: `${rematchBin} --text --cwd ${proj} library approve ${stuck}`, description: "self-approve, global flags first" } },
 		{ tool: "read", args: { filePath: path.join(proj, "missing.txt") } },
 		{ tool: "rematch", args: { operation: "status", arguments: [] } },
 		{ tool: "rematch", args: { operation: "approve", arguments: [stuck] } },
@@ -110,6 +120,7 @@ const SCRIPT: Record<string, Record<string, unknown>[]> = {
 	"first served prompt": [{ tool: "bash", args: { command: "echo one", description: "one" } }, { text: "first answer" }],
 	"second served prompt": [{ text: "second answer" }],
 	"unrelated later prompt": [{ text: "later answer" }],
+	"fragment carrying prompt": [{ text: "tests first, noted" }],
 };
 const textOf = (c: unknown): string =>
 	typeof c === "string" ? c : Array.isArray(c) ? c.map(x => (typeof x === "string" ? x : (x?.text ?? ""))).join("") : "";
@@ -197,10 +208,13 @@ check(start.ev === "session_start" && start.mode === "opencode" && /^opencode\b/
 check((start.loaded_entries ?? []).some((e: Loose) => e.id === skill.data.id && e.version >= 1 && e.sha), "skill entry loaded with version and sha", start.loaded_entries);
 check((start.hooks_loaded ?? []).includes(hook.data.id), "approved block hook loaded", start.hooks_loaded);
 check(!(start.hooks_loaded ?? []).includes(stuck), "unapproved built-in not loaded", start.hooks_loaded);
-check((start.visible_entries ?? []).includes(skill.data.id), "skill visible through the shared dir", start.visible_entries);
+check((start.visible_entries ?? []).includes(skill.data.id), "skill visible through this directory's view", start.visible_entries);
+check(/^payments-[0-9a-f]{16}$/.test(String(start.exposure_view)) && (start.staging_dirs ?? []).every((d: string) => d.startsWith(path.join(root, "views"))), "OpenCode was given this directory's view, not the shared dir", start);
+check(!fs.existsSync(path.join(root, "skills", "run-tests-before-commit")), "the provisional skill is not in the shared dir");
 const tools = a.filter(r => r.ev === "tool_result");
 const skillCall = tools.find(r => r.tool === "skill");
 check(skillCall?.skill_read === "run-tests-before-commit" && !skillCall.is_error, "shared skill read through OpenCode's native skill tool", skillCall);
+check(skillCall?.skill_entry === skill.data.id, "the skill tool's load credits the entry this directory's view links", skillCall);
 check(String(skillCall?.content_head).includes("run-tests-before-commit"), "skill content came from the shared dir", skillCall?.content_head);
 check(tools.some(r => r.tool === "bash" && r.input.command === "echo migrated" && !r.is_error), "successful bash traced", tools);
 check(tools.some(r => r.tool === "bash" && r.input.command.startsWith("ls /definitely") && r.is_error), "non-zero exit traced as an error", tools);
@@ -210,11 +224,11 @@ check(blocked?.hook_id === hook.data.id && blocked?.tool === "bash" && blocked?.
 const rmPart = tools.find(r => r.input?.command === "rm -rf build");
 check(rmPart?.is_error === true && String(rmPart.content_head).includes("rm -rf is blocked"), "the block reason became the tool error", rmPart);
 const selfApprove = tools.find(r => String(r.input?.command).includes("library approve"));
-check(selfApprove?.is_error === true && String(selfApprove.content_head).includes("user's decision"), "model's self-approval refused", selfApprove);
+check(selfApprove?.is_error === true && String(selfApprove.content_head).includes("reserved to the user"), "model's self-approval refused, global flags first", selfApprove);
 const hooksDir = path.join(home, ".omp/agent/extensions/rematch-hooks");
 check(fs.existsSync(path.join(hooksDir, `${hook.data.id}.ts`)) && !fs.existsSync(path.join(hooksDir, `${stuck}.ts`)), "stuck-detector still unapproved (no compiled module)");
 const status = tools.find(r => r.tool === "rematch" && r.input?.operation === "status");
-check(status?.is_error === false && String(status.content_head).includes("entries"), "read-only rematch tool answered", status);
+check(status?.is_error === false && /"(?:entries|actions)"/.test(String(status.content_head)), "read-only rematch tool answered", status);
 const toolApprove = tools.find(r => r.tool === "rematch" && r.input?.operation === "approve");
 check(String(toolApprove?.content_head).startsWith("unknown operation"), "rematch tool has no approve operation", toolApprove);
 const turns = a.filter(r => r.ev === "turn_end");
@@ -290,6 +304,24 @@ check(!fs.existsSync(path.join(root, "traces", `oc:${created.id}:r2.jsonl`)), "n
 // --- doctor sees the plugin declared in OpenCode's config ---------------------------------
 const oc = rematch(["doctor"]).data.harnesses.opencode;
 check(oc.status === "ok" && oc.plugin === fs.realpathSync(adapter), "doctor: opencode ok, plugin resolves to this adapter", oc);
+
+// --- D: an approved personal fragment rides each main request's system prompt, traced once as sent
+const frag = rematch(["create", "crate-tests-first", "--from", "description", "--description", "run crate tests before committing", "--editor", editorFragment]);
+rematch(["activate", "crate-tests-first", "--unverified"]);
+const fragApproved = approveAction(`instructions:${frag.data.id}`);
+check(fragApproved.ok, "personal instructions approved by the user (reviewed snapshot)", fragApproved);
+const fragFile = path.join(root, "staging/payments/crate-tests-first/AGENTS.fragment.md");
+const fragBlock = `## rematch: crate-tests-first\n\n${fs.readFileSync(fragFile, "utf8").trim()}`;
+await run(["run", "fragment carrying prompt"]);
+const s5 = sessionIds().at(-1) as string;
+check(systems.some(s => s.includes(fragBlock)), "the approved fragment reached the system prompt", systems.at(-1)?.slice(-600));
+const sentRecs = trace(`oc:${s5}`).filter(r => r.ev === "fragments_sent");
+const fragSha = createHash("sha256").update(fs.readFileSync(fragFile)).digest("hex");
+check(
+	sentRecs.length === 1 && sentRecs[0].host === "opencode" && sentRecs[0].fragments?.[0]?.id === frag.data.id && sentRecs[0].fragments?.[0]?.sha === fragSha,
+	"fragments_sent: once, bound to the approved hash",
+	sentRecs,
+);
 
 // --- count: each finished segment folded once ---------------------------------------------
 const c1 = rematch(["count"]);

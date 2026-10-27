@@ -27,6 +27,7 @@ import {
 	errorText,
 	FILES_CHANGED_BUDGET_MS,
 	filesChanged,
+	entryOfSkillDir,
 	head,
 	type Hook,
 	hookFromModule,
@@ -38,6 +39,7 @@ import {
 	markClass,
 	OPERATIONS,
 	type Operation,
+	pendingStatus,
 	prelabel,
 	RETRIEVAL_TYPE,
 	type RetrievedUnit,
@@ -45,10 +47,21 @@ import {
 	retrievedUnits,
 	type PromptFragment,
 	promptFragmentsOf,
+	renderPromptFragments,
 	recordsOf,
+	REVIEW_APPROVE,
+	REVIEW_INSPECT,
+	type ReviewAction,
+	reviewActionsOf,
+	reviewArgv,
+	reviewChoices,
+	reviewTarget,
+	userOnlyReason,
+	userOnlyShellReason,
 	rematchRoot,
 	resolveBinary,
 	shellWords,
+	skillEntryOfRead,
 	skillFromReadPath,
 	skillsInvoked,
 	stringsOf,
@@ -253,32 +266,9 @@ export function loadHookFile(file: string): Hook {
 // ---------------------------------------------------------------------------------------------
 // User authority: approvals, off and marks are the user's (DESIGN §18.3).
 
-/** Tool operations the model may not run: the user's decisions. Null when allowed. */
+/** Tool operations the model may not run: the user's decisions, judged on the argv the binary would run (global flags anywhere). Null when allowed. */
 export function refusedForModel(operation: string, args: readonly string[]): string | null {
-	if (["off", "on", "uninstall", "mark"].includes(operation)) return `${operation} is reserved to the user: /rematch ${operation}`;
-	if (operation === "library" && ["approve", "decline", "pin", "unpin", "disable", "rollback"].includes(args[0] ?? "")) {
-		return `library ${args[0]} is reserved to the user: /rematch ${args[0]} <id> or the session-start digest`;
-	}
-	if (operation === "library" && args[0] === "export" && args.some(a => /^--approve(?:-all)?(?:=|$)/.test(a))) {
-		return "approving an export is reserved to the user: rematch library export --approve in a shell, or the digest";
-	}
-	return null;
-}
-
-// `rematch` in command position (line start, after `;`/`&`/`|`/`(`/`` ` ``/`$(`, or the quoted
-// script of `sh -c`), behind env assignments or `env`/`exec`/`command`/`sudo`/`nohup`/`time`, with or
-// without a path or quotes; global flags (`--text`, `--cwd <dir>`, `--x=y`) before and after
-// `library`, as clap accepts them. `library export … --approve[-all]` approves exports.
-const USER_ONLY_SHELL =
-	/(?:^|[;&|(\n`]|\$\(|-c\s+["'])\s*(?:(?:[A-Za-z_]\w*=\S*|env|exec|command|sudo|nohup|time)\s+)*["']?(?:[^\s"';&|]*\/)?rematch(?:\.sh)?["']?(?:\s+-{1,2}[\w-]+(?:=\S*|\s+(?!["']?(?:library|off|on|uninstall)\b)[^\s;&|]+)?)*\s+["']?(?:library["']?(?:\s+-{1,2}[\w-]+(?:=\S*|\s+(?!["']?(?:approve|decline|pin|unpin|disable|rollback|export)\b)[^\s;&|]+)?)*\s+["']?(?:approve|decline|pin|unpin|disable|rollback|export\b[^\n;&|]*\s--approve(?:-all)?)|off|on|uninstall)\b/;
-
-/**
- * A command line that plainly invokes a user-only rematch decision. A pattern check on the direct
- * call, not a sandbox: the model's shell has the user's permissions and can reach the binary
- * in ways no pattern sees.
- */
-export function userOnlyShell(command: unknown): boolean {
-	return typeof command === "string" && USER_ONLY_SHELL.test(command);
+	return userOnlyReason(buildArgv(operation, args, "-", process.cwd()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -421,7 +411,12 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let visibleEntries: string[] = [];
 	/** Approved personal prompt fragments of the entries loaded for this cwd. */
 	let promptFragments: PromptFragment[] = [];
+	/** The fragment set this trace already recorded as sent (`fragments_sent`). */
+	let sentFragments = "";
 	let skillDirs: string[] = [];
+	let exposureView: string | null = null;
+	/** `name → entry id` of the skills this session's view links. */
+	let viewSkills = new Map<string, string>();
 	let hooks: Hook[] = [];
 	let callHooks: Hook[] = [];
 	let contextHooks: Hook[] = [];
@@ -459,7 +454,19 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 		if (sync.ok && sync.data?.off !== true) {
 			visibleEntries = stringsOf(sync.data?.visible);
+			// This place's view (kept library + this place's provisional entries), per session.
 			skillDirs = stringsOf(sync.data?.dirs);
+			exposureView = typeof sync.data?.view === "string" ? sync.data.view : null;
+			viewSkills = new Map();
+			const links = isRecord(sync.data?.links) ? sync.data.links : {};
+			for (const [name, dir] of Object.entries(links)) {
+				const id = typeof dir === "string" ? entryOfSkillDir(dir) : null;
+				if (id) viewSkills.set(name, id);
+			}
+		} else {
+			// Off, or no answer: nothing of rematch's is offered (never another place's view).
+			skillDirs = [];
+			viewSkills = new Map();
 		}
 	}
 
@@ -533,6 +540,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		const base = plan.continues
 			? prior
 			: { ...restoreState([]), lastInput: prior.lastInput, lastDeliverable: prior.lastDeliverable, lastModel: prior.lastModel };
+		sentFragments = "";
 		trace = {
 			...base,
 			lastModel: base.lastModel ?? modelOf(ctx),
@@ -581,6 +589,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			subpath: repo ? subpathOf(repo, ctx.cwd) : null,
 			head_sha: headSha,
 			visible_entries: visibleEntries,
+			exposure_view: exposureView,
 		});
 	}
 
@@ -626,23 +635,42 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	}
 
 	// --- digest (UI only: never in the provider context) -----------------------------------------
-	async function showDigest(ctx: ExtensionContext): Promise<boolean> {
-		if (!ctx.hasUI) return false;
+	async function showDigest(ctx: ExtensionContext): Promise<ReviewAction[]> {
+		if (!ctx.hasUI) return [];
 		const env = await call(["digest", "--cwd", ctx.cwd], { timeout: 10_000 });
-		if (!env.ok) return false;
+		if (!env.ok) return [];
 		const lines = stringsOf(env.data?.lines);
 		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
 		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
+		const actions = reviewActionsOf(env.data);
+		ctx.ui.setStatus("rematch", pendingStatus(actions));
+		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for you — /rematch review; nothing changes until you decide`, "info");
+		return actions;
+	}
+
+	/** Approve / Decline / Inspect / Later per action (Esc = Later); blocked and conflict actions are shown, not asked. `true` when something changed. */
+	async function review(ctx: ExtensionContext, actions: readonly ReviewAction[]): Promise<boolean> {
 		let changed = false;
-		for (const a of recordsOf(env.data?.approvals)) {
-			if (typeof a.id !== "string") continue;
-			const name = typeof a.name === "string" ? a.name : a.id;
-			const kind = typeof a.kind === "string" ? a.kind : "entry";
-			const body = [a.reason, a.diff].filter((x): x is string => typeof x === "string" && x.length > 0).join("\n\n");
-			const yes = await ctx.ui.confirm(`rematch: approve ${kind} ${name}?`, body);
-			const r = await call(["library", yes ? "approve" : "decline", a.id]);
-			if (yes && r.ok) changed = true;
-			ctx.ui.notify(`rematch: ${yes ? "approved" : "declined"} ${name}${r.ok ? "" : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
+		for (const a of actions) {
+			if (!(a.approve && !a.blocked) && !a.decline) {
+				ctx.ui.notify(`rematch: ${a.kind} ${a.name}: ${a.summary}${a.blocked ? ` — ${a.blocked}` : ""} (rematch library inspect ${a.id})`, "warning");
+				continue;
+			}
+			const choices = reviewChoices(a);
+			const legend = choices.map(c => `${c.label}: ${c.description ?? ""}`).join("\n");
+			let title = `rematch: ${a.kind} ${a.name} — ${a.summary}\n${legend}`;
+			let choice: string | undefined;
+			for (;;) {
+				choice = await ctx.ui.select(title, choices.map(c => c.label));
+				if (choice !== REVIEW_INSPECT) break;
+				const inspected = await call(["library", "inspect", a.id]);
+				title = `rematch: ${a.kind} ${a.name}\n\n${inspected.ok ? stringsOf(inspected.data?.lines).join("\n") : (inspected.error ?? "")}\n\n${legend}`;
+			}
+			const argv = reviewArgv(a, choice);
+			if (!argv) continue;
+			const r = await call(argv);
+			if (r.ok) changed = true;
+			ctx.ui.notify(`rematch: ${choice === REVIEW_APPROVE ? "approved" : "declined"} ${a.name}${r.ok ? (a.reload ? ` (${a.reload})` : "") : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
 		}
 		// An approved hook runs from the next call; its skill links reach the list at the next /reload.
 		if (changed) {
@@ -758,9 +786,17 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 					if (!ok) throw new Error("uninstall not confirmed (run /rematch uninstall --yes)");
 					finalArgs = [...args, "--yes"];
 				}
-				if (operation === "digest" && ctx.hasUI) {
-					// Lines as notifications, approvals as confirm dialogs.
-					reloadAfter = await showDigest(ctx);
+				const target = reviewTarget(shellWords(raw ?? ""));
+				if (target && ctx.hasUI) {
+					// A typed approve/decline without a hash: this action's dialog, which carries it.
+					const inspected = await call(["library", "inspect", target]);
+					if (!inspected.ok) throw new Error(inspected.error ?? `no action ${target}`);
+					reloadAfter = await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }));
+					value = null;
+				} else if ((operation === "digest" || shellWords(raw ?? "")[0] === "review") && ctx.hasUI) {
+					// Lines as notifications; actions on `/rematch review` as Approve/Decline/Inspect/Later dialogs.
+					const actions = await showDigest(ctx);
+					reloadAfter = shellWords(raw ?? "")[0] === "review" ? await review(ctx, actions) : false;
 					value = null;
 				} else {
 					value = await runOperation(operation, finalArgs, ctx, ctx.signal);
@@ -788,13 +824,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	// --- tool_call hooks (block, stuck): fail closed ---------------------------------------------
 	pi.on("tool_call", event => {
-		if (!enabled) return undefined;
-		if (event.toolName === "bash" && userOnlyShell((event.input as Json).command)) {
-			const reason = "rematch approvals, declines, disable/rollback, off/on and uninstall are reserved to the user: /rematch";
-			write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: "rematch:user-only", reason, args_hash: argsHash(event.input) });
+		// On or off: `rematch on` from the model's shell would be the switch the user did not flip.
+		const refused = event.toolName === "bash" && isRecord(event.input) ? userOnlyShellReason(event.input.command) : null;
+		if (refused) {
+			write("tool_blocked", { tool: event.toolName, call_id: event.toolCallId, hook_id: "rematch:user-only", reason: refused, args_hash: argsHash(event.input) });
 			blockedCalls.add(event.toolCallId);
-			return { block: true, reason };
+			return { block: true, reason: refused };
 		}
+		if (!enabled) return undefined;
 		if (callHooks.length === 0) return undefined;
 		let key: string | null = null;
 		let blocked: { hook: Hook; reason: string } | null = null;
@@ -884,7 +921,15 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		try {
 			if (!enabled) return undefined;
 			const systemPrompt = appendPromptFragments((event as { systemPrompt?: unknown }).systemPrompt, promptFragments);
-			return typeof systemPrompt === "string" ? { systemPrompt } : undefined;
+			if (typeof systemPrompt !== "string") return undefined;
+			// Record the set this prompt actually carries (approved sha each), once per set per trace.
+			const sig = promptFragments.map(f => `${f.id}:${f.sha ?? ""}`).join("|");
+			if (trace && sig !== sentFragments) {
+				sentFragments = sig;
+				const bytes = Buffer.byteLength(renderPromptFragments(promptFragments) ?? "", "utf8");
+				write("fragments_sent", { host: "pi", fragments: promptFragments.map(f => ({ id: f.id, name: f.name, sha: f.sha ?? "", via: "pi:before_agent_start" })), bytes });
+			}
+			return { systemPrompt };
 		} catch (error) {
 			log(`prompt fragments failed: ${errorText(error)}`);
 			return undefined;
@@ -982,7 +1027,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	pi.on(
 		"tool_execution_end",
-		guard("tool_execution_end", (event: { toolName: string; toolCallId: string; parentToolCallId?: string; result: unknown; isError: boolean }) => {
+		guard("tool_execution_end", (event: { toolName: string; toolCallId: string; parentToolCallId?: string; result: unknown; isError: boolean }, ctx) => {
 			if (!enabled || !trace || event.parentToolCallId) return;
 			const input = callArgs.has(event.toolCallId) ? callArgs.get(event.toolCallId) : null;
 			callArgs.delete(event.toolCallId);
@@ -1001,6 +1046,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				error_class: isError ? "error" : null,
 				content_head: head(textOf(content), LIMITS.contentHead),
 				skill_read: event.toolName === "read" && !isError ? skillFromReadPath(rawPath) : null,
+				skill_entry: event.toolName === "read" && !isError ? skillEntryOfRead(rawPath, viewSkills, ctx.cwd) : null,
 				path: typeof rawPath === "string" ? stripSelectors(rawPath) : null,
 			});
 			if (trace.errors.push(isError)) trace.reasons.add("tool_error_cluster");

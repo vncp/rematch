@@ -153,6 +153,59 @@ pub fn is_package(dir: &Path) -> bool {
     dir.join("SKILL.md").is_file() && (dir.join("units").is_dir() || dir.join("facts").is_dir())
 }
 
+/// Bytes of omp's skill catalog line `- {name}: {description}\n` (`system-prompt.md`
+/// `<skills>`): the raw metadata, an upper bound for hosts that preview or compress it (omp
+/// shows ≤ 100 chars until its compressor answers, and the compressor reads the whole value).
+/// The SKILL.md body is read on demand (`skill://<name>`, `/skill:<name>`, a Read of the file)
+/// and budgeted per entry (`lint::EntryCost::body`).
+pub fn catalog_line_bytes(name: &str, description: &str) -> usize {
+    name.len() + description.len() + SKILL_LINE_OVERHEAD
+}
+
+/// `- ` + `: ` + newline of a skill catalog line.
+pub const SKILL_LINE_OVERHEAD: usize = 5;
+/// omp's task-tool agent line ``- `{name}`{markers}: {description}\n``: 7 bytes of syntax plus
+/// the longest marker (` (READ-ONLY; investigation only, no edits)`, 42 bytes).
+pub const AGENT_LINE_OVERHEAD: usize = 49;
+
+/// The first span of `text` that must not reach a catalog line (a skill or agent `name` /
+/// `description`, rendered unescaped into the system prompt or the task tool): control and
+/// format characters (a newline would start a line of its own), markup (`<`, `>`: `</skills>`),
+/// backticks, fences (`~~~`) and template braces (`{{`, `}}`). `None` when clean.
+pub fn catalog_text_problem(text: &str) -> Option<String> {
+    for (i, c) in text.char_indices() {
+        let bad = c.is_control() || is_format_char(c) || matches!(c, '<' | '>' | '`');
+        if bad {
+            return Some(format!("{:?} at byte {i}", c));
+        }
+    }
+    ["~~~", "{{", "}}"].into_iter().find(|s| text.contains(s)).map(|s| format!("{s:?}"))
+}
+
+fn is_format_char(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}')
+}
+
+/// Text rematch itself writes into a catalog line (a description it fills from an entry's
+/// trigger line): whitespace collapsed, every [`catalog_text_problem`] character dropped, cut to
+/// `max` bytes on a char boundary. Authored descriptions are never rewritten; lint reports them.
+pub fn catalog_line(text: &str, max: usize) -> String {
+    let kept: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|&c| !(c.is_control() || is_format_char(c) || matches!(c, '<' | '>' | '`')))
+        .collect();
+    let mut out = kept.replace("~~~", "").replace("{{", "").replace("}}", "");
+    out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.len() > max {
+        let mut cut = max;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    out
+}
 /// A trigger line: `Use when …`, `Use this skill whenever …`, `- **Use for …`.
 pub static TRIGGER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(?:[-*]\s+)?(?:\*\*)?use (?:this skill |it )?(?:when|whenever|for|to|if|on)\b").unwrap()

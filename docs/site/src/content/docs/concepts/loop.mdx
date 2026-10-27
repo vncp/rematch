@@ -6,11 +6,11 @@ description: How a correction in one session becomes a provisional entry, and ho
 import { Steps, Aside } from '@astrojs/starlight/components';
 import Diagram from '../../../components/Diagram.astro';
 
-A session that ended with a correction produces at most one bounded proposal at the start of the next session. Later sessions that match load it, and counters decide whether it stays. The real session is the reference run, and the next matched session is the probe, so interactive use costs no reruns.
+A session that ended with a correction produces at most one bounded proposal at the start of the next session. Later sessions that match expose it through that place's view, and engine-owned evidence—sustained clean actual use or an authorized comparative probe—decides whether it stays. Interactive reflection never reruns your active session and uses at most three editor/classifier calls.
 
 <Diagram
 	name="loop"
-	alt="The rematch loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off."
+	alt="The rematch loop. In the session: trace, flag, load scoped skill and agent views, guard with approved hooks. In a detached background worker: classify and triage, propose, lint and budget, start a scoped trial or a review action, observe actual use or run an authorized probe, then decide. An evidence boundary separates them: no proposal without a trace. You review waiting actions, mark, or turn it off."
 />
 
 Inside a session, the extension only records and loads. Everything that proposes or decides runs in the binary, outside the session's model loop: started detached at the next session start, alongside your work. The line between them: [the evidence boundary](/rematch/concepts/evidence-boundary/).
@@ -40,12 +40,11 @@ Inside a session, the extension only records and loads. Everything that proposes
 7. **Stage.** Written to `staging/<branch>/<name>/` as provisional, with the predicate, model family, originating session and manifest. A near-duplicate routes its evidence to the existing entry instead.
    - `library::stage`, `dedup`
 
-8. **Load.** At the next session start the entries matching the working directory are linked into the shared skills directory, which joins omp's skill paths. Every session loads them; there is no withheld arm.
-   - `library::sync_shared_skills`, `library::list_for_match`
+8. **Load (scoped per place).** At the next session start, `skills sync` links the kept library (`~/.rematch/skills/`) plus only the provisional entries matching that place into `~/.rematch/views/<key>/skills/`. There is no withheld arm, and another repo's trials are never exposed here.
+   - `library::sync_shared_skills`, `library::sync_view`, `library::list_for_match`
 
-9. **Count and decide.** For every finished trace: did the motivating redirect class recur while the entry was loaded, and was there harm? Then the decision rule. After a keep or retire, the reflector writes `EXPERIENCE.md` beside the entry; later proposals read it.
-   - `counters::fold_session`, `counters::decide` — rules: [counters](/rematch/concepts/counters/)
-
+9. **Count, probe and decide.** For every finished trace: did the session complete and actually use the entry (`used`), did the motivating redirect class recur (`recurrence`), and was there `harm`? If an eligible provisional entry has an authorized replay task, `reflect --pending` can also run one bounded omp comparison (2 rollouts, ≤ 300 s each, 1 per pass, 4 per 24 h). After a keep or retire, the reflector writes `EXPERIENCE.md` beside the entry.
+   - `counters::fold_session`, `probes::pass`, `counters::decide` — rules: [counters](/rematch/concepts/counters/) and [automatic probes](/rematch/guides/automatic-probes/)
 </Steps>
 
 ## Why it is built this way
@@ -53,9 +52,9 @@ Inside a session, the extension only records and loads. Everything that proposes
 | Choice | Why | Decision |
 |---|---|---|
 | No proposal without a trace | every entry cites the moment (`session_id`, `seq`) it came from; editing a harness without an execution behind it dropped Harness² from 73.4 to 63.2 on code | D1 |
-| At most three model calls, no reruns | one batched classifier call, one editor, one lint retry; the next matched session is the probe | D6, D7 |
+| At most three editor/classifier calls | one batched classifier call, one editor, one lint retry; optional background probes run only on tasks you explicitly authorized (2 omp rollouts, 0 editor calls) | D6, D7, D31 |
 | No composer and no model selector in interactive mode | choosing between untested texts is blind selection, which produced Harness²'s worst regressions | D6 |
-| Kept by use, judged by recurrence | the signal is the recurrence of the redirect class that motivated the entry, not tokens, turns or a judge; unvalidated model-written patches were net negative in Harness-R1 (21 of 39 lowered success) | D8, D10 |
+| Kept by actual use or comparative support, judged by recurrence | catalog listing alone earns no credit; keep requires ≥ 4 clean completed sessions with actual use (`accepted_in_use`) or a bound supporting comparison (`comparative_support`); unvalidated patches were net negative in Harness-R1 (21 of 39 lowered success) | D8, D10, D31 |
 | Appended, never rewritten | entries are itemized units with their own counters; a model never rewrites the library or the improver prompts; a monolithic rewrite collapsed a context from 18,282 tokens to 122 in ACE | D14, D25 |
 | Only failures are reflected on | the system never grades its own successes | D9 |
 | Modest expectations | published harness gains were 54% overfitting on audit; the deployed-static regime showed low single digits for strong models | D18, D19 |
@@ -75,15 +74,15 @@ Evidence for each id: [research decisions](/rematch/background/decisions/).
 | | Hand-written skills | compound-forge (SkillOpt / GEPA) | rematch |
 |---|---|---|---|
 | Evidence | your memory of what went wrong | a benchmark suite you maintain | the trace of the session that went wrong |
-| Cost per improvement | your time | dozens to hundreds of rollouts | ≤ 3 model calls, 0 reruns (interactive); 4–10 rollouts with a verifier (batch) |
-| What decides | you | validation score on held-out cases | recurrence of the motivating redirect over later matched sessions; a verifier in batch mode |
-| Activates on its own | everything you write | nothing (proposals are reviewed) | skill text in personal scope; never scripts, hooks, team or fork changes |
-| Exit for a bad change | you notice | regression on the suite | counters retire it; rollback restores the predecessor; `off` stops everything |
+| Cost per improvement | your time | dozens to hundreds of rollouts | ≤ 3 editor/classifier calls; optional 2-rollout probe when authorized; 4–10 rollouts in batch mode |
+| What decides | you | validation score on held-out cases | ≥ 4 clean actual uses (`accepted_in_use`) or an authorized probe (`comparative_support`), with 0 recurrence/harm |
+| Activates on its own | everything you write | nothing (proposals are reviewed) | scoped skill/rule/fact trials; never personal `AGENTS.md`, scripts, hooks, agents, probes, team or fork changes |
+| Exit for a bad change | you notice | regression on the suite | counters or a regressed probe retire it; rollback restores the predecessor; `off` stops everything |
 
-The loop design, scoped editors, lint for generalization and the experience library come from Harness² (Xu et al., arXiv 2610.14224); the `improver/` prompts are derived from its Appendix H, not verbatim. rematch adds the zero-rerun interactive mode with a deterministic predicate and raw counters (D10, D12), and a boundary that lets the harness propose without being trusted (D24).
+The loop design, scoped editors, lint for generalization and the experience library come from Harness² (Xu et al., arXiv 2610.14224); the `improver/` prompts are derived from its Appendix H, not verbatim. rematch adds personal-first harness optimization with scoped trials (D29, D30), dual retention evidence (`accepted_in_use` and `comparative_support`, D10, D12, D31), and a persistent action queue that keeps executable and prompt changes behind explicit approval (D24, D32).
 
-<Aside type="note" title="The cost of no reruns">
-A single user is not blinded, so the counters measure only the recurrence of one redirect class, something you would not fake. Nothing is ever called verified.
+<Aside type="note" title="Observational acceptance vs comparative support">
+Sustained clean use in real sessions is positive evidence of acceptance, not a controlled causal proof of improvement. A bounded probe compares baseline and candidate on one authorized task, seed and model in omp—not universal correctness. Nothing is ever called verified.
 </Aside>
 
 ## See also

@@ -37,7 +37,7 @@ Batch mode drives omp only. There is no Claude Code or Codex batch run yet (the 
 
 </Steps>
 
-The winner's lessons are staged provisional. They become kept only when the **next** run of that task passes with them loaded.
+The winner's lessons are staged provisional, with the run's winner-versus-reference comparison recorded for exactly that content (it counts only if the winning rollout read the lesson and no sealed path changed). The **next** run of that task decides: it passes with them loaded and the comparison supports them → kept (`comparative_support`); it passes but nothing supports them → they stay trials on the observed-use path; it fails → retired.
 
 ## What a run does
 

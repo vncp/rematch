@@ -55,7 +55,7 @@ fn reflect_history_reads_the_lake_events_and_agrees_with_the_transcript() {
     // `report` on the same root: the lake, with the verdict line.
     let rep = b.run(&["report"]);
     assert_eq!(rep["source"], "lake", "{rep}");
-    assert!(rep["lines"].as_array().unwrap().last().unwrap().as_str().unwrap().starts_with("verdict: an entry reached kept over ≥ 4 matched sessions: "), "{rep}");
+    assert!(rep["lines"].as_array().unwrap().last().unwrap().as_str().unwrap().starts_with("verdict: an entry kept in real use (≥ 4 clean actual uses): "), "{rep}");
 }
 
 /// Four clean imported sessions that read the skill, then one with a tool-error cluster.
@@ -121,7 +121,7 @@ fn report_falls_back_to_the_ledger_without_a_lake() {
     assert_eq!((r["source"].as_str(), r["window"]["spec"].as_str()), (Some("ledger"), Some("2w")), "{r}");
     let lines = r["lines"].as_array().unwrap();
     assert!(lines[0].as_str().unwrap().starts_with("report · source ledger · machines "), "{r}");
-    assert_eq!(lines.last().unwrap(), "verdict: an entry reached kept over ≥ 4 matched sessions: no; recurrence fell on a covered trigger: no");
+    assert_eq!(lines.last().unwrap(), "verdict: an entry kept in real use (≥ 4 clean actual uses): no; recurrence fell on a covered trigger: no; kept on comparative support: no");
     let (v, code) = env.run_cmd(env.cmd(&["report", "--window", "6x"]));
     assert_eq!((code, v["ok"].clone()), (1, json!(false)), "{v}");
     env.run(&["lake", "export"]);

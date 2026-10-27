@@ -4,7 +4,7 @@ description: The eight parts of a harness rematch can change, and what each need
 editUrl: https://github.com/vncp/rematch/edit/main/docs/DESIGN.md
 ---
 
-A harness has eight parts an improver can edit. rematch maps each to one omp component and gives each its own activation rule: text in your personal scope activates as provisional, anything executable waits for your approval, anything beyond your machine waits for a merged PR.
+A harness has eight parts an improver can edit. rematch maps each to one omp component and gives each its own activation rule: skill, rule and fact text in your personal scope activate automatically as scoped provisional trials; personal `AGENTS.md` instructions, subagents, scripts and hooks wait in the persistent action queue for your approval; anything beyond your machine waits for a branch or PR.
 
 Who approves what, and how team and fork changes leave your machine: [the evidence boundary](/rematch/concepts/evidence-boundary/#scope-and-who-merges).
 

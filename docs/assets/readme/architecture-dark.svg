@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 600" width="1100" height="600" role="img" aria-labelledby="title desc">
 <title id="title">rematch architecture</title>
-<desc id="desc">omp emits extension events to the extension, which writes traces and asks the binary which staging directories match the working directory. The binary owns the ledger, the library, lint, staging, jobs, batch mode and PR output, and calls omp non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent.</desc>
+<desc id="desc">omp emits extension events and discovers scoped skill and agent views. The binary owns the ledger, library, lint, adoption actions and bounded probes, and calls omp for editor and solver work. Personal AGENTS.md changes require approval and preserve user text. Canonical state lives under ~/.rematch; sharing to teams or forks is optional.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9a9a9a"/></marker><marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#6360f0"/></marker></defs>
 <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif">
 <rect x="0.5" y="0.5" width="1099" height="599" rx="16" fill="#0a0a0a" stroke="#262626"/>
@@ -45,15 +45,15 @@
 <text x="592" y="181.688" font-size="12.5" fill="#9a9a9a">trace · predicate · lint · library · ledger</text>
 <line x1="592" y1="199.2" x2="818" y2="199.2" stroke="#262626"/>
 <text x="592" y="227.88799999999998" font-size="16" font-weight="600" fill="#f2f2f2">reflect · count</text>
-<text x="592" y="246.88799999999998" font-size="12.5" fill="#9a9a9a">triage → edit → lint → stage → decide</text>
+<text x="592" y="246.88799999999998" font-size="12.5" fill="#9a9a9a">propose → trial → use evidence → decide</text>
 <line x1="592" y1="264.4" x2="818" y2="264.4" stroke="#262626"/>
-<text x="592" y="293.08799999999997" font-size="16" font-weight="600" fill="#f2f2f2">create · improve</text>
-<text x="592" y="312.08799999999997" font-size="12.5" fill="#9a9a9a">sessions | task | draft · split · unit edits</text>
+<text x="592" y="293.08799999999997" font-size="16" font-weight="600" fill="#f2f2f2">personal adoption</text>
+<text x="592" y="312.08799999999997" font-size="12.5" fill="#9a9a9a">review → approved AGENTS.md section</text>
 <line x1="592" y1="329.59999999999997" x2="818" y2="329.59999999999997" stroke="#262626"/>
-<text x="592" y="358.288" font-size="16" font-weight="600" fill="#f2f2f2">batch</text>
-<text x="592" y="377.288" font-size="12.5" fill="#9a9a9a">worktree, candidates, composer, verifier</text>
+<text x="592" y="358.288" font-size="16" font-weight="600" fill="#f2f2f2">probes · batch</text>
+<text x="592" y="377.288" font-size="12.5" fill="#9a9a9a">worktrees, bounded runs, fixed verifier</text>
 <line x1="592" y1="394.8" x2="818" y2="394.8" stroke="#262626"/>
-<text x="592" y="423.488" font-size="16" font-weight="600" fill="#f2f2f2">scope</text>
+<text x="592" y="423.488" font-size="16" font-weight="600" fill="#f2f2f2">optional sharing</text>
 <text x="592" y="442.488" font-size="12.5" fill="#9a9a9a">ship · export · stale · split · transfer</text>
 <rect x="880" y="56" width="190" height="420" rx="12" fill="#121212" stroke="#262626"/>
 <text x="902" y="92" font-size="12" font-weight="600" letter-spacing="0.12em" fill="#9a9a9a">STATE</text>
@@ -66,7 +66,7 @@
 <text x="902" y="246.88799999999998" font-size="12.5" fill="#9a9a9a">sessions · entries · counters</text>
 <line x1="902" y1="264.4" x2="1048" y2="264.4" stroke="#262626"/>
 <text x="902" y="293.08799999999997" font-size="16" font-weight="600" fill="#f2f2f2">staging/&lt;branch&gt;/</text>
-<text x="902" y="312.08799999999997" font-size="12.5" fill="#9a9a9a">loaded on match</text>
+<text x="902" y="312.08799999999997" font-size="12.5" fill="#9a9a9a">canonical trial content</text>
 <line x1="902" y1="329.59999999999997" x2="1048" y2="329.59999999999997" stroke="#262626"/>
 <text x="902" y="358.288" font-size="16" font-weight="600" fill="#f2f2f2">archive/ · drafts/</text>
 <text x="902" y="377.288" font-size="12.5" fill="#9a9a9a">never loaded</text>

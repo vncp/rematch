@@ -19,9 +19,9 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 | Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
 | Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
 | Generated subagents | Yes, once approved | Adapted copies, once approved | No native subagent definitions | Not delivered | No |
-| Personal system prompt (approved `AGENTS.fragment.md`) | `before_agent_start` | Session-start context | `before_agent_start` | System transform | No: skills only |
-| Digest | Notifications/dialog | Session-start message | Notifications/dialog | TUI toast or command | CLI/optional status skill |
-| User approval | Dialog or command | Command | Dialog or command | Command | CLI |
+| Personal instructions (approved `AGENTS.fragment.md`) | Marked block in `<agent_dir>/AGENTS.md`, loaded natively; no runtime insertion | Runtime: session-start context | Runtime: `before_agent_start` | Runtime: system transform | No: skills only |
+| Digest and waiting actions | Toasts, footer status, review dialog | Session-start message | Notifications, review dialog | TUI toast or `/rematch-digest` | CLI/optional status skill |
+| User approval (`--sha` bound) | Dialog supplies the hash; or the command | Command printed with its hash | Dialog supplies the hash; or the command | Command printed with its hash | CLI |
 | Detached reflection trigger | Session start | Session start | Session start | Plugin start | Manual |
 | History importer | Yes | Yes | Native session files | Read-only SQLite store | Rollout files |
 | Batch solver | omp | Uses omp | Uses omp | Uses omp | Uses omp |
@@ -38,15 +38,16 @@ Pi and OpenCode acceptance tests launch their **real pinned runtimes** with a lo
 | `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
 | `/rematch:rematch-library` | every entry with its raw counters |
 | `/rematch:rematch-mark correction` | overrides the classifier for the last turn of this session |
-| `/rematch:rematch-approve <id>` · `/rematch:rematch-decline <id>` | the digest's approve/decline dialog in omp |
+| `/rematch:rematch-inspect <id>` | `rematch library inspect <id>`: one waiting action in full, with its approve and decline commands |
+| `/rematch:rematch-approve <id> --sha <hash>` · `/rematch:rematch-decline <id> --sha <hash>` | the review dialog's Approve / Decline in omp (the session-start message prints both commands with the hash) |
 | `/rematch:rematch-off` · `/rematch:rematch-on` | `/rematch off` · `/rematch on` (`on` also re-links the skills for this directory) |
 
 - Only you can run `mark`, `approve`, `decline`, `off` and `on`; Claude cannot invoke them.
 - Everything else (`create`, `improve`, `run`, `disable`, `rollback`, …) is the `rematch` CLI in a terminal.
 - Codex has no `/rematch` command. The optional `$rematch-status` skill runs the sync, digest and approvals, each command after your approval.
-- In omp, most `/rematch <sub>` commands run `rematch <sub>`; `why`, `library`, `disable`, `rollback`, `approve`, `decline`, `mark` and `digest` differ ([the mapping](/rematch/guides/day-to-day/#omp-commands-and-the-cli)). Approving and uninstalling are reserved to you, never the `rematch` tool.
-- Pi uses `/rematch <subcommand>` and a model-facing `rematch` tool. User-only controls stay in commands and digest confirmations. Install with `pi install /path/to/rematch/adapters/pi`.
-- OpenCode registers `/rematch-status`, `-why`, `-library`, `-digest`, `-mark`, `-approve`, `-decline`, `-off` and `-on`. The model-facing tool is read-only. Configure the plugin's checkout path; do not overwrite the rest of `opencode.json`.
+- In omp, most `/rematch <sub>` commands run `rematch <sub>`; `why`, `library`, `inspect`, `disable`, `rollback`, `approve`, `decline`, `mark` and `digest` differ ([the mapping](/rematch/guides/day-to-day/#omp-commands-and-the-cli)). The model's `rematch` tool and its shell commands are refused every user-only control: approve, decline, pin, unpin, disable, rollback, export approval, mark, on, off, uninstall and `policy scope set|unset`.
+- Pi uses `/rematch <subcommand>` and a model-facing `rematch` tool with the same user-only refusals. Install with `pi install /path/to/rematch/adapters/pi`.
+- OpenCode registers `/rematch-status`, `-digest`, `-inspect`, `-why`, `-library`, `-approve`, `-decline`, `-off`, `-on` and `-mark`. The model-facing tool is read-only. Configure the plugin's checkout path; do not overwrite the rest of `opencode.json`.
 
 ## Pi and OpenCode limits
 

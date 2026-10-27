@@ -7,7 +7,7 @@ tableOfContents: false
 pagefind: false
 hero:
   title: Stop teaching your coding agent the same lesson every session.
-  tagline: rematch improves the agent's harness from the sessions you were going to run anyway, and keeps only what later sessions confirm. No reruns in interactive use; at most three model calls per reflection.
+  tagline: rematch improves the agent's harness from the sessions you were going to run anyway, and keeps what real use or an authorized probe confirms. Interactive reflection uses at most three editor/classifier calls.
   actions:
     - text: Start in 5 minutes
       link: /rematch/start/install/
@@ -67,7 +67,7 @@ The live adapters trace while you work; Codex uses post-hoc import. Reflection u
 
 <Diagram
 	name="loop"
-	alt="The rematch loop. In the session: trace, flag, load, guard. Between sessions: classify, triage, propose, lint, stage, count and decide. An evidence boundary separates them: no proposal without a trace. You see a digest, approve or decline, mark, or turn it off."
+	alt="The rematch loop. In the session: trace, flag, load scoped skill and agent views, guard with approved hooks. In a detached background worker: classify and triage, propose, lint and budget, start a scoped trial or a review action, observe actual use or run an authorized probe, then decide. An evidence boundary separates them: no proposal without a trace. You review waiting actions, mark, or turn it off."
 />
 
 <CardGrid>
@@ -82,8 +82,8 @@ The live adapters trace while you work; Codex uses post-hoc import. Reflection u
 <ul class="rm-never">
 	<li>Run a script or install a hook. Scripts are staged non-executable; hooks are compiled only after you approve them.</li>
 	<li>Change anything beyond your machine. Team and fork changes are branches and PRs; nothing is merged for you.</li>
-	<li>Write a repo's <code>AGENTS.md</code> on your machine.</li>
-	<li>Call a change verified. A change that survives four matched sessions is <code>kept</code>, and its counts are shown raw.</li>
+	<li>Write a repo's <code>AGENTS.md</code> on your machine, or write your personal <code>~/.omp/agent/AGENTS.md</code> without your hash-bound approval.</li>
+	<li>Call a change verified. An entry is <code>kept</code> only after four clean sessions of actual use or an authorized comparative probe, and its counts are shown raw.</li>
 	<li>Keep running after <code>rematch off</code> or <code>REMATCH=0</code>.</li>
 </ul>
 

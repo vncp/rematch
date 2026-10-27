@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::features::porter_stem;
 use crate::paths::RematchPaths;
-use crate::predicate::{matches_subpath, normalize_ext};
+use crate::predicate::{matches_repo_glob, matches_subpath, normalize_ext, Place};
 use crate::types::SessionRecord;
 
 /// `REMATCH_ROOT/policy.json` (also read by `scope::export` and `import --history`).
@@ -67,6 +67,113 @@ struct PolicyPart {
     domains: Vec<DomainDecl>,
     #[serde(default)]
     caps: PolicyCaps,
+    #[serde(default)]
+    scopes: Scopes,
+}
+
+/// One `policy.json` `scopes` item (`rematch policy scope set`): the only place where a skill
+/// of that name is exposed. A git place is named by its normalized remote
+/// (`identity::normalize_remote`, so every clone and worktree of the repo matches) and a glob
+/// over the toplevel-relative cwd; a non-git place by a literal path glob. A scoped name never
+/// enters a location every session loads (`REMATCH_ROOT/skills`, `<agent_dir>/skills`); it
+/// reaches a session only through the view (or repo trials) of a matching place, whichever
+/// source holds it (provisional entry, kept/pinned entry, profile source).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceScope {
+    /// Normalized remote (exact, no glob).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// Glob over the toplevel-relative cwd (`**`: the whole repo); only with `remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
+    /// Literal path glob of a non-git place (matches it and every directory below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_glob: Option<String>,
+}
+
+/// `policy.json` `scopes`, by skill name.
+pub type Scopes = BTreeMap<String, PlaceScope>;
+
+impl PlaceScope {
+    /// The place lies in the scope: the same remote and the subpath glob matches, or (no
+    /// remote) the path glob matches the place's repo or cwd. A scope naming neither, or a
+    /// remote scope at a place without a remote, matches nothing (fail closed).
+    pub fn matches(&self, place: &Place) -> bool {
+        match (self.remote.as_deref(), self.repo_glob.as_deref()) {
+            (Some(want), _) => {
+                place.remote.as_deref() == Some(want) && matches_subpath(self.subpath.as_deref(), place.subpath.as_deref().unwrap_or(""))
+            }
+            (None, Some(glob)) => !glob.trim().is_empty() && matches_repo_glob(glob, &place.path),
+            (None, None) => false,
+        }
+    }
+
+    /// Whether a session where `p` loads may lie in the scope (always-on byte accounting): the
+    /// remotes are equal when both are known, else assume it may (an over-count, never an
+    /// under-count).
+    pub fn may_share(&self, p: &crate::types::Predicate) -> bool {
+        match (self.remote.as_deref(), p.repo_remote.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+
+    /// `remote github.com/acme/web subpath **` / `path /w/notes`.
+    pub fn label(&self) -> String {
+        match (self.remote.as_deref(), self.repo_glob.as_deref()) {
+            (Some(r), _) => format!("remote {r} subpath {}", self.subpath.as_deref().unwrap_or(crate::predicate::ANY_REPO)),
+            (None, Some(g)) => format!("path {g}"),
+            (None, None) => "nowhere (empty scope)".to_string(),
+        }
+    }
+
+    /// A scope `policy scope set` may write: a remote (no glob characters) with a valid subpath
+    /// glob, or a path glob that is not empty or `**` (that would be every place).
+    pub fn check(&self) -> Result<()> {
+        match (self.remote.as_deref(), self.repo_glob.as_deref()) {
+            (Some(r), None) => {
+                if r.trim().is_empty() || r.contains(['*', '?', '[']) {
+                    anyhow::bail!("a scope names one remote, not a glob: {r:?}");
+                }
+                if let Some(s) = self.subpath.as_deref() {
+                    Pattern::new(s).with_context(|| format!("bad subpath glob {s:?}"))?;
+                }
+                Ok(())
+            }
+            (None, Some(g)) => {
+                let g = g.trim();
+                if g.is_empty() || g == crate::predicate::ANY_REPO {
+                    anyhow::bail!("a scope path glob must name a place, not every place: {g:?}");
+                }
+                if self.subpath.is_some() {
+                    anyhow::bail!("a subpath needs a git repo (a remote) to be relative to");
+                }
+                Pattern::new(g).with_context(|| format!("bad path glob {g:?}"))?;
+                Ok(())
+            }
+            _ => anyhow::bail!("a scope names exactly one of a remote or a path glob"),
+        }
+    }
+}
+
+/// A skill named `name` may be exposed at `place`: it has no scope, or its scope matches.
+pub fn scope_allows(scopes: &Scopes, name: &str, place: &Place) -> bool {
+    scopes.get(name).is_none_or(|s| s.matches(place))
+}
+
+fn read_policy_part(paths: &RematchPaths) -> Result<PolicyPart> {
+    let p = paths.root.join(POLICY_FILE);
+    match std::fs::read_to_string(&p) {
+        Ok(t) => serde_json::from_str(&t).with_context(|| format!("parse {}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PolicyPart::default()),
+        Err(e) => Err(e).with_context(|| p.display().to_string()),
+    }
+}
+
+/// `policy.json` `scopes` alone (file read only; empty without the file). An unparseable file
+/// is an error, never "no scopes": exposure must not widen because the policy did not parse.
+pub fn load_scopes(paths: &RematchPaths) -> Result<Scopes> {
+    Ok(read_policy_part(paths)?.scopes)
 }
 
 /// `[[ext]]` row: any of `exts` scores for `domain`'s top level.
@@ -136,6 +243,8 @@ pub struct DomainPolicy {
     pub branch_domains: BTreeMap<String, String>,
     pub rules: DomainRules,
     pub caps: PolicyCaps,
+    /// `policy.json` `scopes` ([`PlaceScope`]), by skill name.
+    pub scopes: Scopes,
 }
 
 impl DomainPolicy {
@@ -143,11 +252,7 @@ impl DomainPolicy {
     /// (file reads only). Missing files are empty (the shipped table for the rules).
     pub fn load(paths: &RematchPaths) -> Result<DomainPolicy> {
         let p = paths.root.join(POLICY_FILE);
-        let part: PolicyPart = match std::fs::read_to_string(&p) {
-            Ok(t) => serde_json::from_str(&t).with_context(|| format!("parse {}", p.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PolicyPart::default(),
-            Err(e) => return Err(e).with_context(|| p.display().to_string()),
-        };
+        let part = read_policy_part(paths)?;
         let mut declared = Vec::with_capacity(part.domains.len());
         for d in part.domains {
             let domain = normalize_domain(&d.domain).with_context(|| format!("{}: bad domain {:?}", p.display(), d.domain))?;
@@ -158,6 +263,7 @@ impl DomainPolicy {
             branch_domains: branch_domains(&paths.branches)?,
             rules: DomainRules::load(&paths.improver.join(DOMAIN_RULES_FILE))?,
             caps: part.caps,
+            scopes: part.scopes,
         })
     }
 
@@ -489,5 +595,34 @@ mod tests {
         assert_eq!(p.declared[0].domain, "web");
         assert_eq!(p.kept_per_domain(), 3);
         assert_eq!(p.branch_domains.into_iter().collect::<Vec<_>>(), vec![("opts".to_string(), "quant.options".to_string())]);
+    }
+
+    #[test]
+    fn place_scopes_match_by_remote_and_subpath_or_path_and_fail_closed() {
+        let web = PlaceScope { remote: Some("github.com/acme/web".into()), subpath: Some("ui/**".into()), repo_glob: None };
+        let at = |path: &str, remote: Option<&str>, sub: &str| Place { path: path.into(), remote: remote.map(str::to_string), subpath: Some(sub.into()), domain: None };
+        assert!(web.matches(&at("/elsewhere/clone", Some("github.com/acme/web"), "ui/forms")), "any clone or worktree of the remote");
+        assert!(!web.matches(&at("/w/web", Some("github.com/acme/web"), "api")));
+        assert!(!web.matches(&at("/w/web", None, "ui")), "no remote at the place: no match");
+        let notes = PlaceScope { repo_glob: Some("/w/notes".into()), ..Default::default() };
+        assert!(notes.matches(&Place::path("/w/notes/a")) && !notes.matches(&Place::path("/w/other")));
+        assert!(!PlaceScope::default().matches(&Place::path("/w/notes")), "an empty scope matches nothing");
+        let scopes: Scopes = [("s".to_string(), notes.clone())].into();
+        assert!(scope_allows(&scopes, "unscoped", &Place::path("/x")) && !scope_allows(&scopes, "s", &Place::path("/x")));
+        assert!(web.check().is_ok() && notes.check().is_ok());
+        assert!(PlaceScope { repo_glob: Some("**".into()), ..Default::default() }.check().is_err(), "every place is not a scope");
+        assert!(PlaceScope { remote: Some("github.com/acme/*".into()), ..Default::default() }.check().is_err());
+        assert!(PlaceScope { subpath: Some("x".into()), ..notes.clone() }.check().is_err());
+        assert!(PlaceScope::default().check().is_err());
+
+        let t = tempfile::tempdir().unwrap();
+        let paths = RematchPaths::with_roots(t.path().join("r"), t.path().join("a"));
+        paths.ensure_dirs().unwrap();
+        assert!(load_scopes(&paths).unwrap().is_empty());
+        std::fs::write(paths.root.join(POLICY_FILE), r#"{"scopes":{"s":{"repo_glob":"/w/notes"}}}"#).unwrap();
+        assert_eq!(load_scopes(&paths).unwrap(), scopes);
+        assert_eq!(DomainPolicy::load(&paths).unwrap().scopes, scopes);
+        std::fs::write(paths.root.join(POLICY_FILE), "{not json").unwrap();
+        assert!(load_scopes(&paths).is_err(), "an unparseable policy never reads as no scopes");
     }
 }

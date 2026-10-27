@@ -9,7 +9,7 @@ rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust bina
 
 <Diagram
 	name="architecture"
-	alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and has the binary sync the shared skills directory before discovery. The Rust binary owns rematch-core, reflect and count, create and improve, batch and scope, and calls omp -p non-interactively for the editor, the classifier and batch rollouts. State lives under ~/.rematch; kept entries are copied into ~/.omp/agent/skills."
+	alt="Architecture. omp (stock or a fork) emits events to the extension, which writes traces and discovers scoped skill and agent views the binary syncs. The Rust binary owns the ledger, library, lint, adoption actions and bounded probes, and calls omp for editor and solver work. Personal AGENTS.md changes need your approval and keep your text. State lives under ~/.rematch; sharing to a team or fork is optional."
 />
 
 ## Units
@@ -17,7 +17,7 @@ rematch is an omp plugin: a TypeScript extension that omp loads, and a Rust bina
 | Unit | Holds | Rule |
 |---|---|---|
 | `extension/` | `index.ts`: trace writer, pre-labels, the skill-path override, the hook runtime (`block` and `stuck` on `tool_call`, `truncate` and `retrieve` on `context`), the `rematch` tool and `/rematch` command, the digest; `agents/` → `~/.rematch/agents/` | forwards raw events; no model calls; every handler fails open except `block`/`stuck` hooks |
-| `adapters/` | `claude-code/`: a plugin (hooks → `scripts/hook.sh`, eight `/rematch:rematch-*` commands); `codex/`: the `$rematch-status` skill and setup notes | forward hook payloads unchanged to the binary; never fail a hook except by an intentional block; no model call inside the session |
+| `adapters/` | `claude-code/`: a plugin (hooks → `scripts/hook.sh`, nine `/rematch:rematch-*` commands); `pi/` and `opencode/`: native host extensions; `codex/`: the `$rematch-status` skill and setup notes | forward events to the binary; never fail a hook except by an intentional block; no model call inside the session |
 | `crates/rematch-core` | trace model and parsers, redirect heuristics, predicates, lint, library and counters, SQLite ledger with content-addressed blobs, mechanical split, simhash dedup, `EXPERIENCE.md`, rate limits, outcome records | pure functions over paths; no process spawning, no network |
 | `crates/rematch` | the CLI: bounded processes, omp argv builders with per-event provider/model verification, detached jobs, reflect/count, create/improve, import, digest, `skills sync`, doctor, uninstall, `retrieve`, built-ins, `batch/`, `scope/` | one JSON envelope per invocation; never holds credentials |
 | `crates/rematch-lake` (cargo feature `lake`, default on) | per-table Arrow schemas, journal and trace writers, `export`/`import`/`rebuild`/`doctor`, `index`/`query` over an external Bellwether binary | read only by historical commands; `--no-default-features` drops it and arrow with it |
@@ -33,11 +33,12 @@ Plain TypeScript; omp loads `index.ts` with no build step (`package.json#omp.ext
 
 | Part | What it does |
 |---|---|
-| Factory | resolves the binary (`$REMATCH_BIN` → `../target/release/rematch` → `../target/debug/rematch` → `PATH`); runs `match` and `skills sync` in parallel (5 s each); adds the shared skills dir to `skills.customDirectories`; imports the hook modules `match` returns. A failure is logged and the session continues without that part. |
+| Factory | resolves the binary (`$REMATCH_BIN` → `../target/release/rematch` → `../target/debug/rematch` → `PATH`); runs `match` and `skills sync` in parallel (5 s each); puts this place's view (`~/.rematch/views/<key>/skills`) in `skills.customDirectories` and hides other places' provisional agents through `task.disabledAgents`; imports the hook modules `match` returns. A failure is logged and the session continues without that part. |
 | Trace | main sessions only append to `<root>/traces/<session_id>.jsonl`; a flagged session gets `<root>/pending/<session_id>.json` at shutdown; `session_switch`/`session_branch` rotate the trace |
-| Session start | spawns `rematch reflect --pending` detached, then shows the digest (≤ 5 lines, then `+N more`) and one confirm per approval; `alt+e` shows the digest on demand |
+| Session start | spawns `rematch reflect --pending` detached, then shows the digest's news as toasts (≤ 5 lines, then `+N more`) and a footer status `rematch: N waiting · /rematch review`; `/rematch review` or `alt+e` opens one dialog per waiting action |
 | Hooks | modules are data (`{id, mode, tool, field, regex, message, pass_condition, params}`); `block` and `stuck` fail closed, `truncate` and `retrieve` fail open. Approving, `activate`, `disable` and `rollback` swap the live hook sets at once. |
-| Entry points | the tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`; approving entries and uninstalling are reserved to you |
+| Entry points | the tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`; every user-only control (approve, decline, pin, unpin, disable, rollback, export approval, mark, on, off, uninstall, `policy scope set\|unset`) is refused to the tool and to the model's shell |
+| Personal instructions | none at runtime: omp reads the approved blocks from `<agent_dir>/AGENTS.md`, which the binary writes |
 | Kill switch | `REMATCH=0` (only the tool and `/rematch` register) or `<root>/off` (handlers stay registered but inert, so `/rematch on` resumes tracing at once; skills apply from the next omp start) |
 
 ## Deviations from the spec

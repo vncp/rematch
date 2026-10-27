@@ -3,22 +3,27 @@
 //!
 //! Locations by status:
 //! - draft → `drafts/<name>/` (never loaded)
-//! - provisional → `staging/<branch>/<name>/` (loaded through the shared skills dir once a
-//!   synced cwd matched it)
+//! - provisional → `staging/<branch>/<name>/` (loaded through the view of each place whose
+//!   sessions its predicate matches, [`sync_view`]; never through the shared dir)
 //! - kept → `<agent_dir>/skills/<name>/` (loaded natively by omp; other harnesses through the
 //!   shared skills dir); with a profile (DESIGN §20) `profile/skills/<name>/` instead, linked
 //!   from `<agent_dir>/skills/<name>`; a replaced kept dir is saved to
 //!   `predecessors/<name>/<version>/` (version 0 = a skill the plugin did not write)
 //! - retired | dormant | stale → `archive/<status>/<id>/` (never loaded, never deleted)
-//! - every loadable skill entry is linked as `skills/<name> → <entry dir>` by
+//! - every kept/pinned skill entry is linked as `skills/<name> → <entry dir>` by
 //!   [`sync_shared_skills`], which every status change, stage and rollback runs (DESIGN §16
-//!   "Shared skills")
+//!   "Shared skills"); a place's view `views/<key>/skills/` adds that place's provisional
+//!   entries ([`sync_view`]), so a session never lists another repo's trial
+//! - a skill name with a place scope (`policy.json` `scopes`, `domain::PlaceScope`) is never
+//!   linked where every session looks (the shared dir, `<agent_dir>/skills`): only a matching
+//!   place's view and repo trials link it, whatever holds it (provisional, kept, profile source)
 //! - agents (kind `agent`: `AGENT.md` + `rematch.json`) take the same locations except
 //!   kept, which is `kept-agents/<name>/` with `AGENT.md` copied to
 //!   `<agent_dir>/agents/<name>.md` (with a profile: copied to `profile/agents/<name>.md`
 //!   and linked from there); a provisional agent, once approved ([`agent_approved`]), is
 //!   also linked as `agents/<name>.md → <entry dir>/AGENT.md`, which omp discovers through
-//!   the plugin's `extension/agents → <root>/agents` symlink. Agent predecessors live in
+//!   the plugin's `extension/agents → <root>/agents` symlink; a session outside the agent's
+//!   places withholds it ([`agent_exposure`]) and `off` removes every link. Agent predecessors live in
 //!   `predecessors/.agents/<name>/<version>/` (entry names never start with `.`).
 //!
 //! `pinned` is a flag (human-owned): automatic transitions refuse pinned entries; the
@@ -36,6 +41,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::{scope_allows, Scopes};
 use crate::ledger::{now_ms, EntryFilter, Ledger};
 use crate::package::{RematchBlock, SkillDoc};
 use crate::paths::RematchPaths;
@@ -48,9 +54,10 @@ pub const REMATCH_JSON: &str = "rematch.json";
 pub const HOOKS_README: &str = "README.md";
 pub const SKILL_MD: &str = "SKILL.md";
 pub const AGENT_MD: &str = "AGENT.md";
-/// Text an entry contributes to `<repo>/AGENTS.md` through `ship --scope team` and, once
-/// approved ([`fragment_approved`]), to the system prompt of main sessions where the entry
-/// matches ([`prompt_fragments`]); the user's own AGENTS.md is never written.
+/// Text an entry contributes, after an exact-hash approval, to the user's personal
+/// `<agent_dir>/AGENTS.md` (`instructions`, omp) and to the system prompt of matched main
+/// sessions in harnesses without that file ([`prompt_fragments`]), or to `<repo>/AGENTS.md`
+/// only through an explicit `ship --scope team`.
 pub const AGENTS_FRAGMENT: &str = "AGENTS.fragment.md";
 /// `Origin::Import { source }` of the entries the binary ships (`rematch builtins`).
 pub const BUILTIN_SOURCE: &str = "builtin";
@@ -180,9 +187,10 @@ pub fn is_kept_slot(paths: &RematchPaths, e: &Entry, path: &Path) -> bool {
 }
 
 /// With the kept dir in the profile: `<agent_dir>/skills/<name>` → it (a real dir there is
-/// left alone; `promote_into` has saved it as a predecessor).
+/// left alone; `promote_into` has saved it as a predecessor). A name with a place scope
+/// (`policy.json` `scopes`) is not linked: omp loads that dir in every session.
 fn link_native_skill(paths: &RematchPaths, e: &Entry) -> Result<()> {
-    if e.kind == Kind::Agent || !e.path.starts_with(crate::profile::dir(paths)) {
+    if e.kind == Kind::Agent || !e.path.starts_with(crate::profile::dir(paths)) || crate::domain::load_scopes(paths)?.contains_key(&e.name) {
         return Ok(());
     }
     let link = native_skill(paths, &e.name);
@@ -361,7 +369,7 @@ pub fn adopt_kept(ledger: &Ledger, paths: &RematchPaths, e: &Entry) -> Result<Op
     n.updated_at = now_ms();
     persist(ledger, &n)?;
     link_native_skill(paths, &n)?;
-    sync_shared_skills(ledger, paths, None)?;
+    sync_shared_skills(ledger, paths)?;
     Ok(Some(n))
 }
 
@@ -601,7 +609,9 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
         doc.set("name", e.name.as_str());
     }
     if doc.get_str("description").is_none_or(|d| d.trim().is_empty()) {
-        doc.set("description", e.trigger_line.as_str());
+        // A description rematch writes is catalog text: one plain bounded line.
+        let limit = crate::lint::LintConfig::default().limits.description_bytes;
+        doc.set("description", crate::package::catalog_line(&e.trigger_line, limit));
     }
     std::fs::write(&primary, doc.render())?;
     if e.kind == Kind::Hook {
@@ -624,7 +634,7 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
             unlink_unapproved_agent(paths, &e)?;
         }
     }
-    sync_shared_skills(ledger, paths, None)?;
+    sync_shared_skills(ledger, paths)?;
     Ok(e)
 }
 
@@ -707,7 +717,7 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     } else if matches!(to, Status::Kept | Status::Pinned) {
         link_native_skill(paths, &e)?;
     }
-    sync_shared_skills(ledger, paths, None)?;
+    sync_shared_skills(ledger, paths)?;
     Ok(e)
 }
 
@@ -842,7 +852,7 @@ pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rol
         }
         None => None,
     };
-    sync_shared_skills(ledger, paths, None)?;
+    sync_shared_skills(ledger, paths)?;
     Ok(Rollback { retired, restored, restored_version: version })
 }
 
@@ -1018,11 +1028,18 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) 
                 bail!("entry {} is not an agent", e.id);
             }
             let sha = agent_sha(&e.path).ok_or_else(|| anyhow!("entry {} has no {AGENT_MD}", e.id))?;
+            // Approval makes its task-tool line always on where it matches: the budget again,
+            // against what is exposed now (other approvals may have filled it since staging).
+            let cost = crate::lint::entry_cost(&e.path, Kind::Agent).catalog;
+            check_always_on(ledger, paths, &e, cost, "agent's task-tool line")?;
             hashed.push((AGENT_MD.to_string(), sha.clone()));
             e.approved_agent = Some(sha);
         }
         Approval::Prompt => {
             let sha = fragment_sha(&e.path).ok_or_else(|| anyhow!("entry {} has no {AGENTS_FRAGMENT}", e.id))?;
+            let c = crate::lint::entry_cost(&e.path, e.kind);
+            let cost = c.catalog + c.fragment;
+            check_always_on(ledger, paths, &e, cost, "AGENTS.fragment.md")?;
             hashed.push((AGENTS_FRAGMENT.to_string(), sha.clone()));
             e.approved_fragment = Some(sha);
         }
@@ -1148,6 +1165,10 @@ pub struct MatchResult {
     /// only then (DESIGN §20).
     #[serde(default)]
     pub profile_present: bool,
+    /// The personal `<agent_dir>/AGENTS.md` sections omp loads now (`instructions::exposure`;
+    /// empty while off). Only omp reads that file.
+    #[serde(default)]
+    pub instructions: crate::instructions::Exposure,
 }
 
 /// A hook entry is active only while its approved module exists: before approval
@@ -1157,22 +1178,29 @@ pub fn hook_active(paths: &RematchPaths, e: &Entry) -> bool {
 }
 
 /// A provisional, non-agent, active entry whose predicate place matches `place`
-/// ([`matches_place`]: remote + subpath, else the repo glob): what a load-time match contributes.
-fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &Place) -> bool {
-    e.status == Status::Provisional && e.kind != Kind::Agent && hook_active(paths, e) && matches_place(&e.predicate, place)
+/// ([`matches_place`]: remote + subpath, else the repo glob) and whose name's place scope, if
+/// any, matches it too (`domain::scope_allows`): what a load-time match contributes.
+fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &Place, scopes: &Scopes) -> bool {
+    e.status == Status::Provisional
+        && e.kind != Kind::Agent
+        && hook_active(paths, e)
+        && matches_place(&e.predicate, place)
+        && scope_allows(scopes, &e.name, place)
 }
 
-/// Load-time match (DESIGN §6): a branch's staging dir is contributed when ≥ 1 of its
-/// provisional non-agent, active ([`hook_active`]) entries' predicates match the place
+/// Load-time match (DESIGN §6): what a session at the place sees. `entries` lists every
+/// provisional non-agent, active ([`hook_active`]) entry whose predicate matches the place
 /// ([`Place::locate`]: the repo's remote and the cwd's subpath, else the repo (else cwd)
-/// against the glob; its declared domain gates entries that carry one). `entries` lists what
-/// will load — provisional entries of contributed branches, every approved provisional agent
-/// ([`agent_approved`]; omp discovers them through the plugin root in every session) and
-/// every kept/pinned entry — with their glob hit (false for an unapproved hook, which must
-/// not count). `hooks` lists approved hook modules of
-/// loadable, matching entries. `skill_dirs` stays in the payload for compatibility;
-/// harnesses load skills from the shared dir ([`sync_shared_skills`]). `domain` is the
-/// place's declared domain (`domain::place_domain`).
+/// against the glob; its declared domain gates entries that carry one) — the place's view,
+/// [`sync_view`] — plus human-pinned provisional entries (in the shared dir), every approved
+/// provisional agent ([`agent_approved`]) that matches (others are withheld, [`agent_exposure`])
+/// and every kept/pinned entry with its glob hit (false for an unapproved hook, which must
+/// not count). A skill-like entry whose name has a place scope (`policy.json` `scopes`) is
+/// listed only where the scope matches: elsewhere nothing exposes it. `hooks` lists approved
+/// hook modules of loadable, matching entries. `skill_dirs`
+/// (staging dirs of the branches with a hit) stays in the payload for compatibility;
+/// harnesses load skills from the view. `domain` is the place's declared domain
+/// (`domain::place_domain`); `instructions` the personal AGENTS.md exposure.
 pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>, cwd: &Path) -> Result<MatchResult> {
     let mut out = MatchResult {
         branch: branch_for(repo, cwd),
@@ -1187,11 +1215,12 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
     let mut place = Place::locate(repo, cwd);
     place.domain = crate::domain::place_domain(paths, &place, &out.branch);
     out.domain = place.domain.clone();
+    let scopes = crate::domain::load_scopes(paths)?;
     let provisional =
         ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
     let mut branches: Vec<&str> = provisional
         .iter()
-        .filter(|e| provisional_hit(paths, e, &place))
+        .filter(|e| provisional_hit(paths, e, &place, &scopes))
         .map(|e| e.branch.as_str())
         .collect();
     branches.sort();
@@ -1207,10 +1236,17 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
         .collect::<Result<Vec<_>>>()?
         .concat();
-    let loaded = provisional
-        .iter()
-        .filter(|e| if e.kind == Kind::Agent { agent_approved(e) } else { branches.contains(&e.branch.as_str()) });
-    for e in loaded.chain(kept.iter()) {
+    // A native user/project agent of the same name is what omp loads: the candidate is not.
+    let native_agents = native_agent_names(paths, cwd);
+    let loaded = provisional.iter().filter(|e| {
+        if e.kind == Kind::Agent {
+            agent_approved(e) && matches_place(&e.predicate, &place) && scope_allows(&scopes, &e.name, &place) && !native_agents.contains(&e.name)
+        } else {
+            provisional_hit(paths, e, &place, &scopes) || (e.pinned && shareable(paths, e) && scope_allows(&scopes, &e.name, &place))
+        }
+    });
+    let kept = kept.iter().filter(|e| e.kind == Kind::Agent || scope_allows(&scopes, &e.name, &place));
+    for e in loaded.chain(kept) {
         let hit = matches_place(&e.predicate, &place) && hook_active(paths, e);
         out.entries.push(MatchedEntry {
             id: e.id.clone(),
@@ -1225,6 +1261,7 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
             out.hooks.push(paths.hooks_dir().join(format!("{}.ts", e.id)));
         }
     }
+    out.instructions = crate::instructions::exposure(ledger, paths)?;
     Ok(out)
 }
 
@@ -1236,13 +1273,18 @@ pub struct PromptFragment {
     pub name: String,
     /// The fragment, trimmed.
     pub text: String,
+    /// The approved sha256 of `AGENTS.fragment.md` (`approved_fragment`): what a host records
+    /// when it actually sends the text (`fragments_sent`).
+    #[serde(default)]
+    pub sha: Sha256Hex,
 }
 
 /// The personal system-prompt text of a match: the approved ([`fragment_approved`])
 /// `AGENTS.fragment.md` of every listed entry with a predicate hit that is provisional, kept
 /// or pinned, by name. Their total text stays within the lint always-on budget
 /// (`limits.always_on_bytes` of `improver/lint.toml`, else the built-in 8192 B); a fragment
-/// that would exceed it is dropped.
+/// that would exceed it is dropped. An approved fragment whose file fails to read is skipped
+/// (fail open) and stays visible as [`unreadable_fragments`].
 pub fn prompt_fragments(ledger: &Ledger, paths: &RematchPaths, entries: &[MatchedEntry]) -> Result<Vec<PromptFragment>> {
     let mut out = Vec::new();
     for me in entries {
@@ -1250,13 +1292,21 @@ pub fn prompt_fragments(ledger: &Ledger, paths: &RematchPaths, entries: &[Matche
             continue;
         }
         let Some(e) = ledger.get_entry(&me.id)? else { continue };
-        let Ok(bytes) = std::fs::read(e.path.join(AGENTS_FRAGMENT)) else { continue };
+        let bytes = match std::fs::read(e.path.join(AGENTS_FRAGMENT)) {
+            Ok(b) => b,
+            Err(err) => {
+                if e.approved_fragment.is_some() {
+                    eprintln!("rematch: approved personal instructions {} not sent: {err}", e.name);
+                }
+                continue;
+            }
+        };
         if e.approved_fragment.as_deref() != Some(sha256_hex(&bytes).as_str()) {
             continue;
         }
         let text = String::from_utf8_lossy(&bytes).trim().to_string();
         if !text.is_empty() {
-            out.push(PromptFragment { id: e.id, name: e.name, text });
+            out.push(PromptFragment { id: e.id, name: e.name, text, sha: sha256_hex(&bytes) });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -1272,6 +1322,36 @@ pub fn prompt_fragments(ledger: &Ledger, paths: &RematchPaths, entries: &[Matche
     Ok(out)
 }
 
+/// An approved `AGENTS.fragment.md` the runtime hosts (Claude Code, Pi, OpenCode) are not given
+/// because its file fails to read ([`prompt_fragments`] skips it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadableFragment {
+    pub id: EntryId,
+    pub name: String,
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Every live (provisional, kept, pinned; not a lesson) entry with an approved fragment whose
+/// `AGENTS.fragment.md` fails to read: approved text no runtime host receives, until the file
+/// reads again or the approval is withdrawn.
+pub fn unreadable_fragments(ledger: &Ledger) -> Result<Vec<UnreadableFragment>> {
+    let mut out = Vec::new();
+    for status in [Status::Provisional, Status::Kept, Status::Pinned] {
+        for e in ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })? {
+            if e.kind == Kind::Lesson || e.approved_fragment.is_none() {
+                continue;
+            }
+            let path = e.path.join(AGENTS_FRAGMENT);
+            if let Err(err) = std::fs::read(&path) {
+                out.push(UnreadableFragment { id: e.id, name: e.name, error: format!("cannot read {}: {err}", path.display()), path });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    Ok(out)
+}
+
 /// Fragments as system-prompt text, identical in every harness: `## rematch: <name>`, a blank
 /// line and the text per fragment (the heading `ship --scope team` gives the AGENTS.md
 /// section), joined by a blank line.
@@ -1279,7 +1359,8 @@ pub fn render_fragments(fragments: &[PromptFragment]) -> String {
     fragments.iter().map(|f| format!("## rematch: {}\n\n{}", f.name, f.text.trim())).collect::<Vec<_>>().join("\n\n")
 }
 
-/// What [`sync_shared_skills`] did to `REMATCH_ROOT/skills/` (DESIGN §16 "Shared skills").
+/// What [`sync_shared_skills`] did to `REMATCH_ROOT/skills/` (DESIGN §16 "Shared skills"), or
+/// [`sync_view`] to one place's view `REMATCH_ROOT/views/<key>/skills/`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SkillsSync {
     /// Names this sync linked or re-pointed.
@@ -1288,7 +1369,8 @@ pub struct SkillsSync {
     pub pruned: Vec<String>,
     /// Links in the directory after the sync.
     pub total: usize,
-    /// Skill directories a harness loads: the shared dir (none while rematch is off).
+    /// Skill directories a harness session loads: the view (or the shared dir); none while
+    /// rematch is off.
     pub dirs: Vec<PathBuf>,
     /// `name → entry dir` of every link after the sync.
     pub links: BTreeMap<String, PathBuf>,
@@ -1299,6 +1381,23 @@ pub struct SkillsSync {
     #[serde(default)]
     pub visible: Vec<EntryId>,
     pub off: bool,
+    /// The view key ([`view_key`]); `None` for the shared dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+    /// Provisional entries this view links that the shared dir does not: what sessions of
+    /// this place see and sessions elsewhere do not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provisional: Vec<EntryId>,
+    /// Names of kept/pinned entries and profile kept sources with a place scope that this view
+    /// links because the scope matches its place (`policy.json` `scopes`): like `provisional`,
+    /// what sessions here see and sessions elsewhere (and the shared dir) do not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped: Vec<String>,
+    /// Provisional agents of a view's session ([`agent_exposure`]): exposed, withheld (omp
+    /// disables those names for the process, `task.disabledAgents`), shadowed by a native
+    /// definition. Empty for the shared dir and while off.
+    #[serde(default)]
+    pub agents: AgentExposure,
 }
 
 impl SkillsSync {
@@ -1377,35 +1476,107 @@ pub fn relink(target: &Path, link: &Path) -> Result<()> {
     })
 }
 
-/// Make `REMATCH_ROOT/skills/` hold one symlink `<name> → <entry dir>` per loadable entry
-/// ([`shareable`]): every kept/pinned entry, and every provisional entry whose predicate
-/// matched a `place` (repo, else cwd) synced so far — union semantics: a provisional link is
-/// never removed because this `place` does not match (another session elsewhere may load it),
-/// only when its entry stops being provisional/kept/pinned (retired, dormant, stale, draft,
-/// deleted, moved). With `place` = `None` (status changes) nothing provisional is added.
-/// One name has one link: a provisional entry matched by this sync takes it; a provisional
-/// candidate already linked shadows the kept entry of its name until it is kept or retired.
-/// The profile's kept sources (`profile::kept_sources`: every `profile/skills/<name>/`, kept on
-/// this machine or another, or adopted) fill names nothing else holds. Only symlinks are
-/// touched; hidden names (another sync's temporary links) are skipped. While rematch is off
-/// every link is removed and `dirs` is empty.
-pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&Place>) -> Result<SkillsSync> {
-    let dir = &paths.skills_shared;
+/// Root of the per-place catalog views: `REMATCH_ROOT/views/`.
+pub fn views_dir(paths: &RematchPaths) -> PathBuf {
+    paths.root.join("views")
+}
+
+/// The view of a place: `<branch>-<16 hex of sha256(path, remote, subpath, domain)>`. Sessions
+/// of the same place share it (their links are the same function of the ledger); sessions of
+/// different places never write each other's.
+pub fn view_key(place: &Place, branch: &str) -> String {
+    let id = format!(
+        "{}\0{}\0{}\0{}",
+        place.path,
+        place.remote.as_deref().unwrap_or(""),
+        place.subpath.as_deref().unwrap_or(""),
+        place.domain.as_deref().unwrap_or("")
+    );
+    format!("{branch}-{}", &sha256_hex(id.as_bytes())[..16])
+}
+
+/// Skills directory of view `key`.
+pub fn view_skills(paths: &RematchPaths, key: &str) -> PathBuf {
+    views_dir(paths).join(key).join("skills")
+}
+
+/// `views/<key>/<this>/`: only what the place alone gets ([`sync_trials`]), for a host that
+/// mounts the kept library elsewhere and reaches trials through a repo-local root.
+pub const TRIALS: &str = "trials";
+
+/// What [`sync_trials`] linked for a repo's top.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Trials {
+    /// `views/<key>/trials/`.
+    pub dir: PathBuf,
+    /// Names linked: the provisional entries that match the top, and the kept/pinned entries
+    /// and profile kept sources whose place scope matches it.
+    pub linked: Vec<String>,
+    /// Names that would match below the top only (a predicate or scope `subpath`): left out,
+    /// a repo root cannot express a subpath.
+    pub subpath_only: Vec<String>,
+}
+
+/// A subpath glob narrower than the whole repo.
+fn narrow(subpath: Option<&str>) -> bool {
+    subpath.is_some_and(|s| !s.trim().is_empty() && s.trim() != crate::predicate::ANY_REPO)
+}
+
+/// What a repo's top (`Place::locate(repo, repo)`, its declared domain) alone gets, linked under
+/// `views/<key>/trials/`: the provisional entries that match it, plus the kept/pinned entries
+/// and profile sources whose place scope (`policy.json` `scopes`) matches it — the scoped kept
+/// library the host's global mount no longer carries. What a host with repo-level discovery
+/// (Codex's `<repo>/.agents/skills`) loads in that repo. Keyed by the repo's top, so sessions
+/// in any subdir of one repo write the same links; an entry or scope narrowed to a subpath is
+/// not a top-level hit and stays out ([`Trials::subpath_only`]). Empty while off.
+pub fn sync_trials(ledger: &Ledger, paths: &RematchPaths, top: &Place, branch: &str) -> Result<Trials> {
+    let dir = views_dir(paths).join(view_key(top, branch)).join(TRIALS);
+    let scopes = crate::domain::load_scopes(paths)?;
+    let live = live_shareable(ledger, paths)?;
+    let sources = if paths.is_off() { Vec::new() } else { crate::profile::kept_sources(paths) };
+    let kept_names: Vec<String> = kept_want(&live, &sources, &Scopes::new(), None).into_keys().collect();
+    let mut want: BTreeMap<String, PathBuf> =
+        kept_want(&live, &sources, &scopes, Some(top)).into_iter().filter(|(n, _)| scopes.contains_key(n)).collect();
+    let mut subpath_only = Vec::new();
+    let widened = |s: &crate::domain::PlaceScope| crate::domain::PlaceScope { subpath: None, ..s.clone() };
+    for e in live.iter().filter(|e| !always_shared(e) && e.status == Status::Provisional && e.kind != Kind::Agent) {
+        if provisional_hit(paths, e, top, &scopes) {
+            want.insert(e.name.clone(), e.path.clone());
+            continue;
+        }
+        let scope = scopes.get(&e.name);
+        let below = (narrow(e.predicate.subpath.as_deref()) || scope.is_some_and(|s| narrow(s.subpath.as_deref())))
+            && hook_active(paths, e)
+            && matches_place(&crate::types::Predicate { subpath: None, ..e.predicate.clone() }, top)
+            && scope.is_none_or(|s| widened(s).matches(top));
+        if below && !subpath_only.contains(&e.name) {
+            subpath_only.push(e.name.clone());
+        }
+    }
+    for (name, s) in &scopes {
+        if kept_names.contains(name) && !want.contains_key(name) && !s.matches(top) && narrow(s.subpath.as_deref()) && widened(s).matches(top) && !subpath_only.contains(name) {
+            subpath_only.push(name.clone());
+        }
+    }
+    apply_links(&dir, &mut want)?;
+    Ok(Trials { dir, linked: want.into_keys().collect(), subpath_only })
+}
+
+/// What one directory of links did.
+#[derive(Default)]
+struct Applied {
+    added: Vec<String>,
+    pruned: Vec<String>,
+    untouched: Vec<String>,
+}
+
+/// Make `dir` hold exactly the symlinks `want` (names that are not symlinks there are never
+/// touched and drop out of `want`; hidden names — another sync's temporary links — are
+/// skipped). A link is removed only while it still points where this sync read it.
+fn apply_links(dir: &Path, want: &mut BTreeMap<String, PathBuf>) -> Result<Applied> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let off = paths.is_off();
-    let live: Vec<Entry> = if off {
-        Vec::new()
-    } else {
-        [Status::Provisional, Status::Kept, Status::Pinned]
-            .into_iter()
-            .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
-            .collect::<Result<Vec<_>>>()?
-            .concat()
-            .into_iter()
-            .filter(|e| shareable(paths, e))
-            .collect()
-    };
-    let (mut current, mut untouched) = (BTreeMap::new(), Vec::new());
+    let mut current = BTreeMap::new();
+    let mut out = Applied::default();
     for ent in std::fs::read_dir(dir)? {
         let ent = ent?;
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -1415,56 +1586,363 @@ pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&
         if ent.file_type()?.is_symlink() {
             current.insert(name, std::fs::read_link(ent.path())?);
         } else {
-            untouched.push(name);
+            out.untouched.push(name);
         }
     }
-    let sources = if off { Vec::new() } else { crate::profile::kept_sources(paths) };
-    let holder = |name: &str, target: &Path| live.iter().find(|e| e.name == name && e.path == target);
-    let from_profile = |name: &str, target: &Path| sources.iter().any(|(n, p)| n == name && p == target);
-    let mut want: BTreeMap<String, PathBuf> = current
-        .iter()
-        .filter(|(n, t)| holder(n, t).is_some() || from_profile(n, t))
-        .map(|(n, t)| (n.clone(), t.clone()))
-        .collect();
-    for e in live.iter().filter(|e| always_shared(e)) {
-        let shadowed = want.get(&e.name).and_then(|t| holder(&e.name, t)).is_some_and(|h| !always_shared(h));
-        if !shadowed {
-            want.insert(e.name.clone(), e.path.clone());
-        }
-    }
-    for (name, src) in &sources {
-        want.entry(name.clone()).or_insert_with(|| src.clone());
-    }
-    if let Some(place) = place {
-        for e in live.iter().filter(|e| provisional_hit(paths, e, place)) {
-            want.insert(e.name.clone(), e.path.clone());
-        }
-    }
-    for n in &untouched {
+    for n in &out.untouched {
         want.remove(n);
     }
-    let mut out = SkillsSync { off, untouched, ..Default::default() };
     for (name, seen) in &current {
         let link = dir.join(name);
-        // Re-read before removing: a concurrent sync may have re-pointed it to a live entry.
         if !want.contains_key(name) && std::fs::read_link(&link).is_ok_and(|t| &t == seen) {
             remove_link(&link)?;
             out.pruned.push(name.clone());
         }
     }
-    for (name, target) in &want {
+    for (name, target) in want.iter() {
         if current.get(name) != Some(target) {
             relink(target, &dir.join(name))?;
             out.added.push(name.clone());
         }
     }
+    Ok(out)
+}
+
+/// Loadable skill-like entries ([`shareable`]) — none while rematch is off.
+fn live_shareable(ledger: &Ledger, paths: &RematchPaths) -> Result<Vec<Entry>> {
+    if paths.is_off() {
+        return Ok(Vec::new());
+    }
+    Ok([Status::Provisional, Status::Kept, Status::Pinned]
+        .into_iter()
+        .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
+        .collect::<Result<Vec<_>>>()?
+        .concat()
+        .into_iter()
+        .filter(|e| shareable(paths, e))
+        .collect())
+}
+
+/// The kept library: kept/pinned entries (status or human pin), then the profile's kept
+/// sources (`profile::kept_sources`) for names nothing else holds. A name with a place scope
+/// (`policy.json` `scopes`) is left out of the library every session sees (`place` `None`) and
+/// kept in a place's library only when its scope matches that place.
+fn kept_want(live: &[Entry], sources: &[(String, PathBuf)], scopes: &Scopes, place: Option<&Place>) -> BTreeMap<String, PathBuf> {
+    let allowed = |name: &str| match place {
+        None => !scopes.contains_key(name),
+        Some(p) => scope_allows(scopes, name, p),
+    };
+    let mut want = BTreeMap::new();
+    for e in live.iter().filter(|e| always_shared(e) && allowed(&e.name)) {
+        want.entry(e.name.clone()).or_insert_with(|| e.path.clone());
+    }
+    for (name, src) in sources.iter().filter(|(n, _)| allowed(n)) {
+        want.entry(name.clone()).or_insert_with(|| src.clone());
+    }
+    want
+}
+
+/// Make `REMATCH_ROOT/skills/` the kept library: one symlink `<name> → <entry dir>` per
+/// kept/pinned entry ([`shareable`]) and per profile kept source, except names with a place
+/// scope ([`kept_want`]; their rematch-made `<agent_dir>/skills/<name>` link into the profile is
+/// removed too, `profile::unlink_scoped`). Provisional entries are never
+/// linked here: they reach sessions only through their place's view ([`sync_view`]), so a
+/// harness that mounts this one directory for every session (Claude Code's plugin, Codex)
+/// never lists another repo's trial. Every status change runs it; it also keeps the other
+/// exposures consistent: links of views whose entry left (or all of them, while off) are
+/// removed, provisional agent links follow off/on and approval ([`sync_agent_links`]), and the
+/// personal AGENTS.md follows its approvals (`instructions::sync`). While rematch is off every
+/// link is removed and `dirs` is empty.
+pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths) -> Result<SkillsSync> {
+    let dir = &paths.skills_shared;
+    let off = paths.is_off();
+    let scopes = crate::domain::load_scopes(paths)?;
+    let live = live_shareable(ledger, paths)?;
+    let sources = if off { Vec::new() } else { crate::profile::kept_sources(paths) };
+    let mut want = kept_want(&live, &sources, &scopes, None);
+    crate::profile::unlink_scoped(paths, &scopes)?;
+    let applied = apply_links(dir, &mut want)?;
+    let mut out = SkillsSync { off, untouched: applied.untouched, added: applied.added, pruned: applied.pruned, ..Default::default() };
     out.total = want.len();
-    out.visible = want.iter().filter_map(|(n, t)| holder(n, t)).map(|e| e.id.clone()).collect();
+    out.visible = want.iter().filter_map(|(n, t)| live.iter().find(|e| &e.name == n && &e.path == t)).map(|e| e.id.clone()).collect();
     out.links = want;
     if !off {
         out.dirs.push(dir.clone());
     }
+    prune_views(paths, &live, &sources)?;
+    if off {
+        for p in crate::project_views::withdraw_all(paths)? {
+            eprintln!("rematch: off: removed repo-local trial delivery {}", p.display());
+        }
+    } else {
+        let may_load: Vec<EntryId> = ledger
+            .list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?
+            .into_iter()
+            .filter(|e| e.kind == Kind::Agent && agent_approved(e))
+            .map(|e| e.id)
+            .collect();
+        crate::project_views::prune_copies(paths, |id| may_load.iter().any(|x| x == id))?;
+    }
+    sync_agent_links(ledger, paths)?;
+    // A read-only or locked personal AGENTS.md never blocks a keep, retire or stage; edited
+    // blocks are already reported as conflicts (`instructions-conflict:<name>` actions).
+    if let Err(e) = crate::instructions::sync(ledger, paths) {
+        eprintln!("rematch: personal AGENTS.md not synced: {e:#}");
+    }
     Ok(out)
+}
+
+/// Remove from every view (its `skills/` and `trials/`) the links whose target is no longer a
+/// loadable entry dir or profile source (every link while off). Only removes: a view gains
+/// links when its own place syncs.
+fn prune_views(paths: &RematchPaths, live: &[Entry], sources: &[(String, PathBuf)]) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(views_dir(paths)) else { return Ok(()) };
+    for (view, sub) in rd.flatten().flat_map(|v| [(v.path(), "skills"), (v.path(), TRIALS)]) {
+        let Ok(links) = std::fs::read_dir(view.join(sub)) else { continue };
+        for l in links.flatten() {
+            let name = l.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !l.file_type().is_ok_and(|t| t.is_symlink()) {
+                continue;
+            }
+            let Ok(target) = std::fs::read_link(l.path()) else { continue };
+            let alive = live.iter().any(|e| e.name == name && e.path == target) || sources.iter().any(|(n, p)| n == &name && p == &target);
+            if !alive {
+                remove_link(&l.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the link `name` from every view (`skills/` and `trials/`): what a new place scope
+/// (`policy scope set`) withdraws, since a view's key does not tell its place. Each place's
+/// next sync ([`sync_view`], [`sync_trials`]) links it again where the scope matches. Returns
+/// the links removed.
+pub fn unlink_from_views(paths: &RematchPaths, name: &str) -> Result<usize> {
+    validate_name(name)?;
+    let Ok(rd) = std::fs::read_dir(views_dir(paths)) else { return Ok(0) };
+    let mut n = 0;
+    for (view, sub) in rd.flatten().flat_map(|v| [(v.path(), "skills"), (v.path(), TRIALS)]) {
+        let link = view.join(sub).join(name);
+        if std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) {
+            remove_link(&link)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// `REMATCH_ROOT/agents/` (what omp reads through `extension/agents`): while off, no links at
+/// all; otherwise a link per approved provisional agent ([`agent_approved`]) and none for an
+/// unapproved one. Per-place exposure of the linked ones is the session's job
+/// ([`SkillsSync::agents`]).
+pub fn sync_agent_links(ledger: &Ledger, paths: &RematchPaths) -> Result<()> {
+    if paths.is_off() {
+        let Ok(rd) = std::fs::read_dir(&paths.agents) else { return Ok(()) };
+        for l in rd.flatten() {
+            if l.file_type().is_ok_and(|t| t.is_symlink()) {
+                remove_link(&l.path())?;
+            }
+        }
+        return Ok(());
+    }
+    unlink_unapproved_agents(ledger, paths)?;
+    for e in ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })? {
+        if e.kind == Kind::Agent && agent_approved(&e) && std::fs::symlink_metadata(agent_link(paths, &e.name)).is_err() && check_agent_link(paths, &e.name, &e.path.join(AGENT_MD)).is_ok() {
+            link_agent(paths, &e)?;
+        }
+    }
+    Ok(())
+}
+
+/// The catalog view of `place` (a session there mounts `dirs`): the kept library of
+/// [`sync_shared_skills`] plus the scoped kept names whose place scope matches here
+/// ([`kept_want`], listed in [`SkillsSync::scoped`]), plus every provisional entry whose
+/// predicate (and scope) matches the place ([`provisional_hit`]), which shadows a kept entry of
+/// its name in this view only. Written under `views/<key>/skills/` ([`view_key`]): concurrent
+/// sessions of other places never touch it and nothing global is pruned per cwd. Also names the
+/// approved provisional agents the place exposes and the linked ones it must withhold. While
+/// off the view is emptied.
+pub fn sync_view(ledger: &Ledger, paths: &RematchPaths, place: &Place, branch: &str, cwd: &Path) -> Result<SkillsSync> {
+    let key = view_key(place, branch);
+    let dir = view_skills(paths, &key);
+    let off = paths.is_off();
+    let scopes = crate::domain::load_scopes(paths)?;
+    let live = live_shareable(ledger, paths)?;
+    let sources = if off { Vec::new() } else { crate::profile::kept_sources(paths) };
+    let mut want = kept_want(&live, &sources, &scopes, Some(place));
+    let mut provisional = Vec::new();
+    for e in live.iter().filter(|e| !always_shared(e) && provisional_hit(paths, e, place, &scopes)) {
+        want.insert(e.name.clone(), e.path.clone());
+        provisional.push(e.id.clone());
+    }
+    let applied = apply_links(&dir, &mut want)?;
+    let mut out = SkillsSync { off, view: Some(key), untouched: applied.untouched, added: applied.added, pruned: applied.pruned, ..Default::default() };
+    out.total = want.len();
+    out.visible = want.iter().filter_map(|(n, t)| live.iter().find(|e| &e.name == n && &e.path == t)).map(|e| e.id.clone()).collect();
+    out.provisional = provisional.into_iter().filter(|id| out.visible.contains(id)).collect();
+    out.scoped = want
+        .iter()
+        .filter(|(n, t)| scopes.contains_key(*n) && !live.iter().any(|e| out.provisional.contains(&e.id) && &e.path == *t))
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.links = want;
+    if off {
+        return Ok(out);
+    }
+    out.dirs.push(dir);
+    out.agents = agent_exposure(ledger, paths, place, cwd)?;
+    Ok(out)
+}
+
+/// Provisional agents for a session at `place` / `cwd` ([`AgentExposure`]): an approved one
+/// whose predicate (and place scope, `policy.json` `scopes`) matches is exposed unless a native
+/// definition of its name wins in omp ([`native_agent_names`]: then it is shadowed — not
+/// offered, not credited); every other name linked under `REMATCH_ROOT/agents/` is withheld,
+/// except a name a native definition holds (`task.disabledAgents` works by name and would hide
+/// the user's agent).
+pub fn agent_exposure(ledger: &Ledger, paths: &RematchPaths, place: &Place, cwd: &Path) -> Result<AgentExposure> {
+    let native = native_agent_names(paths, cwd);
+    let scopes = crate::domain::load_scopes(paths)?;
+    let provisional = ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
+    let mut out = AgentExposure::default();
+    for e in provisional
+        .iter()
+        .filter(|e| e.kind == Kind::Agent && agent_approved(e) && matches_place(&e.predicate, place) && scope_allows(&scopes, &e.name, place))
+    {
+        if !std::fs::read_link(agent_link(paths, &e.name)).is_ok_and(|t| t == e.path.join(AGENT_MD)) {
+            continue;
+        }
+        if native.contains(&e.name) {
+            out.shadowed.push(e.name.clone());
+        } else {
+            out.exposed.push(e.name.clone());
+        }
+    }
+    for l in std::fs::read_dir(&paths.agents).into_iter().flatten().flatten() {
+        let file = l.file_name().to_string_lossy().into_owned();
+        let Some(name) = file.strip_suffix(".md").filter(|n| !n.starts_with('.')) else { continue };
+        if out.exposed.iter().any(|n| n == name) || native.iter().any(|n| n == name) {
+            continue;
+        }
+        out.withheld.push(name.to_string());
+    }
+    out.exposed.sort();
+    out.withheld.sort();
+    out.shadowed.sort();
+    Ok(out)
+}
+
+/// What [`agent_exposure`] decided for one session's place.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExposure {
+    /// Approved provisional agents of the place that the host offers as the candidate.
+    pub exposed: Vec<String>,
+    /// Linked names the session must not offer (other places' agents); never a name a native
+    /// definition holds, which disabling by name would hide too.
+    pub withheld: Vec<String>,
+    /// Approved provisional agents of the place whose name a user or project agent holds: omp
+    /// loads that definition instead, so the candidate is neither offered nor credited.
+    pub shadowed: Vec<String>,
+}
+
+/// Names of the agent definitions omp prefers over the plugin's `agents/` (task/discovery.ts:
+/// project `.omp/agents/*.md` of the nearest ancestors of `cwd`, then the user's
+/// `<agent_dir>/agents/*.md`): each file's frontmatter `name`, else its stem.
+pub fn native_agent_names(paths: &RematchPaths, cwd: &Path) -> Vec<String> {
+    let mut dirs = vec![paths.agents_dir()];
+    dirs.extend(cwd.ancestors().map(|a| a.join(".omp").join("agents")));
+    let mut out = Vec::new();
+    for d in dirs {
+        for f in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = f.path();
+            if p.extension().is_none_or(|x| x != "md") {
+                continue;
+            }
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| SkillDoc::parse(&t).ok())
+                .and_then(|d| d.get_str("name").map(|n| n.trim().to_string()))
+                .filter(|n| !n.is_empty())
+                .unwrap_or(stem);
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Refuse an approval that would make `cost` more bytes always on where `candidate` loads than
+/// `limits.always_on_bytes` leaves room for next to what is exposed now
+/// ([`catalog_other_bytes`]; `improver/lint.toml`, else the built-in budget). Staging linted
+/// each candidate alone, so pending approvals can each fit and still overflow together; the
+/// approval is where they become always on. `what` names the text in the error.
+pub fn check_always_on(ledger: &Ledger, paths: &RematchPaths, candidate: &Entry, cost: usize, what: &str) -> Result<()> {
+    let limit = crate::lint::LintConfig::load(&paths.improver.join("lint.toml")).unwrap_or_default().limits.always_on_bytes;
+    let other = catalog_other_bytes(ledger, paths, candidate, &candidate.path)?;
+    if other + cost > limit {
+        bail!(
+            "approving {} would put {} B always on where it loads ({what} {cost} B + {other} B already exposed) > {limit} B: retire or shorten something exposed there first (`rematch skills sync` itemizes the catalog)",
+            candidate.name,
+            other + cost
+        );
+    }
+    Ok(())
+}
+
+/// Always-on bytes other rematch content already puts in front of a session where `candidate`
+/// would load (`lint::LintContext::catalog_other_bytes`): the catalog line
+/// (`lint::entry_cost`) of every kept/pinned entry and profile kept source (every session sees
+/// them), of every active provisional entry that can share a place with the candidate (same
+/// branch, the same repo glob or remote, or a glob that matches every repo), of every approved
+/// provisional agent among those, plus the personal instructions applied now
+/// (`instructions::exposure`) and the approved fragments injected at runtime in hosts without
+/// that file. A skill name with a place scope (`policy.json` `scopes`) is not global: it counts
+/// only when its scope may hold a session of the candidate (`PlaceScope::may_share`). `exclude`
+/// (the candidate's own dir) and entries of the candidate's id or name are left out: the
+/// candidate is counted by lint itself, and a successor replaces its predecessor. Hand-written
+/// skills rematch did not write are not rematch's to budget.
+pub fn catalog_other_bytes(ledger: &Ledger, paths: &RematchPaths, candidate: &Entry, exclude: &Path) -> Result<usize> {
+    let scopes = crate::domain::load_scopes(paths)?;
+    let in_scope = |name: &str| scopes.get(name).is_none_or(|s| s.may_share(&candidate.predicate));
+    let shares_place = |e: &Entry| {
+        let (a, b) = (&e.predicate, &candidate.predicate);
+        e.branch == candidate.branch
+            || a.repo_glob == crate::predicate::ANY_REPO
+            || b.repo_glob == crate::predicate::ANY_REPO
+            || a.repo_glob == b.repo_glob
+            || (a.repo_remote.is_some() && a.repo_remote == b.repo_remote)
+    };
+    let exposure = crate::instructions::exposure(ledger, paths)?;
+    let mut total = 0;
+    let mut paths_seen: Vec<PathBuf> = Vec::new();
+    for status in [Status::Kept, Status::Pinned, Status::Provisional] {
+        for e in ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })? {
+            if e.path == exclude || e.id == candidate.id || e.name == candidate.name || e.kind == Kind::Lesson || !hook_active(paths, &e) {
+                continue;
+            }
+            // A kept agent is global (`<agent_dir>/agents`); every other name follows its scope.
+            let reach = (e.kind == Kind::Agent && always_shared(&e)) || in_scope(&e.name);
+            let relevant = reach && (always_shared(&e) || (shares_place(&e) && (e.kind != Kind::Agent || agent_approved(&e))));
+            if !relevant {
+                continue;
+            }
+            total += crate::lint::entry_cost(&e.path, e.kind).catalog;
+            if fragment_approved(&e) && !exposure.exposed.iter().any(|x| x.name == e.name) {
+                total += crate::lint::entry_cost(&e.path, e.kind).fragment;
+            }
+            paths_seen.push(e.path);
+        }
+    }
+    for (name, dir) in crate::profile::kept_sources(paths) {
+        if name != candidate.name && !paths_seen.contains(&dir) && in_scope(&name) {
+            total += crate::lint::entry_cost(&dir, Kind::Skill).catalog;
+        }
+    }
+    total += exposure.exposed.iter().filter(|x| x.name != candidate.name).map(|x| x.bytes).sum::<usize>();
+    Ok(total)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1871,7 +2349,7 @@ mod tests {
         std::fs::write(kept.path.join(crate::experience::EXPERIENCE_MD), "notes").unwrap();
         assert_eq!(content_sha256(&kept.path).unwrap(), changed, "EXPERIENCE.md and hidden files are not content");
         // The shared dir reports what it exposes.
-        let s = sync_shared_skills(&x.ledger, &x.paths, None).unwrap();
+        let s = sync_shared_skills(&x.ledger, &x.paths).unwrap();
         assert_eq!(s.visible, vec!["h1".to_string()]);
     }
 
@@ -1993,7 +2471,7 @@ mod tests {
         assert!(pending_parts(&x.paths, &e).is_empty() && fragment_approved(&e));
         assert_eq!(load_entry(&e.path).unwrap().approved_fragment, e.approved_fragment, "rematch.json carries it");
         let got = prompt_fragments(&x.ledger, &x.paths, &here(&x).entries).unwrap();
-        let want = PromptFragment { id: "f1".into(), name: "tests-first".into(), text: fragment.trim().into() };
+        let want = PromptFragment { id: "f1".into(), name: "tests-first".into(), text: fragment.trim().into(), sha: crate::ledger::sha256_hex(fragment.as_bytes()) };
         assert_eq!(got, vec![want.clone()]);
         assert_eq!(render_fragments(&got), format!("## rematch: tests-first\n\n{}", fragment.trim()));
         let elsewhere = list_for_match(&x.ledger, &x.paths, Some(Path::new("/elsewhere")), Path::new("/elsewhere")).unwrap();
@@ -2021,6 +2499,15 @@ mod tests {
         assert_eq!(pending_parts(&x.paths, &edited), vec![Approval::Prompt]);
         assert_eq!(names(&x), vec!["alpha-rule"]);
         assert!(approve(&x.ledger, &x.paths, "f1", Approval::Agent).is_err(), "not an agent");
+
+        // an approved fragment whose file no longer reads: skipped at runtime, listed as unreadable
+        assert!(unreadable_fragments(&x.ledger).unwrap().is_empty());
+        let f2 = x.ledger.get_entry("f2").unwrap().unwrap();
+        std::fs::remove_file(f2.path.join(AGENTS_FRAGMENT)).unwrap();
+        assert!(names(&x).is_empty(), "nothing sent, the match still answers");
+        let gone = unreadable_fragments(&x.ledger).unwrap();
+        assert_eq!(gone.iter().map(|u| (u.id.as_str(), u.name.as_str())).collect::<Vec<_>>(), vec![("f2", "alpha-rule")]);
+        assert!(gone[0].error.starts_with("cannot read ") && gone[0].path == f2.path.join(AGENTS_FRAGMENT), "{gone:?}");
     }
 
     #[test]
@@ -2078,7 +2565,7 @@ mod tests {
         assert_eq!(m.branch, "src");
         assert_eq!(m.skill_dirs, vec![x.paths.staging.join("repo")]);
         let got: Vec<(&str, bool)> = m.entries.iter().map(|e| (e.id.as_str(), e.predicate_hit)).collect();
-        assert_eq!(got, vec![("a", true), ("b", false), ("k", true)]);
+        assert_eq!(got, vec![("a", true), ("k", true)], "a provisional entry without a hit is not in this place's view");
 
         let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/nowhere")), Path::new("/nowhere")).unwrap();
         assert!(m.skill_dirs.is_empty());
@@ -2154,49 +2641,213 @@ mod tests {
     }
 
     #[test]
-    fn shared_skills_union_shadow_prune_and_off() {
+    fn views_scope_provisional_skills_per_place_and_shared_holds_the_kept_library() {
         let x = env();
-        let dir = x.paths.skills_shared.clone();
-        let names = |s: &SkillsSync| (s.added.clone(), s.pruned.clone(), s.total);
-        let link = |n: &str| std::fs::read_link(dir.join(n)).ok();
+        let shared = x.paths.skills_shared.clone();
+        let (repo, other) = (Place::path("/w/repo"), Place::path("/w/other"));
+        let names = |s: &SkillsSync| s.links.keys().cloned().collect::<Vec<_>>();
         stage(&x.ledger, &x.paths, &entry("a", "alpha", "repo", Status::Provisional), &[w("SKILL.md", &skill("alpha"))]).unwrap();
         let mut b = entry("b", "beta", "other", Status::Provisional);
         b.predicate.repo_glob = "/w/other".into();
         stage(&x.ledger, &x.paths, &b, &[w("SKILL.md", &skill("beta"))]).unwrap();
-        assert_eq!(link("alpha"), None, "staging alone matched no cwd");
+        assert!(sync_shared_skills(&x.ledger, &x.paths).unwrap().links.is_empty(), "no provisional entry in the shared dir");
 
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
-        assert_eq!((names(&s), s.dirs.clone()), ((vec!["alpha".into()], vec![], 1), vec![dir.clone()]));
-        // union: another cwd adds its own and keeps alpha
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/other"))).unwrap();
-        assert_eq!(names(&s), (vec!["beta".into()], vec![], 2));
-        assert!(!sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap().changed(), "idempotent");
+        // two places, interleaved as two concurrent sessions would: each view holds its own trial only
+        let view = |p: &Place, b: &str| sync_view(&x.ledger, &x.paths, p, b, Path::new(&p.path)).unwrap();
+        let vr = view(&repo, "repo");
+        let vo = view(&other, "other");
+        let vr2 = view(&repo, "repo");
+        assert_eq!((names(&vr), vr.provisional.clone()), (vec!["alpha".to_string()], vec!["a".to_string()]));
+        assert_eq!(names(&vo), vec!["beta".to_string()]);
+        assert!(!vr2.changed() && names(&vr2) == names(&vr), "the other place's sync changed nothing here");
+        assert_ne!(vr.dirs, vo.dirs);
+        assert_eq!(vr.dirs, vec![view_skills(&x.paths, vr.view.as_deref().unwrap())]);
+        assert_eq!(std::fs::read_link(vr.dirs[0].join("alpha")).unwrap(), x.paths.staging.join("repo/alpha"));
+        assert!(!vo.dirs[0].join("alpha").exists() && !vr.dirs[0].join("beta").exists());
+        assert_ne!(view_key(&repo, "repo"), view_key(&Place { subpath: Some("sub".into()), ..repo.clone() }, "repo"));
         // a directory that is not a link is never touched
-        std::fs::create_dir_all(dir.join("mine")).unwrap();
-        assert_eq!(sync_shared_skills(&x.ledger, &x.paths, None).unwrap().untouched, vec!["mine".to_string()]);
+        std::fs::create_dir_all(shared.join("mine")).unwrap();
+        assert_eq!(sync_shared_skills(&x.ledger, &x.paths).unwrap().untouched, vec!["mine".to_string()]);
 
-        // keep: the link follows the entry to its kept dir
+        // keep: shared to every place, the view link follows the entry to its kept dir
         set_status(&x.ledger, &x.paths, "a", Status::Kept, None).unwrap();
-        assert_eq!(link("alpha"), Some(x.paths.skills_dir().join("alpha")));
-        // a matched provisional candidate of the same name shadows it until retired
+        assert_eq!(std::fs::read_link(shared.join("alpha")).unwrap(), x.paths.skills_dir().join("alpha"));
+        assert!(!vr.dirs[0].join("alpha").exists(), "the stale view link went with the status change");
+        assert_eq!(names(&view(&other, "other")), vec!["alpha".to_string(), "beta".to_string()]);
+        // a matched provisional candidate of the same name shadows it in its place only
         let mut a2 = entry("a2", "alpha", "repo2", Status::Provisional);
         a2.predicate.repo_glob = "/w/repo".into();
         stage(&x.ledger, &x.paths, &a2, &[w("SKILL.md", &skill("alpha"))]).unwrap();
-        sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
-        assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")));
-        sync_shared_skills(&x.ledger, &x.paths, None).unwrap();
-        assert_eq!(link("alpha"), Some(x.paths.staging.join("repo2/alpha")), "a status-change sync keeps the candidate");
+        let vr = view(&repo, "repo");
+        assert_eq!(std::fs::read_link(vr.dirs[0].join("alpha")).unwrap(), x.paths.staging.join("repo2/alpha"));
+        assert_eq!(std::fs::read_link(shared.join("alpha")).unwrap(), x.paths.skills_dir().join("alpha"), "shared keeps the kept one");
         set_status(&x.ledger, &x.paths, "a2", Status::Retired, None).unwrap();
-        assert_eq!(link("alpha"), Some(x.paths.skills_dir().join("alpha")));
-        // retire: pruned
-        set_status(&x.ledger, &x.paths, "b", Status::Retired, None).unwrap();
-        assert_eq!(link("beta"), None);
+        let vr = view(&repo, "repo");
+        assert_eq!(std::fs::read_link(vr.dirs[0].join("alpha")).unwrap(), x.paths.skills_dir().join("alpha"));
 
-        // off: every link goes, the user's dir stays
+        // off: every link of the shared dir and of every view goes, the user's dir stays
         std::fs::write(&x.paths.off_marker, "").unwrap();
-        let s = sync_shared_skills(&x.ledger, &x.paths, Some(&Place::path("/w/repo"))).unwrap();
-        assert_eq!((names(&s), s.off, s.dirs.is_empty()), ((vec![], vec!["alpha".into()], 0), true, true));
-        assert!(dir.join("mine").is_dir());
+        let s = sync_shared_skills(&x.ledger, &x.paths).unwrap();
+        assert!(s.off && s.dirs.is_empty() && s.links.is_empty() && shared.join("mine").is_dir());
+        assert!(std::fs::read_dir(&vo.dirs[0]).unwrap().next().is_none(), "views emptied");
+        let v = view(&repo, "repo");
+        assert!(v.off && v.dirs.is_empty() && v.links.is_empty());
+    }
+
+    #[test]
+    fn place_scopes_keep_a_skill_out_of_every_global_location_and_in_its_places_views() {
+        let x = env();
+        std::fs::create_dir_all(crate::profile::dir(&x.paths).join(".git")).unwrap();
+        let names = |s: &SkillsSync| s.links.keys().cloned().collect::<Vec<_>>();
+        let strs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let web = |path: &str, sub: &str| Place { path: path.into(), remote: Some("github.com/acme/web".into()), subpath: Some(sub.into()), domain: None };
+        let (top, worktree, deep) = (web("/w/web", ""), web("/w/web-wt", ""), web("/w/web-wt", "research/x"));
+        let other = Place { path: "/w/api".into(), remote: Some("github.com/acme/api".into()), subpath: Some(String::new()), domain: None };
+        let notes = Place::path("/w/notes/sub");
+        let native = |n: &str| x.paths.skills_dir().join(n);
+        // Profile sources with no entry here (kept on another machine), a kept entry (its dir in
+        // the profile), a plain kept skill, and a provisional entry that matches every place.
+        for name in ["bellwether-dev", "notes-skill"] {
+            let src = crate::profile::skills_dir(&x.paths).join(name);
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join(SKILL_MD), skill(name)).unwrap();
+        }
+        for (id, name) in [("k", "kept-scoped"), ("p", "plain")] {
+            let mut e = entry(id, name, "repo", Status::Provisional);
+            e.predicate.repo_glob = "**".into();
+            stage(&x.ledger, &x.paths, &e, &[w("SKILL.md", &skill(name))]).unwrap();
+            set_status(&x.ledger, &x.paths, id, Status::Kept, None).unwrap();
+        }
+        let mut t = entry("t", "trial-scoped", "shared", Status::Provisional);
+        t.predicate.repo_glob = "**".into();
+        stage(&x.ledger, &x.paths, &t, &[w("SKILL.md", &skill("trial-scoped"))]).unwrap();
+        crate::profile::link_views(&x.paths).unwrap();
+        assert!(std::fs::read_link(native("bellwether-dev")).is_ok() && std::fs::read_link(native("kept-scoped")).is_ok(), "unscoped: global");
+        std::fs::create_dir_all(native("users-own")).unwrap();
+
+        let policy = |v: serde_json::Value| std::fs::write(x.paths.root.join(crate::domain::POLICY_FILE), v.to_string()).unwrap();
+        policy(serde_json::json!({"environment": "work", "scopes": {
+            "bellwether-dev": {"remote": "github.com/acme/web", "subpath": "**"},
+            "kept-scoped": {"remote": "github.com/acme/web", "subpath": "**"},
+            "late": {"remote": "github.com/acme/web", "subpath": "**"},
+            "trial-scoped": {"remote": "github.com/acme/web", "subpath": "research/**"},
+            "notes-skill": {"repo_glob": "/w/notes"},
+            "users-own": {"repo_glob": "/w/notes"},
+        }}));
+        let views = crate::profile::link_views(&x.paths).unwrap();
+        assert_eq!(views.scoped, strs(&["skills/bellwether-dev", "skills/kept-scoped", "skills/notes-skill"]));
+        for n in ["bellwether-dev", "kept-scoped", "notes-skill"] {
+            assert!(std::fs::symlink_metadata(native(n)).is_err(), "{n} left <agent_dir>/skills");
+        }
+        assert!(native("users-own").is_dir(), "a real directory is the user's");
+        let shared = sync_shared_skills(&x.ledger, &x.paths).unwrap();
+        assert_eq!((names(&shared), shared.visible.clone()), (strs(&["plain"]), strs(&["p"])), "the shared dir holds no scoped name");
+        // A keep under a scope links nothing natively.
+        let mut late = entry("l", "late", "repo", Status::Provisional);
+        late.predicate.repo_glob = "**".into();
+        stage(&x.ledger, &x.paths, &late, &[w("SKILL.md", &skill("late"))]).unwrap();
+        set_status(&x.ledger, &x.paths, "l", Status::Kept, None).unwrap();
+        assert!(std::fs::symlink_metadata(native("late")).is_err() && std::fs::symlink_metadata(x.paths.skills_shared.join("late")).is_err());
+
+        let view = |p: &Place| sync_view(&x.ledger, &x.paths, p, "b", Path::new(&p.path)).unwrap();
+        assert_eq!(names(&view(&other)), strs(&["plain"]), "another repo sees none of them");
+        for p in [&top, &worktree] {
+            let v = view(p);
+            assert_eq!(names(&v), strs(&["bellwether-dev", "kept-scoped", "late", "plain"]), "{}", p.path);
+            assert_eq!((v.scoped.clone(), v.provisional.clone()), (strs(&["bellwether-dev", "kept-scoped", "late"]), vec![]));
+        }
+        let v = view(&deep);
+        assert_eq!(names(&v), strs(&["bellwether-dev", "kept-scoped", "late", "plain", "trial-scoped"]), "the subpath scope matches below research/");
+        assert_eq!(v.provisional, strs(&["t"]));
+        assert_eq!(names(&view(&notes)), strs(&["notes-skill", "plain"]), "a path scope matches below its directory");
+        assert_eq!(names(&view(&Place::path("/w/notes-x"))), strs(&["plain"]));
+        // Repo trials (Codex): the scoped kept library of the top, not the subpath-only trial.
+        let tr = sync_trials(&x.ledger, &x.paths, &top, "b").unwrap();
+        assert_eq!((tr.linked.clone(), tr.subpath_only.clone()), (strs(&["bellwether-dev", "kept-scoped", "late"]), strs(&["trial-scoped"])));
+        assert_eq!(std::fs::read_link(tr.dir.join("bellwether-dev")).unwrap(), crate::profile::skills_dir(&x.paths).join("bellwether-dev"));
+        assert!(sync_trials(&x.ledger, &x.paths, &other, "b").unwrap().linked.is_empty());
+        // Load-time match elsewhere: the scoped entries are not loaded.
+        let m = list_for_match(&x.ledger, &x.paths, None, Path::new("/w/api")).unwrap();
+        let matched: Vec<&str> = m.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(matched.contains(&"plain") && !matched.iter().any(|n| ["kept-scoped", "late", "trial-scoped"].contains(n)), "{matched:?}");
+        // Always-on accounting: scoped names count only where their scope may hold the session.
+        let cand = |remote: &str| Entry { predicate: crate::types::Predicate { repo_remote: Some(remote.into()), ..Default::default() }, ..entry("c", "cand", "repo", Status::Provisional) };
+        let far = catalog_other_bytes(&x.ledger, &x.paths, &cand("github.com/acme/api"), Path::new("/none")).unwrap();
+        let near = catalog_other_bytes(&x.ledger, &x.paths, &cand("github.com/acme/web"), Path::new("/none")).unwrap();
+        let cost = |d: PathBuf| crate::lint::entry_cost(&d, Kind::Skill).catalog;
+        let web_only: usize = ["bellwether-dev", "kept-scoped", "late"].iter().map(|n| cost(crate::profile::skills_dir(&x.paths).join(n))).sum::<usize>()
+            + cost(x.paths.staging.join("shared/trial-scoped"));
+        assert_eq!(near - far, web_only);
+
+        // Unset: global again.
+        policy(serde_json::json!({"environment": "work"}));
+        crate::profile::link_views(&x.paths).unwrap();
+        assert!(std::fs::read_link(native("bellwether-dev")).is_ok() && std::fs::read_link(native("kept-scoped")).is_ok());
+        let shared = sync_shared_skills(&x.ledger, &x.paths).unwrap();
+        assert_eq!(names(&shared), strs(&["bellwether-dev", "kept-scoped", "late", "notes-skill", "plain"]));
+        assert_eq!(names(&view(&other)), strs(&["bellwether-dev", "kept-scoped", "late", "notes-skill", "plain", "trial-scoped"]));
+    }
+
+    #[test]
+    fn approved_agents_are_exposed_only_where_they_match_and_off_unlinks_them() {
+        let x = env();
+        let mut a = agent_entry("g1", "log-triage");
+        a.predicate.repo_glob = "/w/repo".into();
+        stage(&x.ledger, &x.paths, &a, &[w("AGENT.md", &agent_md("log-triage", "v1"))]).unwrap();
+        approve(&x.ledger, &x.paths, "g1", Approval::Agent).unwrap();
+        let link = agent_link(&x.paths, "log-triage");
+        assert!(std::fs::read_link(&link).is_ok());
+        let x_ = |p: &str| agent_exposure(&x.ledger, &x.paths, &Place::path(p), Path::new(p)).unwrap();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(x_("/w/repo"), AgentExposure { exposed: names(&["log-triage"]), ..Default::default() });
+        assert_eq!(x_("/w/other"), AgentExposure { withheld: names(&["log-triage"]), ..Default::default() }, "withheld outside its place");
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/other")), Path::new("/w/other")).unwrap();
+        assert!(m.entries.iter().all(|e| e.id != "g1"), "not loaded elsewhere: {m:?}");
+
+        // Native-authored collisions: a user agent (file named otherwise, frontmatter name equal)
+        // wins in omp; the name is never withheld (that would hide the user's agent) and the
+        // candidate is shadowed in its own place: not offered, not loaded, not credited.
+        std::fs::create_dir_all(x.paths.agents_dir()).unwrap();
+        let mine = x.paths.agents_dir().join("my-triage.md");
+        std::fs::write(&mine, agent_md("log-triage", "mine")).unwrap();
+        assert_eq!(x_("/w/other"), AgentExposure::default());
+        assert_eq!(x_("/w/repo"), AgentExposure { shadowed: names(&["log-triage"]), ..Default::default() });
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
+        assert!(m.entries.iter().all(|e| e.id != "g1"), "a shadowed candidate does not load: {m:?}");
+        std::fs::remove_file(&mine).unwrap();
+        // the same for a project agent in an ancestor of the cwd (`.omp/agents/`)
+        let t = tempfile::tempdir().unwrap();
+        let proj = t.path().join("proj");
+        std::fs::create_dir_all(proj.join(".omp/agents")).unwrap();
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(proj.join(".omp/agents/log-triage.md"), agent_md("log-triage", "project")).unwrap();
+        let sub = proj.join("sub");
+        let got = agent_exposure(&x.ledger, &x.paths, &Place::path(sub.to_string_lossy()), &sub).unwrap();
+        assert_eq!(got, AgentExposure::default(), "the project's agent wins and is never withheld");
+
+        std::fs::write(&x.paths.off_marker, "").unwrap();
+        sync_shared_skills(&x.ledger, &x.paths).unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "off withdraws provisional agents");
+        std::fs::remove_file(&x.paths.off_marker).unwrap();
+        sync_shared_skills(&x.ledger, &x.paths).unwrap();
+        assert!(std::fs::read_link(&link).is_ok(), "on restores the approved link");
+    }
+
+    #[test]
+    fn catalog_other_bytes_counts_what_shares_a_session_with_the_candidate() {
+        let x = env();
+        let cost = |e: &Entry| crate::lint::entry_cost(&e.path, e.kind).catalog;
+        let mine = stage(&x.ledger, &x.paths, &entry("c", "candidate", "repo", Status::Provisional), &[w("SKILL.md", &skill("candidate"))]).unwrap();
+        let same = stage(&x.ledger, &x.paths, &entry("s", "same-branch", "repo", Status::Provisional), &[w("SKILL.md", &skill("same-branch"))]).unwrap();
+        let mut far = entry("f", "far", "elsewhere", Status::Provisional);
+        far.predicate.repo_glob = "/w/elsewhere".into();
+        stage(&x.ledger, &x.paths, &far, &[w("SKILL.md", &skill("far"))]).unwrap();
+        let mut kept = entry("k", "kept-one", "elsewhere", Status::Provisional);
+        kept.predicate.repo_glob = "/w/elsewhere".into();
+        stage(&x.ledger, &x.paths, &kept, &[w("SKILL.md", &skill("kept-one"))]).unwrap();
+        let kept = set_status(&x.ledger, &x.paths, "k", Status::Kept, None).unwrap();
+        let got = catalog_other_bytes(&x.ledger, &x.paths, &mine, &mine.path).unwrap();
+        assert_eq!(got, cost(&same) + cost(&kept), "kept from another branch counts, a far provisional one does not");
     }
 
     fn agent_md(name: &str, prompt: &str) -> String {
@@ -2250,10 +2901,14 @@ mod tests {
 
         let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
         assert!(m.skill_dirs.is_empty(), "agents contribute no skill dir");
+        assert!(m.entries.is_empty(), "the user's own log-triage.md wins in omp: the candidate does not load (shadowed): {m:?}");
+        std::fs::rename(&native, native.with_extension("bak")).unwrap();
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
         let got: Vec<(&str, Kind, bool)> = m.entries.iter().map(|e| (e.id.as_str(), e.kind, e.predicate_hit)).collect();
         assert_eq!(got, vec![("a1", Kind::Agent, true)]);
+        std::fs::rename(native.with_extension("bak"), &native).unwrap();
         let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/elsewhere")), Path::new("/elsewhere")).unwrap();
-        assert_eq!(m.entries.iter().map(|e| e.predicate_hit).collect::<Vec<_>>(), vec![false], "listed (it loads), not counted");
+        assert!(m.entries.is_empty(), "another place withholds the approved agent: {m:?}");
 
         let k1 = set_status(&x.ledger, &x.paths, "a1", Status::Kept, None).unwrap();
         assert_eq!(k1.path, x.paths.kept_agents.join("log-triage"));

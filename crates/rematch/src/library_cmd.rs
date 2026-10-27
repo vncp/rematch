@@ -1,4 +1,4 @@
-//! `library ls|why|disable|rollback|pin|unpin|approve|decline|set-fork-path|export|import-export`
+//! `library ls|why|disable|rollback|pin|unpin|approve|decline|inspect|set-fork-path|export|import-export`
 //! and the `off|on` kill switch.
 
 use std::collections::BTreeMap;
@@ -40,12 +40,31 @@ pub enum LibraryCmd {
     Rollback { skill: String },
     Pin { id: String },
     Unpin { id: String },
-    /// One-tap approval of everything of an entry that waits for it — scripts, hook,
-    /// provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an
-    /// `export:<id>` item.
-    Approve { id: String },
-    /// Decline an approval (retires the entry; `export:<id>` only suppresses the offer).
-    Decline { id: String },
+    /// Approve a pending action exactly as reviewed: an entry id grants its scripts, hook and
+    /// provisional-agent parts; `instructions:<id>` its personal text; `instructions-conflict:<name>`
+    /// restores the approved text over your edit; `instructions-sync` rewrites the personal
+    /// AGENTS.md; `ship-team:<id>`, `fork:<id>`, `probe:<id>`, `export:<id>` (`rematch status`
+    /// lists them). `--sha` is required: the action's `review_sha256` (its approve command
+    /// carries it).
+    Approve {
+        id: String,
+        /// The full sha256 of the reviewed snapshot (`library inspect <id>` shows the command).
+        #[arg(long)]
+        sha: Option<String>,
+    },
+    /// Decline a pending action, bound by `--sha` like approve. An entry id retires the entry
+    /// (its executable parts); `instructions:<id>` declines that text only, the entry stays;
+    /// `instructions-applied:<name>` withdraws an applied text (profile-wide when the profile
+    /// carries it); `instructions-conflict:<name>` keeps your edited text as your own;
+    /// `fragment-unreadable:<id>` withdraws a runtime approval; ship, fork, probe and export
+    /// items only stop the offer.
+    Decline {
+        id: String,
+        #[arg(long)]
+        sha: Option<String>,
+    },
+    /// A pending action in full: target, reach, scope, exact diff and commands.
+    Inspect { id: String },
     /// Set the repo-relative file `ship --scope fork` writes for an entry (and, with
     /// --repo, the fork checkout it goes to).
     SetForkPath {
@@ -65,6 +84,7 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
         LibraryCmd::Ls => ls(ctx),
         LibraryCmd::Why { session, asof } => why(ctx, session.as_deref(), asof.as_deref()),
         LibraryCmd::Disable { id, reason } => {
+            let before = exposed(ctx);
             let e = get(ctx, &id)?;
             let e = if is_foreign(ctx, &e) {
                 let mut u = e.clone();
@@ -73,7 +93,9 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
             } else {
                 library::disable(&ctx.ledger, &ctx.paths, &e.id, &reason)?
             };
-            Ok(json!({"entry": e, "lines": [format!("disabled {} ({})", e.name, e.id)]}))
+            let mut lines = vec![format!("disabled {} ({})", e.name, e.id)];
+            lines.extend(exposure_lines(ctx, &before));
+            Ok(json!({"entry": e, "lines": lines}))
         }
         LibraryCmd::Rollback { skill } => {
             if let Some(cur) = ctx
@@ -87,11 +109,11 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
                     bail!("{skill} is a registered skill whose files rematch does not own; nothing to roll back");
                 }
             }
+            let before = exposed(ctx);
             let r = library::rollback(&ctx.ledger, &ctx.paths, &skill)?;
-            Ok(json!({
-                "rollback": r,
-                "lines": [format!("rolled back {skill} to v{}; retired {}", r.restored_version, r.retired.id)],
-            }))
+            let mut lines = vec![format!("rolled back {skill} to v{}; retired {}", r.restored_version, r.retired.id)];
+            lines.extend(exposure_lines(ctx, &before));
+            Ok(json!({"rollback": r, "lines": lines}))
         }
         LibraryCmd::Pin { id } => {
             let e = set_pinned(ctx, &id, true)?;
@@ -101,47 +123,135 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
             let e = set_pinned(ctx, &id, false)?;
             Ok(json!({"entry": e, "lines": [format!("unpinned {}", e.name)]}))
         }
-        LibraryCmd::Approve { id } => {
-            if id.starts_with("export:") {
-                return crate::scope::export::approve(ctx, &id);
+        LibraryCmd::Approve { id, sha } => {
+            let before = exposed(ctx);
+            let mut out = crate::actions::approve(ctx, &id, sha.as_deref()).map_err(|err| not_an_action(ctx, &id, "approve", err))?;
+            if is_entry_action(&id) {
+                extend_lines(&mut out, exposure_lines(ctx, &before));
             }
-            let e = get(ctx, &id)?;
-            if is_foreign(ctx, &e) {
-                bail!("{} is not a rematch-owned entry; nothing to approve", e.name);
-            }
-            let parts = library::pending_parts(&ctx.paths, &e);
-            if parts.is_empty() {
-                if !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
-                    bail!("{} is {}; only loadable entries can be approved", e.name, enum_str(&e.status));
-                }
-                bail!("nothing of {} waits for approval", e.name);
-            }
-            let receipts = parts.iter().map(|p| library::approve(&ctx.ledger, &ctx.paths, &e.id, *p)).collect::<Result<Vec<_>>>()?;
-            Ok(json!({
-                "receipts": receipts,
-                "approved": parts,
-                "lines": [format!("approved {} of {}", library::parts_label(&parts), e.name)],
-            }))
+            Ok(out)
         }
-        LibraryCmd::Decline { id } => {
-            if id.starts_with("export:") {
-                return crate::scope::export::decline(ctx, &id);
+        LibraryCmd::Decline { id, sha } => {
+            let before = exposed(ctx);
+            let mut out = crate::actions::decline(ctx, &id, sha.as_deref()).map_err(|err| not_an_action(ctx, &id, "decline", err))?;
+            if is_entry_action(&id) {
+                extend_lines(&mut out, exposure_lines(ctx, &before));
             }
-            let e = get(ctx, &id)?;
-            if is_foreign(ctx, &e) {
-                bail!("{} is not a rematch-owned entry; nothing to decline", e.name);
-            }
-            let r = library::decline(&ctx.ledger, &ctx.paths, &e.id, &library::pending_parts(&ctx.paths, &e))?;
-            Ok(json!({"entry": r, "lines": [format!("declined {}; entry retired", e.name)]}))
+            Ok(out)
         }
+        LibraryCmd::Inspect { id } => crate::actions::inspect(ctx, &id),
         LibraryCmd::SetForkPath { id, path, repo } => set_fork_path(ctx, &id, &path, repo.as_deref()),
         LibraryCmd::Export(a) => crate::scope::export::cmd_export(ctx, a),
         LibraryCmd::ImportExport(a) => crate::scope::export::cmd_import_export(ctx, a),
     }
 }
 
+/// An id `library approve|decline` takes as an entry's scripts/hook/agent parts (no action
+/// prefix): retiring the entry can take personal text out of the file.
+fn is_entry_action(id: &str) -> bool {
+    crate::actions::entry_id(id)
+}
+
+fn extend_lines(out: &mut Value, more: Vec<String>) {
+    if more.is_empty() {
+        return;
+    }
+    match out.get_mut("lines").and_then(Value::as_array_mut) {
+        Some(lines) => lines.extend(more.into_iter().map(Value::String)),
+        None => out["lines"] = json!(more),
+    }
+}
+
+/// A failed approve/decline of an entry id with nothing pending says why there is nothing
+/// (and where its personal text waits) instead of "no pending action".
+fn not_an_action(ctx: &AppCtx, id: &str, verb: &str, err: anyhow::Error) -> anyhow::Error {
+    if !crate::actions::entry_id(id) || crate::actions::find(ctx, id).is_ok() {
+        return err;
+    }
+    let Ok(e) = get(ctx, id) else { return err };
+    if is_foreign(ctx, &e) {
+        return anyhow!("{} is not a rematch-owned entry; nothing to {verb}", e.name);
+    }
+    if !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
+        return anyhow!("{} is {}; only loadable entries have parts to {verb}", e.name, enum_str(&e.status));
+    }
+    let retire = if verb == "decline" { format!(" (`rematch library disable {}` retires it)", e.id) } else { String::new() };
+    anyhow!("nothing of {} waits for approval{}{retire}", e.name, text_hint(ctx, &e))
+}
+
 fn get(ctx: &AppCtx, id: &str) -> Result<Entry> {
     ctx.ledger.find_entry(id)?.ok_or_else(|| anyhow!("no entry {id:?}"))
+}
+
+/// Personal-instruction blocks in the personal `AGENTS.md` now: `(name, fragment sha)`.
+fn exposed(ctx: &AppCtx) -> std::collections::BTreeSet<(String, String)> {
+    rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)
+        .map(|x| x.exposed.into_iter().map(|e| (e.name, e.sha)).collect())
+        .unwrap_or_default()
+}
+
+/// What a command did to the personal `AGENTS.md` (the library's sync applies it), what that
+/// means for running sessions, and — when the file is still not what it should be (a failed
+/// write, an unreadable file) — that it was not changed, with the action that stays until it is.
+pub fn exposure_lines(ctx: &AppCtx, before: &std::collections::BTreeSet<(String, String)>) -> Vec<String> {
+    let after = exposed(ctx);
+    let gone: Vec<&str> = before.difference(&after).map(|(n, _)| n.as_str()).collect();
+    let added: Vec<&str> = after.difference(before).map(|(n, _)| n.as_str()).collect();
+    let target = rematch_core::instructions::target(&ctx.paths);
+    let mut out = Vec::new();
+    if !gone.is_empty() {
+        out.push(format!(
+            "personal AGENTS.md {}: removed {}; new sessions no longer load it — a running session keeps the text it was already sent (start a new session)",
+            target.display(),
+            gone.join(", ")
+        ));
+    }
+    if !added.is_empty() {
+        out.push(format!("personal AGENTS.md {}: applied {}; new sessions load it", target.display(), added.join(", ")));
+    }
+    if let Ok(x) = rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths) {
+        for c in x.conflicts.iter().filter(|c| *c != "*") {
+            out.push(format!("personal AGENTS.md {}: block {c} was edited by you and left as is (`rematch library inspect instructions-conflict:{c}`)", target.display()));
+        }
+    }
+    out.extend(drift_lines(ctx));
+    out
+}
+
+/// The personal `AGENTS.md` is not what it should be after this command: say what was left
+/// undone and why, never that it happened. The `instructions-sync` action stays until it is.
+pub fn drift_lines(ctx: &AppCtx) -> Vec<String> {
+    let target = rematch_core::instructions::target(&ctx.paths);
+    let Ok(plan) = rematch_core::instructions::plan_sync(&ctx.ledger, &ctx.paths) else { return Vec::new() };
+    let mut out = Vec::new();
+    for c in plan.conflicts.iter().filter(|c| c.name == "*") {
+        out.push(rematch_core::instructions::conflict_line(&target, c));
+    }
+    if plan.changed {
+        let mut undone = Vec::new();
+        if !plan.removed.is_empty() {
+            undone.push(format!("still holds {} (new sessions still load it)", plan.removed.join(", ")));
+        }
+        if !plan.applied.is_empty() || !plan.updated.is_empty() {
+            undone.push(format!("lacks {}", plan.applied.iter().chain(&plan.updated).cloned().collect::<Vec<_>>().join(", ")));
+        }
+        let why = rematch_core::instructions::last_error(&ctx.paths).map(|e| format!(": the write failed ({e})")).unwrap_or_default();
+        out.push(format!(
+            "personal AGENTS.md {} was not updated{why}; it {} — fix it, then `rematch library inspect {}`",
+            target.display(),
+            if undone.is_empty() { "differs from what it should hold".to_string() } else { undone.join(" and ") },
+            crate::actions::INSTRUCTIONS_SYNC
+        ));
+    }
+    out
+}
+
+/// Where the entry's personal text waits, when it does.
+fn text_hint(ctx: &AppCtx, e: &Entry) -> String {
+    match rematch_core::instructions::pending(&ctx.ledger, &ctx.paths) {
+        Ok(p) if p.iter().any(|p| p.entry.id == e.id) => format!("; its personal text is `instructions:{}` (`rematch library inspect instructions:{}`)", e.id, e.id),
+        _ => String::new(),
+    }
 }
 
 /// Pinning a foreign entry is a ledger flag only (its files are never rewritten). A pin links
@@ -157,7 +267,7 @@ fn set_pinned(ctx: &AppCtx, id: &str, pinned: bool) -> Result<Entry> {
     } else {
         library::set_pinned(&ctx.ledger, &e.id, pinned)?
     };
-    library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
+    library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
     Ok(e)
 }
 
@@ -182,10 +292,13 @@ fn set_fork_path(ctx: &AppCtx, id: &str, path: &str, repo: Option<&std::path::Pa
 }
 
 /// Every entry with raw counters, plus what its approvals and ship state are: `pending`
-/// (parts waiting for `library approve`, [`library::pending_parts`]), `has_fragment` (an
-/// `AGENTS.fragment.md`), `prompt_active` (that fragment approved, so a loadable entry adds it
-/// to the system prompt of main sessions it matches), `fork_path` and `ship_ready` (scopes
-/// `ship` would take it to, `scope::ship::ready`).
+/// (scripts/hook/agent parts waiting for `library approve <id>`, `actions::entry_parts`),
+/// `has_fragment` (an `AGENTS.fragment.md`), `instructions` (its personal text: applied,
+/// awaiting approval, declined, …), `prompt_active` (that text approved for the matched-session
+/// insertion of Claude Code/Pi/OpenCode), `surfaces` (every surface the entry touches with its
+/// state and target), `fork_path` and `ship_ready` (scopes `ship` would take it to,
+/// `scope::ship::ready`). `actions` lists every pending action (diffs cut), `trials` the
+/// automatic provisional trials running now.
 fn ls(ctx: &AppCtx) -> Result<Value> {
     let mut entries = Vec::new();
     let mut lines = Vec::new();
@@ -193,13 +306,15 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
     for r in crate::scope::ship::ready(ctx)? {
         ready.entry(r.id).or_default().push(r.scope);
     }
+    let view = crate::actions::SurfaceView::load(ctx)?;
     for e in ctx.ledger.list_entries(&EntryFilter::default())? {
         let c = ctx.ledger.counters(&e.id)?;
-        let pending = library::pending_parts(&ctx.paths, &e);
+        let pending = crate::actions::entry_parts(ctx, &e);
         let has_fragment = e.path.join(library::AGENTS_FRAGMENT).is_file();
         let prompt_active = has_fragment
             && library::fragment_approved(&e)
             && matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned);
+        let instructions = view.instructions_state(&e);
         let ship_ready = ready.remove(&e.id).unwrap_or_default();
         let mut tags = String::new();
         if e.pinned {
@@ -211,8 +326,8 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
         if !pending.is_empty() {
             tags.push_str(&format!(" · awaits approval: {}", library::parts_label(&pending)));
         }
-        if prompt_active {
-            tags.push_str(" · in system prompt");
+        if let Some(st) = &instructions {
+            tags.push_str(&format!(" · personal text: {st}"));
         }
         if !ship_ready.is_empty() {
             tags.push_str(&format!(" · ship-ready: {}", ship_ready.join(", ")));
@@ -232,7 +347,8 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
             "pinned": e.pinned, "origin": e.origin, "trigger_line": e.trigger_line, "path": e.path,
             "predicate": e.predicate, "counters": c, "evidence": e.evidence.len(), "version": e.version,
             "fork_path": e.fork_path, "fork_repo": e.fork_repo,
-            "pending": pending, "has_fragment": has_fragment, "prompt_active": prompt_active, "ship_ready": ship_ready,
+            "pending": pending, "has_fragment": has_fragment, "instructions": instructions, "prompt_active": prompt_active,
+            "ship_ready": ship_ready, "surfaces": view.of(ctx, &e),
         }));
     }
     // Kept on another machine (or adopted there): linked here, counted only there.
@@ -240,10 +356,22 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
     for k in &elsewhere {
         lines.push(format!("{} skill  {} [profile] not counted on this machine", k.label(), k.name));
     }
+    let actions = crate::actions::pending(ctx)?;
+    let applied = crate::actions::applied(ctx)?;
+    lines.extend(actions.iter().map(crate::actions::Action::line));
+    lines.extend(crate::actions::applied_line(&applied));
     if lines.is_empty() {
         lines.push("library is empty".into());
     }
-    Ok(json!({"entries": entries, "profile_kept": elsewhere.iter().map(|k| k.to_json()).collect::<Vec<_>>(), "lines": lines}))
+    Ok(json!({
+        "entries": entries,
+        "profile_kept": elsewhere.iter().map(|k| k.to_json()).collect::<Vec<_>>(),
+        "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied": applied.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "trials": crate::actions::trials(ctx)?,
+        "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
+        "lines": lines,
+    }))
 }
 
 /// Latest session for the cwd (repo or cwd match), preferring our own traces.
@@ -437,6 +565,23 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
     if s.loaded_entries.is_empty() {
         lines.push("no rematch entries were loaded".into());
     }
+    // Approved personal text the session's host loaded from the personal AGENTS.md (omp).
+    let exposed_now = rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?;
+    let instructions: Vec<Value> = s
+        .instructions_exposed
+        .iter()
+        .map(|id| {
+            let e = ctx.ledger.get_entry(id).ok().flatten();
+            let sha = s.instruction_shas.get(id).cloned();
+            let name = e.as_ref().map_or(id.as_str(), |e| e.name.as_str());
+            lines.push(format!(
+                "personal instructions {name} loaded from {} (fragment {})",
+                exposed_now.target.display(),
+                sha.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("unknown")
+            ));
+            json!({"id": id, "name": e.as_ref().map(|e| e.name.clone()), "sha": sha})
+        })
+        .collect();
     // Kept on another machine: in the shared skills dir for this session too, never counted here.
     let elsewhere: Vec<Value> = crate::profile_cmd::profile_kept(ctx)?
         .into_iter()
@@ -490,6 +635,7 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
                      "takeovers": s.takeovers, "skill_reads": s.skill_reads, "source": s.source, "counted": s.counted},
         "loaded": loaded,
         "profile_kept": elsewhere,
+        "instructions": {"exposed": instructions, "now": exposed_now},
         "redirects": redirects,
         "source": source,
         "asof": past.as_ref().map(|p| json!({"ts": p.ts, "utc": utc(p.ts)})),
@@ -498,15 +644,20 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
 }
 
 /// The kill switch also empties the shared skills dir at once (and `on` restores the kept and
-/// pinned links; provisional ones return with the next sync of a matching cwd).
+/// pinned links; provisional ones return with the next sync of a matching cwd). The library's
+/// sync also removes the unchanged personal-instruction blocks while off and restores them on.
 pub fn cmd_off(ctx: &AppCtx) -> Result<Value> {
+    let before = exposed(ctx);
     std::fs::create_dir_all(&ctx.paths.root)?;
     std::fs::write(&ctx.paths.off_marker, "")?;
-    library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
-    Ok(json!({"off": true, "marker": ctx.paths.off_marker, "lines": ["rematch is off"]}))
+    library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
+    let mut lines = vec!["rematch is off".to_string()];
+    lines.extend(exposure_lines(ctx, &before));
+    Ok(json!({"off": true, "marker": ctx.paths.off_marker, "lines": lines}))
 }
 
 pub fn cmd_on(ctx: &AppCtx) -> Result<Value> {
+    let before = exposed(ctx);
     if ctx.paths.off_marker.exists() {
         std::fs::remove_file(&ctx.paths.off_marker)?;
     }
@@ -515,7 +666,8 @@ pub fn cmd_on(ctx: &AppCtx) -> Result<Value> {
     if env_off {
         lines = vec!["marker removed, but REMATCH=0 is set in the environment".into()];
     }
-    library::sync_shared_skills(&ctx.ledger, &ctx.paths, None)?;
+    library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
+    lines.extend(exposure_lines(ctx, &before));
     Ok(json!({"off": ctx.paths.is_off(), "marker": ctx.paths.off_marker, "env_off": env_off, "lines": lines}))
 }
 

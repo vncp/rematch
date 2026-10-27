@@ -39,8 +39,8 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 | [`improve`](#rematch-improve) | Brownfield: register, audit, split or propose a sibling for an existing skill |
 | [`activate`](#rematch-activate) | Draft → provisional |
 | [`run`](#rematch-run) | Batch run with a verifier (detached; returns a job id) |
-| [`status`](#rematch-status) | Job status (or all jobs + entry counts) |
-| [`library`](#rematch-library) | Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export |
+| [`status`](#rematch-status) | Job status (or all jobs, entry counts, pending actions and automatic trials) |
+| [`library`](#rematch-library) | Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export |
 | [`task`](#rematch-task) | Batch task definitions |
 | [`transfer`](#rematch-transfer) | Cross-branch transfer of kept invariant lessons |
 | [`ship`](#rematch-ship) | Open a team/fork PR for entries |
@@ -54,8 +54,8 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 | [`on`](#rematch-on) | Kill switch off (removes the `off` marker) |
 | [`uninstall`](#rematch-uninstall) | Remove every file rematch wrote (plan only without `--yes`) |
 | [`lake`](#rematch-lake) | The lake (ADR 001): export, import, rebuild, doctor, migrate |
-| [`report`](#rematch-report) | The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm |
-| [`policy`](#rematch-policy) | REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set\|unset), caps (kept_per_domain) |
+| [`report`](#rematch-report) | The kill criterion (ADR 001 L4): kept entries in real use (≥ 4 clean actual uses), kept on comparative support, and recurrence per trigger, with-entry vs before-arm |
+| [`policy`](#rematch-policy) | REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set\|unset), caps (kept_per_domain), a skill's place scope (scope set\|unset) |
 | [`tune`](#rematch-tune) | Predicate tuning: read-but-missed sessions widen a skill's stems, matched-but-unread narrow them; staged as a provisional sibling |
 | [`profile`](#rematch-profile) | The profile (REMATCH_ROOT/profile, a git repo synced across machines): init, adopt, sync, status, install-launchd |
 
@@ -81,8 +81,8 @@ Commands:
   improve      Brownfield: register, audit, split or propose a sibling for an existing skill
   activate     Draft → provisional
   run          Batch run with a verifier (detached; returns a job id)
-  status       Job status (or all jobs + entry counts)
-  library      Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export
+  status       Job status (or all jobs, entry counts, pending actions and automatic trials)
+  library      Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export
   task         Batch task definitions
   transfer     Cross-branch transfer of kept invariant lessons
   ship         Open a team/fork PR for entries
@@ -96,8 +96,8 @@ Commands:
   on           Kill switch off (removes the `off` marker)
   uninstall    Remove every file rematch wrote (plan only without --yes)
   lake         The lake (ADR 001): export, import, rebuild, doctor, migrate
-  report       The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm
-  policy       REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain)
+  report       The kill criterion (ADR 001 L4): kept entries in real use (≥ 4 clean actual uses), kept on comparative support, and recurrence per trigger, with-entry vs before-arm
+  policy       REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain), a skill's place scope (scope set|unset)
   tune         Predicate tuning: read-but-missed sessions widen a skill's stems, matched-but-unread narrow them; staged as a provisional sibling
   profile      The profile (REMATCH_ROOT/profile, a git repo synced across machines): init, adopt, sync, status, install-launchd
   help         Print this message or the help of the given subcommand(s)
@@ -434,7 +434,7 @@ Options:
 ## rematch status
 
 ```text
-Job status (or all jobs + entry counts)
+Job status (or all jobs, entry counts, pending actions and automatic trials)
 
 Usage: rematch status [OPTIONS] [JOB]
 
@@ -450,7 +450,7 @@ Options:
 ## rematch library
 
 ```text
-Library: ls, why, disable, rollback, pin, unpin, approve, decline, set-fork-path, export, import-export
+Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export
 
 Usage: rematch library [OPTIONS] <COMMAND>
 
@@ -461,8 +461,9 @@ Commands:
   rollback       Restore the predecessor of a kept skill or agent; retire the current one
   pin            
   unpin          
-  approve        One-tap approval of everything of an entry that waits for it — scripts, hook, provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an `export:<id>` item
-  decline        Decline an approval (retires the entry; `export:<id>` only suppresses the offer)
+  approve        Approve a pending action exactly as reviewed: an entry id grants its scripts, hook and provisional-agent parts; `instructions:<id>` its personal text; `instructions-conflict:<name>` restores the approved text over your edit; `instructions-sync` rewrites the personal AGENTS.md; `ship-team:<id>`, `fork:<id>`, `probe:<id>`, `export:<id>` (`rematch status` lists them). `--sha` is required: the action's `review_sha256` (its approve command carries it)
+  decline        Decline a pending action, bound by `--sha` like approve. An entry id retires the entry (its executable parts); `instructions:<id>` declines that text only, the entry stays; `instructions-applied:<name>` withdraws an applied text (profile-wide when the profile carries it); `instructions-conflict:<name>` keeps your edited text as your own; `fragment-unreadable:<id>` withdraws a runtime approval; ship, fork, probe and export items only stop the offer
+  inspect        A pending action in full: target, reach, scope, exact diff and commands
   set-fork-path  Set the repo-relative file `ship --scope fork` writes for an entry (and, with --repo, the fork checkout it goes to)
   export         Work → home export of invariant entries
   import-export  Import an export directory
@@ -568,7 +569,7 @@ Options:
 ### rematch library approve
 
 ```text
-One-tap approval of everything of an entry that waits for it — scripts, hook, provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an `export:<id>` item
+Approve a pending action exactly as reviewed: an entry id grants its scripts, hook and provisional-agent parts; `instructions:<id>` its personal text; `instructions-conflict:<name>` restores the approved text over your edit; `instructions-sync` rewrites the personal AGENTS.md; `ship-team:<id>`, `fork:<id>`, `probe:<id>`, `export:<id>` (`rematch status` lists them). `--sha` is required: the action's `review_sha256` (its approve command carries it)
 
 Usage: rematch library approve [OPTIONS] <ID>
 
@@ -576,6 +577,7 @@ Arguments:
   <ID>  
 
 Options:
+      --sha <SHA>  The full sha256 of the reviewed snapshot (`library inspect <id>` shows the command)
       --text       Human-readable output instead of the JSON envelope
       --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
   -h, --help       Print help
@@ -584,9 +586,26 @@ Options:
 ### rematch library decline
 
 ```text
-Decline an approval (retires the entry; `export:<id>` only suppresses the offer)
+Decline a pending action, bound by `--sha` like approve. An entry id retires the entry (its executable parts); `instructions:<id>` declines that text only, the entry stays; `instructions-applied:<name>` withdraws an applied text (profile-wide when the profile carries it); `instructions-conflict:<name>` keeps your edited text as your own; `fragment-unreadable:<id>` withdraws a runtime approval; ship, fork, probe and export items only stop the offer
 
 Usage: rematch library decline [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --sha <SHA>  
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+### rematch library inspect
+
+```text
+A pending action in full: target, reach, scope, exact diff and commands
+
+Usage: rematch library inspect [OPTIONS] <ID>
 
 Arguments:
   <ID>  
@@ -683,6 +702,7 @@ Options:
       --max-time <MAX_TIME>  Per-rollout time cap: `600`, `90s`, `10m`, `1h`
       --tools <TOOLS>        omp `--tools` list for rollouts
       --seed <SEEDS>         Rollout seed (repeatable); exported to rollouts and verifiers as `REMATCH_SEED`
+      --editable <EDITABLE>  Repo-relative path a rollout may change (repeatable): the solution scope. Without one, runs still execute but mint no comparative evidence
   -h, --help                 Print help
 ```
 
@@ -1101,7 +1121,7 @@ Options:
 ## rematch report
 
 ```text
-The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm
+The kill criterion (ADR 001 L4): kept entries in real use (≥ 4 clean actual uses), kept on comparative support, and recurrence per trigger, with-entry vs before-arm
 
 Usage: rematch report [OPTIONS]
 
@@ -1116,14 +1136,15 @@ Options:
 ## rematch policy
 
 ```text
-REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain)
+REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain), a skill's place scope (scope set|unset)
 
 Usage: rematch policy [OPTIONS] <COMMAND>
 
 Commands:
-  show    The policy file, the declared domains and caps in effect, and the branch domain.yml domains
+  show    The policy file, the declared domains, caps and skill scopes in effect, and the branch domain.yml domains
   domain  Declare (set) or remove (unset) the domain of a repo remote (or remote glob, or a repo path)
   caps    Caps (`kept_per_domain`: kept entries per top-level domain across branches, default 8)
+  scope   Place scope of a skill name: exposed only in one repo (by remote, any clone or worktree) or directory, never globally (set|unset; reserved to the user)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1135,7 +1156,7 @@ Options:
 ### rematch policy show
 
 ```text
-The policy file, the declared domains and caps in effect, and the branch domain.yml domains
+The policy file, the declared domains, caps and skill scopes in effect, and the branch domain.yml domains
 
 Usage: rematch policy show [OPTIONS]
 
@@ -1225,6 +1246,58 @@ Usage: rematch policy caps set [OPTIONS] <CAP> <VALUE>
 Arguments:
   <CAP>    [possible values: kept_per_domain]
   <VALUE>  
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+### rematch policy scope
+
+```text
+Place scope of a skill name: exposed only in one repo (by remote, any clone or worktree) or directory, never globally (set|unset; reserved to the user)
+
+Usage: rematch policy scope [OPTIONS] <COMMAND>
+
+Commands:
+  set    Expose skill `<name>` only at `<target>`: a repo path on this machine (stored as its normalized remote, so every clone and worktree matches), a normalized remote (`github.com/org/repo`), or a directory outside git (stored as its path). Withdraws the name from REMATCH_ROOT/skills and <agent_dir>/skills, rewrites the place of its live entries and resyncs
+  unset  Remove the scope of `<name>`: its kept and profile copies are global again (entry predicates keep the scoped place)
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+#### rematch policy scope set
+
+```text
+Expose skill `<name>` only at `<target>`: a repo path on this machine (stored as its normalized remote, so every clone and worktree matches), a normalized remote (`github.com/org/repo`), or a directory outside git (stored as its path). Withdraws the name from REMATCH_ROOT/skills and <agent_dir>/skills, rewrites the place of its live entries and resyncs
+
+Usage: rematch policy scope set [OPTIONS] <NAME> <TARGET>
+
+Arguments:
+  <NAME>    
+  <TARGET>  
+
+Options:
+      --subpath <SUBPATH>  Only below this toplevel-relative path glob (default `**`, the whole repo)
+      --text               Human-readable output instead of the JSON envelope
+      --cwd <DIR>          Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help               Print help
+```
+
+#### rematch policy scope unset
+
+```text
+Remove the scope of `<name>`: its kept and profile copies are global again (entry predicates keep the scoped place)
+
+Usage: rematch policy scope unset [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  
 
 Options:
       --text       Human-readable output instead of the JSON envelope

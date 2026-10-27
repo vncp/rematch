@@ -19,7 +19,7 @@ use clap::Args;
 use rematch_core::counters::{family_divergence, DAY_MS};
 use rematch_core::ledger::{EntryFilter, now_ms};
 use rematch_core::library::stage;
-use rematch_core::lint::{branch_always_on_bytes, LintContext};
+use rematch_core::lint::LintContext;
 use rematch_core::package::slug;
 use rematch_core::rate::MAX_PROVISIONAL_PER_BRANCH;
 use rematch_core::{Entry, Family, FamilyCounters, Status};
@@ -148,11 +148,12 @@ pub fn check(ctx: &AppCtx) -> Result<Vec<SplitOutcome>> {
             families_excluded: vec![],
             last_tune_at: None,
             tune: None,
+            retention: None,
             ..e.clone()
         };
         let branch_dir = ctx.paths.staging_branch(&e.branch);
         let lctx = LintContext {
-            branch_other_bytes: branch_always_on_bytes(&branch_dir, &branch_dir.join(&name)),
+            catalog_other_bytes: rematch_core::library::catalog_other_bytes(&ctx.ledger, &ctx.paths, &sib, &branch_dir.join(&name))?,
             ..Default::default()
         };
         let rep = lint_edits(ctx, &sib, &files, &lctx)?;
@@ -238,6 +239,7 @@ mod tests {
             tokens: 0,
             turns: 0,
             ts,
+            used: Some(0),
         }
     }
 

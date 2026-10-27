@@ -17,7 +17,19 @@ import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
-import { decode, type Envelope, errorText, isRecord, type PromptFragment, promptFragmentsOf, rematchRoot, renderPromptFragments, resolveBinary, truncationMarker } from "../../extension/index.ts";
+import {
+	decode,
+	type Envelope,
+	errorText,
+	isRecord,
+	type PromptFragment,
+	promptFragmentsOf,
+	rematchRoot,
+	renderPromptFragments,
+	resolveBinary,
+	truncationMarker,
+	userOnlyShellReason,
+} from "../../extension/index.ts";
 
 type Json = Record<string, unknown>;
 type SessionInfo = { parent: string | null; directory: string | null; version: string | null };
@@ -39,65 +51,6 @@ const TOOL_OPERATIONS: Record<string, string[]> = {
 	match: ["match"],
 	"builtins-ls": ["builtins", "ls"],
 };
-
-/** `rematch <args>` that only the user runs: library approve/decline/pin/unpin/disable/rollback, export --approve, on, off, uninstall. */
-const USER_ONLY_LIBRARY: Record<string, true> = { approve: true, decline: true, pin: true, unpin: true, disable: true, rollback: true };
-
-function userOnlyArgs(args: readonly string[]): boolean {
-	const positional: string[] = [];
-	let approveFlag = false;
-	for (let i = 0; i < args.length; i++) {
-		const a = args[i] as string;
-		// Global flags (`--text`, `--cwd DIR`, `--cwd=DIR`) may stand anywhere, clap accepts them after the subcommand too.
-		if (a === "--cwd") {
-			i++;
-			continue;
-		}
-		if (a.startsWith("-")) {
-			if (a === "--approve" || a === "--approve-all") approveFlag = true;
-			continue;
-		}
-		positional.push(a);
-	}
-	const [cmd, sub] = positional;
-	if (cmd === "on" || cmd === "off" || cmd === "uninstall") return true;
-	return cmd === "library" && ((sub !== undefined && USER_ONLY_LIBRARY[sub] === true) || (sub === "export" && approveFlag));
-}
-
-/** Words that may stand before the command itself: runners (`sudo rematch …`, `sh rematch.sh …`) and their flags. */
-const COMMAND_PREFIX: Record<string, true> = { env: true, exec: true, command: true, sudo: true, nohup: true, time: true, sh: true, bash: true, zsh: true };
-
-/**
- * Whether a shell line runs one of the user's controls (`/rematch-approve`, `/rematch-decline`,
- * `/rematch-on`, `/rematch-off` are the user's commands): a `rematch` / `rematch.sh` word,
- * quoted or by path, in command position (after env assignments and runners such as `sudo`,
- * `sh`, or the quoted script of `sh -c`) of any `;`/`&&`/`|`/subshell segment, followed by
- * those words with global flags anywhere. Mentions elsewhere (`git commit -m "… rematch off"`,
- * `echo rematch on`) pass. A guard against the direct command, not a sandbox: an arbitrary
- * script, `eval` of a built string or an alias still runs.
- */
-export function isApprovalCommand(command: unknown): boolean {
-	if (typeof command !== "string") return false;
-	for (const segment of command.split(/&&|\|\||[;&|\n()`]|\$\(/)) {
-		const words = (segment.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(w => w.replace(/["']/g, ""));
-		for (let i = 0; i < words.length; i++) {
-			const word = words[i] as string;
-			const base = word.split("/").pop() ?? "";
-			if (base === "rematch" || base === "rematch.sh") {
-				if (userOnlyArgs(words.slice(i + 1))) return true;
-				break;
-			}
-			// The quoted script of `sh -c "…"` is a command line of its own.
-			if (/\s/.test(word) && i > 0) {
-				if (isApprovalCommand(word)) return true;
-				break;
-			}
-			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-") || COMMAND_PREFIX[base] === true) continue;
-			break;
-		}
-	}
-	return false;
-}
 
 /**
  * What a `retrieve` reply lets the plugin cache for the session until its next prompt or tool
@@ -190,18 +143,19 @@ export function commands(bin: string): Record<string, { template: string; descri
 			`!\`${b} --text status\`\n\n!\`${b} --text skills sync --harness opencode\`\n\n${show("rematch status` and `rematch skills sync --harness opencode")}`,
 			"rematch status: jobs, entries, and the skills linked for this directory",
 		),
-		"rematch-digest": cmd("digest", `!\`${b} --text digest\`\n\n${show("rematch digest")}`, "rematch digest: what changed and the approvals waiting"),
+		"rematch-digest": cmd("digest", `!\`${b} --text digest\`\n\n${show("rematch digest")}`, "rematch digest: what changed and every action waiting (each stays until you decide)"),
+		"rematch-inspect": cmd("inspect", `!\`${b} --text library inspect $ARGUMENTS\`\n\n${show("rematch library inspect")}`, "rematch inspect <action id>: the whole proposal and its exact approve command"),
 		"rematch-why": cmd("why", `!\`${b} --text library why $ARGUMENTS\`\n\n${show("rematch library why")}`, "rematch library why [oc:<session>]"),
 		"rematch-library": cmd("library", `!\`${b} --text library ls\`\n\n${show("rematch library ls")}`, "rematch library ls: every entry with status and counters"),
 		"rematch-approve": cmd(
 			"approve",
 			`!\`${b} --text library approve $ARGUMENTS\`\n\n${show("rematch library approve")}`,
-			"rematch approve <id>: approve an entry's scripts, hook, subagent and prompt fragment (yours only)",
+			"rematch approve <id> --sha <hash>: approve an action exactly as the digest or /rematch-inspect shows it (yours only)",
 		),
 		"rematch-decline": cmd(
 			"decline",
 			`!\`${b} --text library decline $ARGUMENTS\`\n\n${show("rematch library decline")}`,
-			"rematch decline <id> (yours only)",
+			"rematch decline <id> --sha <hash>: as the digest or /rematch-inspect shows it (yours only)",
 		),
 		"rematch-off": cmd("off", `!\`${b} --text off\`\n\n${show("rematch off")}`, "rematch off: the kill switch"),
 		"rematch-on": cmd("on", `!\`${b} --text on\`\n\n!\`${b} --text skills sync --harness opencode\`\n\n${show("rematch on")}`, "rematch on"),
@@ -274,8 +228,12 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	/** `retrieve` context per session for the current prompt (null: no units); dropped on new input and on every hook reload. */
 	const retrieved = new Map<string, string | null>();
 	let skillsPaths: string[] = [];
+	/** This directory's view (`load.dirs`: the kept library plus this directory's provisional entries); what `config` gives OpenCode. */
+	let viewDirs: string[] = [];
 	/** Approved personal prompt fragments of the entries `match` loads for this directory. */
 	let promptFragments: PromptFragment[] = [];
+	/** Per session: the fragment set already recorded as sent (`fragments_sent`). */
+	const sentFragments = new Map<string, string>();
 
 	/** `match` for this directory: the fragments to append to main sessions' system prompts; a failed match keeps the previous ones. */
 	async function loadFragments() {
@@ -285,6 +243,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 
 	function adopt(load: unknown) {
 		if (!isRecord(load) || !Array.isArray(load.hooks)) return;
+		viewDirs = Array.isArray(load.dirs) ? load.dirs.filter((d): d is string => typeof d === "string") : [];
 		const tools = new Set<string>();
 		const rules: TruncateRule[] = [];
 		for (const h of load.hooks.filter(isRecord)) {
@@ -424,8 +383,9 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	const hooks: Hooks = {
 		config: async cfg => {
 			try {
-				const paths = cfg.skills?.paths ?? [];
-				if (!paths.includes(sharedSkills)) cfg.skills = { ...(cfg.skills ?? {}), paths: [...paths, sharedSkills] };
+				// This process's directory only: its view, never the shared dir of every repo's trials.
+				const paths = (cfg.skills?.paths ?? []).filter(p => p !== sharedSkills && !p.startsWith(path.join(root, "views") + path.sep));
+				cfg.skills = { ...(cfg.skills ?? {}), paths: [...paths, ...viewDirs] };
 				skillsPaths = [...(cfg.skills?.paths ?? [])];
 				const mine = commands(bin);
 				const existing = cfg.command ?? {};
@@ -514,9 +474,10 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 
 		"tool.execute.before": async (inp, out) => {
 			const args = isRecord(out.args) ? out.args : {};
-			if (inp.tool === "bash" && isApprovalCommand(args.command)) {
+			const refused = inp.tool === "bash" ? userOnlyShellReason(args.command) : null;
+			if (refused) {
 				throw new Error(
-					"rematch: approving, declining and switching rematch on or off is the user's decision. Ask the user to run /rematch-approve <id>, /rematch-decline <id>, /rematch-on or /rematch-off.",
+					`rematch: ${refused.replace(/:.*$/, "")}. Ask the user to run /rematch-approve <id>, /rematch-decline <id>, /rematch-mark, /rematch-on or /rematch-off, or the command in their own shell.`,
 				);
 			}
 			if (isOff() || callTools.size === 0 || !(callTools.has("*") || callTools.has(inp.tool))) return;
@@ -569,7 +530,15 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 				const info = await sessionInfo(sid);
 				if (info.parent) return;
 				const block = renderPromptFragments(promptFragments);
-				if (block) out.system.push(block);
+				if (block) {
+					out.system.push(block);
+					// Record what this request actually carries (approved sha per fragment), once per set.
+					const sig = promptFragments.map(f => `${f.id}:${f.sha}`).join("|");
+					if (sentFragments.get(sid) !== sig) {
+						sentFragments.set(sid, sig);
+						enqueue(sid, { kind: "fragments", fragments: promptFragments.map(f => ({ id: f.id, name: f.name, sha: f.sha })), bytes: Buffer.byteLength(block, "utf8") });
+					}
+				}
 				if (!retrieves) return;
 				let context = retrieved.get(sid);
 				if (context === undefined) {

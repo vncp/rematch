@@ -611,7 +611,7 @@ pub fn before_numbers(ctx: &AppCtx, e: &Entry) -> Result<Numbers> {
 
 /// The text a fork entry ships: `fork/<file name of fork_path>` when the package has
 /// it, else the SKILL.md (agents: AGENT.md) body without frontmatter.
-fn fork_content(e: &Entry, fork_path: &str) -> Result<String> {
+pub(crate) fn fork_content(e: &Entry, fork_path: &str) -> Result<String> {
     let base = Path::new(fork_path).file_name().ok_or_else(|| anyhow!("fork_path has no file name"))?;
     let dedicated = e.path.join("fork").join(base);
     if dedicated.is_file() {
@@ -703,6 +703,7 @@ mod tests {
                 tokens: 10,
                 turns: 2,
                 ts: 2_000,
+                used: Some(0),
             })
             .unwrap();
         // auto-selection: predicate content recurred in alpha and beta

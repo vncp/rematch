@@ -245,12 +245,14 @@ fn approved_hooks_block_through_hook_check() {
     assert_eq!(check("ses_h", None, "cargo test")["block"], false, "nothing approved, nothing blocks");
     let ls = env.run(&["builtins", "ls"]);
     let stuck = ls["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
-    // The digest (the plugin's toast in the TUI) names the approvals and the user's commands.
+    // The digest (the plugin's toast in the TUI) names every waiting action and the user's commands.
     let d = &send(&env, me, vec![json!({"kind": "digest"})])[0]["digest"];
     let toast = d["toast"].as_str().unwrap();
-    assert!(toast.contains(&format!("approve hook stuck-detector: /rematch-approve {stuck} · /rematch-decline {stuck}")), "{toast}");
-    assert!(d["approvals"].as_array().unwrap().iter().any(|a| a["id"] == json!(stuck)), "{d}");
-    env.run(&["library", "approve", &stuck]);
+    assert!(toast.contains("action(s) waiting") && toast.contains("/rematch-inspect "), "{toast}");
+    let a = d["actions"].as_array().unwrap().iter().find(|a| a["id"] == json!(stuck)).cloned().unwrap_or_else(|| panic!("{d}"));
+    let line = a["line"].as_str().unwrap();
+    assert!(line.contains(&format!("/rematch-approve {stuck}")) && line.contains(&format!("/rematch-decline {stuck}")), "{line}");
+    env.approve(&stuck);
     let load = send(&env, me, vec![json!({"kind": "load"})]);
     assert_eq!(load[0]["hooks"], json!([{"id": stuck, "mode": "stuck", "tool": "*", "params": {"repeats": 3}}]), "{load:?}");
 
@@ -393,7 +395,7 @@ fn approved_retrieve_hook_adds_system_context_with_attribution() {
     assert!(send(&env, me, vec![json!({"kind": "retrieve", "session": "ses_r"})])[0].get("context").is_none());
     send(&env, me, vec![json!({"kind": "shutdown"})]);
 
-    env.run(&["library", "approve", &hook]);
+    env.approve(&hook);
     let load = send(&env, me, vec![json!({"kind": "load"})]);
     assert!(load[0]["hooks"].as_array().unwrap().iter().any(|h| h["mode"] == "retrieve"), "{load:?}");
     // Asked before the session's prompt reached the trace: no input yet, so nothing is decided
@@ -420,4 +422,41 @@ fn approved_retrieve_hook_adds_system_context_with_attribution() {
     assert!(recs[0]["hooks_loaded"].as_array().unwrap().contains(&json!(hook)));
     assert!(!recs[0]["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(hook)), "credited through retrieval");
     assert_eq!(recs.iter().filter(|x| x["ev"] == "input").count(), 1, "units are not an input");
+}
+
+#[test]
+fn skill_loads_and_sent_fragments_credit_their_entries() {
+    let env = Env::new();
+    let me = std::process::id();
+    let d = env.run(&["create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", &editor_script("editor-ok.sh")]);
+    let id = d["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "ledger-test-gate", "--unverified"]);
+    let view = env.run(&["skills", "sync", "--harness", "opencode", "--cwd", env.repo.to_str().unwrap()])["dirs"][0].as_str().unwrap().to_string();
+    let given = |paths: Value, events: Vec<Value>| call(&env, "trace-event", &json!({"pid": me, "directory": env.repo, "version": "1.19.4", "skills_paths": paths, "events": events}));
+    let load = |call: &str| tool("ses_k", call, "skill", "completed", json!({"name": "ledger-test-gate"}), "<skill_content>", None);
+
+    // Through this directory's view the `skill` tool's load is the entry's.
+    given(json!([view]), vec![prompt("ses_k", 1_000, "Commit the ledger changes"), load("k1")]);
+    // A same-named project skill OpenCode also reads: which one it loaded is unknown, no credit.
+    let native = env.repo.join(".opencode/skill/ledger-test-gate");
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(native.join("SKILL.md"), "---\nname: ledger-test-gate\ndescription: mine\n---\n\nMine.\n").unwrap();
+    given(json!([view]), vec![load("k2")]);
+    std::fs::remove_dir_all(env.repo.join(".opencode")).unwrap();
+    // OpenCode was not given the view: nothing of rematch was offered to load.
+    given(json!([]), vec![load("k3")]);
+    let loads: Vec<Value> = trace(&env, "oc:ses_k").into_iter().filter(|r| r["ev"] == "tool_result").collect();
+    assert_eq!(loads.iter().map(|r| r["skill_read"].clone()).collect::<Vec<_>>(), vec![json!("ledger-test-gate"); 3]);
+    assert_eq!(loads.iter().map(|r| r["skill_entry"].clone()).collect::<Vec<_>>(), vec![json!(id), Value::Null, Value::Null]);
+
+    // The plugin put approved fragments into a request: recorded once per (id, sha); a hashless
+    // fragment is not one rematch approved.
+    let sha = "f".repeat(64);
+    let sent = json!({"kind": "fragments", "session": "ses_k", "fragments": [{"id": id, "name": "ledger-test-gate", "sha": sha}], "bytes": 42});
+    let bare = json!({"kind": "fragments", "session": "ses_k", "fragments": [{"id": id, "name": "ledger-test-gate", "sha": ""}], "bytes": 9});
+    given(json!([view]), vec![sent.clone(), sent, bare]);
+    let recs: Vec<Value> = trace(&env, "oc:ses_k").into_iter().filter(|r| r["ev"] == "fragments_sent").collect();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert_eq!((recs[0]["host"].as_str(), recs[0]["bytes"].as_u64()), (Some("opencode"), Some(42)));
+    assert_eq!(recs[0]["fragments"], json!([{"id": id, "name": "ledger-test-gate", "sha": sha, "via": "opencode:system.transform"}]));
 }

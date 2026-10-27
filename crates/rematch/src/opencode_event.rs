@@ -134,10 +134,55 @@ pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
     Ok(Loaded { m, hooks, loaded_entries })
 }
 
-/// The shared skills dir is among the `skills.paths` the plugin gave OpenCode.
-fn skills_delivered(ctx: &AppCtx, env: &Env) -> bool {
-    let shared = rematch_core::paths::canonicalize(&ctx.paths.skills_shared).unwrap_or_else(|_| ctx.paths.skills_shared.clone());
-    env.skills_paths.iter().any(|p| Path::new(p) == ctx.paths.skills_shared || rematch_core::paths::canonicalize(p).is_ok_and(|c| c == shared))
+/// `dir` is among the `skills.paths` the plugin gave OpenCode.
+fn delivered(env: &Env, dir: &Path) -> bool {
+    let canon = rematch_core::paths::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    env.skills_paths.iter().any(|p| Path::new(p) == dir || rematch_core::paths::canonicalize(p).is_ok_and(|c| c == canon))
+}
+
+/// Skill directories OpenCode was given for this process: the place's view (the plugin puts
+/// it into `skills.paths`, so provisional entries of this place load), else only the kept
+/// library (an older plugin or a manual `skills.paths`: no provisional entry reached the
+/// model). `None` when neither.
+fn delivered_sync<'a>(ctx: &AppCtx, env: &Env, synced: &'a crate::skills_cmd::CwdSync) -> Option<&'a rematch_core::library::SkillsSync> {
+    if synced.view.dirs.first().is_some_and(|d| delivered(env, d)) {
+        Some(&synced.view)
+    } else if delivered(env, &ctx.paths.skills_shared) {
+        Some(&synced.shared)
+    } else {
+        None
+    }
+}
+
+/// The rematch entry a successful OpenCode skill load or `read` opened. A `read` of a
+/// `…/<name>/SKILL.md` resolves through the `rematch.json` beside it. The `skill` tool loads by
+/// name: credited only through a skills dir OpenCode was given (this directory's view, else the
+/// kept library) and only when no other skill root OpenCode reads holds a skill of that name
+/// (another `skills.paths` entry, `.opencode/skill(s)` or `.claude/skills` from the directory up,
+/// the user's `~/.config/opencode/skill(s)` and `~/.claude/skills`): which one OpenCode picked
+/// is then unknown, so a same-named native skill earns rematch nothing.
+fn skill_entry_of(ctx: &AppCtx, env: &Env, cwd: &Path, name: &str, path: Option<&str>) -> Option<String> {
+    if let Some(p) = path.filter(|p| p.ends_with("SKILL.md")) {
+        return crate::skills_cmd::entry_of_skill_path(p);
+    }
+    let synced = crate::skills_cmd::sync_cwd(ctx, cwd).ok()?;
+    let ours = delivered_sync(ctx, env, &synced)?.dirs.first()?.join(name);
+    let id = rematch_core::library::load_entry(&ours).ok()?.id;
+    let home = rematch_core::paths::home_dir();
+    let mut roots: Vec<PathBuf> = env
+        .skills_paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p != &ctx.paths.skills_shared && !p.starts_with(rematch_core::library::views_dir(&ctx.paths)))
+        .collect();
+    for a in cwd.ancestors() {
+        roots.extend([".opencode/skill", ".opencode/skills", ".claude/skills"].map(|d| a.join(d)));
+    }
+    if let Some(h) = home {
+        roots.extend([".config/opencode/skill", ".config/opencode/skills", ".claude/skills"].map(|d| h.join(d)));
+    }
+    let native = roots.iter().any(|r| r.join(name).join("SKILL.md").is_file() && rematch_core::library::load_entry(&r.join(name)).map_or(true, |e| e.id != id));
+    (!native).then_some(id)
 }
 
 // ---- segments ----
@@ -199,19 +244,20 @@ fn open_segment(ctx: &AppCtx, env: &Env, ev: &Value, native: &str, model: Option
     Ok((sid, tf))
 }
 
-/// `session_start` after matching the directory and syncing the shared skills dir.
+/// `session_start` after matching the directory and syncing the kept library and its view.
 #[allow(clippy::too_many_arguments)]
 fn start(ctx: &AppCtx, env: &Env, ev: &Value, tf: &mut TraceFile, sid: &str, mode: &str, model: Option<ModelRef>, extra: &mut Value) -> Result<()> {
     let cwd = env.cwd(ctx, ev);
     let loaded = load(ctx, &cwd)?;
-    let (sync, _) = crate::skills_cmd::sync_cwd(ctx, &cwd)?;
-    let delivered = skills_delivered(ctx, env);
-    // Without the shared dir in OpenCode's `skills.paths` no skill entry reached the model.
-    let loaded_entries: Vec<LoadedEntry> = if delivered {
-        loaded.loaded_entries.clone()
-    } else {
-        loaded.loaded_entries.iter().filter(|e| loaded.hooks.iter().any(|h| h.id == e.id)).cloned().collect()
-    };
+    let synced = crate::skills_cmd::sync_cwd(ctx, &cwd)?;
+    let sync = delivered_sync(ctx, env, &synced);
+    // Only entries behind a directory OpenCode was given reached the model (hooks run anyway).
+    let loaded_entries: Vec<LoadedEntry> = loaded
+        .loaded_entries
+        .iter()
+        .filter(|e| loaded.hooks.iter().any(|h| h.id == e.id) || sync.is_some_and(|s| s.visible.contains(&e.id)))
+        .cloned()
+        .collect();
     let repo_dir = repo_of(&cwd);
     let id = repo_dir.as_deref().map(|r| rematch_core::identity::identify(r, &cwd)).unwrap_or_default();
     let repo = repo_dir.map(|p| p.to_string_lossy().into_owned());
@@ -234,11 +280,13 @@ fn start(ctx: &AppCtx, env: &Env, ev: &Value, tf: &mut TraceFile, sid: &str, mod
         omp_version: if version.is_empty() { "opencode".into() } else { format!("opencode {version}") },
         loaded_entries: loaded_entries.clone(),
         hooks_loaded: loaded.hooks.iter().map(|h| h.id.clone()).collect(),
-        staging_dirs: if delivered { sync.dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect() } else { Vec::new() },
+        staging_dirs: sync.map(|s| s.dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect()).unwrap_or_default(),
         repo_remote: id.remote,
         subpath: id.subpath,
         head_sha: id.head_sha,
-        visible_entries: if delivered { sync.visible.clone() } else { Vec::new() },
+        visible_entries: sync.map(|s| s.visible.clone()).unwrap_or_default(),
+        instructions_exposed: Vec::new(),
+        exposure_view: sync.and_then(|s| s.view.clone()),
     })?;
     extra["started"] = json!(sid);
     extra["loaded_entries"] = json!(loaded_entries);
@@ -351,7 +399,7 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
 fn event(ctx: &AppCtx, env: &Env, ev: &Value) -> Result<Value> {
     let kind = str_of(ev, "kind");
     if ctx.paths.is_off() {
-        // Nothing loads or is written while off; the sync empties the shared dir.
+        // Nothing loads or is written while off; the sync empties the shared dir and views.
         if kind == "load" {
             crate::skills_cmd::sync_cwd(ctx, &env.cwd(ctx, ev))?;
         }
@@ -360,15 +408,18 @@ fn event(ctx: &AppCtx, env: &Env, ev: &Value) -> Result<Value> {
     match kind {
         "load" => {
             let cwd = env.cwd(ctx, ev);
-            let (sync, _) = crate::skills_cmd::sync_cwd(ctx, &cwd)?;
+            let synced = crate::skills_cmd::sync_cwd(ctx, &cwd)?;
+            let sync = &synced.view;
             let loaded = load(ctx, &cwd)?;
             let hooks: Vec<Value> = loaded.hooks.iter().map(|h| json!({"id": h.id, "mode": h.mode, "tool": h.tool, "params": h.params})).collect();
-            Ok(json!({"kind": kind, "skills_dir": ctx.paths.skills_shared, "dirs": sync.dirs, "skills": sync.links.keys().collect::<Vec<_>>(), "hooks": hooks}))
+            // `dirs`: this place's view (kept library + this place's provisional entries), the
+            // one directory the plugin puts into `skills.paths` for this process.
+            Ok(json!({"kind": kind, "skills_dir": ctx.paths.skills_shared, "view": sync.view, "dirs": sync.dirs, "skills": sync.links.keys().collect::<Vec<_>>(), "hooks": hooks}))
         }
         "reconcile" => Ok(json!({"kind": kind, "finalized": settle(ctx, None)?})),
         "shutdown" => Ok(json!({"kind": kind, "finalized": settle(ctx, Some(env.pid))?})),
         "digest" => Ok(json!({"kind": kind, "digest": digest(ctx)?})),
-        "prompt" | "tool" | "turn" | "idle" | "retrieve" => session_event(ctx, env, ev, kind),
+        "prompt" | "tool" | "turn" | "idle" | "retrieve" | "fragments" => session_event(ctx, env, ev, kind),
         other => bail!("unknown OpenCode event kind {other:?}"),
     }
 }
@@ -395,8 +446,24 @@ fn session_event(ctx: &AppCtx, env: &Env, ev: &Value, kind: &str) -> Result<Valu
             let call = str_of(part, "callID");
             let seen = tf.records.iter().any(|r| matches!(r, TraceRecord::ToolResult { call_id, .. } if call_id == call));
             let seq = tf.seq();
-            if let (false, Some(rec)) = (seen && !call.is_empty(), oc::tool_result_record(seq, part)) {
+            if let (false, Some(mut rec)) = (seen && !call.is_empty(), oc::tool_result_record(seq, part)) {
+                if let TraceRecord::ToolResult { skill_read: Some(name), path, is_error: false, skill_entry, .. } = &mut rec {
+                    *skill_entry = skill_entry_of(ctx, env, &env.cwd(ctx, ev), name, path.as_deref());
+                }
                 tf.push(rec)?;
+            }
+        }
+        "fragments" => {
+            // The plugin put these approved fragments into this request's system prompt.
+            let fragments: Vec<rematch_core::trace::ExposedInstruction> = serde_json::from_value(ev["fragments"].clone()).unwrap_or_default();
+            let sent = |f: &rematch_core::trace::ExposedInstruction| {
+                tf.records.iter().any(|r| matches!(r, TraceRecord::FragmentsSent { fragments: x, .. } if x.iter().any(|y| y.id == f.id && y.sha == f.sha)))
+            };
+            let new: Vec<_> = fragments.into_iter().filter(|f| !f.sha.is_empty() && !sent(f)).map(|f| rematch_core::trace::ExposedInstruction { via: "opencode:system.transform".into(), ..f }).collect();
+            if !new.is_empty() {
+                let seq = tf.seq();
+                let bytes = ev.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                tf.push(TraceRecord::FragmentsSent { seq, t: tf.now, host: "opencode".into(), fragments: new, bytes })?;
             }
         }
         "turn" => {
@@ -425,8 +492,8 @@ fn session_event(ctx: &AppCtx, env: &Env, ev: &Value, kind: &str) -> Result<Valu
             // plugin asks again on the next request instead of caching "no units".
             let has_input = tf.records.iter().any(|r| matches!(r, TraceRecord::Input { .. }));
             extra["has_input"] = json!(has_input);
-            // Units only from packages OpenCode was given (the shared dir in `skills.paths`).
-            if has_input && skills_delivered(ctx, env) {
+            // Units only from packages OpenCode was given (the view or kept library in `skills.paths`).
+            if has_input && (delivered(env, &ctx.paths.skills_shared) || env.skills_paths.iter().any(|p| Path::new(p).starts_with(rematch_core::library::views_dir(&ctx.paths)))) {
                 let cwd = env.cwd(ctx, ev);
                 if let Some(context) = retrieve(ctx, &mut tf, &cwd)? {
                     extra["context"] = json!(context);
@@ -493,27 +560,29 @@ fn prompt(tf: &mut TraceFile, ev: &Value) -> Result<()> {
 /// Characters of the toast (OpenCode toasts are one short notice; `/rematch-digest` shows all).
 const TOAST_CHARS: usize = 900;
 
-/// The session-start digest (`rematch digest`, which advances `digest.last`): its lines,
-/// the approvals waiting (each with the commands the user runs), and a short toast text.
+/// The session-start digest (`rematch digest`, which advances `digest.last`): its lines, every
+/// action waiting for the user (`digest.actions`: listed every session until decided, each with
+/// its exact approve/decline/inspect commands, never its proposed text), and a short toast.
 fn digest(ctx: &AppCtx) -> Result<Value> {
     let d = crate::digest::cmd_digest(ctx)?;
     let lines: Vec<String> = d["lines"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
-    let approvals: Vec<Value> = d["approvals"]
+    let actions: Vec<Value> = d["actions"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|a| a["id"].is_string())
-        .map(|a| json!({"id": a["id"], "kind": a["kind"], "name": a["name"]}))
+        .map(|a| json!({"id": a["id"], "kind": a["kind"], "name": a["name"], "state": a["state"], "line": crate::trace_event::action_line(a, "/rematch-")}))
         .collect();
-    // Approvals first: they wait for the user; the lines are news.
+    // Actions first: they wait for the user; the lines are news.
     let mut toast = String::new();
-    for a in &approvals {
-        let id = a["id"].as_str().unwrap_or_default();
-        toast.push_str(&format!(
-            "approve {} {}: /rematch-approve {id} · /rematch-decline {id}\n",
-            a["kind"].as_str().unwrap_or("entry"),
-            a["name"].as_str().unwrap_or(id)
-        ));
+    if !actions.is_empty() {
+        toast.push_str(&format!("{} action(s) waiting (nothing changes until you decide):\n", actions.len()));
+    }
+    for a in actions.iter().take(3) {
+        toast.push_str(&format!("{}\n", a["line"].as_str().unwrap_or_default()));
+    }
+    if actions.len() > 3 {
+        toast.push_str(&format!("+{} more actions (/rematch-digest)\n", actions.len() - 3));
     }
     for l in lines.iter().take(3) {
         toast.push_str(&format!("{l}\n"));
@@ -522,7 +591,7 @@ fn digest(ctx: &AppCtx) -> Result<Value> {
         toast.push_str(&format!("+{} more (/rematch-digest)\n", lines.len() - 3));
     }
     let toast = rematch_core::features::head(toast.trim_end(), TOAST_CHARS);
-    Ok(json!({"lines": lines, "approvals": approvals, "toast": if toast.is_empty() { Value::Null } else { json!(toast) }}))
+    Ok(json!({"lines": lines, "actions": actions, "toast": if toast.is_empty() { Value::Null } else { json!(toast) }}))
 }
 
 /// Tool results whose paths join the retrieval query (the extension's `retrievalQuery`).
@@ -776,6 +845,8 @@ mod tests {
             subpath: None,
             head_sha: None,
             visible_entries: vec![],
+            instructions_exposed: vec![],
+            exposure_view: None,
         };
         let shut = |seq| TraceRecord::SessionShutdown { seq, t: 0, reasons: vec![], flagged: false, files_changed: vec![] };
         assert!(!finished(&[]));

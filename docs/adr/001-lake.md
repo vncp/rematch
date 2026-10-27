@@ -88,7 +88,7 @@ rematch lake query <table> <lookup…> [--asof V --known K]   bellwether locate/
 rematch lake import --from <lake>         merge another machine's partitions and watermarks; never the index
 rematch lake rebuild                      SQLite ledger from the journal partitions (entries json, sessions, counters, receipts, outcomes); admissions/jobs/minhash are rebuilt or recomputed
 rematch lake doctor                       watermarks, lag, orphan partitions, index completeness per key, pinned Bellwether version
-rematch report [--window 6w]              the kill criterion from the lake alone: kept entries over ≥ 4 matched sessions; recurrence per trigger, before-arm vs. with-entry
+rematch report [--window 6w]              the kill criterion from the lake alone: kept entries in real use (≥ 4 clean actual uses; amended by D31, was ≥ 4 matched sessions), comparative keeps apart; recurrence per trigger, before-arm vs. with-entry
 ```
 
 `lake export` runs at the end of `reflect --pending` (detached, bounded: a journal drain, never an index) and on demand. `lake index` runs only on demand or when `lake query` finds a root with files newer than its manifest. The ledger stays authoritative per machine; `lake rebuild` exists so "the ledger is derived" is a true sentence, but cross-machine use is read-only: `report`, `transfer suggest`, and `shared` promotion read `counters`/`entries` through `lake query`, never by merging ledgers.

@@ -110,7 +110,7 @@ fn builtins_install_once_and_wait_for_approval() {
     assert_eq!(stuck["kind"], "hook");
     assert!(stuck["diff"].as_str().unwrap().contains(r#"params: {"repeats":3},"#), "{stuck}");
     let id = stuck["id"].as_str().unwrap().to_string();
-    env.run(&["library", "approve", &id]);
+    env.approve(&id);
     let module = std::fs::read_to_string(env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts"))).unwrap();
     assert!(module.contains(r#"mode: "stuck","#) && !module.contains("=>"), "{module}");
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
@@ -175,7 +175,7 @@ fn retrieval_record_credits_the_hook_and_the_package_through_count() {
     let pkg = staged(&env, "ledger-test-gate", "Run the ledger tests before committing payment changes");
     write(&env.root.join("staging/payments/ledger-test-gate/units/reconcile.md"), "# Ledger reconciliation\n\nRun the reconciliation migration before the ledger tests.\n");
     let hook = builtin(&env, "context-unit-retrieval")["id"].as_str().unwrap().to_string();
-    env.run(&["library", "approve", &hook]);
+    env.approve(&hook);
     assert_eq!(builtin(&env, "context-unit-retrieval")["approved"], true);
     let retrieval = || {
         json!({"ev":"retrieval","entry_ids":[hook],"units":[{"entry_id":pkg,"path":"units/reconcile.md","bytes":80}],"bytes":80})
@@ -204,14 +204,20 @@ fn retrieval_record_credits_the_hook_and_the_package_through_count() {
     assert_eq!(rows(&hook), vec![(s1.clone(), 1)], "no retrieval record, no credit for the retrieve hook");
     assert_eq!(rows(&pkg), vec![(s1.clone(), 1), (s2.clone(), 1)]);
 
-    // Sessions 3 and 4 (clean, retrieved again): four clean matched sessions keep the package.
+    // Sessions 3–5 (clean, retrieved again): session 2 loaded the package but never retrieved
+    // or read it (matched, no use), so the fourth clean actual use comes in session 5.
     context_session(&env, "0199d000-0000-7000-8000-000000000003", &[], Some(retrieval()));
     context_session(&env, "0199d000-0000-7000-8000-000000000004", &[&pkg], Some(retrieval()));
     let c = count(&env);
+    assert!(c["decisions"].as_array().unwrap().iter().all(|d| d["entry"] != pkg.as_str()), "3 clean uses of 4 matched: {c}");
+    context_session(&env, "0199d000-0000-7000-8000-000000000005", &[], Some(retrieval()));
+    let c = count(&env);
     let d = c["decisions"].as_array().unwrap().iter().find(|d| d["entry"] == pkg.as_str()).cloned().unwrap_or(Value::Null);
     assert_eq!(d["decision"], "keep", "{c}");
+    assert_eq!(d["retention"]["reason"], "accepted_in_use", "{d}");
     assert_eq!(env.entry(&pkg)["status"], "kept");
-    assert_eq!(rows(&pkg).len(), 4);
+    assert_eq!(rows(&pkg).len(), 5);
+    // The retrieve hook applied in 4 clean completed sessions: actual use, so it is kept too.
     let h = builtin(&env, "context-unit-retrieval");
-    assert_eq!((h["counters"]["matched"].as_u64(), h["status"].as_str()), (Some(3), Some("provisional")), "{h}");
+    assert_eq!((h["counters"]["matched"].as_u64(), h["status"].as_str()), (Some(4), Some("kept")), "{h}");
 }

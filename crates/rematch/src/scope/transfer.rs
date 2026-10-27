@@ -21,10 +21,11 @@ use clap::{Args, Subcommand};
 use rematch_core::dedup::{entry_content, near_duplicate};
 use rematch_core::ledger::{EntryFilter, SessionFilter};
 use rematch_core::library::{set_status, stage, validate_name, SHARED_BRANCH};
-use rematch_core::lint::{branch_always_on_bytes, LintContext};
+use rematch_core::lint::LintContext;
 use rematch_core::predicate::{derive, predicate_hash, ANY_REPO};
 use rematch_core::rate::{can_admit, record_admission, RateLimit};
-use rematch_core::{Edit, Entry, LessonTag, Link, LinkRel, Origin, Predicate, Status};
+use rematch_core::counters;
+use rematch_core::{Edit, Entry, LessonTag, Link, LinkRel, Origin, Predicate, Retention, RetentionReason, Status};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -35,8 +36,6 @@ use crate::lake_read::{self, Source};
 
 /// Minimum shared structural facet keys for a transfer suggestion.
 pub const MIN_OVERLAP: usize = 2;
-/// A second branch's canary counts toward `shared` promotion from this many clean matches.
-pub const PROMOTE_CANARY_MATCHED: u32 = 4;
 
 #[derive(Debug, Clone, Args)]
 pub struct TransferArgs {
@@ -282,6 +281,7 @@ pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Orig
         families_excluded: vec![],
         last_tune_at: None,
         tune: None,
+        retention: None,
         links: vec![Link { rel: LinkRel::TransfersFrom, id: src.id.clone() }],
         ..src.clone()
     };
@@ -291,7 +291,7 @@ pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Orig
 fn transfer_lint(ctx: &AppCtx, e: &Entry, files: &[Edit]) -> Result<rematch_core::LintReport> {
     let branch_dir = ctx.paths.staging_branch(&e.branch);
     let lctx = LintContext {
-        branch_other_bytes: branch_always_on_bytes(&branch_dir, &branch_dir.join(&e.name)),
+        catalog_other_bytes: rematch_core::library::catalog_other_bytes(&ctx.ledger, &ctx.paths, e, &branch_dir.join(&e.name))?,
         transfer: true,
         ..Default::default()
     };
@@ -341,13 +341,19 @@ pub fn apply(ctx: &AppCtx, lesson_id: &str, branch: &str) -> Result<Value> {
     }))
 }
 
-/// Clean canary: provisional, matched ≥ 4, no recurrence, no harm.
-fn clean_canary(ctx: &AppCtx, e: &Entry) -> Result<bool> {
-    if e.status != Status::Provisional {
-        return Ok(false);
+/// The honest evidence an entry lends a promotion: a kept entry's recorded retention
+/// (accepted in use or comparative support; legacy or user-only evidence promotes nothing),
+/// or a provisional entry that meets the keep gate now (`counters::keep_reason`).
+fn promotion_evidence(ctx: &AppCtx, e: &Entry) -> Result<Option<RetentionReason>> {
+    let honest = |r: RetentionReason| matches!(r, RetentionReason::AcceptedInUse | RetentionReason::ComparativeSupport);
+    match e.status {
+        Status::Kept if !e.pinned => Ok(e.retention.as_ref().map(|r| r.reason).filter(|r| honest(*r))),
+        Status::Provisional => {
+            let c = ctx.ledger.counters(&e.id)?;
+            Ok(counters::keep_reason(e, &c, crate::probes::evidence_for(ctx, e).as_ref()))
+        }
+        _ => Ok(None),
     }
-    let c = ctx.ledger.counters(&e.id)?;
-    Ok(c.matched >= PROMOTE_CANARY_MATCHED && c.recurrence == 0 && c.harm == 0)
 }
 
 /// Copy entries kept in ≥ 2 branches to `shared` as kept. The shared copy takes the
@@ -372,6 +378,9 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
         if in_shared {
             continue;
         }
+        // Promotion is an automatic keep: every branch counted must carry honest evidence.
+        let Some(own) = promotion_evidence(ctx, e)? else { continue };
+        let mut reasons: Vec<(String, RetentionReason)> = vec![(e.id.clone(), own)];
         let text = content_text(e);
         let mut branches: BTreeSet<String> = BTreeSet::from([e.branch.clone()]);
         let mut domains: Vec<Option<&str>> = vec![e.predicate.domain.as_deref()];
@@ -379,9 +388,13 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             let same = x.name == e.name
                 || x.links.iter().any(|l| l.rel == LinkRel::TransfersFrom && l.id == e.id)
                 || near_duplicate(&text, &content_text(x));
-            if same && (x.status == Status::Kept || clean_canary(ctx, x)?) {
+            if !same {
+                continue;
+            }
+            if let Some(r) = promotion_evidence(ctx, x)? {
                 branches.insert(x.branch.clone());
                 domains.push(x.predicate.domain.as_deref());
+                reasons.push((x.id.clone(), r));
             }
         }
         if branches.len() < 2 {
@@ -444,7 +457,27 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             }
         }
         let note = format!("promoted to shared: kept in {}", p.branches.join(", "));
-        let kept = set_status(&ctx.ledger, &ctx.paths, &staged.id, Status::Kept, Some(&note))?;
+        let mut kept = set_status(&ctx.ledger, &ctx.paths, &staged.id, Status::Kept, Some(&note))?;
+        // The copy's evidence is its sources' (it has no use of its own yet): comparative
+        // support only when every source has it.
+        let reason = if reasons.iter().all(|(_, r)| *r == RetentionReason::ComparativeSupport) {
+            RetentionReason::ComparativeSupport
+        } else {
+            RetentionReason::AcceptedInUse
+        };
+        let sources: Vec<String> = reasons.iter().map(|(id, r)| format!("{id} ({})", rematch_core::ledger::enum_str(r))).collect();
+        kept.retention = Some(Retention {
+            reason,
+            at: ctx.now,
+            version: kept.version,
+            content_sha256: kept.content_sha256.clone(),
+            matched: 0,
+            used: 0,
+            used_clean: 0,
+            probe: None,
+            detail: format!("promoted to shared from {}", sources.join(", ")),
+        });
+        crate::reflect::save_entry(ctx, &kept)?;
         if let (Some(r), Some(a)) = (&anchor_pass, p.anchor.as_mut()) {
             a["certificate"] = json!(anchor::certify(ctx, &kept, r, None)?);
         }
@@ -611,14 +644,30 @@ mod tests {
                     tokens: 0,
                     turns: 0,
                     ts: 1_000 + i,
+                    used: Some(1),
                 })
                 .unwrap();
         }
+        assert!(promote_shared(ctx).unwrap().is_empty(), "a legacy kept entry (no recorded evidence) promotes nothing");
+        let mut a = a;
+        a.retention = Some(Retention {
+            reason: RetentionReason::AcceptedInUse,
+            at: 1,
+            version: a.version,
+            content_sha256: a.content_sha256.clone(),
+            matched: 4,
+            used: 4,
+            used_clean: 4,
+            probe: None,
+            detail: "fixture".into(),
+        });
+        ctx.ledger.upsert_entry(&a).unwrap();
         let p = promote_shared(ctx).unwrap();
         assert_eq!(p.len(), 1, "{p:?}");
         assert_eq!(p[0].branches, vec!["options".to_string(), "quant".to_string()]);
         let shared = ctx.ledger.get_entry(p[0].shared_id.as_deref().unwrap()).unwrap().unwrap();
         assert_eq!(shared.status, Status::Kept);
+        assert_eq!(shared.retention.as_ref().map(|r| r.reason), Some(RetentionReason::AcceptedInUse));
         assert_eq!(shared.branch, SHARED_BRANCH);
         assert_eq!(shared.predicate.repo_glob, ANY_REPO);
         assert_eq!(shared.predecessor.as_deref(), Some(a.id.as_str()));

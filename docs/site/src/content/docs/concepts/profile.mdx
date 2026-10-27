@@ -19,10 +19,12 @@ Between two Macs over a private GitHub repo: hand-written subagent prompts adopt
     - \<name\>/ kept skills and adopted hand-written skills
   - agents/
     - \<name\>.md kept and adopted agents
+  - instructions/
+    - \<name\>.md canonical approved personal instructions (applied to each machine's `<agent_dir>/AGENTS.md`)
+    - \<name\>.decision the latest profile-wide decision about that text (approved or withdrawn)
   - fragments/
     - \<name\>.md AGENTS.fragment.md of kept agents
   - hooks/
-    - \<id\>.ts approved hooks
   - config/
     - policy.json
     - roles.yml the model behind each role, per machine
@@ -43,16 +45,27 @@ Hand-written skills and agents enter as **pinned** entries: measured like any en
 | the lake and its indexes | history travels through the lake, not the profile |
 | `staging/`, `drafts/`, `archive/`, `predecessors/` | provisional and retired state |
 | traces, pending files, jobs | per-session data |
-| credentials and omp's own `config.yml` | model choices travel only through `roles.yml` |
+| credentials, omp's `config.yml`, `personal-instructions/` (per-file state) and `project-links.json` | model choices travel only through `roles.yml`; `<agent_dir>/AGENTS.md` and repo-local links are written per machine |
 | `rematch.json` and `EXPERIENCE.md` inside each skill | written from this machine's ledger (absolute paths, its state) |
 
 ## Kept elsewhere, loaded here
 
-Every `profile/skills/<name>/` with a `SKILL.md` is linked into `~/.rematch/skills/` when no ledger entry holds that name. So a skill kept on another machine loads here like this machine's kept entries.
+Every `profile/skills/<name>/` with a `SKILL.md` is linked into `~/.rematch/skills/` (and each place view) when no ledger entry holds that name. So a skill kept on another machine loads here too.
 
 - It is counted only by the machine whose ledger holds the entry.
 - A hook linked from another machine runs only where its entry is known.
 - Built-in entries have per-machine ids and are approved per machine.
+
+## Personal instructions across machines
+
+An instruction you approve on one machine travels as `profile/instructions/<name>.md` (its exact bytes) with `<name>.decision`, and every machine and omp profile that syncs applies it to its own `<agent_dir>/AGENTS.md`. Each machine keeps its own file and state; the profile carries only the text and the decision.
+
+- **Withdrawal is profile-wide.** Declining or withdrawing a text the profile carries, on any machine, removes it from the profile at the next `rematch profile sync` and records the withdrawal; every machine (the one that approved it included) drops those bytes at its own sync, until someone approves them again.
+- **Your edits stay yours.** A block you edited inside on one machine is a conflict there and is never overwritten by a sync.
+- **The budget applies on arrival.** A profile text that does not fit this machine's always-on budget is not written; it waits as a blocked `instructions-applied:<name>` action, and `profile sync` says so.
+- **Opting an omp profile out.** An omp profile listed in `policy.json` `skip_profiles` receives no profile texts and contributes none; approvals made there still apply to its own file.
+
+Applied blocks, wherever they came from, are listed under `applied` in `rematch status` and can be inspected and withdrawn there ([withdraw an applied block](/rematch/guides/approve-scripts-and-hooks/#withdraw-an-applied-block)).
 
 ## How it syncs
 
