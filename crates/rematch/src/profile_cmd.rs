@@ -360,7 +360,15 @@ fn adopt_path(ctx: &AppCtx, src: &Path) -> Result<Value> {
         library::validate_name(name.trim_end_matches(".md"))?;
         let dst = profile::agents_dir(&ctx.paths).join(&name);
         if dst.exists() {
-            bail!("the profile already holds agents/{name}");
+            // The same agent already adopted from another machine: identical content means
+            // this copy is redundant — replace it with the link. Different content is a
+            // conflict for the user to resolve, never silently overwritten.
+            if same_contents(src, &dst)? {
+                std::fs::remove_file(src)?;
+                std::os::unix::fs::symlink(&dst, src)?;
+                return Ok(json!({"name": name.trim_end_matches(".md"), "kind": "agent", "as": "linked (identical copy already in the profile)", "from": src, "to": dst}));
+            }
+            bail!("the profile already holds a different agents/{name}; diff it against {} and adopt or discard by hand", src.display());
         }
         profile::move_and_link(src, &dst)?;
         return Ok(json!({"name": name.trim_end_matches(".md"), "kind": "agent", "as": "file", "from": src, "to": dst}));
@@ -379,7 +387,12 @@ fn adopt_path(ctx: &AppCtx, src: &Path) -> Result<Value> {
     }
     let dst = profile::skills_dir(&ctx.paths).join(&name);
     if dst.exists() {
-        bail!("the profile already holds skills/{name}");
+        if same_tree(src, &dst)? {
+            std::fs::remove_dir_all(src)?;
+            std::os::unix::fs::symlink(&dst, src)?;
+            return Ok(json!({"name": name, "kind": "skill", "as": "linked (identical copy already in the profile)", "from": src, "to": dst}));
+        }
+        bail!("the profile already holds a different skills/{name}; diff it against {} and adopt or discard by hand", src.display());
     }
     profile::move_and_link(src, &dst)?;
     let e = match existing {
@@ -710,4 +723,37 @@ mod tests {
         assert!(p.contains("<string>/u/a&amp;b/rematch</string>\n\t\t<string>profile</string>\n\t\t<string>sync</string>\n\t</array>"), "{p}");
         assert!(p.contains("<integer>300</integer>") && p.contains("<key>PATH</key>") && !p.contains("--no-push"), "{p}");
     }
+}
+
+/// Byte-equal regular files.
+fn same_contents(a: &Path, b: &Path) -> Result<bool> {
+    Ok(std::fs::read(a)? == std::fs::read(b)?)
+}
+
+/// Same relative file set with byte-equal contents (symlinks compared by target).
+fn same_tree(a: &Path, b: &Path) -> Result<bool> {
+    fn listing(root: &Path) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        fn walk(root: &Path, cur: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) -> Result<()> {
+            for ent in std::fs::read_dir(cur)? {
+                let p = ent?.path();
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
+                if rel == "rematch.json" || rel == "EXPERIENCE.md" {
+                    continue;
+                }
+                let md = std::fs::symlink_metadata(&p)?;
+                if md.is_dir() {
+                    walk(root, &p, out)?;
+                } else if md.file_type().is_symlink() {
+                    out.insert(rel, std::fs::read_link(&p)?.to_string_lossy().into_owned().into_bytes());
+                } else {
+                    out.insert(rel, std::fs::read(&p)?);
+                }
+            }
+            Ok(())
+        }
+        walk(root, root, &mut out)?;
+        Ok(out)
+    }
+    Ok(listing(a)? == listing(b)?)
 }
