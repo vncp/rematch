@@ -28,6 +28,28 @@ wins (it exists only where a technical constraint was verified).
 | Agent dir resolution (`omp://config-usage.md#profiles`, `omp://extension-loading.md`, `@oh-my-pi/pi-utils/src/dirs.ts`): `PI_CONFIG_DIR` replaces `~/.omp`; `OMP_PROFILE` (when defined, including empty/`default` which selects default and suppresses `PI_PROFILE`) else `PI_PROFILE` selects `~/.omp/profiles/<name>/agent` (ignoring `PI_CODING_AGENT_DIR`); in the default profile `PI_CODING_AGENT_DIR` overrides `~/.omp/agent` (unless it equals a profile-derived agent dir inherited from `PI_PROFILE`). | `RematchPaths::resolve()` follows omp's exact precedence; `REMATCH_ROOT` stays `$REMATCH_ROOT` or `~/.rematch` (shared across profiles). `import --history` without `--sessions` imports the default agent dir plus every `<config_root>/profiles/*/agent/sessions` except profiles in `--skip-profile <name>` or `policy.json` `{"skip_profiles":[...]}`. |
 | `context` event (`pi-coding-agent/src/extensibility/shared-events.ts` `ContextEvent {messages}`; `extensions/runner.ts` `emitContext`): runs before every provider request on a `structuredClone` of the messages; each handler's returned `{messages}` feeds the next; the persisted history is untouched; each handler is bounded by a 30 s timeout (`EXTENSION_HANDLER_TIMEOUT_MS`). Message shapes (`pi-ai/src/types.ts`): `user {content: string \| blocks, synthetic?}`, `toolResult {toolCallId, toolName, content: (text\|image)[], isError}`; assistant tool calls are `{type:"toolCall", id, name, arguments}` blocks. A `CustomMessage {role:"custom", customType, content, display, details?, timestamp}` (`pi-agent-core/src/compaction/messages.ts`) is sent to the provider as a `developer` message (`convertMessageToLlm`, reached from `session/messages.ts` `convertToLlm`) | `truncate` and `retrieve` hooks rewrite only the outgoing copy: truncation replaces old `toolResult` text, retrieval appends one hidden `CustomMessage` (`customType: "com.vncp.rematch.retrieval"`). |
 
+### Native Windows portability
+
+The Windows delivery target is the omp integration. `scripts/install.ps1` builds the
+binary, creates the native file/directory links, registers the extension and installs
+`rematch.exe` in the user's `.local/bin`. Developer Mode or an elevated token is required
+for symlink creation. Install/uninstall honor `HOME`, then `USERPROFILE`.
+
+Process lifetimes use an owned Windows Job Object: the child starts suspended, joins
+the job, then resumes; timeout or cancellation terminates its descendants too.
+Detached jobs either leave a kill-on-close parent job or return an explicit refusal.
+Unix retains process groups and SIGTERM/SIGKILL. Locks use OS locks rather than pid-file
+ownership; trace writers lock a distant byte on Windows so ordinary readers are not blocked.
+
+For `.cmd`/`.bat` omp launchers, prompts travel unchanged through stdin instead of argv.
+Executable launchers and Unix retain the existing argv contract. This applies to both
+editor calls and batch rollouts; unbounded shell quoting of model-generated text is not used.
+
+The native CI workflow covers Windows and Linux, including portable process/lock tests.
+Windows also runs an isolated PowerShell install → CLI/profile/lake → uninstall smoke.
+The omp host and model provider are not exercised by that smoke: its omp shim implements
+plugin-management/version operations only. Pi/OpenCode runtime Windows parity remains unverified.
+
 ## 1. Topology
 
 ```
@@ -47,8 +69,8 @@ Root `REMATCH_ROOT` = `$REMATCH_ROOT` or `~/.rematch` (shared across profiles). 
 
 <!-- ANCHOR: files -->
 ```
-traces/<session_id>.jsonl         extension / adapter trace (schema §3); Claude Code sessions `cc:<uuid>`, Codex `codex:<id>` (§18)
-pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect
+traces/<session_id>.jsonl         extension / adapter trace (schema §3); Claude Code sessions `cc:<uuid>`, Codex `codex:<id>` (§18); on Windows the file name is the id through `paths::encode_file_stem` (`cc%3A<uuid>.jsonl`: `:` would address an NTFS stream), the id itself elsewhere
+pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect; named like traces/
 skills/<name>                     symlink → staging/<branch>/<name>/ or the kept dir, one per loadable entry: the one skill dir omp, Claude Code and Codex load (§16 "Shared skills")
 ledger.sqlite  blobs/<sha256>     ledger (schema §5) + content-addressed blobs
 staging/<branch>/<name>/          provisional entries (loaded through skills/ once a synced cwd matched them; agents via agents/)
@@ -647,13 +669,15 @@ Built behind the cargo feature `lake` of the `rematch` package (default on; `arr
 
 ```
 lake/manifest.json                                   {lake_version: 1, bellwether_version_pinned: null until the first `lake index` (§19.2), watermarks: {machine: last exported journal seq}, events_exported: {session_id: true}, events_missing: [session_id]}
-lake/events/{harness}/{day}/{session_id}.parquet     one file per closed session: its trace when traces/<id>.jsonl is closed (a session_shutdown record), else (imported history) the records `reflect --history` synthesizes from the harness transcript; harness omp | claude-code (cc:) | codex (codex:); day = UTC date of session_start.t (a ledger-only session: started_at)
+lake/events/{harness}/{day}/{session_id}.parquet     one file per closed session: its trace when traces/<id>.jsonl is closed (a session_shutdown record), else (imported history) the records `reflect --history` synthesizes from the harness transcript; harness omp | claude-code (cc:) | codex (codex:) | pi (pi:) | opencode (oc:); day = UTC date of session_start.t (a ledger-only session: started_at); the file name is `paths::encode_file_stem(session_id)` on every platform (`cc:<uuid>` → `cc%3A<uuid>`; `%`, `<>:"/\|?*`, control chars, a leading `.`, a trailing `.`/space and a Windows device name are `%XX`), so a lake copies between Unix and Windows unchanged
 lake/{table}/{day}/{machine}-{seq}.parquet           sessions redirects entries counters proposals receipts: journal rows of one export run; day = export UTC day; seq = journal seq of the run's first row of that table (unpadded)
 lake/outcomes/{domain}/{day}/{machine}-{seq}.parquet the same, split by subject.domain
 lake/blobs/<sha256>                                  proposal replies and receipt certificates the exported rows point at
 ```
 
 Files are written to `.<name>.tmp-<pid>` and renamed, never rewritten (an existing path is skipped) — with one exception: an `events` file exported before the `tool_cmd` column existed is rewritten once, by `lake index` (`events::upgrade`: the same records as a fresh export writes them now, so the bytes equal a new export's), because Bellwether reads one schema per root and refuses a key on a column some file lacks (`column "tool_cmd" not in source schema`); a scan before that derives the column from `tool`/`tool_input`. Partition values (`harness`, `day`, `session_id` of events; `day`; `domain` of outcomes) live only in the path. Time columns are `Timestamp(ms, "UTC")`, lists `List<Utf8>` (non-null items), statistics untruncated (`statistics_truncate_length(None)`, `column_index_truncate_length(None)`). Same journal rows ⇒ byte-identical files.
+
+Events file names before the portable codec. Exports before it named a session's file by its raw id (`events/claude-code/<day>/cc:<uuid>.parquet`; `/`, `\` and NUL as `_`, a leading `.` prefixed `_`). Nothing is renamed or rewritten: such a file stays where it is and is still found (`events::find_events_file` tries the encoded name, then the raw one; Windows never holds a raw name with `:`), still settles its session (`lake export` writes no second file next to it), and reads back with the right `session_id` (`events::session_of_file` decodes only a stem that is exactly an encoding, so `cc:<uuid>` and a literal `a%41` stay as they are and nothing is decoded twice). `lake import` keys events by `(harness, decoded session_id)` and writes every copy under the encoded name, so a pre-codec Unix lake imports onto Windows and a session already present under either name is skipped. `session_id` in a Bellwether index of a pre-codec lake is the raw name for old files and the encoded one for new files; `lake query` rows carry the decoded id either way.
 
 Columns. Every append table starts with `seq` (Int64, journal seq), `known` (ts, ledger clock of the write), `machine`, `op` (`insert`/`update`/`snapshot`), `row_key` and ends with `json` (the record as written, compact JSON):
 

@@ -79,7 +79,7 @@ pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<(SkillsSync, Vec<PathBuf>)> 
         for ent in std::fs::read_dir(&dir)? {
             let p = ent?.path();
             if std::fs::symlink_metadata(&p)?.file_type().is_symlink() {
-                std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
+                library::unlink(&p).with_context(|| format!("remove {}", p.display()))?;
             }
         }
         // Anything but links is not ours: the directory then stays.
@@ -307,8 +307,8 @@ pub fn sync_plugin_agents(ctx: &AppCtx, plugin_root: &Path) -> Result<Option<Age
 
 /// Codex's user skill root, `$HOME/.agents/skills` (developers.openai.com/codex/skills).
 fn codex_user_skills() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".agents").join("skills"))
+    let home = rematch_core::paths::home_dir().ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(home.join(".agents").join("skills"))
 }
 
 /// Kept-entry copies older versions wrote under `~/.agents/skills/` (directories holding
@@ -348,8 +348,8 @@ fn codex(ctx: &AppCtx, repo: Option<&Path>) -> Result<(Vec<PathBuf>, Vec<PathBuf
         std::fs::remove_dir_all(&copy).with_context(|| format!("remove {}", copy.display()))?;
         migrated.push(copy);
     }
-    let shared = std::fs::canonicalize(&ctx.paths.skills_shared)?;
-    let reached = candidates.into_iter().filter(|p| std::fs::canonicalize(p).is_ok_and(|c| c == shared)).collect();
+    let shared = rematch_core::paths::canonicalize(&ctx.paths.skills_shared)?;
+    let reached = candidates.into_iter().filter(|p| rematch_core::paths::canonicalize(p).is_ok_and(|c| c == shared)).collect();
     Ok((reached, migrated))
 }
 
@@ -433,7 +433,8 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
     Ok(out)
 }
 
-#[cfg(test)]
+// Every test here builds symlinks (unprivileged only on Unix).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::app::{new_entry, NewEntry};
@@ -471,7 +472,7 @@ mod tests {
     #[test]
     fn legacy_link_dirs_go_after_the_first_sync() {
         let t = tempfile::tempdir().unwrap();
-        let base = t.path().canonicalize().unwrap();
+        let base = rematch_core::paths::canonicalize(t.path()).unwrap();
         let repo = base.join("payments");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let c = ctx(&base, &repo);
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn plugin_link_points_at_the_shared_dir() {
         let t = tempfile::tempdir().unwrap();
-        let base = t.path().canonicalize().unwrap();
+        let base = rematch_core::paths::canonicalize(t.path()).unwrap();
         let c = ctx(&base, &base);
         let plugin = base.join("plugin");
         std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();

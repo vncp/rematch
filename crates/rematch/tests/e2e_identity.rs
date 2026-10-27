@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! Identity that survives machines (ADR 001 L1) end to end through the binary: a session
 //! traced in another checkout of the same remote counts an entry whose predicate matches by
 //! remote only, `why` shows the remote and the content sha, and `lake migrate` fills the
@@ -38,6 +39,7 @@ fn session(env: &Env, sid: &str, repo: &str, remote: Option<&str>, loaded: Value
     );
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn a_worktree_session_matches_its_repos_entry_by_remote() {
     let env = Env::new();
@@ -84,6 +86,7 @@ fn a_worktree_session_matches_its_repos_entry_by_remote() {
     assert!(j.iter().all(|r| r.machine == "test-host"));
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn lake_migrate_fills_pre_l1_rows_once() {
     let env = Env::new();

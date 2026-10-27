@@ -64,7 +64,7 @@ fn idle(sid: &str) -> Value {
 }
 
 fn trace(env: &Env, sid: &str) -> Vec<Value> {
-    let p = env.root.join("traces").join(format!("{sid}.jsonl"));
+    let p = env.trace_path(sid);
     std::fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
@@ -74,7 +74,7 @@ fn evs(recs: &[Value]) -> Vec<&str> {
 
 /// The pid of a process that has exited.
 fn dead_pid() -> u32 {
-    let mut c = std::process::Command::new("true").spawn().unwrap();
+    let mut c = std::process::Command::new(BIN).arg("--version").stdout(Stdio::null()).spawn().unwrap();
     let pid = c.id();
     c.wait().unwrap();
     pid
@@ -114,7 +114,7 @@ fn live_runs_segments_and_finalization() {
     assert_eq!(recs[5]["path"], file.as_str());
     assert_eq!(recs[7]["text_head"], "Added the reconcile command.");
     assert_eq!((recs[8]["turns"].as_u64(), recs[8]["yielded"].as_bool()), (Some(2), Some(true)));
-    let owner = env.root.join("opencode/open/oc:ses_main1.json");
+    let owner = env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_main1")));
     assert!(owner.is_file(), "the process owns the open segment");
 
     // Replayed payloads (a plugin restart, a duplicate bus event) write nothing.
@@ -144,7 +144,7 @@ fn live_runs_segments_and_finalization() {
     // prompt delivered into its running run is a takeover.
     let r = send(&env, me, vec![json!({"kind": "prompt", "session": "ses_child", "parent": main, "message": {"time": {"created": 3}}, "parts": [{"type": "text", "text": "child work"}]})]);
     assert_eq!(r[0]["skipped"], "subagent");
-    assert!(!env.root.join("traces/oc:ses_child.jsonl").exists());
+    assert!(!env.trace_path("oc:ses_child").exists());
     send(
         &env,
         me,
@@ -168,7 +168,8 @@ fn live_runs_segments_and_finalization() {
     let last = recs.last().unwrap();
     assert_eq!((last["ev"].as_str(), last["flagged"].as_bool()), (Some("session_shutdown"), Some(true)));
     assert_eq!(last["reasons"], json!(["redirect:negation"]));
-    let pending: Value = serde_json::from_str(&std::fs::read_to_string(env.root.join("pending/oc:ses_main1.json")).unwrap()).unwrap();
+    let pending_file = env.root.join("pending").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_main1")));
+    let pending: Value = serde_json::from_str(&std::fs::read_to_string(pending_file).unwrap()).unwrap();
     assert_eq!((pending["source"].as_str(), pending["session_id"].as_str()), (Some("opencode"), Some("oc:ses_main1")));
     let other = trace(&env, "oc:ses_other");
     assert_eq!(&evs(&other)[6..], ["agent_end", "session_shutdown"], "the open run ends before the shutdown");
@@ -176,10 +177,10 @@ fn live_runs_segments_and_finalization() {
     assert_eq!(send(&env, me, vec![json!({"kind": "shutdown"})])[0]["finalized"], json!([]));
 
     // Continued later (another process): a new segment; the finished one is never appended to.
-    let frozen = std::fs::read_to_string(env.root.join("traces/oc:ses_main1.jsonl")).unwrap();
+    let frozen = std::fs::read_to_string(env.trace_path("oc:ses_main1")).unwrap();
     let r = send(&env, 4242, vec![prompt(main, 9_000, "Now add a dry-run flag to the command"), turn(main, 9_100, "stop", "Done."), idle(main)]);
     assert_eq!(r[0]["started"], "oc:ses_main1:r2");
-    assert_eq!(std::fs::read_to_string(env.root.join("traces/oc:ses_main1.jsonl")).unwrap(), frozen);
+    assert_eq!(std::fs::read_to_string(env.trace_path("oc:ses_main1")).unwrap(), frozen);
     let r2 = trace(&env, "oc:ses_main1:r2");
     assert_eq!((r2[0]["mode"].as_str(), r2[0]["session_id"].as_str()), (Some("opencode:resume"), Some("oc:ses_main1:r2")));
     assert_eq!(evs(&r2), ["session_start", "input", "turn_end", "agent_end"]);
@@ -198,7 +199,7 @@ fn reconcile_settles_dead_and_quiet_segments() {
     // A process that died mid-run (no dispose): the next start finalizes its segment.
     let gone = dead_pid();
     send(&env, gone, vec![prompt("ses_dead", 1_000, "Refactor the ledger module"), tool("ses_dead", "d1", "edit", "completed", json!({"filePath": "src/ledger.rs"}), "ok", None)]);
-    assert!(env.root.join("opencode/open/oc:ses_dead.json").is_file());
+    assert!(env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_dead"))).is_file());
     // A live owner that has been quiet for longer than the threshold, with no run going.
     let repo = env.repo.to_string_lossy();
     env.write_records(
@@ -210,7 +211,8 @@ fn reconcile_settles_dead_and_quiet_segments() {
             json!({"seq":3,"t":1_003,"ev":"agent_end","turns":1,"is_terminal":true,"yielded":true}),
         ],
     );
-    std::fs::write(env.root.join("opencode/open/oc:ses_quiet.json"), json!({"session": "ses_quiet", "pids": [me]}).to_string()).unwrap();
+    let quiet_owner = env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_quiet")));
+    std::fs::write(quiet_owner, json!({"session": "ses_quiet", "pids": [me]}).to_string()).unwrap();
     // A live owner, recently active: left open.
     send(&env, me, vec![prompt("ses_live", 1_000, "Keep working on the ledger")]);
 
@@ -222,7 +224,7 @@ fn reconcile_settles_dead_and_quiet_segments() {
     let dead = trace(&env, "oc:ses_dead");
     assert_eq!(&evs(&dead)[dead.len() - 2..], ["agent_end", "session_shutdown"]);
     assert_eq!(dead[dead.len() - 2]["yielded"], false, "the run never finished");
-    assert!(env.root.join("opencode/open/oc:ses_live.json").is_file());
+    assert!(env.root.join("opencode/open").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_live"))).is_file());
     assert!(!evs(&trace(&env, "oc:ses_live")).contains(&"session_shutdown"));
     // The quiet session's next event opens its second segment.
     let r = send(&env, me, vec![prompt("ses_quiet", 50_000, "Back to the reconcile flag")]);
@@ -267,7 +269,7 @@ fn approved_hooks_block_through_hook_check() {
     // Another call passes; a subagent (no trace) is never stuck-blocked.
     assert_eq!(check("ses_h", None, "cargo test -p ledger")["block"], false);
     assert_eq!(check("ses_child", Some("ses_h"), "cargo test -p payments")["block"], false);
-    assert!(!env.root.join("traces/oc:ses_child.jsonl").exists());
+    assert!(!env.trace_path("oc:ses_child").exists());
 
     // The kill switch: nothing is checked or written.
     env.run(&["off"]);
@@ -360,7 +362,7 @@ fn opencode_history_imports_and_reflects() {
     assert_eq!(sub["redirects"], json!([]), "{sub}");
 
     // reflect --history reads the session back from the store.
-    let editor = script("editor-ok.sh");
+    let editor = editor_script("editor-ok.sh");
     let r = env.run(&["reflect", "--history", "--editor", &editor]);
     let hist = &r["history"];
     assert_eq!(hist["handed"], json!([sid]), "{r}");
@@ -377,7 +379,7 @@ fn opencode_history_imports_and_reflects() {
 fn approved_retrieve_hook_adds_system_context_with_attribution() {
     let env = Env::new();
     let me = std::process::id();
-    let d = env.run(&["create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", &script("editor-ok.sh")]);
+    let d = env.run(&["create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", &editor_script("editor-ok.sh")]);
     let pkg = d["id"].as_str().unwrap().to_string();
     env.run(&["activate", "ledger-test-gate", "--unverified"]);
     let unit = env.root.join("staging/payments/ledger-test-gate/units/reconcile.md");

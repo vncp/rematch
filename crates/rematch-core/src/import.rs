@@ -1705,7 +1705,7 @@ mod tests {
                         .strip_prefix(&slug)
                         .unwrap()
                         .to_string_lossy()
-                        .into_owned(),
+                        .replace('\\', "/"),
                     f.parent_id.clone(),
                 )
             })

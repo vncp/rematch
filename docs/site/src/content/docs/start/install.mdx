@@ -45,6 +45,16 @@ You need omp 18.12 and a Rust toolchain, in a checkout of this repo.
 - Runs `rematch doctor` and prints the optional model roles.
 </Aside>
 
+<Aside type="note" title="Windows">
+Turn on Developer Mode (Settings → System → For developers): every library view is a symlink, and Windows lets a normal user create one only there. `rematch doctor` reports it as a `problem:` otherwise. Then run, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+It does what `install.sh` does; the shim is `~\.local\bin\rematch.exe`, a symlink to `target\release\rematch.exe`, and that directory is added to your user `PATH`. `scripts\uninstall.ps1` undoes it.
+</Aside>
+
 </TabItem>
 <TabItem label="Claude Code">
 

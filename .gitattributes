@@ -1,0 +1,2 @@
+# Shell relays and scripted-editor fixtures run under POSIX sh (including Git for Windows).
+*.sh text eol=lf

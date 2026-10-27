@@ -41,8 +41,8 @@ From `docs/DESIGN.md` §1 (region `files`) by `docs/site/scripts/gen.ts`. Edit t
 :::
 
 ```
-traces/<session_id>.jsonl         extension / adapter trace (schema §3); Claude Code sessions `cc:<uuid>`, Codex `codex:<id>` (§18)
-pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect
+traces/<session_id>.jsonl         extension / adapter trace (schema §3); Claude Code sessions `cc:<uuid>`, Codex `codex:<id>` (§18); on Windows the file name is the id through `paths::encode_file_stem` (`cc%3A<uuid>.jsonl`: `:` would address an NTFS stream), the id itself elsewhere
+pending/<session_id>.json         {session_id, flagged_at, reasons:[...], trace}   written at shutdown; deleted by reflect; named like traces/
 skills/<name>                     symlink → staging/<branch>/<name>/ or the kept dir, one per loadable entry: the one skill dir omp, Claude Code and Codex load (§16 "Shared skills")
 ledger.sqlite  blobs/<sha256>     ledger (schema §5) + content-addressed blobs
 staging/<branch>/<name>/          provisional entries (loaded through skills/ once a synced cwd matched them; agents via agents/)

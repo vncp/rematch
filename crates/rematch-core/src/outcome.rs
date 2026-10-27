@@ -167,22 +167,32 @@ pub fn outcome_tokens(o: &Outcome) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Host name: `$REMATCH_MACHINE` when set (tests, renamed hosts), else `gethostname`.
+/// Host name: `$REMATCH_MACHINE` when set (tests, renamed hosts), else `gethostname`
+/// (Windows: `%COMPUTERNAME%`).
 pub fn machine_name() -> String {
     if let Ok(m) = std::env::var("REMATCH_MACHINE") {
         if !m.trim().is_empty() {
             return m.trim().to_string();
         }
     }
-    let mut buf = [0u8; 256];
-    // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates on success
-    // (we also bound the scan by the buffer length).
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc == 0 {
-        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-        let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
-        if !name.is_empty() {
-            return name;
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates on success
+        // (we also bound the scan by the buffer length).
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        if !name.trim().is_empty() {
+            return name.trim().to_string();
         }
     }
     "unknown".to_string()

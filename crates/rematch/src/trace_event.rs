@@ -135,11 +135,11 @@ fn cwd_of(ctx: &AppCtx, payload: &Value) -> PathBuf {
 
 // ---- the trace file ----
 
-/// The session's trace, locked (advisory `flock`) for the life of the value: hooks of one
-/// session run concurrently (parallel tool calls).
+/// The session's trace, locked against other appenders for the life of the value: hooks of
+/// one session run concurrently (parallel tool calls).
 pub(crate) struct TraceFile {
     pub(crate) path: PathBuf,
-    file: std::fs::File,
+    file: Appender,
     pub(crate) records: Vec<TraceRecord>,
     pub(crate) now: i64,
 }
@@ -147,13 +147,8 @@ pub(crate) struct TraceFile {
 impl TraceFile {
     pub(crate) fn open(ctx: &AppCtx, sid: &str) -> Result<TraceFile> {
         std::fs::create_dir_all(&ctx.paths.traces)?;
-        let path = ctx.paths.traces.join(format!("{sid}.jsonl"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        file.lock().with_context(|| format!("lock {}", path.display()))?;
+        let path = ctx.paths.trace_file(sid);
+        let file = Appender::open(&path).with_context(|| format!("open and lock {}", path.display()))?;
         let records = trace::read_trace(&path)?;
         Ok(TraceFile { path, file, records, now: ctx.now })
     }
@@ -165,7 +160,7 @@ impl TraceFile {
     pub(crate) fn push(&mut self, rec: TraceRecord) -> Result<()> {
         let mut line = serde_json::to_string(&rec)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes()).with_context(|| format!("append to {}", self.path.display()))?;
+        self.file.0.write_all(line.as_bytes()).with_context(|| format!("append to {}", self.path.display()))?;
         self.records.push(rec);
         Ok(())
     }
@@ -194,6 +189,64 @@ impl TraceFile {
             TraceRecord::ModelChange { to: Some(m), .. } => Some(m.clone()),
             _ => None,
         })
+    }
+}
+
+/// A file opened for appending, exclusive among appenders until dropped. Unix: `flock`
+/// (advisory). Windows: byte-range locks are mandatory, so the lock covers one byte far past
+/// any record ([`APPENDERS_BYTE`]): readers of the trace, this process included, are never
+/// refused.
+struct Appender(std::fs::File);
+
+/// Offset of the byte Windows appenders lock (beyond any file this code writes).
+#[cfg(windows)]
+const APPENDERS_BYTE: u64 = 1 << 62;
+
+impl Appender {
+    fn open(path: &Path) -> std::io::Result<Appender> {
+        // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE; append-only handles
+        // have FILE_APPEND_DATA instead. Read access lets LockFileEx lock this handle.
+        let file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        #[cfg(unix)]
+        file.lock()?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+            let mut at = appenders_byte();
+            // SAFETY: a handle owned by `file` and an OVERLAPPED that outlives the call (the
+            // handle is synchronous: the call returns once the lock is held).
+            if unsafe { LockFileEx(file.as_raw_handle(), LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut at) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Appender(file))
+    }
+}
+
+#[cfg(windows)]
+fn appenders_byte() -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+    OVERLAPPED {
+        Internal: 0,
+        InternalHigh: 0,
+        Anonymous: OVERLAPPED_0 { Anonymous: OVERLAPPED_0_0 { Offset: APPENDERS_BYTE as u32, OffsetHigh: (APPENDERS_BYTE >> 32) as u32 } },
+        hEvent: std::ptr::null_mut(),
+    }
+}
+
+impl Drop for Appender {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = self.0.unlock();
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+            let mut at = appenders_byte();
+            // SAFETY: as in `open`; unlocks the byte this handle locked.
+            unsafe { UnlockFileEx(self.0.as_raw_handle(), 0, 1, 0, &mut at) };
+        }
     }
 }
 
@@ -392,7 +445,7 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
             tf.push(TraceRecord::SessionShutdown { seq, t: tf.now, reasons: reasons.clone(), flagged, files_changed })?;
             if flagged {
                 std::fs::create_dir_all(&ctx.paths.pending)?;
-                let p = ctx.paths.pending.join(format!("{sid}.json"));
+                let p = ctx.paths.pending_file(&sid);
                 let body = json!({"session_id": sid, "flagged_at": ctx.now, "reasons": reasons, "trace": tf.path, "source": "claude-code"});
                 std::fs::write(&p, serde_json::to_string(&body)?).with_context(|| format!("write {}", p.display()))?;
                 extra["pending"] = json!(p);
@@ -778,7 +831,7 @@ pub fn hook_check(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<V
     let subagent = payload.get("agent_id").is_some_and(|v| !v.is_null());
     let sid = session_of(a, payload)?;
     let hash = args_hash(&input);
-    let trace_path = ctx.paths.traces.join(format!("{sid}.jsonl"));
+    let trace_path = ctx.paths.trace_file(&sid);
     let records = if subagent || !trace_path.is_file() { Vec::new() } else { trace::read_trace(&trace_path)? };
     let stuck_ids: Vec<&str> = loaded.hooks.iter().filter(|h| h.mode == HookMode::Stuck).map(|h| h.id.as_str()).collect();
     let mut blocked: Option<(&HookModule, String)> = None;
@@ -909,5 +962,29 @@ mod tests {
         assert_eq!(field_value(&input, "path"), Some("/etc/passwd"));
         assert_eq!(field_value(&json!({"path": "/a"}), "file_path"), Some("/a"));
         assert_eq!(field_value(&input, "command"), None);
+    }
+
+    #[test]
+    fn appenders_exclude_each_other_but_never_readers() {
+        use std::time::Duration;
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("cc%3As.jsonl");
+        let mut a = Appender::open(&p).unwrap();
+        a.0.write_all(b"{}\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}\n", "a reader is not refused while an appender holds the lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                let mut b = Appender::open(&p).unwrap();
+                b.0.write_all(b"{\"b\":1}\n").unwrap();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a second appender waits");
+        drop(a);
+        rx.recv_timeout(Duration::from_secs(10)).expect("the second appender gets the lock once the first drops");
+        waiter.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}\n{\"b\":1}\n");
     }
 }

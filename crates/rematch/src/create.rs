@@ -216,7 +216,7 @@ fn lake_sessions(ctx: &AppCtx, stems: &[String], exts: &[String]) -> Result<Vec<
 }
 
 fn reference_of(ctx: &AppCtx, s: &SessionRecord) -> Value {
-    let trace = ctx.paths.traces.join(format!("{}.jsonl", s.id));
+    let trace = ctx.paths.trace_file(&s.id);
     let records = lake_read::lake_events(ctx, s).or_else(|| trace.is_file().then(|| trace::read_trace(&trace).unwrap_or_default()));
     let excerpt = records
         .and_then(|recs| trace::find_moment(s).map(|m| trace::excerpt_around(&recs, m.seq, 5, 5)))
@@ -371,7 +371,8 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
 fn from_task(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let task = a.task.as_deref().ok_or_else(|| crate::envelope::Usage("--from task needs --task <id>".into()))?;
     let trace_path = crate::batch::worker::cmd_reference_rollout(ctx, task)?;
-    let sid = trace_path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad trace path"))?.to_string();
+    let stem = trace_path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad trace path"))?;
+    let sid = rematch_core::paths::id_from_file_stem(stem).into_owned();
     let records = trace::read_trace(&trace_path)?;
     let mut s = trace::fold_trace(&records, &sid);
     s.domain = rematch_core::domain::session_domain(&s, &ctx.domain_policy()?);
@@ -490,7 +491,7 @@ pub fn cmd_activate(ctx: &AppCtx, a: ActivateArgs) -> Result<Value> {
     let mut evidence = None;
     if let Some(task) = &a.task {
         let trace_path = crate::batch::worker::cmd_reference_rollout(ctx, task)?;
-        let sid = trace_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let sid = rematch_core::paths::id_from_file_stem(trace_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default()).into_owned();
         let records = trace::read_trace(&trace_path)?;
         let mut s = trace::fold_trace(&records, &sid);
         s.domain = rematch_core::domain::session_domain(&s, &ctx.domain_policy()?);

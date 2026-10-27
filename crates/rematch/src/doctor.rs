@@ -84,7 +84,7 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
                 (_, false) => "not linked".to_string(),
                 (Ok(entries), true) => format!(
                     "linked{}, loads {}",
-                    std::fs::canonicalize(&module).map(|t| format!(" → {}", t.display())).unwrap_or_default(),
+                    rematch_core::paths::canonicalize(&module).map(|t| format!(" → {}", t.display())).unwrap_or_default(),
                     entries.join(", ")
                 ),
                 (Err(why), true) => format!("linked, does not load ({why})"),
@@ -119,6 +119,12 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
     // `match` and `skills sync` treat an unreadable domain policy as "no domain"; say so here.
     if let Err(e) = ctx.domain_policy() {
         problems.push(format!("domain policy invalid (policy.json domains/caps, branches/*/domain.yml or domain_rules.toml): {e:#}"));
+    }
+    // Every library view is a symlink; Windows creates them unprivileged only in Developer Mode.
+    let symlinks = symlink_probe(&ctx.paths.root);
+    if let Err(e) = &symlinks {
+        let hint = if cfg!(windows) { "; turn on Developer Mode (Settings → System → For developers) or run elevated" } else { "" };
+        problems.push(format!("cannot create symlinks under {}: {e:#}{hint}", ctx.paths.root.display()));
     }
 
     let sessions = ctx.ledger.list_sessions(&SessionFilter::default())?;
@@ -212,6 +218,7 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
         "ledger": {"path": ctx.paths.ledger_file, "schema_version": schema, "binary_schema_version": SCHEMA_VERSION,
                    "sessions": sessions.len(), "traced_sessions": traced, "entries": by_status},
         "improver": {"dir": ctx.paths.improver, "files": improver},
+        "symlinks": symlinks.is_ok(),
         "paths": {"root": ctx.paths.root, "config_root": ctx.paths.config_root, "profile": ctx.paths.profile,
                   "agent_dir": ctx.paths.agent_dir, "traces": ctx.paths.traces, "pending": ctx.paths.pending,
                   "staging": ctx.paths.staging, "drafts": ctx.paths.drafts, "archive": ctx.paths.archive, "jobs": ctx.paths.jobs,
@@ -224,6 +231,14 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
     }))
 }
 
+/// Create and remove one directory symlink in `dir`.
+fn symlink_probe(dir: &Path) -> Result<()> {
+    let link = dir.join(format!(".doctor-link-{}", std::process::id()));
+    rematch_core::library::symlink_dir(dir, &link)?;
+    rematch_core::library::unlink(&link)?;
+    Ok(())
+}
+
 /// One block of `doctor`'s `harnesses`: its text line, its JSON (status and problems are
 /// added by the caller), and whether it is set up at all.
 struct Harness {
@@ -234,7 +249,7 @@ struct Harness {
 }
 
 fn resolves_to(p: &Path, want: &Path) -> bool {
-    match (std::fs::canonicalize(p), std::fs::canonicalize(want)) {
+    match (rematch_core::paths::canonicalize(p), rematch_core::paths::canonicalize(want)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
@@ -243,7 +258,7 @@ fn resolves_to(p: &Path, want: &Path) -> bool {
 /// The linked extension loads: its module dir resolves, its `package.json` is ours and every
 /// `omp.extensions` entry is a file. Ok: the entries.
 fn extension_loads(module: &Path) -> Result<Vec<String>, String> {
-    let dir = std::fs::canonicalize(module).map_err(|e| format!("{} does not resolve ({e})", module.display()))?;
+    let dir = rematch_core::paths::canonicalize(module).map_err(|e| format!("{} does not resolve ({e})", module.display()))?;
     let pj = dir.join("package.json");
     let text = std::fs::read_to_string(&pj).map_err(|e| format!("{}: {e}", pj.display()))?;
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", pj.display()))?;
@@ -277,7 +292,7 @@ fn claude_code_harness(ctx: &AppCtx) -> Harness {
         };
     }
     let mut problems = Vec::new();
-    let target = std::fs::canonicalize(&link).ok();
+    let target = rematch_core::paths::canonicalize(&link).ok();
     if target.is_none() {
         problems.push(format!("{} does not resolve (a dangling link): link it to <repo>/adapters/claude-code", link.display()));
     }
@@ -344,7 +359,7 @@ fn claude_code_harness(ctx: &AppCtx) -> Harness {
 /// `~/.agents/skills/rematch` (Codex's user skill root): present and resolving to the
 /// shared skills dir.
 fn codex_harness(ctx: &AppCtx) -> Harness {
-    let Some(link) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".agents/skills/rematch")) else {
+    let Some(link) = rematch_core::paths::home_dir().map(|h| h.join(".agents/skills/rematch")) else {
         return Harness { line: "codex: not set up (HOME is not set)".into(), json: json!({"link": null}), problems: vec![], set_up: false };
     };
     if std::fs::symlink_metadata(&link).is_err() {

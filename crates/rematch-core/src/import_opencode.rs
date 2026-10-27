@@ -78,11 +78,12 @@ pub fn native_id(ledger_id: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// OpenCode's data dir: `$XDG_DATA_HOME/opencode`, else `$HOME/.local/share/opencode`
-/// (`xdg-basedir`, which OpenCode uses on every platform).
+/// OpenCode's data dir: `$XDG_DATA_HOME/opencode`, else `<home>/.local/share/opencode`
+/// (`xdg-basedir`, which OpenCode uses on every platform; home is `os.homedir()`: `$HOME`,
+/// else `%USERPROFILE%` on Windows).
 pub fn data_dir() -> Option<PathBuf> {
-    let non_empty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    non_empty("XDG_DATA_HOME").or_else(|| non_empty("HOME").map(|h| h.join(".local").join("share"))).map(|d| d.join("opencode"))
+    let xdg = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+    xdg.or_else(|| crate::paths::home_dir().map(|h| h.join(".local").join("share"))).map(|d| d.join("opencode"))
 }
 
 /// The store OpenCode itself opens: `$OPENCODE_DB` when absolute, else

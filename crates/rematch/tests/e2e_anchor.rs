@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! End-to-end anchor replay (SPEC "Rollback and anchors"): before an entry replaces a kept
 //! one, the kept entry's originating task is replayed once in batch mode (fake omp, a
 //! verifier that passes or fails via `$ANCHOR_VERDICT`). All three call sites: `count`
@@ -165,6 +166,7 @@ fn count_four(f: &Fixture, verdict: &str) -> Value {
     c["decisions"].as_array().unwrap().iter().find(|d| d["entry"] == f.sibling.as_str()).cloned().expect("sibling decided")
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_count_keep_replays_once_and_passes() {
     let f = fixture(Some(VERIFIER), true);
@@ -192,6 +194,7 @@ fn anchor_count_keep_replays_once_and_passes() {
     assert_eq!(f.worktrees(), 1);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_count_keep_failing_replay_retires_sibling() {
     let f = fixture(Some(VERIFIER), true);
@@ -222,6 +225,7 @@ fn anchor_count_keep_without_verifier_uses_canary() {
     assert_eq!(f.get(&f.kept).status, Status::Dormant);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_count_keep_deferred_while_task_locked() {
     let f = fixture(Some(VERIFIER), true);
@@ -229,7 +233,8 @@ fn anchor_count_keep_deferred_while_task_locked() {
     let runs = f.env.root.join("runs").join(ANCHOR_TASK);
     std::fs::create_dir_all(&runs).unwrap();
     let lock = runs.join(".lock");
-    std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    let held = std::fs::File::create(&lock).unwrap();
+    held.lock().unwrap();
 
     let d = count_four(&f, "pass");
     assert_eq!(d["decision"], "keep", "{d}");
@@ -248,7 +253,7 @@ fn anchor_count_keep_deferred_while_task_locked() {
     assert_eq!(f.worktrees(), 1, "no worktree left");
 
     // Lock released: the next matched session decides again and the replay runs.
-    std::fs::remove_file(&lock).unwrap();
+    drop(held);
     f.env.write_trace("0199b000-0000-7000-8000-000000000005", &[&f.sibling], false);
     let c = f.run(&["count", "--editor", &script("editor-ok.sh")], "pass");
     let d = c["decisions"].as_array().unwrap().iter().find(|d| d["entry"] == f.sibling.as_str()).cloned().expect("decided");
@@ -302,6 +307,7 @@ fn promote(verdict: &str) -> (Fixture, Value) {
     (f, row)
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_promote_shared_passing_replay_keeps_and_certifies() {
     let (f, row) = promote("pass");
@@ -319,6 +325,7 @@ fn anchor_promote_shared_passing_replay_keeps_and_certifies() {
     assert_eq!(row["anchor"]["certificate"].as_str().map(str::len), Some(64), "{row}");
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_promote_shared_failing_replay_retires_copy_and_settles() {
     let (f, row) = promote("fail");
@@ -341,13 +348,15 @@ fn anchor_promote_shared_failing_replay_retires_copy_and_settles() {
     assert_eq!(f.rollouts(), 1);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_promote_shared_deferred_while_task_locked_then_retried() {
     let f = promote_fixture();
     let runs = f.env.root.join("runs").join(ANCHOR_TASK);
     std::fs::create_dir_all(&runs).unwrap();
     let lock = runs.join(".lock");
-    std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    let held = std::fs::File::create(&lock).unwrap();
+    held.lock().unwrap();
 
     let row = promote_row(&f, "pass");
     assert_eq!(f.rollouts(), 0, "no rollout while the task is locked");
@@ -359,7 +368,7 @@ fn anchor_promote_shared_deferred_while_task_locked_then_retried() {
     assert!(!runs.join("1").exists(), "no workspace materialized");
 
     // Lock released: the next pass stages a fresh copy and replays.
-    std::fs::remove_file(&lock).unwrap();
+    drop(held);
     let row = promote_row(&f, "pass");
     assert_eq!(row["anchor"]["replay"]["pass"], true, "{row}");
     assert_eq!(f.rollouts(), 1);
@@ -367,6 +376,7 @@ fn anchor_promote_shared_deferred_while_task_locked_then_retried() {
     assert_eq!(f.get(&f.kept).status, Status::Dormant);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_manual_replay_reports_and_stages_nothing() {
     let f = fixture(Some(VERIFIER), true);
@@ -417,6 +427,7 @@ fn next_run(verdict: &str) -> (Fixture, Value) {
     (f, out)
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_batch_next_run_passing_replay_keeps_and_certifies() {
     let (f, out) = next_run("pass");
@@ -433,6 +444,7 @@ fn anchor_batch_next_run_passing_replay_keeps_and_certifies() {
     assert_eq!(f.worktrees(), 1);
 }
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn anchor_batch_next_run_failing_replay_retires_pending_entry() {
     let (f, out) = next_run("fail");

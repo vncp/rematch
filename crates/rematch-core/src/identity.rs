@@ -32,7 +32,7 @@ pub fn normalize_remote(url: &str) -> Option<String> {
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         (strip_user_port(authority), path)
-    } else if s.starts_with('/') || s.starts_with('.') || s.starts_with('~') {
+    } else if s.starts_with('/') || s.starts_with('.') || s.starts_with('~') || (cfg!(windows) && is_windows_path(s)) {
         return file_remote(s);
     } else {
         match s.split_once(':') {
@@ -63,15 +63,29 @@ fn trim_repo_path(path: &str) -> String {
     p.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
 }
 
+/// A Windows local path git takes for a filesystem remote (`has_dos_drive_prefix`, UNC):
+/// `C:\…`, `C:/…`, `\\server\share\…`; never an scp-like `host:path`.
+fn is_windows_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || s.starts_with(r"\\")
+}
+
 fn file_remote(path: &str) -> Option<String> {
+    // Windows spellings: `\` separators, and `file:///C:/x` naming the drive path `C:/x`.
+    let path = path.trim();
+    let path: std::borrow::Cow<str> = if cfg!(windows) { path.replace('\\', "/").into() } else { path.into() };
+    let path = match path.strip_prefix('/') {
+        Some(rest) if cfg!(windows) && is_windows_path(rest) => rest,
+        _ => &path,
+    };
     let p = trim_repo_path(path);
-    let root = if path.trim().starts_with('/') { "/" } else { "" };
+    let root = if cfg!(windows) && path.starts_with("//") { "//" } else if path.starts_with('/') { "/" } else { "" };
     (!p.is_empty()).then(|| format!("file:{root}{p}"))
 }
 
 /// Identity of a repo without a remote: `local:<sha256 of the toplevel path>`.
 pub fn local_identity(toplevel: &Path) -> String {
-    let p = std::fs::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
+    let p = crate::paths::canonicalize(toplevel).unwrap_or_else(|_| toplevel.to_path_buf());
     format!("{LOCAL_PREFIX}{}", sha256_hex(p.to_string_lossy().as_bytes()))
 }
 
@@ -137,7 +151,7 @@ pub fn repo_remote_of(toplevel: &Path) -> Option<String> {
             return Some(n);
         }
     }
-    let common = std::fs::canonicalize(&common).unwrap_or(common);
+    let common = crate::paths::canonicalize(&common).unwrap_or(common);
     let main = match (common.file_name(), common.parent()) {
         (Some(n), Some(parent)) if n == ".git" => parent.to_path_buf(),
         _ => toplevel.to_path_buf(),
@@ -181,8 +195,8 @@ pub fn subpath_of(toplevel: &Path, cwd: &Path) -> Option<String> {
             .map(|r| r.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))
     };
     rel(toplevel, cwd).or_else(|| {
-        let top = std::fs::canonicalize(toplevel).ok()?;
-        let c = std::fs::canonicalize(cwd).ok()?;
+        let top = crate::paths::canonicalize(toplevel).ok()?;
+        let c = crate::paths::canonicalize(cwd).ok()?;
         rel(&top, &c)
     })
 }
@@ -260,6 +274,21 @@ mod tests {
         assert_eq!(normalize_remote("https://github.com/"), None);
         let n = normalize_remote("git@github.com:vncp/rematch.git").unwrap();
         assert_eq!(normalize_remote(&n).unwrap(), n);
+        // Drive and UNC paths are filesystem remotes on Windows (git's `has_dos_drive_prefix`);
+        // elsewhere `c:path` is scp-like, as git reads it there.
+        for (url, win) in [
+            (r"C:\repos\x.git", "file:C:/repos/x"),
+            ("C:/repos/x/", "file:C:/repos/x"),
+            ("file:///C:/repos/x.git", "file:C:/repos/x"),
+            (r"\\srv\share\x.git", "file://srv/share/x"),
+        ] {
+            if cfg!(windows) {
+                assert_eq!(normalize_remote(url).as_deref(), Some(win), "{url}");
+            } else {
+                assert!(normalize_remote(url).is_none_or(|n| !n.starts_with("file:C:")), "{url}");
+            }
+        }
+        assert_eq!(normalize_remote("c:org/repo").as_deref(), if cfg!(windows) { Some("file:c:org/repo") } else { Some("c/org/repo") });
     }
 
     #[test]

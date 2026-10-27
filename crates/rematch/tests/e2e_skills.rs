@@ -1,3 +1,4 @@
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
 //! End-to-end for the shared skills dir (DESIGN §16 "Shared skills"): `skills sync --cwd`
 //! adds the provisional entries a cwd matches and never drops one because another cwd does
 //! not match it; status changes re-point (keep) or prune (retire) at once; the kill switch
@@ -8,6 +9,7 @@ mod common;
 use common::*;
 use serde_json::json;
 
+#[cfg(unix)] // POSIX sh fixtures
 #[test]
 fn union_keep_retire_and_off() {
     let env = Env::new();

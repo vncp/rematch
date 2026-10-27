@@ -18,6 +18,15 @@ pub fn script(name: &str) -> String {
     scripts().join(name).to_string_lossy().into_owned()
 }
 
+/// `--editor` is a POSIX shell command, not an executable path. Quote the fixture so
+/// backslashes/spaces cannot be parsed as shell syntax; Git for Windows accepts C:/ paths.
+pub fn editor_script(name: &str) -> String {
+    let p = script(name);
+    #[cfg(windows)]
+    let p = p.replace('\\', "/");
+    format!("'{}'", p.replace('\'', "'\\''"))
+}
+
 pub struct Env {
     pub _tmp: tempfile::TempDir,
     pub root: PathBuf,
@@ -30,7 +39,7 @@ pub struct Env {
 impl Env {
     pub fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path().canonicalize().unwrap();
+        let t = rematch_core::paths::canonicalize(tmp.path()).unwrap();
         let repo = t.join("work").join("payments");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -126,13 +135,13 @@ impl Env {
         let traces = self.root.join("traces");
         std::fs::create_dir_all(&traces).unwrap();
         let body: String = recs.iter().map(|r| format!("{r}\n")).collect();
-        let path = traces.join(format!("{sid}.jsonl"));
+        let path = self.trace_path(sid);
         std::fs::write(&path, body).unwrap();
         if redirect {
             let pending = self.root.join("pending");
             std::fs::create_dir_all(&pending).unwrap();
             std::fs::write(
-                pending.join(format!("{sid}.json")),
+                pending.join(format!("{}.json", rematch_core::paths::id_file_stem(sid))),
                 json!({"session_id":sid,"flagged_at":1_010,"reasons":["redirect:negation"],"trace":path}).to_string(),
             )
             .unwrap();
@@ -165,10 +174,14 @@ impl Env {
     }
 
     pub fn write_records(&self, sid: &str, recs: &[Value]) {
-        let traces = self.root.join("traces");
-        std::fs::create_dir_all(&traces).unwrap();
+        std::fs::create_dir_all(self.root.join("traces")).unwrap();
         let body: String = recs.iter().map(|r| format!("{r}\n")).collect();
-        std::fs::write(traces.join(format!("{sid}.jsonl")), body).unwrap();
+        std::fs::write(self.trace_path(sid), body).unwrap();
+    }
+
+    /// `traces/<id>.jsonl` as the binary names it (`RematchPaths::trace_file`).
+    pub fn trace_path(&self, sid: &str) -> PathBuf {
+        self.root.join("traces").join(format!("{}.jsonl", rematch_core::paths::id_file_stem(sid)))
     }
 
     pub fn entry(&self, id: &str) -> Value {

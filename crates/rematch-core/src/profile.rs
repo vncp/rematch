@@ -326,7 +326,7 @@ fn prune_dangling(dir: &Path, under: &Path, label: &str, out: &mut Views) -> Res
     for (name, p) in names {
         let Ok(t) = std::fs::read_link(&p) else { continue };
         if t.starts_with(under) && !p.exists() {
-            std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
+            crate::library::unlink(&p).with_context(|| format!("remove {}", p.display()))?;
             out.pruned.push(format!("{label}/{name}"));
         }
     }
@@ -404,7 +404,7 @@ pub fn link_views(paths: &RematchPaths) -> Result<Views> {
         let o = ensure_link(paths, &policy, &root_policy)?;
         note(&mut out, o, crate::domain::POLICY_FILE.to_string());
     } else if std::fs::read_link(&root_policy).is_ok_and(|t| t.starts_with(dir(paths))) && !root_policy.exists() {
-        std::fs::remove_file(&root_policy)?;
+        crate::library::unlink(&root_policy)?;
         out.pruned.push(crate::domain::POLICY_FILE.to_string());
     }
     for (name, src) in children(&domains_dir(paths), |n, p| n.ends_with(".yml") && p.is_file()) {
@@ -512,7 +512,7 @@ mod tests {
 
     fn env() -> (tempfile::TempDir, RematchPaths) {
         let t = tempfile::tempdir().unwrap();
-        let root = t.path().canonicalize().unwrap();
+        let root = crate::paths::canonicalize(t.path()).unwrap();
         let paths = RematchPaths::with_roots(root.join("rematch"), root.join("agent"));
         paths.ensure_dirs().unwrap();
         std::fs::create_dir_all(dir(&paths).join(".git")).unwrap();

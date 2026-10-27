@@ -1,3 +1,5 @@
+// POSIX-only: sh fixtures, Unix file modes and unprivileged symlinks.
+#![cfg(unix)]
 //! End-to-end through the Claude Code adapter's own hook relay (`adapters/claude-code/scripts/
 //! hook.sh`): synthetic Claude Code hook payloads → `traces/cc:<uuid>.jsonl` + the pending
 //! flag → `reflect --pending` stages an entry → `skills sync --harness claude-code` links it

@@ -37,6 +37,17 @@ in `~/.local/bin`. Keep the checkout: the shim points to its release binary.
 Then start omp and work normally. A correction can flag a session for reflection
 in the background at the next session start; a proposal is not guaranteed.
 
+On Windows, turn on Developer Mode first (Settings → System → For developers):
+rematch's library is made of symlinks, which Windows lets a normal user create only
+there. Then, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+It does the same, with the shim `~\.local\bin\rematch.exe` (a symlink to the release
+binary) and that directory added to your user `PATH`.
+
 Optionally seed the ledger from existing omp sessions:
 
 ```sh
@@ -182,7 +193,9 @@ verbatim copies ([provenance and changes](docs/research.md#5-porting-notes-what-
 
 Counters report recurrence and harm, not a controlled estimate of improvement.
 Scratch-repository demonstrations and synthetic tests are not production evidence.
-Live runs documented so far are on macOS arm64; Linux is untested and Windows is unsupported.
+Live model-backed runs documented so far are on macOS arm64. Native CI checks the Windows
+omp path and Linux; POSIX shell fixtures remain Unix-only. Pi/OpenCode host runtime
+compatibility on Windows is not yet certified.
 See [status and limits](https://vncp.github.io/rematch/background/status/) for evidence and open gaps.
 
 ## Docs

@@ -475,7 +475,7 @@ fn import_harness_stats<U, S>(
         }
         st.redirects += rec.redirects.len() as u32;
         ctx.ledger.upsert_session(&rec)?;
-        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", rec.id));
+        let trace_path = ctx.paths.trace_file(&rec.id);
         if !subagent && !rec.flagged && !counted && !rec.loaded_entries.is_empty() && !trace_path.exists() {
             let mut body = String::new();
             for r in &trace(&session) {
@@ -543,7 +543,7 @@ pub fn locate_session_file(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Pat
 fn cwd_slugs(cwd: &str) -> Vec<String> {
     let cwd = Path::new(cwd);
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = rematch_core::paths::home_dir() {
         if let Ok(rel) = cwd.strip_prefix(&home) {
             out.push(format!("-{}", rel.to_string_lossy().replace('/', "-")));
         }
@@ -665,7 +665,7 @@ pub fn read_transcript(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Transcr
 /// Trace records of a ledger session: its live trace when present, else the trace
 /// synthesized from its harness transcript ([`read_transcript`]). `None` when neither exists.
 pub fn records_for_session(ctx: &AppCtx, s: &SessionRecord) -> Result<Option<Vec<TraceRecord>>> {
-    let tp = ctx.paths.traces.join(format!("{}.jsonl", s.id));
+    let tp = ctx.paths.trace_file(&s.id);
     if tp.is_file() {
         return Ok(Some(trace::read_trace(&tp)?));
     }

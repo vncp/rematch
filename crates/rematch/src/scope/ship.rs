@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(shipped.len(), 1, "{out}");
         let branch = shipped[0]["branch"].as_str().unwrap();
         assert_eq!(branch, "rematch/ledger-migrations-e0001".replace("e0001", &short_id("e-team-0001")));
-        assert_eq!(PathBuf::from(shipped[0]["repo"].as_str().unwrap()).canonicalize().unwrap(), r1.canonicalize().unwrap());
+        assert_eq!(rematch_core::paths::canonicalize(shipped[0]["repo"].as_str().unwrap()).unwrap(), rematch_core::paths::canonicalize(&r1).unwrap());
         // user checkout untouched; branch carries the files and the evidence body
         assert!(!r1.join(".omp").exists());
         let files = sh(&r1, &["git", "ls-tree", "-r", "--name-only", branch]);

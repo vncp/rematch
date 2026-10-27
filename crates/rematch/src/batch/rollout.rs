@@ -3,7 +3,6 @@
 //! every assistant message) and let the verifier judge the worktree.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -104,15 +103,13 @@ pub fn run_rollout(
     let dest = workspace(ctx, task, seed, label);
     let install = sub.materialize(tree, &dest).with_context(|| format!("materialize {label}"))?;
     let call = sub.rollout_cmd(&install, task, seed)?;
-    let mut cmd = Command::new(omp_bin);
-    cmd.args(omp::tools_argv(&call))
-        .current_dir(&install.worktree)
-        .envs(omp::child_env())
+    let (mut cmd, input) = omp::command(omp_bin, &omp::tools_argv(&call));
+    cmd.current_dir(&install.worktree)
         .env("REMATCH_SEED", seed.to_string())
         // A rollout is not an interactive session: the plugin stays inert inside it.
         .env("REMATCH", "0");
     tracing_line(&format!("rollout {label} seed={seed}: {}", omp::selector(&call.model)));
-    let b = proc::run_bounded(cmd, task.max_time() + KILL_GRACE)?;
+    let b = proc::run_bounded_input(cmd, task.max_time() + KILL_GRACE, input.as_deref())?;
     std::fs::write(&install.events, &b.stdout).with_context(|| format!("write {}", install.events.display()))?;
     let events_blob = ctx.ledger.put_blob(b.stdout.as_bytes())?;
 
