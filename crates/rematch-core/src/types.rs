@@ -83,6 +83,11 @@ pub struct Predicate {
     /// empty or `**` = the whole repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
+    /// Dotted lowercase work domain (`web.frontend`, `quant`; `domain::domain_of`). When both
+    /// the predicate and the session carry one, the session's must equal it or extend it
+    /// (`quant` matches `quant.options`); absent on either side, it is not tested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// The unit of evidence everywhere: one trace record in one session.
@@ -300,6 +305,55 @@ pub struct Entry {
     /// (`library::content_sha256`); set at stage and keep. Cross-machine identity (ADR 001).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<Sha256Hex>,
+    /// When a predicate tune last staged a sibling of this entry (`rematch tune`, DESIGN §6
+    /// "Predicate tuning"): at most one tune per entry per 7 days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tune_at: Option<UnixMs>,
+    /// Set on a sibling a predicate tune staged: the parent, the predicate change and the
+    /// sessions behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tune: Option<PredicateTune>,
+}
+
+/// What a predicate tune changed and why (DESIGN §6 "Predicate tuning"): written on the
+/// staged sibling (`Entry.tune`, so `rematch.json` carries it) and in its proposal row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateTune {
+    /// The entry the sibling was tuned from (`sibling_of`) and its version then.
+    pub parent: EntryId,
+    pub parent_version: u32,
+    pub at: UnixMs,
+    /// `widen` (read-but-missed), `narrow` (matched-but-unread) or `domain` (only the
+    /// domain was set).
+    pub direction: String,
+    /// The parent's predicate.
+    pub from: Predicate,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub added_exts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_set: Option<String>,
+    pub evidence: TuneEvidence,
+}
+
+/// Session ids behind a tune, per signal, and where the rows came from (`lake`|`ledger`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneEvidence {
+    /// Sessions that read the entry while visible and that its predicate missed.
+    #[serde(default)]
+    pub read_missed: Vec<String>,
+    /// Sessions the predicate hit with the entry loaded and never read.
+    #[serde(default)]
+    pub matched_unread: Vec<String>,
+    /// The sessions the change was computed from (a subset of the above).
+    #[serde(default)]
+    pub used: Vec<String>,
+    #[serde(default)]
+    pub source: String,
+    pub window_ms: i64,
 }
 
 fn one() -> u32 {
@@ -595,6 +649,10 @@ pub struct SessionRecord {
     /// cwd relative to the repo toplevel (`""` at the top).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
+    /// Dotted lowercase work domain (`domain::domain_of`: policy.json, else the branch's
+    /// `domain.yml`, else inference from exts and stems); `None` when undecided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     /// HEAD commit at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_sha: Option<String>,

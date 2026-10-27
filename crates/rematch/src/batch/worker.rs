@@ -815,16 +815,20 @@ impl Cycle<'_> {
             families_excluded: Vec::new(),
             links: Vec::new(),
             content_sha256: None,
+            last_tune_at: None,
+            tune: None,
         })
     }
 
     /// DESIGN §6: the task repo, the reference rollout's file extensions, and its stems
-    /// (task prompt + touched basenames) ranked by tf-idf against the session corpus.
+    /// (task prompt + touched basenames) ranked by tf-idf against the session corpus; the
+    /// domain is the reference rollout's (`domain::session_domain`).
     fn predicate(&self, reference: &Rollout) -> Result<Predicate> {
         let corpus: Vec<Vec<String>> =
             self.ctx.ledger.list_sessions(&Default::default())?.into_iter().map(|s| s.stems).collect();
         let stems = rank_stems(&reference.session.stems, &corpus);
-        Ok(derive(Some(&self.task.repo.to_string_lossy()), &reference.session.exts, &stems))
+        let domain = rematch_core::domain::session_domain(&reference.session, &self.ctx.domain_policy()?);
+        Ok(derive(Some(&self.task.repo.to_string_lossy()), &reference.session.exts, &stems, domain.as_deref()))
     }
 
     /// 3–4. Composed variants for every (invariant, domain) pair; confirmation when > 1.
@@ -1003,7 +1007,8 @@ impl Cycle<'_> {
         if fresh.is_empty() {
             return Ok((out, json!({"skipped": "every lesson duplicated an existing entry"})));
         }
-        if let Err(r) = rematch_core::rate::can_admit(&ctx.ledger, &hash, &self.branch, ctx.now) {
+        let kept_per_domain = ctx.domain_policy()?.kept_per_domain();
+        if let Err(r) = rematch_core::rate::can_admit(&ctx.ledger, &hash, &self.branch, predicate.domain.as_deref(), kept_per_domain, ctx.now) {
             let note = format!("{r}");
             for l in fresh {
                 out.push(json!({"name": l.name, "refused": note}));

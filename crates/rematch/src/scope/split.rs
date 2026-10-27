@@ -144,6 +144,8 @@ pub fn check(ctx: &AppCtx) -> Result<Vec<SplitOutcome>> {
             pending_next_run: false,
             fork_commit: None,
             families_excluded: vec![],
+            last_tune_at: None,
+            tune: None,
             ..e.clone()
         };
         let branch_dir = ctx.paths.staging_branch(&e.branch);

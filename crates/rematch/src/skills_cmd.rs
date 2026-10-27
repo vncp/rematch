@@ -2,9 +2,10 @@
 //! `REMATCH_ROOT/skills/` is the one skill directory every harness loads — omp through
 //! `skills.customDirectories`, Claude Code through the plugin's `skills/` symlink, Codex
 //! through `~/.agents/skills/rematch`. The link rules live in
-//! [`rematch_core::library::sync_shared_skills`]; this module adds the cwd, the per-harness
-//! reach checks, the migration from the per-harness directories of older versions, and the
-//! Claude Code plugin's `agents/` copies ([`sync_plugin_agents`], DESIGN §18.1).
+//! [`rematch_core::library::sync_shared_skills`] (kept sources include every
+//! `profile/skills/<name>/` of the profile, DESIGN §20); this module adds the cwd, the
+//! per-harness reach checks, the migration from the per-harness directories of older versions,
+//! and the Claude Code plugin's `agents/` copies ([`sync_plugin_agents`], DESIGN §18.1).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,7 +61,8 @@ pub fn cmd_skills(ctx: &AppCtx, cmd: SkillsCmd) -> Result<Value> {
 /// sync and the legacy dirs removed.
 pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<(SkillsSync, Vec<PathBuf>)> {
     let repo = repo_of(cwd);
-    let place = rematch_core::predicate::Place::locate(repo.as_deref(), cwd);
+    let mut place = rematch_core::predicate::Place::locate(repo.as_deref(), cwd);
+    place.domain = rematch_core::domain::place_domain(&ctx.paths, &place, &library::branch_for(repo.as_deref(), cwd));
     let s = library::sync_shared_skills(&ctx.ledger, &ctx.paths, Some(&place))?;
     let mut removed = Vec::new();
     for name in LEGACY_LINK_DIRS {
@@ -367,6 +369,8 @@ fn sync(ctx: &AppCtx, harness: Option<SyncHarness>) -> Result<Value> {
     let mut out = serde_json::to_value(&s)?;
     out["cwd"] = json!(ctx.cwd);
     out["repo"] = json!(repo);
+    // Kept skills linked from the profile (this machine's keeps, other machines', adopted ones).
+    out["profile_sources"] = json!(rematch_core::profile::kept_sources(&ctx.paths).len());
     match harness {
         Some(SyncHarness::ClaudeCode) => match claude_plugin_root() {
             Some(root) => {

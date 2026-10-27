@@ -325,6 +325,14 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
         s.subpath.as_deref().map(|p| if p.is_empty() { "." } else { p }).unwrap_or("unknown"),
         s.head_sha.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("unknown"),
     ));
+    // The recorded domain, and what today's policy decides (they differ after a `policy
+    // domain set` until `lake migrate` reapplies it).
+    let now = rematch_core::domain::session_decision(&s, &ctx.domain_policy()?);
+    lines.push(format!(
+        "domain {} · policy now: {}",
+        s.domain.as_deref().unwrap_or("none"),
+        now.as_ref().map(|(d, src)| format!("{d} ({})", src.name())).unwrap_or_else(|| "undecided".into()),
+    ));
     if let Some(p) = &past {
         lines.push(format!("as of {} (source {})", utc(p.ts), p.source.name()));
     }
@@ -334,6 +342,7 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
             continue;
         };
         let glob = predicate::matches_place(&e.predicate, &place);
+        let domain_ok = rematch_core::domain::domain_matches(e.predicate.domain.as_deref(), s.domain.as_deref());
         let hit = predicate::count_match(&e.predicate, &place, &s.exts, &s.stems);
         let loaded_version = s.loaded_versions.get(&e.id).copied();
         let this = ctx.ledger.counter_rows(&e.id)?.into_iter().find(|r| r.session_id == s.id);
@@ -345,11 +354,13 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
             Some(None) => format!("{}; not in the ledger as of {}", enum_str(&e.status), utc(past.as_ref().map_or(0, |p| p.ts))),
         };
         lines.push(format!(
-            "loaded {} v{} ({}) sha {}: place {} · predicate {} · this session {} · total matched {} recurrence {} harm {}",
+            "loaded {} v{} ({}) sha {}: domain {} {} · place {} · predicate {} · this session {} · total matched {} recurrence {} harm {}",
             e.name,
             loaded_version.unwrap_or(e.version),
             status,
             e.content_sha256.as_deref().map(|h| &h[..h.len().min(12)]).unwrap_or("none"),
+            e.predicate.domain.as_deref().unwrap_or("any"),
+            if domain_ok { "ok" } else { "mismatch" },
             if glob { "hit" } else { "miss" },
             if hit { "hit" } else { "miss" },
             this.as_ref().map(|r| format!("recurrence {} harm {}", r.recurrence, r.harm)).unwrap_or_else(|| "not counted".into()),
@@ -359,6 +370,7 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
         ));
         let mut row = json!({
             "id": e.id, "name": e.name, "status": e.status, "predicate": e.predicate, "glob_hit": glob,
+            "domain": e.predicate.domain, "domain_ok": domain_ok,
             "version": e.version, "loaded_version": loaded_version, "content_sha256": e.content_sha256,
             "predicate_hit": hit, "session_counters": this, "counters": agg,
             "stems_overlap": e.predicate.stems.iter().filter(|x| s.stems.contains(x)).collect::<Vec<_>>(),
@@ -366,6 +378,19 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
         if let Some(t) = then {
             row["asof"] = json!({"status": t.map(|t| t.status), "version": t.map(|t| t.version),
                                  "content_sha256": t.and_then(|t| t.content_sha256.clone())});
+        }
+        if let Some(t) = crate::tune::pending_tune(ctx, &e)? {
+            let c = ctx.ledger.counters(&t.id)?;
+            lines.push(format!(
+                "  predicate tune v{} pending ({} · {} · matched {} recurrence {} harm {})",
+                t.version,
+                t.id,
+                t.tune.as_ref().map(crate::tune::note_of).unwrap_or_default(),
+                c.matched,
+                c.recurrence,
+                c.harm
+            ));
+            row["tune_pending"] = json!({"id": t.id, "version": t.version, "predicate": t.predicate, "tune": t.tune, "counters": c});
         }
         loaded.push(row);
     }
@@ -400,6 +425,8 @@ fn why(ctx: &AppCtx, session: Option<&str>, asof: Option<&str>) -> Result<Value>
     let source = past.as_ref().map_or(Source::Ledger, |p| p.source);
     Ok(json!({
         "session": {"id": s.id, "cwd": s.cwd, "repo": s.repo, "repo_remote": s.repo_remote, "subpath": s.subpath,
+                     "domain": s.domain,
+                     "domain_now": now.as_ref().map(|(d, src)| json!({"domain": d, "source": src})),
                      "head_sha": s.head_sha, "files_changed": s.files_changed, "loaded_entry_shas": s.loaded_entry_shas,
                      "visible_entries": s.visible_entries, "family": s.family, "model": s.model, "started_at": s.started_at,
                      "ended_at": s.ended_at, "turns": s.turns, "tokens_in": s.tokens_in, "tokens_out": s.tokens_out,

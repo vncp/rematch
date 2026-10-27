@@ -1,11 +1,15 @@
 //! `rematch report` (ADR 001 L4; SPEC §"Kill criterion for the project"). Over a window:
 //! (a) entries that reached `kept` with ≥ 4 matched sessions; (b) per trigger predicate,
 //! the recurrence of its redirect class on matched sessions that loaded an entry of the
-//! trigger (with-arm) against matched sessions that loaded none (before-arm); (c) the
-//! verdict line. From the lake alone when there is one — every machine's history, at
-//! whatever lag the last export left — else from this ledger's journal (`"source":
-//! "ledger"`). Both read ADR 001's as-of rule: each row as its origin ledger held it at the
-//! window's end. Built-in entries are reported but never decide the verdict.
+//! trigger (with-arm) against matched sessions that loaded none (before-arm), grouped by the
+//! trigger's domain (DESIGN §6 "Domain") with a per-domain summary; a predicate tune's
+//! sibling joins its parent's trigger, each session judged by the predicate of the version
+//! it loaded; (c) every predicate tune in the window, parent and sibling with-arms side by
+//! side (DESIGN §6 "Predicate tuning"); (d) the verdict line. From the lake alone when there
+//! is one — every machine's history, at whatever lag the last export left — else from this
+//! ledger's journal (`"source": "ledger"`). Both read ADR 001's as-of rule: each row as its
+//! origin ledger held it at the window's end. Built-in entries are reported but never decide
+//! the verdict.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,12 +61,12 @@ pub fn parse_day(s: &str) -> Result<i64> {
     }
 }
 
-fn utc(ms: i64) -> String {
+pub(crate) fn utc(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
 }
 
 /// The as-of rows of one table, decoded; rows that do not decode are skipped (stderr).
-fn decode<T: DeserializeOwned>(rows: Vec<JournalRow>) -> Vec<(String, T)> {
+pub(crate) fn decode<T: DeserializeOwned>(rows: Vec<JournalRow>) -> Vec<(String, T)> {
     rows.into_iter()
         .filter_map(|r| match serde_json::from_value::<T>(r.json) {
             Ok(v) => Some((r.machine, v)),
@@ -91,6 +95,8 @@ pub struct Data {
     counters: Vec<(String, CounterJson)>,
     /// Sessions started in the window, redirect labels as of the window's end.
     pub sessions: Vec<(String, SessionRecord)>,
+    pub start: i64,
+    pub end: i64,
 }
 
 pub fn load(ctx: &AppCtx, src: Source, start: i64, end: i64) -> Result<Data> {
@@ -114,7 +120,7 @@ pub fn load(ctx: &AppCtx, src: Source, start: i64, end: i64) -> Result<Data> {
             }
         }
     }
-    Ok(Data { entries, counters, sessions })
+    Ok(Data { entries, counters, sessions, start, end })
 }
 
 #[derive(Default)]
@@ -124,9 +130,37 @@ struct Arm {
     redirects: usize,
 }
 
+/// One domain's triggers: their arms summed (a session matching two triggers counts twice).
+#[derive(Default)]
+struct DomainSum {
+    triggers: usize,
+    covered: usize,
+    fell: usize,
+    with: Arm,
+    before: Arm,
+    lines: Vec<String>,
+}
+
+/// Label of a trigger's domain group.
+const NO_DOMAIN: &str = "(none)";
+
 impl Arm {
     fn rate(&self) -> Option<f64> {
         (self.sessions > 0).then(|| self.recurred as f64 / self.sessions as f64)
+    }
+
+    fn add(&mut self, o: &Arm) {
+        self.sessions += o.sessions;
+        self.recurred += o.recurred;
+        self.redirects += o.redirects;
+    }
+
+    /// One matched session: recurred when it holds a redirect of `class`.
+    fn add_session(&mut self, s: &SessionRecord, class: Option<RedirectClass>) {
+        let n = s.redirects.iter().filter(|r| class_recurs(class, redirect_class_of(r.class, &r.prelabel))).count();
+        self.sessions += 1;
+        self.recurred += (n > 0) as usize;
+        self.redirects += n;
     }
 
     fn json(&self) -> Value {
@@ -146,17 +180,58 @@ fn names(entries: &[&(String, Entry)]) -> String {
     set.into_iter().collect::<Vec<_>>().join("/")
 }
 
+/// Whether session `s` (of machine `sm`) loaded `e` (of machine `em`): by id on the entry's
+/// own machine (ids are machine-local, and a predicate tune's sibling shares its parent's
+/// content hash, so only the id tells the versions apart), by content hash on another.
+fn loaded_in(sm: &str, s: &SessionRecord, em: &str, e: &Entry) -> bool {
+    if sm == em {
+        s.loaded_entries.contains(&e.id)
+    } else {
+        e.content_sha256.as_ref().is_some_and(|h| s.loaded_entry_shas.contains(h))
+    }
+}
+
+/// Every predicate tune sibling (`Entry.tune`) whose parent the rows hold → the entry its
+/// lineage started from, both as `(machine, id)`.
+fn tune_roots(entries: &[(String, Entry)]) -> BTreeMap<(&str, &str), (&str, &str)> {
+    let by_id: BTreeMap<(&str, &str), &Entry> = entries.iter().map(|(m, e)| ((m.as_str(), e.id.as_str()), e)).collect();
+    let mut out = BTreeMap::new();
+    for (m, e) in entries {
+        let mut cur = e;
+        for _ in 0..entries.len() {
+            match cur.tune.as_ref().and_then(|t| by_id.get(&(m.as_str(), t.parent.as_str()))) {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        if cur.id != e.id {
+            out.insert((m.as_str(), e.id.as_str()), (m.as_str(), cur.id.as_str()));
+        }
+    }
+    out
+}
+
 /// The report over `data` for the window `[start, end]`.
 pub fn compute(data: &Data) -> (Value, Vec<String>) {
     // (a) kept entries and their matched sessions in the window, by id on the entry's
-    // machine or by content hash on any machine.
+    // machine or by content hash on any machine — except the rows of another version in its
+    // own tune lineage, which shares its content hash but not its predicate.
+    let root = tune_roots(&data.entries);
+    let lineage_of = |m: &str, id: &str| -> (String, String) {
+        let (rm, rid) = root.get(&(m, id)).copied().unwrap_or((m, id));
+        (rm.to_string(), rid.to_string())
+    };
     let mut kept = Vec::new();
     for (m, e) in data.entries.iter().filter(|(_, e)| e.status == Status::Kept) {
+        let mine = lineage_of(m, &e.id);
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let (mut recurrence, mut harm) = (0u32, 0u32);
         for (cm, c) in &data.counters {
-            let ours = (cm == m && c.row.entry_id == e.id)
-                || (e.content_sha256.is_some() && c.content_sha256 == e.content_sha256);
+            let own_machine = cm == m;
+            let ours = (own_machine && c.row.entry_id == e.id)
+                || (e.content_sha256.is_some()
+                    && c.content_sha256 == e.content_sha256
+                    && !(own_machine && c.row.entry_id != e.id && lineage_of(cm, &c.row.entry_id) == mine));
             if ours && c.row.matched > 0 && seen.insert(c.row.session_id.as_str()) {
                 recurrence += c.row.recurrence;
                 harm += c.row.harm;
@@ -169,34 +244,48 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
         }));
     }
 
-    // (b) triggers: entries grouped by predicate hash.
+    // (b) triggers: entries grouped by predicate hash; a predicate tune's sibling joins the
+    // group of the entry it was tuned from (its tune lineage), so widening a predicate opens
+    // no trigger of its own.
     let mut groups: BTreeMap<String, Vec<&(String, Entry)>> = BTreeMap::new();
-    for x in data.entries.iter().filter(|(_, e)| e.status != Status::Draft) {
+    let live: Vec<&(String, Entry)> = data.entries.iter().filter(|(_, e)| e.status != Status::Draft).collect();
+    for x in live.iter().filter(|(m, e)| !root.contains_key(&(m.as_str(), e.id.as_str()))) {
         groups.entry(predicate_hash(&x.1.predicate)).or_default().push(x);
     }
+    let lineage = |es: &[&(String, Entry)]| -> Vec<&(String, Entry)> {
+        let heads: BTreeSet<(&str, &str)> = es.iter().map(|(m, e)| (m.as_str(), e.id.as_str())).collect();
+        live.iter().filter(|(m, e)| root.get(&(m.as_str(), e.id.as_str())).is_some_and(|r| heads.contains(r))).copied().collect()
+    };
     let mut triggers = Vec::new();
     let mut fell_on: Vec<String> = Vec::new();
-    let mut trigger_lines = Vec::new();
+    let mut by_domain: BTreeMap<String, DomainSum> = BTreeMap::new();
     for (hash, mut es) in groups {
         es.sort_by_key(|(_, e)| (e.created_at, e.id.clone()));
         let class: Option<RedirectClass> = es.iter().find_map(|(_, e)| e.redirect_class.filter(|c| *c != RedirectClass::None));
         let pred = &es.iter().max_by_key(|(_, e)| e.updated_at).expect("non-empty group").1.predicate;
-        let ids: BTreeSet<(&str, &str)> = es.iter().map(|(m, e)| (m.as_str(), e.id.as_str())).collect();
-        let shas: BTreeSet<&str> = es.iter().filter_map(|(_, e)| e.content_sha256.as_deref()).collect();
+        let tunes = lineage(&es);
+        let members: Vec<&(String, Entry)> = es.iter().chain(tunes.iter()).copied().collect();
         let builtin = es.iter().all(|(_, e)| is_builtin(e));
         let (mut with, mut before) = (Arm::default(), Arm::default());
         for (m, s) in &data.sessions {
-            if !count_match(pred, &Place::of_session(s), &s.exts, &s.stems) {
-                continue;
-            }
-            let loaded = s.loaded_entry_shas.iter().any(|h| shas.contains(h.as_str()))
-                || s.loaded_entries.iter().any(|id| ids.contains(&(m.as_str(), id.as_str())));
-            let n = s.redirects.iter().filter(|r| class_recurs(class, redirect_class_of(r.class, &r.prelabel))).count();
-            let arm = if loaded { &mut with } else { &mut before };
-            arm.sessions += 1;
-            arm.recurred += (n > 0) as usize;
-            arm.redirects += n;
+            let place = Place::of_session(s);
+            let loaded: Vec<&Entry> = members.iter().filter(|(em, e)| loaded_in(m, s, em, e)).map(|(_, e)| e).collect();
+            // The with-arm tests the predicate of the version the session loaded; the
+            // before-arm, the trigger's.
+            let arm = if loaded.is_empty() {
+                if !count_match(pred, &place, &s.exts, &s.stems) {
+                    continue;
+                }
+                &mut before
+            } else {
+                if !loaded.iter().any(|e| count_match(&e.predicate, &place, &s.exts, &s.stems)) {
+                    continue;
+                }
+                &mut with
+            };
+            arm.add_session(s, class);
         }
+        let es: Vec<&(String, Entry)> = members;
         let delta = with.rate().zip(before.rate()).map(|(w, b)| w - b);
         let covered = with.sessions > 0;
         let fell = delta.is_some_and(|d| d < 0.0);
@@ -205,9 +294,16 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
         if fell && !builtin {
             fell_on.push(label.clone());
         }
+        let domain = pred.domain.clone().unwrap_or_else(|| NO_DOMAIN.to_string());
+        let sum = by_domain.entry(domain).or_default();
+        sum.triggers += 1;
+        sum.covered += covered as usize;
+        sum.fell += (fell && !builtin) as usize;
+        sum.with.add(&with);
+        sum.before.add(&before);
         if with.sessions + before.sessions > 0 {
-            trigger_lines.push(format!(
-                "trigger {label}{} [{}] class {class_s}: with {} · before {}{}",
+            sum.lines.push(format!(
+                "  trigger {label}{} [{}] class {class_s}: with {} · before {}{}",
                 if builtin { " (built-in)" } else { "" },
                 &hash[..12],
                 with.text(),
@@ -216,11 +312,81 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
             ));
         }
         triggers.push(json!({
-            "predicate_hash": hash, "names": label, "predicate": pred, "redirect_class": class.map(class_name),
+            "predicate_hash": hash, "names": label, "predicate": pred, "domain": pred.domain, "redirect_class": class.map(class_name),
             "builtin": builtin, "covered": covered,
             "entries": es.iter().map(|(m, e)| json!({"machine": m, "id": e.id, "name": e.name, "status": e.status,
                                                       "content_sha256": e.content_sha256})).collect::<Vec<_>>(),
             "with": with.json(), "before": before.json(), "delta": delta, "fell": fell,
+        }));
+    }
+    // Per-domain summary, then that domain's trigger lines; domains with no matched session
+    // in the window print nothing.
+    let mut trigger_lines = Vec::new();
+    let mut domains = Vec::new();
+    for (d, sum) in &by_domain {
+        domains.push(json!({
+            "domain": d, "triggers": sum.triggers, "covered": sum.covered, "fell": sum.fell,
+            "with": sum.with.json(), "before": sum.before.json(),
+        }));
+        if sum.lines.is_empty() {
+            continue;
+        }
+        trigger_lines.push(format!(
+            "domain {d}: {} trigger(s), {} covered, {} fell · with {} · before {}",
+            sum.triggers,
+            sum.covered,
+            sum.fell,
+            sum.with.text(),
+            sum.before.text()
+        ));
+        trigger_lines.extend(sum.lines.iter().cloned());
+    }
+
+    // Predicate tunes staged in the window: the parent's and the sibling's with-arms side by
+    // side (each the sessions that loaded that version and that its own predicate hit) against
+    // the before-arm of the parent's predicate, so a widening is read against the version each
+    // session loaded and never against a predicate that did not exist then.
+    let mut tunes = Vec::new();
+    let mut tune_lines = Vec::new();
+    for (m, t) in &data.entries {
+        let Some(tune) = t.tune.as_ref().filter(|x| (data.start..=data.end).contains(&x.at)) else { continue };
+        let Some((_, p)) = data.entries.iter().find(|(pm, p)| pm == m && p.id == tune.parent) else { continue };
+        let class = [p, t].iter().find_map(|e| e.redirect_class.filter(|c| *c != RedirectClass::None));
+        let (mut v1, mut v2, mut before) = (Arm::default(), Arm::default(), Arm::default());
+        for (sm, s) in &data.sessions {
+            let place = Place::of_session(s);
+            let (lp, lt) = (loaded_in(sm, s, m, p), loaded_in(sm, s, m, t));
+            if lp && count_match(&p.predicate, &place, &s.exts, &s.stems) {
+                v1.add_session(s, class);
+            }
+            if lt && count_match(&t.predicate, &place, &s.exts, &s.stems) {
+                v2.add_session(s, class);
+            }
+            if !lp && !lt && count_match(&p.predicate, &place, &s.exts, &s.stems) {
+                before.add_session(s, class);
+            }
+        }
+        tune_lines.push(format!(
+            "tune {} v{}→v{} ({}, {}): {} · v{} with {} · v{} with {} · before {}",
+            t.name,
+            p.version,
+            t.version,
+            utc(tune.at),
+            rematch_core::ledger::enum_str(&t.status),
+            crate::tune::note_of(tune),
+            p.version,
+            v1.text(),
+            t.version,
+            v2.text(),
+            before.text(),
+        ));
+        tunes.push(json!({
+            "machine": m, "name": t.name, "at": tune.at, "direction": tune.direction,
+            "parent": {"id": p.id, "version": p.version, "status": p.status, "predicate_hash": predicate_hash(&p.predicate), "predicate": p.predicate},
+            "tune": {"id": t.id, "version": t.version, "status": t.status, "predicate_hash": predicate_hash(&t.predicate), "predicate": t.predicate},
+            "added": tune.added, "removed": tune.removed, "added_exts": tune.added_exts, "domain_set": tune.domain_set,
+            "evidence": tune.evidence, "redirect_class": class.map(class_name),
+            "v1": v1.json(), "v2": v2.json(), "before": before.json(),
         }));
     }
 
@@ -258,10 +424,13 @@ pub fn compute(data: &Data) -> (Value, Vec<String>) {
         lines.push("triggers: no matched session in the window".into());
     }
     lines.extend(trigger_lines);
+    lines.extend(tune_lines);
     lines.push(verdict_line);
     let out = json!({
         "kept": kept,
         "triggers": triggers,
+        "domains": domains,
+        "tunes": tunes,
         "verdict": {"kept_over_min": !reached.is_empty(), "kept_entries": reached,
                     "recurrence_fell": !fell_on.is_empty(), "fell_on": fell_on},
     });
@@ -425,5 +594,48 @@ mod tests {
         assert_eq!(out["kept"], json!([]), "{out}");
         assert_eq!(out["verdict"]["kept_over_min"], false, "{out}");
         assert!(parse_window("6x").is_err() && parse_window("0w").is_err() && parse_day("2026-13-01").is_err());
+    }
+
+    /// Two domains: a web and a mobile review trigger with identical stems; each counts only
+    /// its own domain's sessions, and the lines group under a per-domain summary.
+    #[test]
+    fn triggers_group_by_domain_and_never_cross_it() {
+        let mut t = env();
+        let ctx = &t.ctx;
+        let now = now_ms();
+        let review = |id: &str, name: &str, domain: &str| {
+            let mut e = entry(id, name, "app");
+            e.predicate.file_exts = vec![];
+            e.predicate.stems = vec!["review".into(), "checklist".into()];
+            e.predicate.domain = Some(domain.into());
+            stage(ctx, &e, &[])
+        };
+        review("e-web", "web-review", "web");
+        review("e-mob", "mobile-review", "mobile");
+        for (i, d) in ["web.frontend", "web", "mobile", "mobile", "mobile"].iter().enumerate() {
+            let mut s = session(&format!("s-{i}"), "app", Some("/w/app"), "anthropic/claude-opus", now - (5 + i as i64) * DAY_MS);
+            s.stems = vec!["review".into(), "checklist".into()];
+            s.domain = Some(d.to_string());
+            if i == 0 || i == 2 {
+                s.redirects = vec![negation(&s.id, s.started_at + 10)];
+            }
+            ctx.ledger.upsert_session(&s).unwrap();
+        }
+        t.ctx.now = now_ms();
+        let out = report(&t.ctx);
+        let arm = |name: &str| {
+            let t = out["triggers"].as_array().unwrap().iter().find(|t| t["names"] == name).unwrap().clone();
+            (t["domain"].as_str().map(str::to_string), t["before"]["sessions"].as_u64(), t["before"]["recurred"].as_u64())
+        };
+        assert_eq!(arm("web-review"), (Some("web".into()), Some(2), Some(1)), "{out}");
+        assert_eq!(arm("mobile-review"), (Some("mobile".into()), Some(3), Some(1)), "{out}");
+        let lines: Vec<&str> = out["lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("{p}: {lines:#?}"));
+        assert_eq!(lines[at("domain mobile:")], "domain mobile: 1 trigger(s), 0 covered, 0 fell · with no sessions · before 1/3 recurred (1 redirect(s), rate 0.33)");
+        assert!(lines[at("domain mobile:") + 1].starts_with("  trigger mobile-review"));
+        assert!(lines[at("domain web:") + 1].starts_with("  trigger web-review"));
+        assert!(at("domain mobile:") < at("domain web:"));
+        assert_eq!(out["domains"].as_array().unwrap().len(), 2);
+        println!("{}", lines.join("\n"));
     }
 }

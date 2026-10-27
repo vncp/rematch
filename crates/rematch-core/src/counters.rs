@@ -400,4 +400,25 @@ mod tests {
         assert_eq!(decide(&e, &c, 100), Decision::Keep);
         assert_eq!(l.get_entry("e1").unwrap().unwrap().helpful, 4);
     }
+
+    #[test]
+    fn web_entry_is_not_counted_in_a_mobile_session_with_identical_stems() {
+        let (_t, l) = ledger();
+        let mut e = entry("e-web", "review-checklist", "repo", Status::Provisional);
+        e.predicate.file_exts = vec![];
+        e.predicate.stems = vec!["review".into(), "checklist".into()];
+        e.predicate.domain = Some("web".into());
+        l.upsert_entry(&e).unwrap();
+        let at = |id: &str, domain: Option<&str>| {
+            let mut s = session(id, "repo", 1_000);
+            s.stems = vec!["review".into(), "checklist".into()];
+            s.loaded_entries = vec!["e-web".into()];
+            s.domain = domain.map(str::to_string);
+            s
+        };
+        assert!(fold_session(&l, &at("s-mobile", Some("mobile")), std::slice::from_ref(&e), &[]).unwrap().is_empty());
+        assert_eq!(fold_session(&l, &at("s-web", Some("web.frontend")), std::slice::from_ref(&e), &[]).unwrap().len(), 1);
+        assert_eq!(fold_session(&l, &at("s-none", None), std::slice::from_ref(&e), &[]).unwrap().len(), 1, "undecided: not tested");
+        assert_eq!(l.counters("e-web").unwrap().matched, 2);
+    }
 }

@@ -20,7 +20,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use rematch_core::features::head;
 use rematch_core::ledger::EntryFilter;
-use rematch_core::library::{branch_for, dir_for, SHARED_BRANCH};
+use rematch_core::library::{branch_for, SHARED_BRANCH};
 use rematch_core::lint::{lint_entry, LintConfig, LintContext};
 use rematch_core::types::{Activation, Certificate, Entry, Origin, Paired, Receipt, Sha256Hex, Status, Verdict};
 use serde::Serialize;
@@ -127,12 +127,11 @@ pub fn replaced_kept(ctx: &AppCtx, e: &Entry) -> Result<Option<Entry>> {
     if crate::reflect::is_foreign(ctx, e) {
         return Ok(None);
     }
-    let slot = dir_for(&ctx.paths, e, Status::Kept);
     Ok(ctx
         .ledger
         .list_entries(&EntryFilter { status: Some(Status::Kept), name: Some(e.name.clone()), ..Default::default() })?
         .into_iter()
-        .find(|k| k.id != e.id && k.path == slot))
+        .find(|k| k.id != e.id && rematch_core::library::is_kept_slot(&ctx.paths, e, &k.path)))
 }
 
 /// Replay before `sibling` replaces `kept` (omp from `$OMP_BIN`/PATH). Takes the anchor

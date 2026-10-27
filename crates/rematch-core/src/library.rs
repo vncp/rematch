@@ -6,15 +6,17 @@
 //! - provisional → `staging/<branch>/<name>/` (loaded through the shared skills dir once a
 //!   synced cwd matched it)
 //! - kept → `<agent_dir>/skills/<name>/` (loaded natively by omp; other harnesses through the
-//!   shared skills dir); a replaced kept dir is saved to `predecessors/<name>/<version>/`
-//!   (version 0 = a skill the plugin did not write)
+//!   shared skills dir); with a profile (DESIGN §20) `profile/skills/<name>/` instead, linked
+//!   from `<agent_dir>/skills/<name>`; a replaced kept dir is saved to
+//!   `predecessors/<name>/<version>/` (version 0 = a skill the plugin did not write)
 //! - retired | dormant | stale → `archive/<status>/<id>/` (never loaded, never deleted)
 //! - every loadable skill entry is linked as `skills/<name> → <entry dir>` by
 //!   [`sync_shared_skills`], which every status change, stage and rollback runs (DESIGN §16
 //!   "Shared skills")
 //! - agents (kind `agent`: `AGENT.md` + `rematch.json`) take the same locations except
 //!   kept, which is `kept-agents/<name>/` with `AGENT.md` copied to
-//!   `<agent_dir>/agents/<name>.md`; a provisional agent is also linked as
+//!   `<agent_dir>/agents/<name>.md` (with a profile: copied to `profile/agents/<name>.md`
+//!   and linked from there); a provisional agent is also linked as
 //!   `agents/<name>.md → <entry dir>/AGENT.md`, which omp discovers through the plugin's
 //!   `extension/agents → <root>/agents` symlink. Agent predecessors live in
 //!   `predecessors/.agents/<name>/<version>/` (entry names never start with `.`).
@@ -143,11 +145,48 @@ pub fn dir_for(paths: &RematchPaths, e: &Entry, status: Status) -> PathBuf {
         Status::Draft => paths.drafts.join(&e.name),
         Status::Provisional => paths.staging.join(&e.branch).join(&e.name),
         Status::Kept | Status::Pinned if e.kind == Kind::Agent => paths.kept_agents.join(&e.name),
+        Status::Kept | Status::Pinned if crate::profile::present(paths) => crate::profile::skills_dir(paths).join(&e.name),
         Status::Kept | Status::Pinned => paths.skills_dir().join(&e.name),
         Status::Retired => paths.archive.join("retired").join(&e.id),
         Status::Dormant => paths.archive.join("dormant").join(&e.id),
         Status::Stale => paths.archive.join("stale").join(&e.id),
     }
+}
+
+/// omp's native path of a kept skill: `<agent_dir>/skills/<name>` (the kept dir itself, or with
+/// a profile a link to `profile/skills/<name>`).
+pub fn native_skill(paths: &RematchPaths, name: &str) -> PathBuf {
+    paths.skills_dir().join(name)
+}
+
+/// Whether `path` is where a kept entry of `e`'s kind and name lives: [`dir_for`] kept, or
+/// for a skill kept before the profile existed its native dir.
+pub fn is_kept_slot(paths: &RematchPaths, e: &Entry, path: &Path) -> bool {
+    path == dir_for(paths, e, Status::Kept) || (e.kind != Kind::Agent && path == native_skill(paths, &e.name))
+}
+
+/// With the kept dir in the profile: `<agent_dir>/skills/<name>` → it (a real dir there is
+/// left alone; `promote_into` has saved it as a predecessor).
+fn link_native_skill(paths: &RematchPaths, e: &Entry) -> Result<()> {
+    if e.kind == Kind::Agent || !e.path.starts_with(crate::profile::dir(paths)) {
+        return Ok(());
+    }
+    let link = native_skill(paths, &e.name);
+    std::fs::create_dir_all(paths.skills_dir())?;
+    match std::fs::symlink_metadata(&link) {
+        Ok(md) if !md.file_type().is_symlink() => Ok(()),
+        Ok(_) if std::fs::read_link(&link).is_ok_and(|t| t == e.path) => Ok(()),
+        _ => relink(&e.path, &link),
+    }
+}
+
+/// Remove `<agent_dir>/skills/<name>` while it is a link to `dir`.
+fn unlink_native_skill(paths: &RematchPaths, name: &str, dir: &Path) -> Result<()> {
+    let link = native_skill(paths, name);
+    if std::fs::read_link(&link).is_ok_and(|t| t == dir) {
+        remove_link(&link)?;
+    }
+    Ok(())
 }
 
 /// Staging link of a provisional agent (`<root>/agents/<name>.md`).
@@ -221,11 +260,18 @@ fn write_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
     let f = kept_agent_file(paths, &e.name);
     std::fs::create_dir_all(paths.agents_dir())?;
     remove_link(&f)?;
+    if crate::profile::present(paths) {
+        let p = crate::profile::agents_dir(paths).join(format!("{}.md", e.name));
+        std::fs::create_dir_all(crate::profile::agents_dir(paths))?;
+        std::fs::copy(e.path.join(AGENT_MD), &p).with_context(|| format!("copy AGENT.md to {}", p.display()))?;
+        return symlink_file(&p, &f);
+    }
     std::fs::copy(e.path.join(AGENT_MD), &f).with_context(|| format!("copy AGENT.md to {}", f.display()))?;
     Ok(())
 }
 
-/// Remove omp's copy of a kept agent while it is still the one this entry wrote.
+/// Remove omp's copy of a kept agent while it is still the one this entry wrote (with a
+/// profile: the link and the profile's copy it points to).
 fn remove_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
     let f = kept_agent_file(paths, &e.name);
     let ours = std::fs::read_to_string(&f)
@@ -234,9 +280,47 @@ fn remove_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
         .and_then(|d| d.rematch())
         .is_some_and(|b| b.id == e.id);
     if ours {
+        if let Ok(t) = std::fs::read_link(&f) {
+            if t.starts_with(crate::profile::agents_dir(paths)) {
+                std::fs::remove_file(&t)?;
+            }
+        }
         std::fs::remove_file(&f)?;
     }
     Ok(())
+}
+
+/// `--adopt` of `profile init`: a kept/pinned entry rematch owns moves into the profile — a
+/// skill's dir to `profile/skills/<name>/` (linked from `<agent_dir>/skills/<name>`), an agent's
+/// omp copy to `profile/agents/<name>.md` (linked). `None` when there is nothing to move.
+pub fn adopt_kept(ledger: &Ledger, paths: &RematchPaths, e: &Entry) -> Result<Option<Entry>> {
+    if !crate::profile::present(paths) || !matches!(e.status, Status::Kept | Status::Pinned) {
+        return Ok(None);
+    }
+    if e.kind == Kind::Agent {
+        let f = kept_agent_file(paths, &e.name);
+        if std::fs::read_link(&f).is_ok_and(|t| t.starts_with(crate::profile::dir(paths))) || !e.path.join(AGENT_MD).is_file() {
+            return Ok(None);
+        }
+        write_kept_agent(paths, e)?;
+        return Ok(Some(e.clone()));
+    }
+    let dst = dir_for(paths, e, e.status);
+    if e.path == dst || !e.path.is_dir() || load_entry(&e.path).map_or(true, |x| x.id != e.id) {
+        return Ok(None);
+    }
+    if dst.exists() {
+        bail!("{} already holds {}", dst.display(), e.name);
+    }
+    let src = e.path.clone();
+    move_dir(&src, &dst)?;
+    let mut n = e.clone();
+    n.path = dst;
+    n.updated_at = now_ms();
+    persist(ledger, &n)?;
+    link_native_skill(paths, &n)?;
+    sync_shared_skills(ledger, paths, None)?;
+    Ok(Some(n))
 }
 
 pub fn load_entry(dir: &Path) -> Result<Entry> {
@@ -539,6 +623,9 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     if agent && matches!(from, Status::Kept | Status::Pinned) && !matches!(to, Status::Kept | Status::Pinned) {
         remove_kept_agent(paths, &e)?;
     }
+    if !agent && matches!(from, Status::Kept | Status::Pinned) && !matches!(to, Status::Kept | Status::Pinned) {
+        unlink_native_skill(paths, &e.name, &src)?;
+    }
     if matches!(to, Status::Kept | Status::Pinned) && !matches!(from, Status::Kept | Status::Pinned) {
         promote_into(ledger, paths, &mut e, &dst, now)?;
         copy_dir(&src, &dst)?;
@@ -568,6 +655,8 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
             Status::Kept | Status::Pinned => write_kept_agent(paths, &e)?,
             _ => {}
         }
+    } else if matches!(to, Status::Kept | Status::Pinned) {
+        link_native_skill(paths, &e)?;
     }
     sync_shared_skills(ledger, paths, None)?;
     Ok(e)
@@ -576,11 +665,24 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
 /// Before a provisional entry takes `<skills>/<name>/` (agents: `kept-agents/<name>/`):
 /// save whatever is there to `predecessors/<name>/<version>/` (agents:
 /// `predecessors/.agents/<name>/<version>/`; a user's own `<agent_dir>/agents/<name>.md`
-/// is saved as version 0). A replaced rematch entry becomes dormant (its files live in
+/// is saved as version 0). With a profile the kept dir is `profile/skills/<name>/` and what
+/// holds `<agent_dir>/skills/<name>` (a dir kept before the profile, a user's skill or link)
+/// is the one replaced. A replaced rematch entry becomes dormant (its files live in
 /// predecessors, ready for rollback); a pinned one blocks the keep.
 fn promote_into(ledger: &Ledger, paths: &RematchPaths, e: &mut Entry, dst: &Path, now: UnixMs) -> Result<()> {
     let pred_root = predecessor_root(paths, e.kind, &e.name);
-    if !dst.exists() {
+    let native_dir = native_skill(paths, &e.name);
+    let occupant = if dst.exists() {
+        dst.to_path_buf()
+    } else if e.kind != Kind::Agent
+        && dst.starts_with(crate::profile::dir(paths))
+        && std::fs::symlink_metadata(&native_dir).is_ok_and(|md| {
+            !md.file_type().is_symlink()
+                || std::fs::read_link(&native_dir).is_ok_and(|t| !t.starts_with(crate::profile::dir(paths)))
+        })
+    {
+        native_dir
+    } else {
         let native = kept_agent_file(paths, &e.name);
         if e.kind == Kind::Agent && native.is_file() {
             let mut save = pred_root.join("0");
@@ -591,7 +693,8 @@ fn promote_into(ledger: &Ledger, paths: &RematchPaths, e: &mut Entry, dst: &Path
             std::fs::copy(&native, save.join(AGENT_MD))?;
         }
         return Ok(());
-    }
+    };
+    let dst = occupant.as_path();
     let old = load_entry(dst).ok().and_then(|o| ledger.get_entry(&o.id).ok().flatten());
     if let Some(o) = &old {
         if o.pinned || o.status == Status::Pinned {
@@ -668,6 +771,10 @@ pub fn rollback(ledger: &Ledger, paths: &RematchPaths, name: &str) -> Result<Rol
         std::fs::remove_dir_all(&pred_dir)?;
     } else {
         move_dir(&pred_dir, &home)?;
+        if !agent && home.starts_with(crate::profile::dir(paths)) && std::fs::symlink_metadata(native_skill(paths, name)).is_err() {
+            std::fs::create_dir_all(paths.skills_dir())?;
+            relink(&home, &native_skill(paths, name))?;
+        }
     }
     let _ = std::fs::remove_dir(&pred_root);
     let restored = match prev {
@@ -760,7 +867,17 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) 
             std::fs::create_dir_all(&dir)?;
             write_hooks_readme(&dir)?;
             let file = dir.join(format!("{}.ts", e.id));
-            std::fs::write(&file, &module)?;
+            // With a profile the module is written there and linked (DESIGN §20).
+            if crate::profile::present(paths) {
+                let target = crate::profile::hooks_dir(paths).join(format!("{}.ts", e.id));
+                std::fs::create_dir_all(crate::profile::hooks_dir(paths))?;
+                std::fs::write(&target, &module)?;
+                remove_link(&file)?;
+                symlink_file(&target, &file)?;
+            } else {
+                remove_link(&file)?;
+                std::fs::write(&file, &module)?;
+            }
             hashed.push((file.to_string_lossy().to_string(), crate::ledger::sha256_hex(module.as_bytes())));
         }
     }
@@ -841,11 +958,8 @@ fn write_hooks_readme(dir: &Path) -> Result<()> {
 }
 
 fn remove_hook(paths: &RematchPaths, id: &str) -> Result<()> {
-    let f = paths.hooks_dir().join(format!("{id}.ts"));
-    if f.exists() {
-        std::fs::remove_file(f)?;
-    }
-    Ok(())
+    remove_link(&paths.hooks_dir().join(format!("{id}.ts")))?;
+    remove_link(&crate::profile::hooks_dir(paths).join(format!("{id}.ts")))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -875,6 +989,14 @@ pub struct MatchResult {
     pub entries: Vec<MatchedEntry>,
     pub hooks: Vec<PathBuf>,
     pub off: bool,
+    /// The place's declared domain (`policy.json` `domains`, else the branch's `domain.yml`);
+    /// the session's extensions and stems are unknown at load time, so no inference here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// `REMATCH_ROOT/profile/.git` exists: the extension runs `profile sync` at session start
+    /// only then (DESIGN §20).
+    #[serde(default)]
+    pub profile_present: bool,
 }
 
 /// A hook entry is active only while its approved module exists: before approval
@@ -892,23 +1014,28 @@ fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &Place) -> bool {
 /// Load-time match (DESIGN §6): a branch's staging dir is contributed when ≥ 1 of its
 /// provisional non-agent, active ([`hook_active`]) entries' predicates match the place
 /// ([`Place::locate`]: the repo's remote and the cwd's subpath, else the repo (else cwd)
-/// against the glob). `entries` lists what will load — provisional entries of contributed
+/// against the glob; its declared domain gates entries that carry one). `entries` lists what
+/// will load — provisional entries of contributed
 /// branches, every provisional agent (omp discovers them through the plugin root in
 /// every session) and every kept/pinned entry — with their glob hit (false for an
 /// unapproved hook, which must not count). `hooks` lists approved hook modules of
 /// loadable, matching entries. `skill_dirs` stays in the payload for compatibility;
-/// harnesses load skills from the shared dir ([`sync_shared_skills`]).
+/// harnesses load skills from the shared dir ([`sync_shared_skills`]). `domain` is the
+/// place's declared domain (`domain::place_domain`).
 pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>, cwd: &Path) -> Result<MatchResult> {
     let mut out = MatchResult {
         branch: branch_for(repo, cwd),
         repo: repo.map(|r| r.to_string_lossy().to_string()),
         off: paths.is_off(),
+        profile_present: crate::profile::present(paths),
         ..Default::default()
     };
     if out.off {
         return Ok(out);
     }
-    let place = Place::locate(repo, cwd);
+    let mut place = Place::locate(repo, cwd);
+    place.domain = crate::domain::place_domain(paths, &place, &out.branch);
+    out.domain = place.domain.clone();
     let provisional =
         ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })?;
     let mut branches: Vec<&str> = provisional
@@ -1023,8 +1150,10 @@ pub fn relink(target: &Path, link: &Path) -> Result<()> {
 /// deleted, moved). With `place` = `None` (status changes) nothing provisional is added.
 /// One name has one link: a provisional entry matched by this sync takes it; a provisional
 /// candidate already linked shadows the kept entry of its name until it is kept or retired.
-/// Only symlinks are touched; hidden names (another sync's temporary links) are skipped. While
-/// rematch is off every link is removed and `dirs` is empty.
+/// The profile's kept sources (`profile::kept_sources`: every `profile/skills/<name>/`, kept on
+/// this machine or another, or adopted) fill names nothing else holds. Only symlinks are
+/// touched; hidden names (another sync's temporary links) are skipped. While rematch is off
+/// every link is removed and `dirs` is empty.
 pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&Place>) -> Result<SkillsSync> {
     let dir = &paths.skills_shared;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -1054,14 +1183,22 @@ pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths, place: Option<&
             untouched.push(name);
         }
     }
+    let sources = if off { Vec::new() } else { crate::profile::kept_sources(paths) };
     let holder = |name: &str, target: &Path| live.iter().find(|e| e.name == name && e.path == target);
-    let mut want: BTreeMap<String, PathBuf> =
-        current.iter().filter(|(n, t)| holder(n, t).is_some()).map(|(n, t)| (n.clone(), t.clone())).collect();
+    let from_profile = |name: &str, target: &Path| sources.iter().any(|(n, p)| n == name && p == target);
+    let mut want: BTreeMap<String, PathBuf> = current
+        .iter()
+        .filter(|(n, t)| holder(n, t).is_some() || from_profile(n, t))
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
     for e in live.iter().filter(|e| always_shared(e)) {
         let shadowed = want.get(&e.name).and_then(|t| holder(&e.name, t)).is_some_and(|h| !always_shared(h));
         if !shadowed {
             want.insert(e.name.clone(), e.path.clone());
         }
+    }
+    for (name, src) in &sources {
+        want.entry(name.clone()).or_insert_with(|| src.clone());
     }
     if let Some(place) = place {
         for e in live.iter().filter(|e| provisional_hit(paths, e, place)) {
@@ -1121,29 +1258,60 @@ fn written_by_us(ledger: &Ledger, md: &Path) -> Result<bool> {
     Ok(ledger.get_entry(&block.id)?.is_some())
 }
 
+/// The file carries a `rematch:` block (written by rematch on this machine or another).
+fn has_rematch_block(md: &Path) -> bool {
+    std::fs::read_to_string(md).ok().and_then(|t| SkillDoc::parse(&t).ok()).and_then(|d| d.rematch()).is_some()
+}
+
 /// Everything the plugin wrote and nothing else: kept skill dirs whose SKILL.md (and
 /// kept `<agent_dir>/agents/*.md` files whose frontmatter) has a `rematch:` block with
 /// an id known to the ledger, the provisional-agent link dir, the shared skills dir (links
-/// only; removing it never follows them), the rematch-hooks dir, and the root.
+/// only; removing it never follows them), the rematch-hooks dir, and the root. The profile
+/// (`REMATCH_ROOT/profile/`, the user's git repo) stays: only the links into it go, and an
+/// adopted hand-written skill or agent (no `rematch:` block) is restored as a copy in place
+/// of its link.
 pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
+    let profile_dir = crate::profile::dir(paths);
+    let into_profile = |p: &Path| std::fs::read_link(p).ok().filter(|t| t.starts_with(&profile_dir));
     for d in sorted_children(&paths.skills_dir())? {
+        let name = d.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        let original = paths.predecessors.join(&name).join("0");
+        if let Some(target) = into_profile(&d) {
+            if !has_rematch_block(&target.join(SKILL_MD)) {
+                plan.restore.push((target, d.clone()));
+            } else if original.is_dir() {
+                plan.restore.push((original, d.clone()));
+            }
+            plan.remove.push(d);
+            continue;
+        }
         if !written_by_us(ledger, &d.join(SKILL_MD))? {
             continue;
         }
-        let name = d.file_name().map(|n| n.to_os_string()).unwrap_or_default();
-        let original = paths.predecessors.join(&name).join("0");
         if original.is_dir() {
             plan.restore.push((original, d.clone()));
         }
         plan.remove.push(d);
     }
     for f in sorted_children(&paths.agents_dir())? {
-        if f.extension().is_none_or(|x| x != "md") || !written_by_us(ledger, &f)? {
+        if f.extension().is_none_or(|x| x != "md") {
             continue;
         }
         let name = f.file_stem().and_then(|n| n.to_str()).unwrap_or_default();
         let original = predecessor_root(paths, Kind::Agent, name).join("0").join(AGENT_MD);
+        if let Some(target) = into_profile(&f) {
+            if !has_rematch_block(&target) {
+                plan.restore.push((target, f.clone()));
+            } else if original.is_file() {
+                plan.restore.push((original, f.clone()));
+            }
+            plan.remove.push(f);
+            continue;
+        }
+        if !written_by_us(ledger, &f)? {
+            continue;
+        }
         if original.is_file() {
             plan.restore.push((original, f.clone()));
         }
@@ -1159,7 +1327,9 @@ pub fn uninstall_plan(paths: &RematchPaths, ledger: &Ledger) -> Result<Uninstall
     if hooks.exists() {
         plan.remove.push(hooks);
     }
-    if paths.root.exists() {
+    if profile_dir.exists() {
+        plan.remove.extend(sorted_children(&paths.root)?.into_iter().filter(|p| p != &profile_dir));
+    } else if paths.root.exists() {
         plan.remove.push(paths.root.clone());
     }
     Ok(plan)
@@ -1337,6 +1507,74 @@ mod tests {
         assert!(rb.restored.is_none());
         assert!(std::fs::read_to_string(user_dir.join("SKILL.md")).unwrap().ends_with("mine\n"));
         assert!(rollback(&x.ledger, &x.paths, "ledger-skill").is_err(), "nothing kept left");
+    }
+
+    #[test]
+    fn with_a_profile_keep_writes_there_links_back_rolls_back_and_uninstall_keeps_it() {
+        let x = env();
+        let profile = crate::profile::dir(&x.paths);
+        std::fs::create_dir_all(profile.join(".git")).unwrap();
+        let user_dir = x.paths.skills_dir().join("ledger-skill");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join("SKILL.md"), "---\nname: ledger-skill\ndescription: mine\n---\nmine\n").unwrap();
+        let home = profile.join("skills/ledger-skill");
+
+        // The keep goes to the profile; the user's native dir is the replaced occupant.
+        stage(&x.ledger, &x.paths, &entry("e1", "ledger-skill", "repo", Status::Provisional), &[w("SKILL.md", &skill("ledger-skill"))]).unwrap();
+        let k1 = set_status(&x.ledger, &x.paths, "e1", Status::Kept, None).unwrap();
+        assert_eq!(k1.path, home);
+        assert_eq!(std::fs::read_link(&user_dir).unwrap(), home);
+        assert!(std::fs::read_to_string(x.paths.predecessors.join("ledger-skill/0/SKILL.md")).unwrap().ends_with("mine\n"));
+        assert_eq!(std::fs::read_link(x.paths.skills_shared.join("ledger-skill")).unwrap(), home);
+        assert!(is_kept_slot(&x.paths, &k1, &home) && is_kept_slot(&x.paths, &k1, &user_dir));
+
+        // A sibling replaces it in place; rollback restores e1 there and relinks.
+        let mut e2 = entry("e2", "ledger-skill", "repo", Status::Provisional);
+        e2.sibling_of = Some("e1".into());
+        stage(&x.ledger, &x.paths, &e2, &[w("SKILL.md", &skill("ledger-skill"))]).unwrap();
+        assert_eq!(set_status(&x.ledger, &x.paths, "e2", Status::Kept, None).unwrap().path, home);
+        let rb = rollback(&x.ledger, &x.paths, "ledger-skill").unwrap();
+        assert_eq!(rb.restored.unwrap().path, home);
+        assert_eq!(std::fs::read_link(&user_dir).unwrap(), home);
+
+        // An approved hook is written into the profile and linked.
+        stage(&x.ledger, &x.paths, &hook_entry("h1"), &[]).unwrap();
+        approve(&x.ledger, &x.paths, "h1", Approval::Hook).unwrap();
+        let hook = x.paths.hooks_dir().join("h1.ts");
+        assert_eq!(std::fs::read_link(&hook).unwrap(), profile.join("hooks/h1.ts"));
+        assert!(hook_active(&x.paths, &x.ledger.get_entry("h1").unwrap().unwrap()));
+        disable(&x.ledger, &x.paths, "h1", "test").unwrap();
+        assert!(std::fs::symlink_metadata(&hook).is_err() && !profile.join("hooks/h1.ts").exists());
+
+        // The user's original comes back into the profile; retiring a kept entry drops its link.
+        let rb = rollback(&x.ledger, &x.paths, "ledger-skill").unwrap();
+        assert_eq!(rb.restored_version, 0);
+        assert!(std::fs::read_to_string(home.join("SKILL.md")).unwrap().ends_with("mine\n"));
+        assert_eq!(std::fs::read_link(&user_dir).unwrap(), home);
+
+        // Uninstall: the profile stays; the hand-written skill is restored as a copy.
+        let plan = uninstall_plan(&x.paths, &x.ledger).unwrap();
+        assert!(plan.restore.contains(&(home.clone(), user_dir.clone())), "{plan:?}");
+        assert!(plan.remove.iter().all(|p| !p.starts_with(&profile) && p != &x.paths.root), "{plan:?}");
+        apply_uninstall(&plan).unwrap();
+        assert!(profile.join(".git").is_dir() && home.join("SKILL.md").is_file());
+        assert!(std::fs::symlink_metadata(&user_dir).unwrap().is_dir());
+        assert!(!x.paths.ledger_file.exists());
+    }
+
+    #[test]
+    fn with_a_profile_a_kept_agent_is_copied_there_and_linked() {
+        let x = env();
+        let profile = crate::profile::dir(&x.paths);
+        std::fs::create_dir_all(profile.join(".git")).unwrap();
+        stage(&x.ledger, &x.paths, &agent_entry("a1", "log-triage"), &[w("AGENT.md", &agent_md("log-triage", "Triage."))]).unwrap();
+        set_status(&x.ledger, &x.paths, "a1", Status::Kept, None).unwrap();
+        let f = kept_agent_file(&x.paths, "log-triage");
+        let copy = profile.join("agents/log-triage.md");
+        assert_eq!(std::fs::read_link(&f).unwrap(), copy);
+        assert!(std::fs::read_to_string(&copy).unwrap().contains("Triage."));
+        set_status(&x.ledger, &x.paths, "a1", Status::Retired, None).unwrap();
+        assert!(std::fs::symlink_metadata(&f).is_err() && !copy.exists());
     }
 
     #[test]

@@ -89,6 +89,10 @@ pub fn cmd_doctor(ctx: &AppCtx) -> Result<Value> {
     if let Err(e) = rematch_core::lint::LintConfig::load(&ctx.paths.improver.join("lint.toml")) {
         problems.push(format!("lint.toml invalid: {e:#}"));
     }
+    // `match` and `skills sync` treat an unreadable domain policy as "no domain"; say so here.
+    if let Err(e) = ctx.domain_policy() {
+        problems.push(format!("domain policy invalid (policy.json domains/caps, branches/*/domain.yml or domain_rules.toml): {e:#}"));
+    }
 
     let sessions = ctx.ledger.list_sessions(&SessionFilter::default())?;
     let traced = sessions.iter().filter(|s| s.source == "trace").count();

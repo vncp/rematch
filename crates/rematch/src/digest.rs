@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use rematch_core::features::{exts_of, stems_of_session};
 use rematch_core::ledger::{enum_str, EntryFilter};
+use rematch_core::domain;
 use rematch_core::library;
 use rematch_core::predicate;
 use rematch_core::types::{Entry, Kind, Status};
@@ -26,6 +27,10 @@ pub struct MatchArgs {
     pub inputs: Option<String>,
 }
 
+/// `match --cwd`: the load-time payload. `domain` is the place's declared domain
+/// (`policy.json`, else the branch's `domain.yml`); with `--inputs` the session's exts and
+/// stems are known too, so the full rule (`domain::domain_of`, inference included) decides
+/// it and gates `predicate_hit` like `count` will.
 pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     let repo = rematch_core::import::repo_of(&ctx.cwd);
     let m = library::list_for_match(&ctx.ledger, &ctx.paths, repo.as_deref(), &ctx.cwd)?;
@@ -40,6 +45,14 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
         }
         None => None,
     };
+    let domain = match &refine {
+        Some((exts, stems)) if !m.off => {
+            let place = predicate::Place::locate(repo.as_deref(), &ctx.cwd);
+            let policy = ctx.domain_policy()?;
+            domain::domain_of(place.remote.as_deref(), place.subpath.as_deref(), Some(&m.branch), exts, stems, &policy)
+        }
+        _ => m.domain.clone(),
+    };
     let mut entries = Vec::new();
     for me in &m.entries {
         let e = ctx.ledger.get_entry(&me.id)?;
@@ -49,7 +62,9 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
         }
         let mut hit = me.predicate_hit;
         if let (Some((exts, stems)), Some(e)) = (&refine, &e) {
-            hit = hit && predicate::count_hit(&e.predicate, exts, stems);
+            hit = hit
+                && predicate::count_hit(&e.predicate, exts, stems)
+                && domain::domain_matches(e.predicate.domain.as_deref(), domain.as_deref());
         }
         entries.push(json!({
             "id": me.id, "name": me.name, "kind": me.kind, "status": me.status, "predicate_hit": hit,
@@ -58,6 +73,7 @@ pub fn cmd_match(ctx: &AppCtx, a: MatchArgs) -> Result<Value> {
     }
     let mut out = serde_json::to_value(&m)?;
     out["entries"] = Value::Array(entries);
+    out["domain"] = json!(domain);
     Ok(out)
 }
 
@@ -224,8 +240,23 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
             t.get("to_branch").and_then(Value::as_str).unwrap_or("?"),
         ));
     }
+    // Informational: never applied by the digest (`policy domain set` is the only writer).
+    let domain_proposals = crate::policy_cmd::domain_suggestions(ctx, &ctx.domain_policy()?)?;
+    for d in &domain_proposals {
+        lines.push(format!(
+            "declare domain {} for {}: {}",
+            d["domain"].as_str().unwrap_or("?"),
+            d["remote"].as_str().unwrap_or("?"),
+            d["command"].as_str().unwrap_or("?"),
+        ));
+    }
     if !approvals.is_empty() {
         lines.push(format!("{} approval(s) pending", approvals.len()));
+    }
+    // The last `profile sync` stopped at a rebase conflict (DESIGN §20): shown until one syncs.
+    let profile_conflicts = rematch_core::profile::read_conflicts(&ctx.paths);
+    if !profile_conflicts.is_empty() {
+        lines.push(crate::profile_cmd::conflict_line(&rematch_core::profile::dir(&ctx.paths), &profile_conflicts));
     }
     std::fs::write(last_path(ctx), seen.to_string())?;
     Ok(json!({
@@ -236,6 +267,8 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
         "review": review,
         "stale": stale,
         "transfers": transfers,
+        "domain_proposals": domain_proposals,
+        "profile_conflicts": profile_conflicts,
         "off": ctx.paths.is_off(),
     }))
 }

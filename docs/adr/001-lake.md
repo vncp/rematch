@@ -46,7 +46,7 @@ Every row carries `machine`, `known` (origin ledger ms), journal `seq`. Columns 
 | Table | Grain | Keys | The reader that needs it |
 |---|---|---|---|
 | `events` | one trace record of a closed session | `expr:tool_cmd=json_get(tool_input,'$.command'):exact,counts` · `exact:path` · `exact:skill_read` | `create --from sessions` and `improve` ask "which sessions ran this command / touched this file / read this skill" over all imported history; a session's own excerpt is path resolution, no key |
-| `sessions` | one row per session write | `exact:repo_remote,counts` · `list:loaded_entry_shas` · `list:exts` · `list:stems` · `range:started_at` | `rematch report` before-arm: sessions matching a predicate (`exts`/`stems` contains_all) in a window where the entry was **not** loaded; `create --from sessions` reference search |
+| `sessions` | one row per session write | `exact:repo_remote,counts` · `exact:domain` · `list:loaded_entry_shas` · `list:exts` · `list:stems` · `range:started_at` | `rematch report` before-arm: sessions matching a predicate (`exts`/`stems` contains_all) in a window where the entry was **not** loaded; `create --from sessions` reference search; `exact:domain` (the session's work domain, DESIGN §6 "Domain"; an additive nullable column, null in files exported before it): `report`'s per-domain groups and a trigger's same-domain sessions ("which sessions of `quant.options` in this window") |
 | `redirects` | one row per label write | `temporal:session_id,seq@known` · `exact:class` | `report` and `why --asof`: the class a redirect had as of a date (later marks are new rows) |
 | `entries` | one row per entry write; `valid` = `status_since`, `known` = `updated_at` | `temporal2:entry_id@valid,known` · `exact:content_sha256` | `why --asof` and `reflect --history`: the status an entry had when session S loaded it; cross-machine identity by content |
 | `counters` | one row per fold write; `ts` = session end; carries `content_sha256` | `temporal:content_sha256@ts` | `report` and `shared` promotion across machines: counts for one content over a window, deduped by greatest `known ≤ K` |
@@ -102,6 +102,7 @@ rematch report [--window 6w]              the kill criterion from the lake alone
 | `transfer suggest` | ledger facet rows | `outcomes` `list:facets` contains_all on bare keys |
 | `library why --asof` | current status | `entries` temporal2 + `counters` temporal |
 | `rematch report` | — | `counters` window + `sessions` before-arm + `entries` asof |
+| `rematch tune` (and its pass inside `count`) | — | `sessions` `range:started_at` window (`skill_reads` = the `events.skill_read` key's sessions, `visible_entries`, `loaded_entry_shas`, `stems`/`exts`) → read-but-missed / matched-but-unread per entry; a session's `retrieval` records from its `events` file by path; the ledger journal while the lake lags (DESIGN §6 "Predicate tuning") |
 | a second machine | nothing | `lake import` → `report`/`transfer`/`promote` over both |
 
 ### Not in this decision

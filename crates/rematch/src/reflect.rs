@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use rematch_core::counters;
 use rematch_core::dedup;
+use rematch_core::domain::{self, DomainPolicy};
 use rematch_core::experience::{self, ExperienceQuery};
 use rematch_core::features::{exts_of, head, rank_stems, stems_of_session, stems_of_text, MAX_PREDICATE_STEMS};
 use rematch_core::import::apply_trace_signals;
@@ -202,6 +203,9 @@ pub struct CountSummary {
     pub skipped_unfinished: usize,
     /// Phase-3 passes run after the fold: per-family split, shared promotion, stale sweep.
     pub scope: Value,
+    /// Predicate tuning after the decisions (`tune::pass`): entries with a proposal and what
+    /// became of it. Runs only when sessions were folded.
+    pub tune: Value,
     pub lines: Vec<String>,
 }
 
@@ -215,6 +219,7 @@ impl CountSummary {
             "divergence": self.divergence,
             "skipped_unfinished": self.skipped_unfinished,
             "scope": self.scope,
+            "tune": self.tune,
         })
     }
 }
@@ -240,17 +245,19 @@ fn finished(records: &[TraceRecord]) -> bool {
 /// Ledger row for a trace. A trace synthesized for an imported session (`reflect --history`)
 /// refreshes the import row's signals (seqs then address the trace) and keeps the importer's
 /// counts instead of replacing the row with a trace-sourced one; `count` then marks it counted
-/// once like any other session.
-fn fold_for_ledger(records: &[TraceRecord], sid: &str, existing: Option<SessionRecord>) -> SessionRecord {
+/// once like any other session. The row's domain is decided here (DESIGN §6 "Domain").
+fn fold_for_ledger(records: &[TraceRecord], sid: &str, existing: Option<SessionRecord>, policy: &DomainPolicy) -> SessionRecord {
     let mut folded = trace::fold_trace(records, sid);
     rematch_core::identity::fill_session(&mut folded);
-    match existing {
+    let mut s = match existing {
         Some(mut imported) if folded.source == "import" && imported.source == "import" => {
             apply_trace_signals(&mut imported, &folded);
             imported
         }
         _ => folded,
-    }
+    };
+    s.domain = domain::session_domain(&s, policy);
+    s
 }
 
 /// Entries the user disabled while the session ran (harm).
@@ -271,6 +278,7 @@ fn disabled_during(ctx: &AppCtx, s: &SessionRecord) -> Result<Vec<String>> {
 pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>) -> Result<CountSummary> {
     let mut sum = CountSummary::default();
     let mut sessions: Vec<SessionRecord> = Vec::new();
+    let policy = ctx.domain_policy()?;
     for (sid, path) in trace_files(ctx)? {
         if only.is_some_and(|o| o != sid) {
             continue;
@@ -284,7 +292,7 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
             sum.skipped_unfinished += 1;
             continue;
         }
-        let s = fold_for_ledger(&records, &sid, existing);
+        let s = fold_for_ledger(&records, &sid, existing, &policy);
         ctx.ledger.upsert_session(&s)?;
         sessions.push(s);
     }
@@ -360,6 +368,12 @@ pub fn count_finished(ctx: &AppCtx, only: Option<&str>, editor_cmd: Option<&str>
                 sum.decisions.push(json!({"entry": id, "decision": d, "error": format!("{err:#}")}));
             }
         }
+    }
+    if !sum.folded.is_empty() {
+        sum.tune = match crate::tune::pass(ctx, &mut sum.lines) {
+            Ok(v) => v,
+            Err(e) => json!({"error": format!("{e:#}")}),
+        };
     }
     sum.scope = scope_passes(ctx, &mut sum.lines);
     if !sum.folded.is_empty() {
@@ -1010,7 +1024,7 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
         // `count` already folded this trace into the row.
         Some(s) if s.source == "trace" || s.counted => s,
         existing => {
-            let s = fold_for_ledger(&records, sid, existing);
+            let s = fold_for_ledger(&records, sid, existing, &ctx.domain_policy()?);
             ctx.ledger.upsert_session(&s)?;
             s
         }
@@ -1101,13 +1115,14 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
     let mut ranked = rank_stems(&doc_terms, &corpus);
     ranked.truncate(MAX_PREDICATE_STEMS);
-    let pred = predicate::derive(session.repo.as_deref(), &exts, &ranked);
+    let pred = predicate::derive(session.repo.as_deref(), &exts, &ranked, session.domain.as_deref());
     let hash = predicate::predicate_hash(&pred);
     let cwd = PathBuf::from(&session.cwd);
     let branch = library::branch_for(session.repo.as_deref().map(Path::new), &cwd);
 
     let mut needs_merge = false;
-    if let Err(limit) = rate::can_admit(&ctx.ledger, &hash, &branch, ctx.now) {
+    let kept_per_domain = ctx.domain_policy()?.kept_per_domain();
+    if let Err(limit) = rate::can_admit(&ctx.ledger, &hash, &branch, pred.domain.as_deref(), kept_per_domain, ctx.now) {
         match limit {
             RateLimit::NeedsMerge { .. } => needs_merge = true,
             l @ (RateLimit::PendingCanary { .. } | RateLimit::DailyPredicate { .. } | RateLimit::BranchProvisionalCap { .. }) => {

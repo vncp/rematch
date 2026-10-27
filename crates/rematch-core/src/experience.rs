@@ -179,7 +179,10 @@ fn entry_dirs(paths: &RematchPaths) -> Vec<PathBuf> {
         }
     }
     dirs.extend(children(&paths.drafts));
-    dirs.extend(children(&paths.skills_dir()));
+    // Kept skills in the profile are read there, not again through their native link.
+    let profile = crate::profile::skills_dir(paths);
+    dirs.extend(children(&paths.skills_dir()).into_iter().filter(|p| !std::fs::read_link(p).is_ok_and(|t| t.starts_with(&profile))));
+    dirs.extend(children(&profile));
     dirs.extend(children(&paths.kept_agents));
     dirs.sort();
     dirs

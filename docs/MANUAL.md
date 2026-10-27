@@ -17,6 +17,7 @@ The short version: **use omp as usual.** rematch watches, proposes when you corr
 - [Turning it off, rolling back, uninstalling](#turning-it-off-rolling-back-uninstalling)
 - [Claude Code](#claude-code)
 - [Codex](#codex)
+- [Profile: one setup on every machine](#profile-one-setup-on-every-machine)
 - [Where things are](#where-things-are)
 - [Troubleshooting](#troubleshooting)
 
@@ -204,7 +205,7 @@ rematch transfer suggest | apply <id> --branch <b>         # invariant lessons a
 | `REMATCH=0 omp` | off for one process |
 | `/rematch disable <id>` | retire one entry now |
 | `/rematch rollback <skill>` | previous version back, immediately |
-| `rematch uninstall` | prints what it would remove; `--yes` removes every file rematch wrote (root, hooks, kept entries, restoring predecessors) and nothing else |
+| `rematch uninstall` | prints what it would remove; `--yes` removes every file rematch wrote (root, hooks, kept entries, restoring predecessors) and nothing else; a profile (`~/.rematch/profile/`, your git repo) stays, only the links into it go |
 
 ## Claude Code
 
@@ -270,6 +271,43 @@ One directory, `~/.rematch/skills/`, holds a link `<name> → <entry dir>` for e
 - `~/.rematch` is shared by every omp profile, and so is the directory: a skill kept under one profile's `skills/` is linked for sessions of every profile and harness.
 - Subagents (`kind: agent`) are not skills: omp loads them (provisional ones through the extension's `agents/` link, kept ones from `~/.omp/agent/agents/`); Claude Code loads copies in its plugin's `agents/`, refreshed at each session start; Codex does not load them.
 
+## Domains
+
+Every session and every trigger can carry a **domain**: a dotted lowercase path such as `web`, `web.frontend`, `mobile`, `quant.options` or `3d.animation`. When both an entry's trigger and a session have one, the entry loads and counts only if the session's domain equals the trigger's or extends it (`quant` covers `quant.options`; `web` never covers `mobile`). So a review skill learned on web work never triggers on mobile or 3D work, even when the words are the same. When either side has no domain, nothing changes: entries from before domains, and sessions rematch could not place, behave exactly as before.
+
+How a session's domain is decided, first answer wins (no model is involved):
+
+1. **You declared it in `~/.rematch/policy.json`.** Use the command, which is the only thing that writes that file (other keys in it are kept):
+
+   ```sh
+   rematch policy domain set github.com/acme/web web.frontend          # a normalized remote…
+   rematch policy domain set . web.frontend                            # …or a repo path (its remote is used)
+   rematch policy domain set 'github.com/acme/*' quant                 # a glob over remotes
+   rematch policy domain set github.com/acme/app mobile --subpath ios  # only below ios/ in that repo
+   rematch policy domain unset github.com/acme/app --subpath ios
+   rematch policy show --text
+   ```
+
+   The file holds `"domains": [{"match": {"repo_remote": "...", "subpath": "..."}, "domain": "..."}]`; the command keeps the most specific declarations first (with a subpath, then an exact remote, then globs).
+2. **The branch says so in `~/.rematch/branches/<branch>/domain.yml`** (`domain: quant.options`; the same file that lists the branch's facets, see [domain.yml.md](domain.yml.md)). The branch is the repo's directory name.
+3. **Inference** from the files the session touched and the words it used, with the table in `~/.rematch/improver/domain_rules.toml` (yours to edit; an upgrade does not overwrite an edited copy). Extensions score 2 each, stems 1 each: `tsx jsx css html vue svelte` → `web`, `swift kt m dart` → `mobile`, `blend fbx gltf usd anim` → `3d`, `parquet sql ipynb csv` → `data`, `rs go c cpp java` → `backend`; words like backtest, sharpe, nbbo, option, strategy, portfolio → `quant`; anim, rig, bake, skeleton, keyframe → `3d.animation`; component, css, layout → `web.frontend`; ios, android, swiftui, compose → `mobile`. The best domain needs a score of at least 2 and must beat the runner-up by at least 1, otherwise the session gets none. A second level (`web.frontend`) only comes from a word rule.
+
+What happens with it:
+
+- **New entries take the domain of the session they came from** (reflection, `create --from task`); `create --from sessions` and `improve` take the domain most of their reference sessions share.
+- **At session start** only rules 1 and 2 apply (the files and words are not known yet): `rematch match --cwd <dir>` prints the place's `domain`, and an entry of another domain does not load there. When the session ends, `count` decides the full domain and counts with it.
+- **See it in `why`.** `rematch library why <session> --text` prints `domain <recorded> · policy now: <what today's policy decides> (policy.json|domain.yml|inferred)`, and for each loaded entry `domain <its domain> ok|mismatch` next to the place and predicate verdicts (a mismatch makes the place a miss):
+
+  ```
+  domain mobile · policy now: mobile (policy.json)
+  loaded web-review v1 (provisional) sha 9d8209857232: domain web.frontend mismatch · place miss · predicate miss · this session not counted · …
+  loaded ios-review v1 (provisional) sha 7947e0f201a9: domain mobile ok · place hit · predicate hit · this session recurrence 1 harm 0 · …
+  ```
+- **After declaring or changing a domain, run `rematch lake migrate`.** It re-decides every recorded session with the current policy and gives each entry its originating session's domain; a second run changes nothing. `policy domain set` tells you how many recorded sessions would change.
+- **The digest proposes, never applies.** When at least five sessions in a repo without a declaration read skills that all belong to one domain, the session-start digest adds `declare domain <d> for <remote>: rematch policy domain set <remote> <d>`.
+- **A cap per domain.** At most 8 kept entries per top-level domain across all branches on this machine (`rematch policy caps set kept_per_domain <n>`); past it, a new candidate is merged into an existing entry instead, like the per-branch cap.
+- **`report` groups by domain** (see below).
+
 ## The lake
 
 The ledger keeps current state; the lake keeps history. Every write the ledger makes is journaled with the ledger's own clock, and `rematch lake export` copies the journal, plus the trace of every closed session, into Parquet files under `~/.rematch/lake/` that are written once and never changed. Nothing in a session reads it: `match`, `skills sync` and the hooks never open it, so a slow disk or a large lake costs a session nothing. Design: [ADR 001](adr/001-lake.md); file layout and columns: DESIGN §19.1.
@@ -293,7 +331,7 @@ rematch lake query outcomes --key list:facets --values mechanism,universe --all
 - **Two machines.** Each machine exports under its own name (`$REMATCH_MACHINE`, else the host name, fixed in the ledger at first use). `lake import --from <other>` copies the files you do not have and merges the watermarks; `lake doctor` then lists both machines. The other machine's rows are read-only here: they never enter this ledger.
 - **Rebuild.** `lake rebuild` replays one machine's journal (yours unless `--machine`) into a fresh ledger: `library ls` and the counters come back exactly. It refuses a ledger that already holds anything; `--force` replaces it and keeps the old file as `ledger.sqlite.pre-rebuild-<ms>`. Traces, staging dirs and skills are files, not ledger rows: copy them with the root if you are moving machines.
 - **Before the journal.** Rows that existed when the journal was added are journaled once as `snapshot` rows (their state at that moment, not their history); `lake doctor` shows that range.
-- **After upgrading: `rematch lake migrate`.** Entries and sessions written before this version lack the identity that lets two machines (or two checkouts) recognize the same thing: the content hash of an entry and the repo's remote. `rematch lake migrate` fills them once: `content_sha256` on every entry, `repo_remote` + `subpath` on each entry whose repo is on this machine (its repo path stays as the fallback) and on each session whose repo is here. It reads files only, runs no model and no git, and a second run changes nothing. Until it runs, those entries match by repo path as before; afterwards a worktree or another clone of the same remote loads and counts them too.
+- **After upgrading: `rematch lake migrate`.** Entries and sessions written before this version lack the identity that lets two machines (or two checkouts) recognize the same thing: the content hash of an entry and the repo's remote. `rematch lake migrate` fills them once: `content_sha256` on every entry, `repo_remote` + `subpath` on each entry whose repo is on this machine (its repo path stays as the fallback) and on each session whose repo is here. It also decides each session's domain with the current policy and gives each entry its originating session's domain (see Domains); run it again after `rematch policy domain set`. It reads files only, runs no model and no git, and a second run changes nothing. Until it runs, those entries match by repo path as before; afterwards a worktree or another clone of the same remote loads and counts them too.
 - **Built without it.** The lake needs the cargo feature `lake` (on by default). `cargo build --no-default-features` (or `REMATCH_NO_LAKE=1 scripts/install.sh`) builds a binary without arrow; there every `lake` subcommand except `migrate` answers `built without the lake feature`.
 - **Who reads it.** Historical commands read the lake when there is one and say so in their output (`"source": "lake"` or `"ledger"`): `reflect --history` and `improve` take a session's records from its events file (falling back to the trace or the harness transcript, so a deleted transcript no longer loses an exported session); `create --from sessions` searches every machine's `sessions`; `transfer suggest` reads every machine's outcome facets; `library why --asof` reads `entries` and `redirects`; `rematch report` (below) reads the lake alone. The first four read the ledger instead while the lake is behind it (`lake doctor` shows the lag; `lake export` closes it), so an export lag never hides a local write; the session-start digest never reads the lake.
 
@@ -308,18 +346,103 @@ rematch report --since 2026-09-15       # from that UTC day to now
 SPEC's kill criterion, computed instead of eyeballed: after six weeks of daily use, has an entry reached `kept` over at least four matched sessions, and has recurrence fallen on a trigger the library covers? `report` answers both from the lake when there is one (every machine's history after `lake import`), else from this ledger's journal (`"source": "ledger"`); the output is the JSON envelope, `--text` prints the lines.
 
 - **Kept over ≥ 4.** Every entry whose status at the window's end is `kept`, with the sessions in the window its counter rows matched (on any machine, by entry id or by content hash), their recurrence and harm.
-- **Recurrence per trigger.** Entries are grouped by trigger predicate. Each session started in the window whose files and terms match the predicate falls in one of two arms: *with* (it loaded an entry of that trigger) or *before* (it loaded none). Each arm shows sessions, sessions where the trigger's redirect class recurred (the entry's motivating class; for a classless entry, a correction or preference), the redirects of that class, and the rate (recurred / sessions); then `Δ` = with − before, and `fell` when it is negative. A trigger is *covered* when its with-arm is not empty.
+- **Recurrence per trigger.** Entries are grouped by trigger predicate. Each session started in the window whose files and terms match the predicate (and whose domain fits the trigger's, see Domains) falls in one of two arms: *with* (it loaded an entry of that trigger) or *before* (it loaded none). Each arm shows sessions, sessions where the trigger's redirect class recurred (the entry's motivating class; for a classless entry, a correction or preference), the redirects of that class, and the rate (recurred / sessions); then `Δ` = with − before, and `fell` when it is negative. A trigger is *covered* when its with-arm is not empty. Triggers are listed under their domain (`(none)` for a trigger without one), each domain headed by a summary line whose arms add up its triggers' (a session matching two triggers counts twice).
 - **The verdict line.** `verdict: an entry reached kept over ≥ 4 matched sessions: yes (<names>)|no; recurrence fell on a covered trigger: yes (<triggers>)|no`. Built-in entries are listed but never count toward it.
 - **As of the window's end.** Every row is read as its ledger held it then (a status or a redirect label written later does not count), so a report for a past window does not change when entries move on.
 
 On the seed of `report`'s unit test (one trigger, both arms, after `lake export`; machine name shortened):
 
 ```
-report · source lake (lag 0 journal row(s)) · machines laptop · window 2026-09-14 21:30 UTC → 2026-10-26 21:30 UTC (6w)
+report · source lake (lag 0 journal row(s)) · machines laptop · window 2026-09-15 00:02 UTC → 2026-10-27 00:02 UTC (6w)
 kept run-tests-before-commit: 4 matched session(s) in the window (≥ 4), recurrence 0, harm 0
-trigger run-tests-before-commit [6675c0a0d803] class correction: with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50) · Δ -0.50 fell
+domain (none): 2 trigger(s), 1 covered, 1 fell · with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50)
+  trigger run-tests-before-commit [6675c0a0d803] class correction: with 0/4 recurred (0 redirect(s), rate 0.00) · before 2/4 recurred (2 redirect(s), rate 0.50) · Δ -0.50 fell
 verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-before-commit); recurrence fell on a covered trigger: yes (run-tests-before-commit)
 ```
+
+With two domains in one monorepo (`web/` declared `web.frontend`, `ios/` declared `mobile`, a review skill learned in each, six sessions with the same words):
+
+```
+domain mobile: 1 trigger(s), 1 covered, 0 fell · with 2/3 recurred (2 redirect(s), rate 0.67) · before no sessions
+  trigger ios-review [60b78f6a0c69] class correction|preference: with 2/3 recurred (2 redirect(s), rate 0.67) · before no sessions
+domain web.frontend: 1 trigger(s), 1 covered, 0 fell · with 1/3 recurred (1 redirect(s), rate 0.33) · before no sessions
+  trigger web-review [6f88fb35eae6] class correction|preference: with 1/3 recurred (1 redirect(s), rate 0.33) · before no sessions
+```
+
+## Predicate tuning
+
+```sh
+rematch tune --dry-run --text                    # signals and proposals for every entry; writes nothing
+rematch tune --entry ledger-helper --text        # stage the tune of one entry (id or name)
+rematch tune --window 30d --dry-run              # <n>w, <n>d or <n>h, ending now (default 6w)
+```
+
+A trigger predicate is a guess made at stage time. Sessions tell whether it was right: the model opens a skill (`skill://name`, `skills/<name>/SKILL.md`, a retrieved unit) the predicate did not match, or the predicate matches and the skill is loaded but never read. `tune` counts both per entry over the window and proposes a new predicate — no model call — that `count` then judges like any new entry.
+
+- **Read-but-missed** (the stems missed): a session read the entry while it was visible (the shared skills dir exposed it, it was loaded, or it is your own skill registered in place) at a place the predicate covers, and the predicate did not hit. Three such sessions widen it: the stems found in at least two of them join the current ones (ranked by tf-idf, at most 10), and the file extensions they touched join a non-empty extension list (at most 8; an empty list already matches every extension).
+- **Matched-but-unread** (the stems overmatch): the predicate hit, the entry was loaded, nothing read it. Four such sessions, with fewer than three read-but-missed, narrow it: the stems only unread sessions carry go, two always stay.
+- **Domains.** A read in a domain the entry's domain does not cover (`cross_domain_reads`) or at a place the predicate does not cover (`cross_place_reads`) is shown and never used. An entry without a domain whose reads all carry one domain, in at least three sessions, gets that domain. A domain is never changed or widened, and stems are never pooled across domains.
+- **Nothing is edited in place.** A tune stages a provisional sibling: the same files, version + 1, `sibling_of` the parent, a new predicate (a new canary, under the usual lint and rate limits) and a `status_note` such as `predicate tune: +[orderbook, parser, quot] -[] from 3 session(s)`. The session ids behind it are in the sibling's `rematch.json` (`tune.evidence`) and its proposal row. The parent keeps serving; the counters keep or retire the sibling, and a kept sibling replaces a kept parent through the anchor replay.
+- **Guards.** At most one tune per entry every 7 days and one pending tune at a time; never on pinned, built-in or hook entries; never a change of repo, remote or subpath, never `**`; a provisional parent rematch staged is tuned once its own canary has kept it (its staging slot holds one version). `--dry-run` runs every guard and says `would stage` or `skipped: <reason>`.
+- **It runs by itself.** `count` (and so `reflect --pending`) runs the same pass after its decisions whenever it counted a session; its lines start with `tune:`.
+- **Reading it back.** `library why <session>` prints `predicate tune v2 pending (…)` under the parent while the sibling is provisional. `report` lists every tune in the window with both versions' with-arms side by side and the parent predicate's before-arm, and counts each session against the predicate of the version it loaded, so a wider predicate cannot improve a verdict by matching more sessions.
+
+On a root where `ledger-helper` (stems `ledger helper round audit`) was read in three imported sessions about the order book parser:
+
+```
+tune · source ledger · window 6w (2026-09-15 00:00 UTC → 2026-10-27 00:00 UTC) · 3 session(s) · dry run
+ledger-helper v1: read-but-missed 3 · matched-but-unread 0 · matched-and-read 0 → predicate tune: +[orderbook, parser, quot] -[] from 3 session(s) → would stage v2 (provisional, predicate b2c09424571f)
+```
+
+## Profile: one setup on every machine
+
+The profile is a git repo at `~/.rematch/profile/` that holds your omp setup: what rematch kept, the skills and agents you wrote by hand, approved hooks, `policy.json`, model roles per machine, branch `domain.yml` files and improver prompts you edited. Every machine that syncs it loads the same setup. (Not omp's `--profile`: this one follows you across machines.)
+
+**First machine** — create a private, empty git repo anywhere (GitHub, a server, a USB disk), then:
+
+```sh
+rematch profile init --remote git@github.com:you/omp-profile.git --adopt --text
+```
+
+`--adopt` moves your kept entries and the hand-written skills in `~/.omp/agent/skills/` and agents in `~/.omp/agent/agents/` into the profile and leaves a link where each was, so omp loads them as before. Hand-written skills become **pinned** entries: measured like any entry, never moved, replaced or retired by the loop. Without `--remote` the profile stays local until you add one (`git -C ~/.rematch/profile remote add origin <url>`).
+
+**Every other machine:**
+
+```sh
+rematch profile init --remote git@github.com:you/omp-profile.git --text
+```
+
+It clones, links every skill, agent and hook into `~/.omp/agent/` and `~/.rematch/skills/`, and pushes the machine's name into `profile.json`. Add `--adopt` to bring that machine's own skills in too.
+
+**One more skill or agent:** `rematch profile adopt ~/.agents/skills/scratch` (a skill dir) or `rematch profile adopt ~/.omp/agent/agents/reviewer.md`.
+
+**Syncing.** It happens by itself: each omp process runs `rematch profile sync` in the background at its first session start when a profile exists (bounded to 8 s; offline, the session simply goes on). A sync commits local changes as `<machine> <time>`, pulls with rebase, relinks, and pushes. What it pulls loads in your next session. By hand: `rematch profile sync --text` (`--no-push` to only pull; `--timeout <s>` for the network part, default 10). To sync on a timer too:
+
+```sh
+rematch profile install-launchd --interval 300 --text   # writes ~/Library/LaunchAgents/com.vncp.rematch.profile-sync.plist
+launchctl load -w ~/Library/LaunchAgents/com.vncp.rematch.profile-sync.plist
+```
+
+It writes the plist and prints the `launchctl load` line; it never loads it for you. Its output goes to `~/.rematch/profile-sync.log`.
+
+**Keeps go to the profile.** Once a profile exists, a kept entry is written to `profile/skills/<name>/` (agents: `profile/agents/<name>.md`) with a link from `~/.omp/agent/`, and an approved hook to `profile/hooks/`. A skill kept on another machine loads here after the next sync; it is counted only on the machine that kept it (counters live in each machine's ledger), and a hook approved on another machine runs here only for entries this machine knows (built-in hooks are approved per machine).
+
+**Model roles per machine** in `profile/config/roles.yml`, read before `~/.omp/agent/config.yml`:
+
+```yaml
+editor:                       # rematch-editor; also classifier, solver, or any modelRoles key
+  default: anthropic/claude-opus-5-5
+  Vincent-M5M.local: openai/gpt-5     # this hostname only
+classifier: fakeprov/small-model      # every machine
+```
+
+`rematch doctor --text` shows `role rematch-editor: … (via profile:rematch-editor)`; `rematch profile status --text` lists this machine's roles.
+
+**Conflicts.** When two machines changed the same file, the sync stops the rebase, leaves the repo clean at your local commit, does not push, and says which files; the digest shows `profile: 1 conflict(s) not synced (skills/hand-notes/SKILL.md); resolve with git -C ~/.rematch/profile pull --rebase, then rematch profile sync` until it is resolved. Resolve it like any rebase (`git -C ~/.rematch/profile pull --rebase`, edit, `git add`, `git rebase --continue`), then `rematch profile sync`.
+
+**What never syncs.** The ledger and its counters, the lake, traces, pending sessions, provisional and draft entries (`staging/`, `drafts/`), the archive and predecessors, jobs, credentials, omp's own `config.yml` (model choices only through `roles.yml`), and inside each skill its `rematch.json` and `EXPERIENCE.md` (written from this machine's ledger). History moves through the lake, not the profile.
+
+**Status and leaving.** `rematch profile status --text` shows branch, remote, ahead/behind as of the last fetch, uncommitted changes and conflicts. `rematch uninstall --yes` keeps `~/.rematch/profile/` (it is your repo), removes the links into it, and puts your hand-written skills and agents back in `~/.omp/agent/` as plain files.
 
 ## Where things are
 
@@ -333,18 +456,21 @@ verdict: an entry reached kept over ≥ 4 matched sessions: yes (run-tests-befor
   agents/            links to provisional agents (extension/agents points here)
   kept-agents/       entry dirs of kept agents
   drafts/ archive/   never loaded (archive is never deleted)
-  improver/          editor.md, classifier.md, reflector.md, lint.toml
+  improver/          editor.md, classifier.md, reflector.md, lint.toml, domain_rules.toml (domain inference table)
+  policy.json        work/home export policy, skipped profiles, declared domains and caps (written by `rematch policy`; a link into profile/ once a profile exists)
+  branches/<b>/      domain.yml: the branch's domain and facet keys
+  profile/           your profile git repo (see Profile): kept and adopted skills/agents, hooks, config, edited improver files
   jobs/ runs/ tasks/ batch mode
   builtins.version   hash of the shipped built-in entries (installed once; retired ones stay retired)
   lake/              the journal and closed sessions as Parquet (see The lake); never read by a session
   lake-index/        Bellwether indexes for this machine (L3; never synced)
   off                kill-switch marker
-~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/)
-~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/)
-~/.omp/agent/extensions/rematch-hooks/   approved hooks (data-only modules: block, stuck, truncate, retrieve)
+~/.omp/agent/skills/<name>/              kept entries (predecessor in ~/.rematch/predecessors/); with a profile, links into ~/.rematch/profile/skills/
+~/.omp/agent/agents/<name>.md            kept agents (predecessor in ~/.rematch/predecessors/.agents/); with a profile, links into ~/.rematch/profile/agents/
+~/.omp/agent/extensions/rematch-hooks/   approved hooks (data-only modules: block, stuck, truncate, retrieve); with a profile, links into ~/.rematch/profile/hooks/
 ```
 
-Roles, in `~/.omp/agent/config.yml`:
+Roles, in `~/.omp/agent/config.yml` (a profile's `config/roles.yml` answers first, per machine; see Profile):
 
 ```yaml
 modelRoles:

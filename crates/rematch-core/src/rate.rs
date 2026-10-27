@@ -1,5 +1,6 @@
 //! Admission rate limits and caps (DESIGN §8; SPEC "Caps and rates").
 
+use crate::domain::top_domain;
 use crate::ledger::{EntryFilter, Ledger};
 use crate::library::is_builtin;
 use crate::types::{Status, UnixMs};
@@ -21,8 +22,8 @@ pub enum RateLimit {
     #[error("branch {branch} already has {count} provisional entries (max {MAX_PROVISIONAL_PER_BRANCH})")]
     BranchProvisionalCap { branch: String, count: usize },
     /// Kept cap reached: the candidate must merge into or revise an existing entry.
-    #[error("kept cap reached (general {general}/{MAX_KEPT_GENERAL}, branch {branch} {branch_kept}/{MAX_KEPT_PER_BRANCH}); needs_merge")]
-    NeedsMerge { branch: String, general: usize, branch_kept: usize },
+    #[error("kept cap reached (general {general}/{MAX_KEPT_GENERAL}, branch {branch} {branch_kept}/{MAX_KEPT_PER_BRANCH}, domain {} {domain_kept}); needs_merge", domain.as_deref().unwrap_or("-"))]
+    NeedsMerge { branch: String, general: usize, branch_kept: usize, domain: Option<String>, domain_kept: usize },
     #[error(transparent)]
     Storage(#[from] anyhow::Error),
 }
@@ -57,11 +58,28 @@ fn count(ledger: &Ledger, status: Status, branch: &str) -> Result<usize, RateLim
         .count())
 }
 
+/// Kept entries (every branch, built-ins excluded) whose predicate domain has the top level `top`.
+fn kept_in_domain(ledger: &Ledger, top: &str) -> Result<usize, RateLimit> {
+    Ok(ledger
+        .list_entries(&EntryFilter { status: Some(Status::Kept), ..Default::default() })?
+        .iter()
+        .filter(|e| !is_builtin(e) && e.predicate.domain.as_deref().is_some_and(|d| top_domain(d) == top))
+        .count())
+}
+
 /// Checks, in order: pending canary on the predicate; ≤ 1 admission per predicate per
 /// UTC day; ≤ 10 provisional in the branch; kept caps (5 general in `shared` + 5 per
-/// branch) ⇒ `NeedsMerge`. Built-in entries (`library::is_builtin`) are no canaries and
-/// take no cap slot.
-pub fn can_admit(ledger: &Ledger, predicate_hash: &str, branch: &str, now: UnixMs) -> Result<(), RateLimit> {
+/// branch, and `kept_per_domain` (`policy.json` `caps.kept_per_domain`, default 8) per
+/// top-level domain of the candidate's predicate across every branch) ⇒ `NeedsMerge`.
+/// Built-in entries (`library::is_builtin`) are no canaries and take no cap slot.
+pub fn can_admit(
+    ledger: &Ledger,
+    predicate_hash: &str,
+    branch: &str,
+    domain: Option<&str>,
+    kept_per_domain: usize,
+    now: UnixMs,
+) -> Result<(), RateLimit> {
     let pending = ledger.list_entries(&EntryFilter {
         status: Some(Status::Provisional),
         predicate_hash: Some(predicate_hash.into()),
@@ -80,13 +98,21 @@ pub fn can_admit(ledger: &Ledger, predicate_hash: &str, branch: &str, now: UnixM
     }
     let general = count(ledger, Status::Kept, SHARED_BRANCH)?;
     let branch_kept = if branch == SHARED_BRANCH { general } else { count(ledger, Status::Kept, branch)? };
-    let full = if branch == SHARED_BRANCH {
-        general >= MAX_KEPT_GENERAL
-    } else {
-        branch_kept >= MAX_KEPT_PER_BRANCH
+    let top = domain.map(top_domain).filter(|t| !t.is_empty());
+    let domain_kept = match top {
+        Some(t) => kept_in_domain(ledger, t)?,
+        None => 0,
     };
+    let branch_full = if branch == SHARED_BRANCH { general >= MAX_KEPT_GENERAL } else { branch_kept >= MAX_KEPT_PER_BRANCH };
+    let full = branch_full || (top.is_some() && domain_kept >= kept_per_domain);
     if full {
-        return Err(RateLimit::NeedsMerge { branch: branch.into(), general, branch_kept });
+        return Err(RateLimit::NeedsMerge {
+            branch: branch.into(),
+            general,
+            branch_kept,
+            domain: top.map(str::to_string),
+            domain_kept,
+        });
     }
     Ok(())
 }
@@ -105,6 +131,11 @@ mod tests {
     const DAY: UnixMs = 86_400_000;
     // 2026-10-25T00:00:00Z
     const T0: UnixMs = 1_792_886_400_000;
+
+    /// The checks without a candidate domain (the domain cap has its own test).
+    fn can_admit(l: &Ledger, h: &str, branch: &str, now: UnixMs) -> Result<(), RateLimit> {
+        super::can_admit(l, h, branch, None, crate::domain::DEFAULT_KEPT_PER_DOMAIN, now)
+    }
 
     #[test]
     fn utc_day_boundaries() {
@@ -176,5 +207,32 @@ mod tests {
             Err(RateLimit::NeedsMerge { general, .. }) => assert_eq!(general, 5),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn kept_cap_per_top_level_domain_across_branches() {
+        let (_t, l) = ledger();
+        let kept = |id: &str, branch: &str, domain: Option<&str>| {
+            let mut e = entry(id, "n", branch, Status::Kept);
+            e.predicate.domain = domain.map(str::to_string);
+            l.upsert_entry(&e).unwrap();
+        };
+        // 3 web entries in three branches (each well under its branch cap), one web.frontend
+        kept("w1", "a", Some("web"));
+        kept("w2", "b", Some("web.frontend"));
+        kept("w3", "c", Some("web"));
+        kept("m1", "a", Some("mobile"));
+        kept("x1", "a", None);
+        assert!(super::can_admit(&l, "new", "d", Some("web.a11y"), 4, T0).is_ok(), "3 < 4");
+        kept("w4", "d", Some("web"));
+        match super::can_admit(&l, "new", "e", Some("web.a11y"), 4, T0) {
+            Err(RateLimit::NeedsMerge { domain, domain_kept, branch_kept, .. }) => {
+                assert_eq!((domain.as_deref(), domain_kept, branch_kept), (Some("web"), 4, 0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(super::can_admit(&l, "new", "e", Some("mobile"), 4, T0).is_ok(), "other domain has room");
+        assert!(super::can_admit(&l, "new", "e", None, 4, T0).is_ok(), "no domain: no domain cap");
+        assert!(super::can_admit(&l, "new", "e", Some("web"), 5, T0).is_ok(), "configurable");
     }
 }

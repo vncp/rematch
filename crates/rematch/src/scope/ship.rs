@@ -583,7 +583,7 @@ mod tests {
             ctx.ledger.upsert_session(&session(&format!("s{}", i + 1), "alpha", Some(&r.to_string_lossy()), "anthropic/claude-opus", 1_000 + i as i64)).unwrap();
         }
         let mut e = crate::scope::testutil::entry("e-team-0001", "ledger-migrations", "alpha");
-        e.predicate.repo_glob = rematch_core::predicate::derive(Some(&r1.to_string_lossy()), &[], &[]).repo_glob;
+        e.predicate.repo_glob = rematch_core::predicate::derive(Some(&r1.to_string_lossy()), &[], &[], None).repo_glob;
         let e = stage(ctx, &e, &[("scripts/check.sh", "cargo test -p ledger\n")]);
         keep(ctx, &e.id);
         ctx.ledger

@@ -86,7 +86,8 @@ fn read_files(files: &[PathBuf]) -> Result<BTreeMap<String, String>> {
 }
 
 fn check_rate(ctx: &AppCtx, pred: &Predicate, branch: &str) -> Result<()> {
-    match rate::can_admit(&ctx.ledger, &predicate::predicate_hash(pred), branch, ctx.now) {
+    let kept_per_domain = ctx.domain_policy()?.kept_per_domain();
+    match rate::can_admit(&ctx.ledger, &predicate::predicate_hash(pred), branch, pred.domain.as_deref(), kept_per_domain, ctx.now) {
         Ok(()) | Err(RateLimit::NeedsMerge { .. }) => Ok(()),
         Err(e) => bail!("refused by rate limits: {e}"),
     }
@@ -250,7 +251,9 @@ fn from_sessions(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
     let mut ranked = rank_stems(&doc_terms, &corpus);
     ranked.truncate(MAX_PREDICATE_STEMS);
-    let pred = predicate::derive(repo, &exts, &ranked);
+    // The trigger lives in the domain most references share (none when they disagree).
+    let domain = rematch_core::domain::majority_domain(refs.iter().map(|s| s.domain.as_deref()));
+    let pred = predicate::derive(repo, &exts, &ranked, domain.as_deref());
     let branch = branch_of(ctx, a)?;
     check_rate(ctx, &pred, &branch)?;
     let input = json!({
@@ -305,7 +308,8 @@ fn from_task(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let trace_path = crate::batch::worker::cmd_reference_rollout(ctx, task)?;
     let sid = trace_path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad trace path"))?.to_string();
     let records = trace::read_trace(&trace_path)?;
-    let s = trace::fold_trace(&records, &sid);
+    let mut s = trace::fold_trace(&records, &sid);
+    s.domain = rematch_core::domain::session_domain(&s, &ctx.domain_policy()?);
     ctx.ledger.upsert_session(&s)?;
     let moment = trace::find_moment(&s).unwrap_or(Moment { session_id: sid.clone(), seq: records.last().map(TraceRecord::seq).unwrap_or(0) });
     let inputs: Vec<String> = records.iter().filter_map(|r| match r { TraceRecord::Input { text, .. } => Some(text.clone()), _ => None }).collect();
@@ -314,7 +318,7 @@ fn from_task(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
     let mut ranked = rank_stems(&doc_terms, &corpus);
     ranked.truncate(MAX_PREDICATE_STEMS);
-    let pred = predicate::derive(s.repo.as_deref(), &s.exts, &ranked);
+    let pred = predicate::derive(s.repo.as_deref(), &s.exts, &ranked, s.domain.as_deref());
     let branch = branch_of(ctx, a)?;
     check_rate(ctx, &pred, &branch)?;
     let last_text = records.iter().rev().find_map(|r| match r { TraceRecord::TurnEnd { text_head, .. } if !text_head.is_empty() => Some(text_head.clone()), _ => None }).unwrap_or_default();
@@ -362,7 +366,18 @@ fn from_description(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
     let mut ranked = rank_stems(&stems_of_session(&[request_text(a)], &paths), &corpus);
     ranked.truncate(MAX_PREDICATE_STEMS);
-    let pred = predicate::derive(repo.as_deref().map(|r| r.to_str().unwrap_or("")), &rematch_core::features::exts_of(&paths), &ranked);
+    let exts = rematch_core::features::exts_of(&paths);
+    // No session behind a description: the cwd's place and the description's own exts/stems.
+    let place = predicate::Place::locate(repo.as_deref(), &ctx.cwd);
+    let domain = rematch_core::domain::domain_of(
+        place.remote.as_deref(),
+        place.subpath.as_deref(),
+        Some(&library::branch_for(repo.as_deref(), &ctx.cwd)),
+        &exts,
+        &ranked,
+        &ctx.domain_policy()?,
+    );
+    let pred = predicate::derive(repo.as_deref().map(|r| r.to_str().unwrap_or("")), &exts, &ranked, domain.as_deref());
     let branch = branch_of(ctx, a)?;
     let input = json!({
         "mode": "from_description",
@@ -412,7 +427,8 @@ pub fn cmd_activate(ctx: &AppCtx, a: ActivateArgs) -> Result<Value> {
         let trace_path = crate::batch::worker::cmd_reference_rollout(ctx, task)?;
         let sid = trace_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
         let records = trace::read_trace(&trace_path)?;
-        let s = trace::fold_trace(&records, &sid);
+        let mut s = trace::fold_trace(&records, &sid);
+        s.domain = rematch_core::domain::session_domain(&s, &ctx.domain_policy()?);
         ctx.ledger.upsert_session(&s)?;
         evidence = Some(moment_of(&s));
     }

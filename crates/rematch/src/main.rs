@@ -18,6 +18,8 @@ pub mod lake_cmd;
 pub mod lake_migrate;
 pub mod lake_read;
 pub mod omp;
+pub mod policy_cmd;
+pub mod profile_cmd;
 pub mod proc;
 pub mod reflect;
 pub mod report;
@@ -25,6 +27,7 @@ pub mod retrieve;
 pub mod scope;
 pub mod skills_cmd;
 pub mod trace_event;
+pub mod tune;
 pub mod uninstall;
 
 use std::path::PathBuf;
@@ -125,6 +128,18 @@ enum Cmd {
     },
     /// The kill criterion (ADR 001 L4): kept entries over ≥ 4 matched sessions and recurrence per trigger, with-entry vs before-arm.
     Report(report::ReportArgs),
+    /// REMATCH_ROOT/policy.json: show, declare a repo's domain (domain set|unset), caps (kept_per_domain).
+    Policy {
+        #[command(subcommand)]
+        cmd: policy_cmd::PolicyCmd,
+    },
+    /// Predicate tuning: read-but-missed sessions widen a skill's stems, matched-but-unread narrow them; staged as a provisional sibling.
+    Tune(tune::TuneArgs),
+    /// The profile (REMATCH_ROOT/profile, a git repo synced across machines): init, adopt, sync, status, install-launchd.
+    Profile {
+        #[command(subcommand)]
+        cmd: profile_cmd::ProfileCmd,
+    },
 }
 
 impl Cmd {
@@ -161,6 +176,9 @@ impl Cmd {
             Cmd::Uninstall(_) => "uninstall",
             Cmd::Lake { .. } => "lake",
             Cmd::Report(_) => "report",
+            Cmd::Policy { .. } => "policy",
+            Cmd::Tune(_) => "tune",
+            Cmd::Profile { .. } => "profile",
         }
     }
 }
@@ -198,6 +216,9 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Uninstall(a) => uninstall::cmd_uninstall(ctx, a),
         Cmd::Lake { cmd } => lake_cmd::cmd_lake(ctx, cmd),
         Cmd::Report(a) => report::cmd_report(ctx, a),
+        Cmd::Policy { cmd } => policy_cmd::cmd_policy(ctx, cmd),
+        Cmd::Tune(a) => tune::cmd_tune(ctx, a),
+        Cmd::Profile { cmd } => profile_cmd::cmd_profile(ctx, cmd),
     }
 }
 

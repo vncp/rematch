@@ -1,5 +1,6 @@
 //! omp `config.yml` → `modelRoles` lookup (DESIGN §0): `<agent_dir>/config.yml` with
-//! `<repo>/.omp/config.yml` overlaid; custom roles fall back along fixed chains.
+//! `<repo>/.omp/config.yml` overlaid; custom roles fall back along fixed chains. With a profile,
+//! its `config/roles.yml` (DESIGN §20) answers each role of the chain first, per machine.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -76,14 +77,22 @@ pub fn model_roles(paths: &RematchPaths, cwd: &Path) -> Result<BTreeMap<String, 
     Ok(roles)
 }
 
+/// Each role of `chain` in turn: the profile's `roles.yml` for this machine
+/// (`profile::role_selector`, reported as `via profile:<role>`), then the merged `modelRoles`.
 pub fn resolve_chain(paths: &RematchPaths, cwd: &Path, chain: &[&str]) -> Result<RoleRef> {
     let roles = model_roles(paths, cwd)?;
+    let machine = rematch_core::outcome::machine_name();
     for role in chain {
-        if let Some(sel) = roles.get(*role).filter(|s| !s.trim().is_empty()) {
-            let model = parse_selector(sel)?;
-            let selector = format!("{}/{}", model.provider, model.id);
-            return Ok(RoleRef { role_used: role.to_string(), model, selector });
-        }
+        let (sel, via) = match rematch_core::profile::role_selector(paths, role, &machine)? {
+            Some(s) => (s, format!("profile:{role}")),
+            None => match roles.get(*role).filter(|s| !s.trim().is_empty()) {
+                Some(s) => (s.clone(), role.to_string()),
+                None => continue,
+            },
+        };
+        let model = parse_selector(&sel)?;
+        let selector = format!("{}/{}", model.provider, model.id);
+        return Ok(RoleRef { role_used: via, model, selector });
     }
     bail!(
         "no model configured for roles {} (set modelRoles in {})",

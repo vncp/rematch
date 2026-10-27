@@ -1444,6 +1444,8 @@ pub(crate) mod tests {
             families_excluded: vec![],
             links: vec![],
             content_sha256: None,
+            last_tune_at: None,
+            tune: None,
         }
     }
 

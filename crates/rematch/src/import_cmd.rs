@@ -213,6 +213,7 @@ impl HistoryStats {
 fn import_dir_stats(ctx: &AppCtx, dir: &Path) -> Result<HistoryStats> {
     let files = scan_sessions_dir(dir)?;
     let mut st = HistoryStats { files: files.len(), ..Default::default() };
+    let policy = ctx.domain_policy()?;
     for f in &files {
         let session = match read_session(&f.path) {
             Ok(s) => s,
@@ -224,7 +225,8 @@ fn import_dir_stats(ctx: &AppCtx, dir: &Path) -> Result<HistoryStats> {
                 continue;
             }
         };
-        let rec = session_record(&session);
+        let mut rec = session_record(&session);
+        rec.domain = rematch_core::domain::session_domain(&rec, &policy);
         if rec.id.is_empty() {
             st.failed += 1;
             continue;
@@ -384,6 +386,7 @@ fn import_harness_stats<S>(
     trace: impl Fn(&S) -> Vec<TraceRecord>,
 ) -> Result<HistoryStats> {
     let mut st = HistoryStats { files: files.len(), ..Default::default() };
+    let policy = ctx.domain_policy()?;
     for f in &files {
         let session = match read(f) {
             Ok(s) => s,
@@ -395,7 +398,8 @@ fn import_harness_stats<S>(
                 continue;
             }
         };
-        let rec = record(&session);
+        let mut rec = record(&session);
+        rec.domain = rematch_core::domain::session_domain(&rec, &policy);
         if rec.id.is_empty() {
             st.failed += 1;
             continue;
@@ -712,7 +716,7 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path, migrate: bool) -> Result<Value> 
         let doc = SkillDoc::parse(&md).unwrap_or(SkillDoc { body: md.clone(), ..Default::default() });
         let (text, trigger_line) = trigger_text(&doc);
         let stems = ranked_text_stems(&format!("{name} {text}"), &corpus);
-        let pred = predicate::derive(None, &[], &stems);
+        let pred = predicate::derive(None, &[], &stems, None);
         let mut e = new_entry(
             NewEntry {
                 kind: Kind::Skill,
@@ -779,7 +783,7 @@ pub fn import_forge(ctx: &AppCtx, forge: &Path, migrate: bool) -> Result<Value> 
                     status: Status::Provisional,
                     family: family.clone(),
                     origin: Origin::Import { source: "forge".into() },
-                    predicate: predicate::derive(None, &[], &stems),
+                    predicate: predicate::derive(None, &[], &stems, None),
                     trigger_line: title.clone(),
                     path: dir.clone(),
                 },

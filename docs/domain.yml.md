@@ -10,7 +10,11 @@ domain: <dotted subject path>   # prefix-seekable: quant.options, repo.payments,
 facets: [<key>, <key>, ...]     # structural facet keys of this branch
 ```
 
-- `domain` (optional): the dotted `subject.domain` prefix this branch's outcomes use.
+- `domain` (optional): the dotted `subject.domain` prefix this branch's outcomes use. It is
+  also the branch's work domain (DESIGN §6 "Domain"): a session in the branch takes it unless
+  `policy.json` declares one for its remote (which wins), and a `transfer apply` copy into
+  the branch takes it as its trigger's domain. Lowercase dotted segments of `[a-z0-9_-]`;
+  run `rematch lake migrate` after changing it to re-decide recorded sessions.
 - `facets`: the structural keys. Order does not matter; keys are compared exactly after trimming.
 
 **Transfer rule.** `transfer suggest` lists a kept lesson tagged `invariant` from

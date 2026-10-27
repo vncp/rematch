@@ -26,7 +26,7 @@ pub enum LakeCmd {
     Index(IndexArgs),
     /// One key lookup over a lake table → rows (JSON): planned by the table's index and its residual, else a full scan (`indexed: false`).
     Query(QueryArgs),
-    /// Fill identity fields on rows that predate them: content_sha256 on entries, repo_remote/subpath on predicates and sessions whose repo is on this machine (idempotent).
+    /// Fill identity fields on rows that predate them (content_sha256 on entries, repo_remote/subpath on predicates and sessions whose repo is on this machine) and (re)apply the domain policy to sessions and entry predicates (idempotent).
     Migrate,
 }
 

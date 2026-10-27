@@ -19,6 +19,7 @@ pub mod paths; // REMATCH_ROOT / agent dir resolution
 pub mod ledger; // SQLite schema + blobs
 pub mod predicate; // derive / match (load-time and count-time)
 pub mod library; // Entry lifecycle, status transitions, staging/kept/archive moves, rollback, pin
+pub mod domain; // session/predicate work domain: policy.json, domain.yml, inference table
 pub mod counters; // fold sessions into counters, Decision rules
 pub mod lint; // lint.toml rules → LintReport
 pub mod package; // SKILL.md frontmatter, package layout, mechanical split (>8 KB)
@@ -26,5 +27,6 @@ pub mod dedup; // simhash near-duplicate routing
 pub mod experience; // EXPERIENCE.md writer/reader
 pub mod rate; // admissions / caps
 pub mod identity; // repo_remote normalization, subpath, HEAD (ADR 001)
+pub mod profile; // REMATCH_ROOT/profile: layout, views linked into omp/rematch, roles.yml (DESIGN §20)
 
 pub use types::*;

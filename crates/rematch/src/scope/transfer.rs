@@ -210,24 +210,33 @@ pub fn suggest(ctx: &AppCtx, keys: &OutcomeKeys) -> Result<Vec<Suggestion>> {
     Ok(out)
 }
 
-/// Where a copy in `branch` loads (repo glob, remote, subpath; no content rules): derived
-/// from the branch's latest session repo, else the place of a live entry already there.
+/// Where a copy in `branch` loads (repo glob, remote, subpath, and the branch's
+/// `domain.yml` domain; no content rules): derived from the branch's latest session repo,
+/// else the place of a live entry already there.
 fn branch_place(ctx: &AppCtx, branch: &str) -> Result<Option<Predicate>> {
+    let domain = ctx.domain_policy()?.branch_domains.get(branch).cloned();
     if let Some(anchor) = branch_anchor(ctx, branch)? {
-        return Ok(Some(derive(Some(&anchor), &[], &[])));
+        return Ok(Some(derive(Some(&anchor), &[], &[], domain.as_deref())));
     }
     Ok(ctx
         .ledger
         .list_entries(&EntryFilter { branch: Some(branch.to_string()), ..Default::default() })?
         .into_iter()
         .rev()
-        .map(|e| Predicate { repo_glob: e.predicate.repo_glob, repo_remote: e.predicate.repo_remote, subpath: e.predicate.subpath, ..Default::default() })
+        .map(|e| Predicate {
+            repo_glob: e.predicate.repo_glob,
+            repo_remote: e.predicate.repo_remote,
+            subpath: e.predicate.subpath,
+            domain: domain.clone(),
+            ..Default::default()
+        })
         .find(|p| !p.repo_glob.trim().is_empty()))
 }
 
 /// A copy of `src` for another branch: new id, zeroed counters, re-approval required,
-/// workspace facts dropped, loading where `place` says (its repo glob, remote and subpath; the
-/// content rules stay `src`'s). Returns the entry, its files and the dropped fact paths.
+/// workspace facts dropped, loading where `place` says (its repo glob, remote, subpath and
+/// domain; the content rules stay `src`'s). Returns the entry, its files and the dropped
+/// fact paths.
 pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Origin) -> Result<(Entry, Vec<Edit>, Vec<String>)> {
     let mut files = package_edits(&src.path)?;
     let mut dropped = Vec::new();
@@ -254,6 +263,7 @@ pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Orig
             repo_glob: place.repo_glob,
             repo_remote: place.repo_remote,
             subpath: place.subpath,
+            domain: place.domain,
             ..src.predicate.clone()
         },
         predecessor: None,
@@ -268,6 +278,8 @@ pub(crate) fn copy_for(src: &Entry, branch: &str, place: Predicate, origin: Orig
         pending_next_run: false,
         fork_commit: None,
         families_excluded: vec![],
+        last_tune_at: None,
+        tune: None,
         links: vec![Link { rel: LinkRel::TransfersFrom, id: src.id.clone() }],
         ..src.clone()
     };
@@ -313,7 +325,8 @@ pub fn apply(ctx: &AppCtx, lesson_id: &str, branch: &str) -> Result<Value> {
         bail!("only lessons tagged invariant transfer; {} is untagged", src.name);
     }
     let hash = predicate_hash(&e.predicate);
-    match can_admit(&ctx.ledger, &hash, branch, ctx.now) {
+    let kept_per_domain = ctx.domain_policy()?.kept_per_domain();
+    match can_admit(&ctx.ledger, &hash, branch, e.predicate.domain.as_deref(), kept_per_domain, ctx.now) {
         Ok(()) => {}
         Err(RateLimit::NeedsMerge { .. }) => {} // the copy is no duplicate (checked above); it earns its place by counters
         Err(err) => bail!("rate limit: {err}"),
@@ -359,12 +372,14 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
         }
         let text = content_text(e);
         let mut branches: BTreeSet<String> = BTreeSet::from([e.branch.clone()]);
+        let mut domains: Vec<Option<&str>> = vec![e.predicate.domain.as_deref()];
         for x in all.iter().filter(|x| x.branch != e.branch && x.branch != SHARED_BRANCH && x.id != e.id) {
             let same = x.name == e.name
                 || x.links.iter().any(|l| l.rel == LinkRel::TransfersFrom && l.id == e.id)
                 || near_duplicate(&text, &content_text(x));
             if same && (x.status == Status::Kept || clean_canary(ctx, x)?) {
                 branches.insert(x.branch.clone());
+                domains.push(x.predicate.domain.as_deref());
             }
         }
         if branches.len() < 2 {
@@ -379,7 +394,8 @@ pub fn promote_shared(ctx: &AppCtx) -> Result<Vec<Promotion>> {
             blocked: None,
             anchor: None,
         };
-        let place = derive(None, &[], &[]);
+        // Kept in branches of one domain: the shared copy stays in it; across domains, none.
+        let place = derive(None, &[], &[], rematch_core::domain::common_domain(domains).as_deref());
         debug_assert_eq!(place.repo_glob, ANY_REPO);
         let origin = Origin::Import { source: format!("shared:{}", e.id) };
         let (mut copy, files, dropped) = copy_for(e, SHARED_BRANCH, place, origin)?;

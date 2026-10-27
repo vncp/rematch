@@ -2,9 +2,10 @@
 //! separate libraries"): invariant entries only, each with per-entry approval and the
 //! diff shown, off by default at work.
 //!
-//! Policy: `REMATCH_ROOT/policy.json` `{"environment":"work"|"home","export_enabled":bool}`.
-//! Missing file ⇒ home. `export_enabled` defaults to false at work and true at home;
-//! export refuses when work && !export_enabled.
+//! Policy: `REMATCH_ROOT/policy.json` `{"environment":"work"|"home","export_enabled":bool}`
+//! (other keys belong to `rematch policy` and `domain`). Missing file ⇒ home.
+//! `export_enabled` defaults to false at work and true at home; export refuses when work &&
+//! !export_enabled.
 //!
 //! Layout of the export dir (default `REMATCH_ROOT/export/`, a git repo created on first
 //! export): `<entry-id>/` holding the package files and a `rematch.json` stripped to a
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use rematch_core::dedup::{entry_content, route_duplicate, EntryContent};
+use rematch_core::domain::POLICY_FILE;
 use rematch_core::ledger::{sha256_hex, EntryFilter, SessionFilter};
 use rematch_core::library::{load_entry, stage, REMATCH_JSON, SHARED_BRANCH};
 use rematch_core::lint::{branch_always_on_bytes, LintContext};
@@ -29,7 +31,6 @@ use super::{branch_anchor, git, git_commit, lint_edits, lint_errors, package_edi
 use crate::app::{absolute, AppCtx};
 use crate::envelope::Usage;
 
-pub const POLICY_FILE: &str = "policy.json";
 /// Local record of declined exports: `{entry_id: content sha256}`.
 pub const DECLINED_FILE: &str = "export-declined.json";
 
@@ -124,6 +125,8 @@ fn portable(e: &Entry) -> Entry {
         fork_repo: None,
         fork_commit: None,
         families_excluded: vec![],
+        last_tune_at: None,
+        tune: None,
         manifest: e.manifest.clone().map(|mut m| {
             m.evidence.session_id.clear();
             m
@@ -406,7 +409,8 @@ pub fn cmd_import_export(ctx: &AppCtx, args: ImportExportArgs) -> Result<Value> 
             continue;
         }
         let branch = if branch_exists(ctx, &src.branch)? { src.branch.clone() } else { SHARED_BRANCH.to_string() };
-        let place = derive(branch_anchor(ctx, &branch)?.as_deref(), &[], &[]);
+        // The same entry on another machine: its domain travels with it.
+        let place = derive(branch_anchor(ctx, &branch)?.as_deref(), &[], &[], src.predicate.domain.as_deref());
         let origin = Origin::Import { source: format!("export:{}", src.id) };
         let (e, files, dropped) = super::transfer::copy_for(&src, &branch, place, origin)?;
         let branch_dir = ctx.paths.staging_branch(&branch);

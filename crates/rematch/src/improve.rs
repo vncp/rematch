@@ -89,8 +89,9 @@ fn common_repo(sessions: &[SessionRecord]) -> Option<String> {
     repos.all(|r| r.as_deref() == Some(first.as_str())).then_some(first)
 }
 
-/// Register (or reuse) the provisional brownfield entry for the skill at `dir`.
-fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], branch: &str) -> Result<(Entry, bool)> {
+/// Register (or reuse) the provisional brownfield entry for the skill at `dir` (also used by
+/// `profile adopt`, which then pins it).
+pub(crate) fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], branch: &str) -> Result<(Entry, bool)> {
     for e in ctx.ledger.list_entries(&EntryFilter { name: Some(name.into()), ..Default::default() })? {
         let same_dir = std::fs::canonicalize(&e.path).map(|p| p == dir).unwrap_or(e.path == dir);
         if same_dir && !matches!(e.status, Status::Retired) {
@@ -125,7 +126,8 @@ fn register(ctx: &AppCtx, name: &str, dir: &Path, sessions: &[SessionRecord], br
     let mut exts: Vec<(&str, usize)> = freq.into_iter().collect();
     exts.sort_by_key(|x| std::cmp::Reverse(x.1));
     let exts: Vec<String> = exts.into_iter().take(MAX_EXTS).map(|(e, _)| e.to_string()).collect();
-    let pred = predicate::derive(common_repo(sessions).as_deref(), &exts, &stems);
+    let domain = rematch_core::domain::majority_domain(sessions.iter().map(|s| s.domain.as_deref()));
+    let pred = predicate::derive(common_repo(sessions).as_deref(), &exts, &stems, domain.as_deref());
     let mut e = new_entry(
         NewEntry {
             kind: Kind::Skill,

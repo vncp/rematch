@@ -767,6 +767,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
 	let tracksCalls = false;
+	/** `match` saw `REMATCH_ROOT/profile/.git`: session start runs one `profile sync` (DESIGN §20). */
+	let profilePresent = false;
+	let profileSynced = false;
 
 	/** Match and sync `cwd`, adopt its entries, hooks and skill dirs; `fresh` drops every cached result first. Never throws. */
 	async function loadMatch(cwd: string, fresh: boolean): Promise<void> {
@@ -792,6 +795,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				enabled = false;
 				return;
 			}
+			profilePresent = data.profile_present === true;
 			const next: Hook[] = [];
 			for (const file of stringsOf(data.hooks)) {
 				try {
@@ -1247,6 +1251,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (!enabled || !isMain(ctx)) return;
 			await reload(ctx.cwd, false);
 			await startSession(ctx, true);
+			// The profile (a git repo) is pulled, relinked and pushed once per process, in the
+			// background: bounded by the binary (`--timeout 8`, offline fails open) and by the exec.
+			if (profilePresent && !profileSynced) {
+				profileSynced = true;
+				void call(["profile", "sync", "--timeout", "8"], { timeout: 10_000 }).then(r => {
+					if (r.ok && r.data?.offline === true) log("debug", `profile sync offline: ${String(r.data?.error ?? "")}`);
+				});
+			}
 		}),
 	);
 

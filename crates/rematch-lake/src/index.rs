@@ -109,6 +109,7 @@ pub const TABLE_DEFS: &[TableDef] = &[
         window: "started_at",
         keys: &[
             exact("exact:repo_remote,counts", "exact:repo_remote", &["repo_remote"]),
+            exact("exact:domain", "exact:domain", &["domain"]),
             list("list:loaded_entry_shas", &["loaded_entry_shas"]),
             list("list:exts", &["exts"]),
             list("list:stems", &["stems"]),

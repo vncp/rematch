@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rematch_core::ledger::{now_ms, sha256_hex, Ledger};
+use rematch_core::domain::DomainPolicy;
 use rematch_core::paths::RematchPaths;
 
 pub struct AppCtx {
@@ -23,6 +24,7 @@ pub const IMPROVER_FILES: &[(&str, &str)] = &[
     ("reflector.md", include_str!("../../../improver/reflector.md")),
     ("classifier.md", include_str!("../../../improver/classifier.md")),
     ("lint.toml", include_str!("../../../improver/lint.toml")),
+    ("domain_rules.toml", include_str!("../../../improver/domain_rules.toml")),
     ("omp-no-tools.yml", include_str!("../../../improver/omp-no-tools.yml")),
 ];
 
@@ -51,6 +53,11 @@ impl AppCtx {
 
     pub fn improver_file(&self, name: &str) -> PathBuf {
         self.paths.improver.join(name)
+    }
+
+    /// `policy.json` domains and caps, branch `domain.yml` files, `improver/domain_rules.toml`.
+    pub fn domain_policy(&self) -> Result<DomainPolicy> {
+        DomainPolicy::load(&self.paths)
     }
 }
 

@@ -279,6 +279,8 @@ type HostState = {
 	visible?: string[];
 	approvals?: object[];
 	onApprove?: () => void;
+	/** `match` reports `profile_present` (REMATCH_ROOT/profile/.git exists). */
+	profilePresent?: boolean;
 	/** Answers for `git rev-parse --show-toplevel --verify -q HEAD` and `git remote get-url origin`. */
 	git?: { top: string; head?: string; remote?: string };
 };
@@ -325,7 +327,7 @@ async function host(name: string, state: HostState) {
 			execs.push(argv);
 			switch (argv[0]) {
 				case "match":
-					return ok({ entries: state.entries, hooks: state.hooks });
+					return ok({ entries: state.entries, hooks: state.hooks, profile_present: state.profilePresent === true });
 				case "skills":
 					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], visible: state.visible ?? [], off: false });
 				case "library":
@@ -529,5 +531,16 @@ describe("factory", () => {
 		expect(overrides.filter(([scope]) => scope === h.settings)).toHaveLength(1);
 		await h.fire("session_start");
 		expect(h.traceOf()[0].staging_dirs).toEqual([shared]);
+	});
+
+	test("session start runs one profile sync only when match reports a profile", async () => {
+		const without = await host("no-profile", { entries: [], hooks: [] });
+		await without.fire("session_start");
+		expect(without.execs.filter(a => a[0] === "profile")).toEqual([]);
+		const h = await host("profile", { entries: [], hooks: [], profilePresent: true });
+		expect(h.execs.filter(a => a[0] === "profile")).toEqual([]);
+		await h.fire("session_start");
+		await h.fire("session_start");
+		expect(h.execs.filter(a => a[0] === "profile")).toEqual([["profile", "sync", "--timeout", "8"]]);
 	});
 });

@@ -102,7 +102,7 @@ fn entry(env: &Env, origin: Value, extra: Value) -> Entry {
         "status": "provisional",
         "family": family_of("anthropic", "claude-opus-5-5"),
         "origin": origin,
-        "predicate": derive(Some(&repo), &["rs".to_string()], &[]),
+        "predicate": derive(Some(&repo), &["rs".to_string()], &[], None),
         "trigger_line": "Use when committing in the payments crate.",
         "version": 1,
         "path": "",

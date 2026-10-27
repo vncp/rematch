@@ -39,8 +39,9 @@ fn dedup_capped(items: impl IntoIterator<Item = String>, cap: usize) -> Vec<Stri
 /// Build the predicate written at stage time. `ranked_stems` come already ranked
 /// (tf-idf, `features` module); order is preserved and the first 10 kept. When `repo` is a
 /// git worktree on this machine, `repo_remote` is its identity (`identity::repo_remote_of`,
-/// file reads only) and `subpath` = `**` (the whole repo, like the glob).
-pub fn derive(repo: Option<&str>, exts: &[String], ranked_stems: &[String]) -> Predicate {
+/// file reads only) and `subpath` = `**` (the whole repo, like the glob). `domain` is the
+/// originating session's (or the reference sessions' majority, `domain::majority_domain`).
+pub fn derive(repo: Option<&str>, exts: &[String], ranked_stems: &[String], domain: Option<&str>) -> Predicate {
     let repo = repo.map(|r| r.trim_end_matches('/')).filter(|r| !r.is_empty());
     let repo_glob = match repo {
         Some(r) => Pattern::escape(r),
@@ -53,6 +54,7 @@ pub fn derive(repo: Option<&str>, exts: &[String], ranked_stems: &[String]) -> P
         stems: dedup_capped(ranked_stems.iter().map(|s| normalize_stem(s)), MAX_STEMS),
         subpath: repo_remote.as_ref().map(|_| ANY_REPO.to_string()),
         repo_remote,
+        domain: domain.and_then(crate::domain::normalize_domain),
     }
 }
 
@@ -87,9 +89,11 @@ pub fn literal_path(glob: &str) -> Option<PathBuf> {
     Some(PathBuf::from(out))
 }
 
-/// Order-insensitive identity of a predicate (rate limits, sibling routing). `repo_remote`
-/// and `subpath` are left out: they restate the glob's repo, and a hash that changed when
-/// `lake migrate` filled them would split one trigger into two.
+/// Order-insensitive identity of a predicate (rate limits, sibling routing, `report`
+/// triggers). `repo_remote` and `subpath` are left out: they restate the glob's repo, and a
+/// hash that changed when `lake migrate` filled them would split one trigger into two. A
+/// `domain` is part of it when present (a web and a mobile trigger with the same content are
+/// two triggers); an absent one leaves the hash of a pre-domain predicate unchanged.
 pub fn predicate_hash(p: &Predicate) -> Sha256Hex {
     let mut exts: Vec<String> = p.file_exts.iter().map(|e| normalize_ext(e)).collect();
     exts.sort();
@@ -97,11 +101,14 @@ pub fn predicate_hash(p: &Predicate) -> Sha256Hex {
     let mut stems: Vec<String> = p.stems.iter().map(|s| normalize_stem(s)).collect();
     stems.sort();
     stems.dedup();
-    let canon = serde_json::json!({
+    let mut canon = serde_json::json!({
         "repo_glob": p.repo_glob.trim_end_matches('/'),
         "file_exts": exts,
         "stems": stems,
     });
+    if let Some(d) = p.domain.as_deref() {
+        canon["domain"] = serde_json::json!(d);
+    }
     hex(&Sha256::digest(canon.to_string().as_bytes()))
 }
 
@@ -147,37 +154,40 @@ pub fn matches_repo(p: &Predicate, repo_or_cwd: &str) -> bool {
 }
 
 /// Where a session runs (or a `match` is asked for): the repo toplevel (else cwd) path for
-/// the glob, and the repo identity when known.
+/// the glob, the repo identity when known, and the work domain when decided.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Place {
     pub path: String,
     pub remote: Option<String>,
     /// cwd relative to the toplevel (`""` at the top).
     pub subpath: Option<String>,
+    /// `domain::domain_of` of the session (count time) or of the place (load time).
+    pub domain: Option<String>,
 }
 
 impl Place {
     /// A path with no identity: the glob decides.
     pub fn path(path: impl Into<String>) -> Place {
-        Place { path: path.into(), remote: None, subpath: None }
+        Place { path: path.into(), remote: None, subpath: None, domain: None }
     }
 
-    /// Where a recorded session ran: its repo (else cwd), remote and subpath.
+    /// Where a recorded session ran: its repo (else cwd), remote, subpath and domain.
     pub fn of_session(s: &SessionRecord) -> Place {
         Place {
             path: s.repo.clone().unwrap_or_else(|| s.cwd.clone()),
             remote: s.repo_remote.clone(),
             subpath: s.subpath.clone(),
+            domain: s.domain.clone(),
         }
     }
 
     /// The place of `cwd` in the worktree `repo` (else of `cwd` alone), its identity read
-    /// from disk (`identity::session_place`, file reads only).
+    /// from disk (`identity::session_place`, file reads only); no domain (callers set it).
     pub fn locate(repo: Option<&Path>, cwd: &Path) -> Place {
         let repo = repo.map(|r| r.to_string_lossy().into_owned());
         let cwd_s = cwd.to_string_lossy();
         let (remote, subpath) = crate::identity::session_place(repo.as_deref(), &cwd_s);
-        Place { path: repo.unwrap_or_else(|| cwd_s.into_owned()), remote, subpath }
+        Place { path: repo.unwrap_or_else(|| cwd_s.into_owned()), remote, subpath, domain: None }
     }
 }
 
@@ -195,10 +205,15 @@ pub fn matches_subpath(glob: Option<&str>, subpath: &str) -> bool {
     Path::new(subpath.trim_matches('/')).ancestors().any(|a| pat.matches_with(&a.to_string_lossy(), opts))
 }
 
-/// Load- and count-time place test (DESIGN §6): when both the predicate and the place carry
-/// a remote, the remotes are equal and the `subpath` glob matches (a worktree or a clone at
-/// another path matches its repo's entries); otherwise the repo glob decides ([`matches_repo`]).
+/// Load- and count-time place test (DESIGN §6): the domain gate first
+/// (`domain::domain_matches`: when both carry a domain, the place's equals or extends the
+/// predicate's); then, when both the predicate and the place carry a remote, the remotes are
+/// equal and the `subpath` glob matches (a worktree or a clone at another path matches its
+/// repo's entries); otherwise the repo glob decides ([`matches_repo`]).
 pub fn matches_place(p: &Predicate, place: &Place) -> bool {
+    if !crate::domain::domain_matches(p.domain.as_deref(), place.domain.as_deref()) {
+        return false;
+    }
     match (p.repo_remote.as_deref(), place.remote.as_deref()) {
         (Some(want), Some(have)) => {
             want == have && matches_subpath(p.subpath.as_deref(), place.subpath.as_deref().unwrap_or(""))
@@ -226,7 +241,7 @@ pub fn count_hit(p: &Predicate, exts: &[String], stems: &[String]) -> bool {
     overlap >= mine.len().min(2)
 }
 
-/// Full count-time predicate hit: place ([`matches_place`]) AND content.
+/// Full count-time predicate hit: place ([`matches_place`], domain gate included) AND content.
 pub fn count_match(p: &Predicate, place: &Place, exts: &[String], stems: &[String]) -> bool {
     matches_place(p, place) && count_hit(p, exts, stems)
 }
@@ -247,14 +262,15 @@ mod tests {
     fn derive_caps_normalizes_and_escapes() {
         let exts = s(&[".RS", "rs", "toml", "a", "b", "c", "d", "e", "f", "g"]);
         let stems: Vec<String> = (0..14).map(|i| format!("Stem{i}")).collect();
-        let p = derive(Some("/w/repo[1]/"), &exts, &stems);
+        let p = derive(Some("/w/repo[1]/"), &exts, &stems, None);
         assert_eq!(p.repo_glob, "/w/repo[[]1[]]");
         assert_eq!(p.file_exts, s(&["rs", "toml", "a", "b", "c", "d", "e", "f"]));
         assert_eq!(p.stems.len(), 10);
         assert_eq!(p.stems[0], "stem0");
         assert!(matches_repo(&p, "/w/repo[1]"));
         assert!(!matches_repo(&p, "/w/repo1"));
-        assert_eq!(derive(None, &[], &[]).repo_glob, "**");
+        assert_eq!(derive(None, &[], &[], None).repo_glob, "**");
+        assert_eq!(derive(None, &[], &[], Some("Web.Frontend")).domain.as_deref(), Some("web.frontend"));
     }
 
     #[test]
@@ -275,6 +291,11 @@ mod tests {
         assert_eq!(predicate_hash(&a), predicate_hash(&b));
         let c = pred("/r", &["rs", "md"], &["ledger"]);
         assert_ne!(predicate_hash(&a), predicate_hash(&c));
+        let mut d = a.clone();
+        d.domain = Some("backend".into());
+        assert_ne!(predicate_hash(&a), predicate_hash(&d), "a domain makes another trigger");
+        let pre = serde_json::json!({"repo_glob": "/r", "file_exts": ["md", "rs"], "stems": ["count", "ledger"]});
+        assert_eq!(predicate_hash(&a), hex(&Sha256::digest(pre.to_string().as_bytes())), "no domain: the pre-domain hash");
         assert_eq!(predicate_hash(&a).len(), 64);
     }
 
@@ -325,12 +346,32 @@ mod tests {
     }
 
     #[test]
+    fn domain_gate_match_mismatch_prefix_absent() {
+        let at = |d: Option<&str>| Place { domain: d.map(str::to_string), ..Place::path("/w/repo") };
+        let mut p = pred("/w/repo", &[], &["review", "checklist"]);
+        let stems = s(&["review", "checklist"]);
+        assert!(count_match(&p, &at(Some("web")), &[], &stems), "no predicate domain: ignored");
+        p.domain = Some("web".into());
+        assert!(count_match(&p, &at(Some("web")), &[], &stems), "equal");
+        assert!(count_match(&p, &at(Some("web.frontend")), &[], &stems), "prefix");
+        assert!(!count_match(&p, &at(Some("mobile")), &[], &stems), "mismatch");
+        assert!(count_match(&p, &at(None), &[], &stems), "no session domain: ignored");
+        p.domain = Some("web.frontend".into());
+        assert!(!count_match(&p, &at(Some("web")), &[], &stems), "the session's broader domain does not widen it");
+        // the gate is part of the place test, before the remote
+        p.repo_remote = Some("github.com/o/r".into());
+        let remote = Place { remote: Some("github.com/o/r".into()), subpath: Some(String::new()), domain: Some("mobile".into()), path: "/x".into() };
+        assert!(!matches_place(&p, &remote));
+        assert!(matches_place(&p, &Place { domain: Some("web.frontend.a11y".into()), ..remote }));
+    }
+
+    #[test]
     fn remote_and_subpath_match_worktrees_and_fall_back_to_the_glob() {
         // An entry derived in /w/main, a session in a worktree at /w/wt of the same remote.
         let mut p = pred("/w/main", &[], &[]);
         p.repo_remote = Some("github.com/org/repo".into());
         p.subpath = Some("**".into());
-        let wt = Place { path: "/w/wt".into(), remote: Some("github.com/org/repo".into()), subpath: Some("crates/x".into()) };
+        let wt = Place { path: "/w/wt".into(), remote: Some("github.com/org/repo".into()), subpath: Some("crates/x".into()), domain: None };
         let at = |sub: &str| Place { subpath: Some(sub.into()), ..wt.clone() };
         assert!(matches_place(&p, &wt), "same remote, other toplevel");
         assert!(!matches_repo(&p, "/w/wt"), "the glob alone would miss it");
@@ -364,10 +405,10 @@ mod tests {
         let ok = std::process::Command::new("git").args(["init", "-q"]).current_dir(t.path()).status().unwrap();
         assert!(ok.success());
         std::fs::write(t.path().join(".git/config"), "[remote \"origin\"]\n\turl = git@github.com:Org/Repo.git\n").unwrap();
-        let p = derive(Some(&t.path().to_string_lossy()), &[], &[]);
+        let p = derive(Some(&t.path().to_string_lossy()), &[], &[], None);
         assert_eq!((p.repo_remote.as_deref(), p.subpath.as_deref()), (Some("github.com/org/repo"), Some("**")));
         assert!(matches_repo(&p, &t.path().to_string_lossy()), "the glob is kept");
-        let none = derive(Some("/w/not-a-repo"), &[], &[]);
+        let none = derive(Some("/w/not-a-repo"), &[], &[], None);
         assert_eq!((none.repo_remote, none.subpath), (None, None));
     }
 }

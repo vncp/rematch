@@ -364,6 +364,8 @@ pub(crate) mod testutil {
             families_excluded: vec![],
             links: vec![],
             content_sha256: None,
+            last_tune_at: None,
+            tune: None,
         }
     }
 
