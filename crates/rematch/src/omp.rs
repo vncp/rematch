@@ -11,7 +11,7 @@ use rematch_core::paths::RematchPaths;
 use rematch_core::types::ModelRef;
 use serde_json::Value;
 
-use crate::proc::run_bounded;
+use crate::proc::run_bounded_input;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -25,8 +25,12 @@ pub fn omp_bin() -> PathBuf {
 
 /// First executable `name` on `$PATH` (Windows: `name` + each `%PATHEXT%` extension).
 pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|d| candidates(&d, name).into_iter().find(|p| is_executable(p)))
+    which_in(&std::env::var_os("PATH")?, name)
+}
+
+/// [`which`] over the search path `path`.
+fn which_in(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|d| candidates(&d, name).into_iter().find(|p| is_executable(p)))
 }
 
 #[cfg(unix)]
@@ -276,13 +280,24 @@ pub fn verify_stream(events: Vec<Value>, expected: &ModelRef, no_tools: bool) ->
     Ok(Verified { text, events, usage })
 }
 
-fn command(argv: &[String]) -> Command {
-    let mut c = Command::new(omp_bin());
-    c.args(argv);
-    for (k, v) in child_env() {
-        c.env(k, v);
-    }
-    c
+/// An omp run: `bin argv…` with [`child_env`], and the bytes for its stdin. A `.cmd`/`.bat`
+/// launcher (npm's Windows shim) runs through cmd.exe, which ends a command line at a newline
+/// and caps it at 8191 characters, so it never gets the prompt as an argument: the trailing
+/// `-- <prompt>` is dropped and the prompt is piped on stdin, which omp takes verbatim as the
+/// prompt (never as a command). Any other program gets the argv unchanged.
+pub fn command(bin: &Path, argv: &[String]) -> (Command, Option<Vec<u8>>) {
+    let (args, input) = match argv {
+        [head @ .., sep, prompt] if sep == "--" && is_batch(bin) => (head, Some(prompt.clone().into_bytes())),
+        _ => (argv, None),
+    };
+    let mut c = Command::new(bin);
+    c.args(args).envs(child_env());
+    (c, input)
+}
+
+/// A Windows batch script (`.cmd`/`.bat`): Windows runs it through cmd.exe.
+fn is_batch(bin: &Path) -> bool {
+    cfg!(windows) && bin.extension().is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
 }
 
 fn check_exit(b: &crate::proc::Bounded, what: &str) -> Result<()> {
@@ -299,19 +314,19 @@ fn check_exit(b: &crate::proc::Bounded, what: &str) -> Result<()> {
 pub fn run_no_tools(call: &NoToolsCall, paths: &RematchPaths) -> Result<Verified> {
     let tmp = tempfile::tempdir().context("tmp cwd for omp")?;
     let argv = no_tools_argv(call, tmp.path(), &paths.improver.join("omp-no-tools.yml"));
-    let mut c = command(&argv);
+    let (mut c, input) = command(&omp_bin(), &argv);
     c.current_dir(tmp.path());
-    let b = run_bounded(c, call.timeout)?;
+    let b = run_bounded_input(c, call.timeout, input.as_deref())?;
     check_exit(&b, "omp -p --no-tools")?;
     verify_stream(parse_events(&b.stdout)?, &call.model, true)
 }
 
 pub fn run_tools(call: &ToolsCall) -> Result<Verified> {
     let argv = tools_argv(call);
-    let mut c = command(&argv);
+    let (mut c, input) = command(&omp_bin(), &argv);
     c.current_dir(&call.cwd);
     // max_time is enforced by omp; the outer bound adds a grace for teardown.
-    let b = run_bounded(c, call.max_time + Duration::from_secs(30))?;
+    let b = run_bounded_input(c, call.max_time + Duration::from_secs(30), input.as_deref())?;
     check_exit(&b, "omp -p")?;
     verify_stream(parse_events(&b.stdout)?, &call.model, false)
 }
@@ -337,6 +352,62 @@ mod tests {
             v.join(" "),
             "--cwd /tmp/x --model anthropic/claude-opus-5-5 --no-tools --system-prompt /i/editor.md --config /i/omp-no-tools.yml --no-prewalk --no-session --no-title --no-extensions --no-skills --no-rules --no-lsp --mode json -p -- P"
         );
+    }
+
+    #[test]
+    fn an_executable_gets_the_prompt_in_argv() {
+        let argv: Vec<String> = ["--mode", "json", "-p", "--", "line one\nline two"].map(String::from).into();
+        let (c, input) = command(Path::new("omp"), &argv);
+        assert_eq!(c.get_args().collect::<Vec<_>>(), argv.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>());
+        assert_eq!(input, None);
+    }
+
+    /// Set to a directory, [`omp_fixture`] acts as omp behind a `.cmd` launcher: it records
+    /// its stdin there and writes the event stream the launcher prints.
+    #[cfg(windows)]
+    const FIXTURE_DIR: &str = "REMATCH_OMP_FIXTURE_DIR";
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process of batch_launcher_gets_the_prompt_on_stdin"]
+    fn omp_fixture() {
+        let Some(dir) = std::env::var_os(FIXTURE_DIR).map(std::path::PathBuf::from) else { return };
+        let mut stdin = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut stdin).unwrap();
+        std::fs::write(dir.join("stdin.bin"), stdin).unwrap();
+        let ev = json!({"type": "message_end", "message": msg("anthropic", "claude-opus-5-5", "reply")});
+        std::fs::write(dir.join("events.jsonl"), format!("{ev}\n")).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_launcher_gets_the_prompt_on_stdin() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("npm prefix");
+        std::fs::create_dir(&dir).unwrap();
+        let bin = dir.join("omp.cmd");
+        let exe = std::env::current_exe().unwrap();
+        // npm's shim shape: cmd.exe runs the script, which starts the real program with `%*`.
+        std::fs::write(
+            &bin,
+            format!(
+                "@echo off\r\n>\"%~dp0args.txt\" echo(%*\r\n\"{}\" omp::tests::omp_fixture --exact --ignored --test-threads=1 >NUL\r\ntype \"%~dp0events.jsonl\"\r\n",
+                exe.display()
+            ),
+        )
+        .unwrap();
+        let prompt = format!("line one\n\"quoted\" 100% & | < > ^ !bang! %PATH%\nünïcødé 漢字 🎯\n{}\n", "x".repeat(10_000));
+        let call = NoToolsCall { model: m(), system_prompt_file: dir.join("editor.md"), prompt: prompt.clone(), timeout: DEFAULT_TIMEOUT };
+        let argv = no_tools_argv(&call, &dir, &dir.join("omp-no-tools.yml"));
+        let (mut c, input) = command(&bin, &argv);
+        c.env(FIXTURE_DIR, &dir);
+        let b = run_bounded_input(c, Duration::from_secs(60), input.as_deref()).unwrap();
+        check_exit(&b, "omp.cmd").unwrap();
+        assert_eq!(verify_stream(parse_events(&b.stdout).unwrap(), &m(), true).unwrap().text, "reply");
+        assert_eq!(std::fs::read(dir.join("stdin.bin")).unwrap(), prompt.as_bytes(), "the prompt arrives byte for byte");
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert!(args.trim_end().ends_with("--mode json -p"), "no `-- <prompt>` in the command line: {args}");
+        assert!(args.starts_with("--cwd ") && args.len() < 2_000, "{args}");
     }
 
     #[test]
@@ -374,5 +445,31 @@ mod tests {
     fn parse_events_requires_json_lines() {
         assert_eq!(parse_events("{\"a\":1}\n\n{\"b\":2}\n").unwrap().len(), 2);
         assert!(parse_events("{\"a\":1}\nnope\n").is_err());
+    }
+
+    #[test]
+    fn which_finds_only_runnable_files_in_path_order() {
+        let t = tempfile::tempdir().unwrap();
+        let (first, second) = (t.path().join("first dir"), t.path().join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        // What npm leaves next to its Windows shims, and an unrunnable file on Unix.
+        std::fs::write(first.join("omp"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(second.join("omp"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(second.join("omp"), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(which_in(&path, "omp"), Some(second.join("omp")), "the first executable on PATH");
+        }
+        #[cfg(windows)]
+        {
+            std::fs::write(second.join("omp.exe"), "").unwrap();
+            assert_eq!(which_in(&path, "omp"), Some(second.join("omp.exe")), "an extensionless shim never runs natively");
+            std::fs::write(first.join("omp.cmd"), "@echo off\r\n").unwrap();
+            assert_eq!(which_in(&path, "omp"), Some(first.join("omp.cmd")), "PATH order first, then PATHEXT");
+        }
+        assert_eq!(which_in(&path, "absent"), None);
     }
 }

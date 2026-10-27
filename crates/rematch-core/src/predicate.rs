@@ -132,8 +132,10 @@ pub fn matches_repo(p: &Predicate, repo_or_cwd: &str) -> bool {
     let Ok(pat) = Pattern::new(glob.trim_end_matches('/')) else {
         return false;
     };
+    // Windows paths are case-insensitive (`C:\Repo` = `c:\repo`); the glob crate already treats
+    // `/` and `\` alike there.
     let opts = MatchOptions {
-        case_sensitive: true,
+        case_sensitive: !cfg!(windows),
         require_literal_separator: false,
         require_literal_leading_dot: false,
     };
@@ -313,6 +315,12 @@ mod tests {
         assert!(matches_repo(&deep, "/w/a/b/svc/src"));
         assert!(matches_repo(&pred("**", &[], &[]), "/anything"));
         assert!(matches_repo(&pred("", &[], &[]), "/anything"));
+        // The glob a Windows toplevel derives (`git rev-parse` gives `/`) matches the cwd a
+        // harness reports there (`\`, any case); on Unix case and `\` are significant.
+        let win = derive(Some("C:/Users/u/repo"), &[], &[], None);
+        assert!(matches_repo(&win, "C:/Users/u/repo/src"));
+        assert_eq!(matches_repo(&win, r"C:\Users\u\repo\src"), cfg!(windows));
+        assert_eq!(matches_repo(&win, "c:/users/U/Repo"), cfg!(windows));
     }
 
     #[test]

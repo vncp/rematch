@@ -286,7 +286,7 @@ fn path_values(t: &TableDef, rel: &Path) -> Vec<(&'static str, Val)> {
         ("events", [harness, day, file]) => vec![
             ("harness", Val::Str((*harness).to_string())),
             ("day", day_val(day).unwrap_or(Val::Null)),
-            ("session_id", Val::Str(file.strip_suffix(".parquet").unwrap_or(file).to_string())),
+            ("session_id", Val::Str(crate::events::session_of_file(file))),
         ],
         ("outcomes", [domain, day, file]) => {
             let mut v = vec![("domain", Val::Str((*domain).to_string()))];
@@ -1138,6 +1138,8 @@ mod tests {
         let v = path_values(t, Path::new("omp/2026-10-26/cc:abc.parquet"));
         assert_eq!(v[2], ("session_id", s("cc:abc")));
         assert_eq!(v[1].1.to_json(), json!("2026-10-26"));
+        let v = path_values(t, Path::new("claude-code/2026-10-26/cc%3Aabc.parquet"));
+        assert_eq!(v[2], ("session_id", s("cc:abc")), "the portable name gives the same id");
         let v = path_values(index::table("outcomes").unwrap(), Path::new("quant.b/2026-10-26/my-host-12.parquet"));
         assert_eq!(v, vec![("domain", s("quant.b")), ("day", day_val("2026-10-26").unwrap()), ("machine", s("my-host")), ("run_seq", Val::I64(12))]);
     }

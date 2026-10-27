@@ -354,7 +354,8 @@ fn skills_invoked(text: &str) -> Vec<String> {
     out
 }
 
-/// `file:///a%20b` → `/a b`; other strings unchanged.
+/// `file:///a%20b` → `/a b`; on Windows `file:///C:/x` → `C:/x` (the drive path); other
+/// strings unchanged.
 fn file_path(p: &str) -> String {
     let Some(rest) = p.strip_prefix("file://") else {
         return p.to_string();
@@ -373,7 +374,12 @@ fn file_path(p: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| rest.to_string())
+    let path = String::from_utf8(out).unwrap_or_else(|_| rest.to_string());
+    let b = path.as_bytes();
+    if cfg!(windows) && b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        return path[1..].to_string();
+    }
+    path
 }
 
 /// A shell argv (`["/bin/zsh","-lc","<script>"]`) or command string → the script text.
@@ -1343,6 +1349,7 @@ mod tests {
         assert!(parse_session("not json\n", None).is_err());
         assert_eq!(file_path("file:///a%20b/c"), "/a b/c");
         assert_eq!(file_path("src/x"), "src/x");
+        assert_eq!(file_path("file:///C:/Users/u/repo"), if cfg!(windows) { "C:/Users/u/repo" } else { "/C:/Users/u/repo" });
         assert_eq!(skill_in_command("cat \"/u/.agents/skills/x-y/SKILL.md\" | head"), Some("x-y".into()));
         assert_eq!(skills_invoked("use $foo-bar and $HOME then [$baz](skill://baz)"), vec!["foo-bar", "baz"]);
     }

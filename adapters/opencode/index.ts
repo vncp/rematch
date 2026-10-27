@@ -318,7 +318,10 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		// binary's pending/.lock), never inside the OpenCode process.
 		if (process.env.OMP_BIN || which("omp")) {
 			try {
-				spawn(bin, ["reflect", "--pending"], { detached: true, stdio: "ignore" }).unref();
+				const args = process.platform === "win32" ? ["reflect", "--pending", "--detach"] : ["reflect", "--pending"];
+				const child = spawn(bin, args, { detached: true, stdio: "ignore" });
+				child.on("error", error => log("warn", `reflect spawn failed: ${errorText(error)}`));
+				child.unref();
 			} catch (error) {
 				log("warn", `reflect spawn failed: ${errorText(error)}`);
 			}

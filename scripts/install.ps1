@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $Root
+$HomeDir = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 
 # The cargo feature `lake` (default on) links arrow/parquet for `rematch lake ...` (ADR 001);
 # nothing in a session uses it. REMATCH_NO_LAKE=1 builds without it.
@@ -37,7 +38,7 @@ function Remove-Link([string]$Path) {
 
 # Provisional agents (kind `agent`) are symlinks in $REMATCH_ROOT\agents; omp discovers
 # task agents in <plugin root>\agents, so the plugin root links there.
-$RematchDir = if ($env:REMATCH_ROOT) { $env:REMATCH_ROOT } else { Join-Path $HOME '.rematch' }
+$RematchDir = if ($env:REMATCH_ROOT) { $env:REMATCH_ROOT } else { Join-Path $HomeDir '.rematch' }
 New-Item -ItemType Directory -Force -Path (Join-Path $RematchDir 'agents') | Out-Null
 $AgentsLink = Join-Path $Root 'extension\agents'
 Remove-Link $AgentsLink
@@ -49,7 +50,7 @@ Write-Host "==> Linking omp plugin from $Root\extension..."
 if ($LASTEXITCODE -ne 0) { throw "omp plugin link failed ($LASTEXITCODE)" }
 
 # The shim: a symlink to the release binary, so rebuilds need no re-install.
-$BinDir = Join-Path $HOME '.local\bin'
+$BinDir = Join-Path $HomeDir '.local\bin'
 $Shim = Join-Path $BinDir 'rematch.exe'
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Remove-Link $Shim

@@ -224,11 +224,12 @@ impl CountSummary {
     }
 }
 
+/// `(session id, path)` of every trace file ([`rematch_core::paths::id_from_file_stem`]).
 fn trace_files(ctx: &AppCtx) -> Result<Vec<(String, PathBuf)>> {
     let mut v: Vec<(String, PathBuf)> = std::fs::read_dir(&ctx.paths.traces)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+        .filter_map(|p| Some((rematch_core::paths::id_from_file_stem(p.file_stem()?.to_str()?).into_owned(), p)))
         .collect();
     v.sort();
     Ok(v)
@@ -651,6 +652,7 @@ fn pending_sessions(ctx: &AppCtx, only: Option<&str>) -> Result<Vec<String>> {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| p.file_stem()?.to_str().map(str::to_string))
         .filter(|s| !s.starts_with('.'))
+        .map(|s| rematch_core::paths::id_from_file_stem(&s).into_owned())
         .filter(|s| only.is_none_or(|o| o == s))
         .collect();
     v.sort();
@@ -658,7 +660,7 @@ fn pending_sessions(ctx: &AppCtx, only: Option<&str>) -> Result<Vec<String>> {
 }
 
 fn pending_path(ctx: &AppCtx, sid: &str) -> PathBuf {
-    ctx.paths.pending.join(format!("{sid}.json"))
+    ctx.paths.pending_file(sid)
 }
 
 fn done(ctx: &AppCtx, sid: &str, mut out: Value) -> Result<Value> {
@@ -1015,7 +1017,7 @@ pub fn reflect_one(ctx: &AppCtx, sid: &str, editor_cmd: Option<&str>, classifier
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .filter(|p| p.is_file())
-        .unwrap_or_else(|| ctx.paths.traces.join(format!("{sid}.jsonl")));
+        .unwrap_or_else(|| ctx.paths.trace_file(sid));
     if !trace_path.is_file() {
         return done(ctx, sid, json!({"outcome": "skipped", "reason": "no_trace"}));
     }
@@ -1305,7 +1307,7 @@ fn stage_history(ctx: &AppCtx, only: Option<&str>, since: Option<i64>, limit: us
         if s.source != "import" || s.history_reflected_at.is_some() || only.is_some_and(|o| o != s.id) {
             continue;
         }
-        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", s.id));
+        let trace_path = ctx.paths.trace_file(&s.id);
         if trace_path.exists() {
             continue;
         }
@@ -1375,7 +1377,7 @@ pub fn cmd_mark(ctx: &AppCtx, a: MarkArgs) -> Result<Value> {
     let existing = match ctx.ledger.get_session(&a.session)? {
         Some(s) => Some(s),
         None => {
-            let trace_path = ctx.paths.traces.join(format!("{}.jsonl", a.session));
+            let trace_path = ctx.paths.trace_file(&a.session);
             if trace_path.is_file() {
                 let s = trace::fold_trace(&trace::read_trace(&trace_path)?, &a.session);
                 ctx.ledger.upsert_session(&s)?;
@@ -1393,7 +1395,7 @@ pub fn cmd_mark(ctx: &AppCtx, a: MarkArgs) -> Result<Value> {
         }
         // … and record the mark itself, anchored to the last user turn in the trace (the
         // turn being overridden) so the moment and the redirect text are real.
-        let trace_path = ctx.paths.traces.join(format!("{}.jsonl", a.session));
+        let trace_path = ctx.paths.trace_file(&a.session);
         let last_input = if trace_path.is_file() {
             trace::read_trace(&trace_path)?.into_iter().rev().find_map(|r| match r {
                 TraceRecord::Input { seq, text, after_deliverable, t, .. } => {
@@ -1427,7 +1429,7 @@ pub fn cmd_mark(ctx: &AppCtx, a: MarkArgs) -> Result<Value> {
     }
     let p = pending_path(ctx, &a.session);
     let mut pending: Value = std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| {
-        json!({"session_id": a.session, "flagged_at": ctx.now, "reasons": [], "trace": ctx.paths.traces.join(format!("{}.jsonl", a.session))})
+        json!({"session_id": a.session, "flagged_at": ctx.now, "reasons": [], "trace": ctx.paths.trace_file(&a.session)})
     });
     let reasons = pending["reasons"].as_array_mut();
     if let Some(r) = reasons {

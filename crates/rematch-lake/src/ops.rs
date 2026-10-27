@@ -70,8 +70,9 @@ fn is_sha(s: &str) -> bool {
 enum Placement {
     /// `{table}/[{domain}/]{day}/{machine}-{seq}.parquet`.
     Run { table: &'static str, machine: String, seq: i64 },
-    /// `events/{harness}/{day}/{session_id}.parquet`.
-    Events { harness: String, file: String },
+    /// `events/{harness}/{day}/{session_id}.parquet`; `session` is the id the name holds
+    /// ([`events::session_of_file`]: an encoded and a legacy raw-id name agree).
+    Events { harness: String, day: String, session: String },
     Blob,
     Manifest,
     Orphan(&'static str),
@@ -88,7 +89,7 @@ fn place(lake: &Path, p: &Path) -> Placement {
         ["manifest.json"] => Placement::Manifest,
         ["blobs", name] if is_sha(name) => Placement::Blob,
         ["events", harness, day, f] if is_day(day) && f.ends_with(".parquet") && f.len() > 8 => {
-            Placement::Events { harness: harness.to_string(), file: f.to_string() }
+            Placement::Events { harness: harness.to_string(), day: day.to_string(), session: events::session_of_file(f) }
         }
         [t, rest @ ..] => {
             let Some(table) = TABLES.iter().copied().find(|x| x == t) else {
@@ -247,12 +248,13 @@ enum Origin<'a> {
     Ledger(&'a SessionRecord),
 }
 
+/// `(session id, path)` of every trace file ([`rematch_core::paths::id_from_file_stem`]).
 fn trace_files(traces: &Path) -> Result<Vec<(String, PathBuf)>> {
     match std::fs::read_dir(traces) {
         Ok(rd) => Ok(rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+            .filter_map(|p| Some((rematch_core::paths::id_from_file_stem(p.file_stem()?.to_str()?).into_owned(), p)))
             .collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e).with_context(|| format!("read {}", traces.display())),
@@ -323,7 +325,9 @@ fn export_events(
             },
         };
         let p = events::events_path(lake, &sid, trace.start);
-        if write_once(&p, &events::batch(&trace)?)? {
+        // A session exported under its pre-codec raw-id name is already in the lake.
+        let legacy = events::legacy_events_path(lake, &sid, trace.start).is_some_and(|l| l.is_file());
+        if !legacy && write_once(&p, &events::batch(&trace)?)? {
             run.written.push(rel(lake, &p));
         }
         settled += 1;
@@ -338,7 +342,9 @@ fn export_events(
 // import
 
 /// Copies another lake's partition files that are absent here — by `(table, machine, seq)`
-/// for append tables, `(harness, session_id)` for events — and its blobs, then merges the
+/// for append tables, `(harness, session_id)` for events (an events file is written under its
+/// encoded name, [`events::events_path`], whatever name the source gave it: a legacy raw-id
+/// name such as `cc:<uuid>.parquet` is not valid on Windows) — and its blobs, then merges the
 /// watermarks per machine. Never touches `lake-index/` (it is outside every lake).
 pub fn import(lake: &Path, from: &Path) -> Result<Value> {
     let src = resolve_lake(from)?;
@@ -353,8 +359,8 @@ pub fn import(lake: &Path, from: &Path) -> Result<Value> {
             Placement::Run { table, machine, seq } => {
                 have_runs.insert((table, machine, seq));
             }
-            Placement::Events { harness, file } => {
-                have_events.insert((harness, file));
+            Placement::Events { harness, session, .. } => {
+                have_events.insert((harness, session));
             }
             _ => {}
         }
@@ -362,17 +368,20 @@ pub fn import(lake: &Path, from: &Path) -> Result<Value> {
     let mut copied: BTreeMap<&str, usize> = BTreeMap::new();
     let mut skipped = 0usize;
     for p in walk(&src)? {
-        let fresh = match place(&src, &p) {
-            Placement::Run { table, machine, seq } => have_runs.insert((table, machine, seq)).then_some(table),
-            Placement::Events { harness, file } => have_events.insert((harness, file)).then_some("events"),
-            Placement::Blob => Some("blobs"),
-            Placement::Manifest | Placement::Orphan(_) => None,
+        let (kind, dst) = match place(&src, &p) {
+            Placement::Run { table, machine, seq } if have_runs.insert((table, machine.clone(), seq)) => {
+                (table, lake.join(p.strip_prefix(&src).expect("walked under src")))
+            }
+            Placement::Events { harness, day, session } if have_events.insert((harness.clone(), session.clone())) => {
+                let name = format!("{}.parquet", rematch_core::paths::encode_file_stem(&session));
+                ("events", lake.join("events").join(harness).join(day).join(name))
+            }
+            Placement::Blob => ("blobs", lake.join(p.strip_prefix(&src).expect("walked under src"))),
+            _ => {
+                skipped += 1;
+                continue;
+            }
         };
-        let Some(kind) = fresh else {
-            skipped += 1;
-            continue;
-        };
-        let dst = lake.join(p.strip_prefix(&src).expect("walked under src"));
         if copy_once(&p, &dst)? {
             *copied.entry(kind).or_default() += 1;
         }
@@ -641,5 +650,57 @@ mod tests {
         assert!(matches!(place(lake, &lake.join("events/omp/2026-10-26/s.parquet")), Placement::Events { .. }));
         assert!(matches!(place(lake, &lake.join("lake-index/x")), Placement::Orphan(_)));
         assert!(matches!(place(lake, &lake.join(format!("blobs/{}", "a".repeat(64)))), Placement::Blob));
+    }
+
+    /// A lake whose events files have the given names (bytes are the name), with a manifest.
+    fn lake_with(names: &[&str]) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        Manifest::load(t.path()).unwrap().save(t.path()).unwrap();
+        for n in names {
+            let p = t.path().join("events/claude-code/2026-10-26").join(n);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, n).unwrap();
+        }
+        t
+    }
+
+    fn event_names(lake: &Path) -> Vec<String> {
+        let mut v: Vec<String> = walk(lake)
+            .unwrap()
+            .into_iter()
+            .filter(|p| matches!(place(lake, p), Placement::Events { .. }))
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn events_import_by_session_under_portable_names() {
+        // A Windows-written lake (portable names) imports onto any machine as is.
+        let windows = lake_with(&["cc%3Aaaa.parquet", "cc%3Abbb.parquet"]);
+        let here = lake_with(&[]);
+        let v = import(here.path(), windows.path()).unwrap();
+        assert_eq!(v["copied"]["events"], 2, "{v}");
+        assert_eq!(event_names(here.path()), ["cc%3Aaaa.parquet", "cc%3Abbb.parquet"]);
+        assert!(matches!(place(here.path(), &here.path().join("events/claude-code/2026-10-26/cc%3Aaaa.parquet")),
+            Placement::Events { session, .. } if session == "cc:aaa"));
+
+        // A pre-codec Unix lake: its raw-id names are copied under portable ones (valid on
+        // Windows), and a session this lake already holds under either name is skipped.
+        #[cfg(unix)]
+        {
+            let unix = lake_with(&["cc:aaa.parquet", "cc:ccc.parquet"]);
+            let v = import(here.path(), unix.path()).unwrap();
+            assert_eq!(v["copied"]["events"], 1, "{v}");
+            assert_eq!(event_names(here.path()), ["cc%3Aaaa.parquet", "cc%3Abbb.parquet", "cc%3Accc.parquet"]);
+            assert_eq!(std::fs::read_to_string(here.path().join("events/claude-code/2026-10-26/cc%3Accc.parquet")).unwrap(), "cc:ccc.parquet");
+            // The other direction: a legacy local file keeps its name and blocks a duplicate.
+            let v = import(unix.path(), windows.path()).unwrap();
+            assert_eq!(v["copied"]["events"], 1, "{v}");
+            assert_eq!(event_names(unix.path()), ["cc%3Abbb.parquet", "cc:aaa.parquet", "cc:ccc.parquet"]);
+        }
+        // No events name this lake holds is invalid on Windows.
+        assert!(event_names(here.path()).iter().all(|n| !n.contains(':')));
     }
 }

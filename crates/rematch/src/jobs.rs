@@ -1,6 +1,6 @@
 //! Detached jobs (DESIGN §14): the binary re-executes itself in a new session
-//! (`setsid`; Windows: detached, new process group), stdio → `jobs/<id>.log`, state in
-//! `jobs/<id>.json` mirrored to the ledger.
+//! (`setsid`; Windows: detached, new process group, out of any job that allows it), stdio →
+//! `jobs/<id>.log`, state in `jobs/<id>.json` mirrored to the ledger.
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -79,13 +79,18 @@ pub fn spawn_detached(ctx: &AppCtx, kind: &str, argv: &[String], payload: &Value
             Ok(())
         });
     }
+    #[cfg(unix)]
+    let spawned = cmd.spawn();
     #[cfg(windows)]
-    {
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    let child = cmd.spawn().context("spawn detached job")?;
+    let spawned = spawn_out_of_job(&mut cmd);
+    let child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            let e = anyhow::Error::from(e).context("spawn detached job");
+            let _ = update(ctx, &id, "failed", &json!({"error": format!("{e:#}")}));
+            return Err(e);
+        }
+    };
     let pid = child.id();
     // The child is reparented when we exit; we never wait on it.
     std::mem::forget(child);
@@ -100,6 +105,53 @@ pub fn spawn_detached(ctx: &AppCtx, kind: &str, argv: &[String], payload: &Value
     }
     write_json(ctx, &id, &Value::Object(merged))?;
     Ok(id)
+}
+
+/// Windows: the worker leaves the spawner's job too (as `setsid` leaves its process
+/// group), so a launcher's job that kills its members when it closes (libuv's, for one)
+/// does not take the worker with it. A job that forbids breakaway refuses that; the worker
+/// then starts inside it only when that job does not kill on close (it outlives the
+/// launcher there), and otherwise is not started at all. Only the spawner's own job can be
+/// inspected: an enclosing job of a nested one is not.
+#[cfg(windows)]
+fn spawn_out_of_job(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    match cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if own_job_kills_on_close()? {
+                return Err(std::io::Error::other(
+                    "this process's job forbids breakaway and kills its members when it closes, so a detached job would end with its launcher; start rematch outside that job",
+                ));
+            }
+            cmd.creation_flags(flags).spawn()
+        }
+        r => r,
+    }
+}
+
+/// The job this process belongs to ends its members when its last handle closes.
+#[cfg(windows)]
+fn own_job_kills_on_close() -> std::io::Result<bool> {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    // SAFETY: a null handle names this process's job; the buffer is a local of the size passed.
+    unsafe {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let ok = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0)
+    }
 }
 
 pub fn read(ctx: &AppCtx, id: &str) -> Result<Value> {
@@ -122,30 +174,37 @@ pub fn update(ctx: &AppCtx, id: &str, status: &str, patch: &Value) -> Result<Val
     Ok(v)
 }
 
+/// The process exists (signal 0 delivered, or refused for permission).
 #[cfg(unix)]
 pub fn pid_alive(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
     if pid <= 0 {
         return false;
     }
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// `tasklist` lists the pid only while the process exists (CSV row starts with the image name).
+/// The process exists and has not exited (or exists and refuses to be opened).
 #[cfg(windows)]
 pub fn pid_alive(pid: i64) -> bool {
-    if pid <= 0 {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    let Ok(pid) = u32::try_from(pid) else { return false };
+    if pid == 0 {
         return false;
     }
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-        .unwrap_or(false)
+    // SAFETY: Win32 calls; the handle is owned (and closed) here.
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let h = OwnedHandle::from_raw_handle(h);
+        WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
+    }
 }
 
 const LIVE: &[&str] = &["starting", "running"];
@@ -206,50 +265,40 @@ pub fn cmd_status(ctx: &AppCtx, job: Option<&str>) -> Result<Value> {
     Ok(json!({"jobs": jobs, "entries": by_status, "off": ctx.paths.is_off(), "lines": lines}))
 }
 
-/// Exclusive lock file with stale-pid takeover (`pending/.lock` for reflect).
+/// Exclusive OS lock on a lock file (`pending/.lock` for reflect): `flock` on Unix,
+/// `LockFileEx` on Windows. The OS releases it when the value drops or the holder dies
+/// however it dies, so there is no stale holder to detect and no pid to trust. The file
+/// (the holder's pid, for people) stays: removing it would let a waiter that opened the old
+/// file and a newcomer that creates a new one both hold "the" lock.
 pub struct LockFile {
-    path: PathBuf,
+    file: std::fs::File,
 }
 
 impl LockFile {
-    /// `Ok(None)` when another live process holds it.
+    /// `Ok(None)` when another holder has it.
     pub fn acquire(path: PathBuf) -> Result<Option<LockFile>> {
         use std::io::Write;
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    writeln!(f, "{}", std::process::id())?;
-                    return Ok(Some(LockFile { path }));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i64>().ok());
-                    match holder {
-                        Some(pid) if pid_alive(pid) && pid != std::process::id() as i64 => return Ok(None),
-                        None if recently_modified(&path) => return Ok(None), // holder still writing its pid
-                        _ => {
-                            // Stale (dead holder or unreadable): take it over.
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-                Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
-            }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("lock {}", path.display())),
         }
-        Ok(None)
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        Ok(Some(LockFile { file }))
     }
-}
-
-fn recently_modified(p: &std::path::Path) -> bool {
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < std::time::Duration::from_secs(5))
 }
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -258,20 +307,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lock_is_exclusive_and_stale_locks_are_taken_over() {
+    fn lock_is_exclusive_until_dropped_and_a_dead_holders_file_is_free() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join(".lock");
-        let a = LockFile::acquire(p.clone()).unwrap().expect("first holder");
-        assert!(p.exists());
-        // A live foreign holder: pid 1 (launchd/init), on Windows pid 4 (System), is always alive.
-        drop(a);
-        std::fs::write(&p, if cfg!(windows) { "4\n" } else { "1\n" }).unwrap();
-        assert!(LockFile::acquire(p.clone()).unwrap().is_none(), "live holder blocks");
-        // A dead holder's lock is taken over.
+        // What a crashed holder leaves: the file, its pid, no lock.
         std::fs::write(&p, "999999999\n").unwrap();
-        let b = LockFile::acquire(p.clone()).unwrap().expect("stale lock taken over");
-        assert!(p.exists());
+        let a = LockFile::acquire(p.clone()).unwrap().expect("a dead holder's file is free");
+        assert!(LockFile::acquire(p.clone()).unwrap().is_none(), "a live holder blocks");
+        drop(a);
+        let b = LockFile::acquire(p.clone()).unwrap().expect("released on drop");
         drop(b);
-        assert!(!p.exists(), "released on drop");
+    }
+
+    #[test]
+    fn liveness_follows_the_process() {
+        assert!(pid_alive(std::process::id() as i64));
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(-1));
+        assert!(!pid_alive(i64::MAX));
+        let child = Command::new(std::env::current_exe().unwrap()).arg("--list").stdout(Stdio::null()).spawn().unwrap();
+        let pid = child.id() as i64;
+        child.wait_with_output().unwrap();
+        assert!(!pid_alive(pid), "an exited, reaped child is gone");
+    }
+
+    /// Set to a root, [`detach_fixture`] is a launcher calling [`spawn_detached`] (which
+    /// re-runs this test binary as the worker) or, with [`JOB_ID_ENV`], that worker.
+    const FIXTURE_ROOT: &str = "REMATCH_DETACH_FIXTURE_ROOT";
+    const FIXTURE_ARGS: [&str; 4] = ["jobs::tests::detach_fixture", "--exact", "--ignored", "--test-threads=1"];
+
+    fn fixture_ctx(root: &std::path::Path) -> AppCtx {
+        let paths = rematch_core::paths::RematchPaths::with_roots(root.join("rematch"), root.join("agent"));
+        paths.ensure_dirs().unwrap();
+        let ledger = rematch_core::ledger::Ledger::open(&paths.ledger_file).unwrap();
+        AppCtx { paths, ledger, now: rematch_core::ledger::now_ms(), cwd: root.to_path_buf(), text: false }
+    }
+
+    #[test]
+    #[ignore = "child process of the detach tests below"]
+    fn detach_fixture() {
+        let Some(root) = std::env::var_os(FIXTURE_ROOT).map(PathBuf::from) else { return };
+        let ctx = fixture_ctx(&root);
+        match std::env::var(JOB_ID_ENV) {
+            Ok(id) => {
+                // Long enough for the test to tear the launcher's tree down first.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                update(&ctx, &id, "done", &json!({"worker_pid": std::process::id()})).unwrap();
+            }
+            Err(_) => {
+                let argv = FIXTURE_ARGS.map(String::from);
+                let outcome = match spawn_detached(&ctx, "fixture", &argv, &json!({})) {
+                    Ok(id) => format!("ok {id}"),
+                    Err(e) => format!("err {e:#}"),
+                };
+                std::fs::write(root.join("launched"), outcome).unwrap();
+            }
+        }
+    }
+
+    /// Runs the launcher fixture to its exit in the tree `spawn` makes; its outcome line.
+    fn launch(
+        root: &std::path::Path,
+        spawn: impl FnOnce(&mut Command) -> std::io::Result<(std::process::Child, crate::proc::Tree)>,
+    ) -> (String, crate::proc::Tree) {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(FIXTURE_ARGS).env(FIXTURE_ROOT, root).env_remove(JOB_ID_ENV).stdout(Stdio::null()).stderr(Stdio::null());
+        let (mut child, tree) = spawn(&mut c).unwrap();
+        assert!(child.wait().unwrap().success(), "launcher failed");
+        (std::fs::read_to_string(root.join("launched")).unwrap(), tree)
+    }
+
+    /// The job's record once it left `starting`/`running`, with liveness (a killed worker
+    /// is `lost`), within 30 s.
+    fn final_record(root: &std::path::Path, id: &str) -> Value {
+        let ctx = fixture_ctx(root);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let rec = status(&ctx, id).unwrap();
+            if !LIVE.contains(&rec["status"].as_str().unwrap_or_default()) {
+                return rec;
+            }
+            assert!(std::time::Instant::now() < until, "worker never finished: {rec}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn detached_worker_outlives_its_launchers_tree() {
+        let t = tempfile::tempdir().unwrap();
+        // Unix: the launcher's own process group. Windows: a job that kills its members on
+        // close and lets them break away (libuv's, which Bun and Node spawn into).
+        let (outcome, tree) = launch(t.path(), crate::proc::Tree::spawn);
+        // The launcher has exited; what is left of its tree goes now, as a session's would
+        // (Windows: closing the job handle at the end of this scope kills again).
+        tree.signal(true);
+        let id = outcome.strip_prefix("ok ").unwrap_or_else(|| panic!("{outcome}"));
+        let rec = final_record(t.path(), id);
+        assert_eq!(rec["status"], "done", "{rec}");
+        assert_eq!(rec["worker_pid"], rec["pid"], "{rec}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detaching_from_a_kill_on_close_job_that_forbids_breakaway_is_refused() {
+        use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let t = tempfile::tempdir().unwrap();
+        let (outcome, _tree) = launch(t.path(), |c| crate::proc::Tree::spawn_in_job(c, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE));
+        assert!(outcome.starts_with("err ") && outcome.contains("forbids breakaway"), "{outcome}");
+        let ctx = fixture_ctx(t.path());
+        let ids: Vec<String> = std::fs::read_dir(&ctx.paths.jobs)
+            .unwrap()
+            .filter_map(|e| e.unwrap().file_name().to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string))
+            .collect();
+        let [id] = &ids[..] else { panic!("one job record: {ids:?}") };
+        let rec = status(&ctx, id).unwrap();
+        assert_eq!(rec["status"], "failed", "never reported as running: {rec}");
+        assert!(rec["error"].as_str().unwrap().contains("forbids breakaway"), "{rec}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_worker_stays_in_a_job_that_neither_kills_nor_lets_go() {
+        let t = tempfile::tempdir().unwrap();
+        let (outcome, tree) = launch(t.path(), |c| crate::proc::Tree::spawn_in_job(c, 0));
+        // The launcher's job handle closes; without kill-on-close its members live on.
+        drop(tree);
+        let id = outcome.strip_prefix("ok ").unwrap_or_else(|| panic!("{outcome}"));
+        assert_eq!(final_record(t.path(), id)["status"], "done");
     }
 }

@@ -83,8 +83,9 @@ impl<F: Fn(&str) -> Option<String>> Env<F> {
         (self.get)(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
     }
 
+    /// Pi's `os.homedir()`: `$HOME`, else `%USERPROFILE%` on Windows.
     fn home(&self) -> Option<PathBuf> {
-        self.non_empty("HOME").map(PathBuf::from)
+        crate::paths::home_from(&self.get)
     }
 
     fn path(&self, k: &str) -> Option<PathBuf> {
@@ -610,7 +611,7 @@ mod tests {
         std::fs::write(entry.join("rematch.json"), json!({"id":"e-pdf","created_at":0,"version":3,"content_sha256":"cafe"}).to_string()).unwrap();
         let shared = tmp.path().join("skills");
         std::fs::create_dir_all(&shared).unwrap();
-        std::os::unix::fs::symlink(&entry, shared.join("pdf-tools")).unwrap();
+        crate::library::symlink_dir(&entry, &shared.join("pdf-tools")).unwrap();
         let md = shared.join("pdf-tools/SKILL.md");
         let s = parse_pi_session(&fixture("/nowhere/proj", md.to_str().unwrap()), None).unwrap();
         assert_eq!(s.id(), format!("pi:{SID}"));

@@ -18,6 +18,24 @@ export function rematchRoot(env: NodeJS.ProcessEnv = process.env): string {
 	return path.join(env.HOME || os.homedir(), ".rematch");
 }
 
+/** Logical trace ids stay unchanged in JSON; Windows filenames escape reserved characters.
+ * Matches rematch-core::paths::id_file_stem. Unix layouts stay unchanged.
+ */
+export function idFileStem(id: string, platform: NodeJS.Platform = process.platform): string {
+	if (platform !== "win32") return id;
+	const chars = Array.from(id);
+	const base = (id.split(".")[0] ?? "").replace(/ +$/, "");
+	const device = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/i.test(base);
+	return chars.map((char, index) => {
+		const edge = (index === 0 && (char === "." || device)) ||
+			(index === chars.length - 1 && (char === "." || char === " "));
+		if (/[<>:"/\\|?*\x00-\x1f%]/u.test(char) || edge) {
+			return Array.from(Buffer.from(char, "utf8"), byte => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`).join("");
+		}
+		return char;
+	}).join("");
+}
+
 export function isExecutable(p: string): boolean {
 	try {
 		fs.accessSync(p, fs.constants.X_OK);
@@ -880,7 +898,10 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	function spawnReflect() {
 		if (!bin) return;
 		try {
-			Bun.spawn({ cmd: [bin, "reflect", "--pending"], stdio: ["ignore", "ignore", "ignore"] }).unref();
+			// On Windows the binary must detach its own worker from the host's job object;
+			// unref only releases the JavaScript handle, not the OS process lifetime.
+			const args = process.platform === "win32" ? ["reflect", "--pending", "--detach"] : ["reflect", "--pending"];
+			Bun.spawn({ cmd: [bin, ...args], stdio: ["ignore", "ignore", "ignore"] }).unref();
 		} catch (error) {
 			log("warn", `reflect spawn failed: ${errorText(error)}`);
 		}
@@ -917,7 +938,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 		trace = {
 			id,
-			file: path.join(root, "traces", `${id}.jsonl`),
+			file: path.join(root, "traces", `${idFileStem(id)}.jsonl`),
 			seq: 0,
 			lastInput: null,
 			lastDeliverable: null,
@@ -975,7 +996,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				const dir = path.join(root, "pending");
 				fs.mkdirSync(dir, { recursive: true });
 				fs.writeFileSync(
-					path.join(dir, `${t.id}.json`),
+					path.join(dir, `${idFileStem(t.id)}.json`),
 					JSON.stringify({ session_id: t.id, flagged_at: Date.now(), reasons, trace: t.file }),
 				);
 			} catch (error) {

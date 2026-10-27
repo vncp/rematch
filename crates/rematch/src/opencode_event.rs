@@ -136,8 +136,8 @@ pub fn load(ctx: &AppCtx, cwd: &Path) -> Result<Loaded> {
 
 /// The shared skills dir is among the `skills.paths` the plugin gave OpenCode.
 fn skills_delivered(ctx: &AppCtx, env: &Env) -> bool {
-    let shared = std::fs::canonicalize(&ctx.paths.skills_shared).unwrap_or_else(|_| ctx.paths.skills_shared.clone());
-    env.skills_paths.iter().any(|p| Path::new(p) == ctx.paths.skills_shared || std::fs::canonicalize(p).is_ok_and(|c| c == shared))
+    let shared = rematch_core::paths::canonicalize(&ctx.paths.skills_shared).unwrap_or_else(|_| ctx.paths.skills_shared.clone());
+    env.skills_paths.iter().any(|p| Path::new(p) == ctx.paths.skills_shared || rematch_core::paths::canonicalize(p).is_ok_and(|c| c == shared))
 }
 
 // ---- segments ----
@@ -147,7 +147,7 @@ fn open_dir(ctx: &AppCtx) -> PathBuf {
 }
 
 fn owner_path(ctx: &AppCtx, sid: &str) -> PathBuf {
-    open_dir(ctx).join(format!("{sid}.json"))
+    open_dir(ctx).join(format!("{}.json", rematch_core::paths::id_file_stem(sid)))
 }
 
 fn read_owners(p: &Path) -> Vec<u32> {
@@ -165,16 +165,6 @@ fn write_owners(p: &Path, native: &str, pids: &[u32]) -> Result<()> {
     std::fs::rename(&tmp, p).with_context(|| format!("rename {}", p.display()))
 }
 
-/// The process exists (signal 0 delivered, or refused for permission).
-pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
-    }
-    // SAFETY: kill with signal 0 only checks that the process exists.
-    let r = unsafe { libc::kill(pid as i32, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 /// A `session_shutdown` after the last `session_start` (`count`'s rule).
 fn finished(records: &[TraceRecord]) -> bool {
     let Some(start) = records.iter().rposition(|r| matches!(r, TraceRecord::SessionStart { .. })) else { return false };
@@ -184,7 +174,7 @@ fn finished(records: &[TraceRecord]) -> bool {
 /// The open segment of a session, started when needed, with `pid` registered as an owner.
 fn open_segment(ctx: &AppCtx, env: &Env, ev: &Value, native: &str, model: Option<ModelRef>, extra: &mut Value) -> Result<(String, TraceFile)> {
     let mut n = 1;
-    while ctx.paths.traces.join(format!("{}.jsonl", oc::segment_id(native, n + 1))).exists() {
+    while ctx.paths.trace_file(&oc::segment_id(native, n + 1)).exists() {
         n += 1;
     }
     let mut sid = oc::segment_id(native, n);
@@ -284,7 +274,7 @@ fn finalize(ctx: &AppCtx, sid: &str, tf: &mut TraceFile) -> Result<Value> {
     let mut pending = Value::Null;
     if flagged {
         std::fs::create_dir_all(&ctx.paths.pending)?;
-        let p = ctx.paths.pending.join(format!("{sid}.json"));
+        let p = ctx.paths.pending_file(sid);
         let body = json!({"session_id": sid, "flagged_at": ctx.now, "reasons": reasons, "trace": tf.path, "source": "opencode"});
         std::fs::write(&p, serde_json::to_string(&body)?).with_context(|| format!("write {}", p.display()))?;
         pending = json!(p);
@@ -300,7 +290,7 @@ fn open_segments(ctx: &AppCtx) -> Vec<(String, PathBuf)> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| Some((p.file_stem()?.to_str()?.to_string(), p)))
+        .filter_map(|p| Some((rematch_core::paths::id_from_file_stem(p.file_stem()?.to_str()?).into_owned(), p)))
         .collect();
     v.sort();
     v
@@ -315,7 +305,7 @@ fn settle(ctx: &AppCtx, leaving: Option<u32>) -> Result<Vec<Value>> {
         if leaving.is_some_and(|p| !pids.contains(&p)) {
             continue;
         }
-        let alive: Vec<u32> = pids.iter().copied().filter(|p| Some(*p) != leaving && pid_alive(*p)).collect();
+        let alive: Vec<u32> = pids.iter().copied().filter(|p| Some(*p) != leaving && crate::jobs::pid_alive(i64::from(*p))).collect();
         let mut tf = TraceFile::open(ctx, &sid)?;
         if !tf.started() || finished(&tf.records) {
             let _ = std::fs::remove_file(&owner);
@@ -677,7 +667,7 @@ fn config_dir() -> Option<PathBuf> {
     let non_empty = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     non_empty("OPENCODE_CONFIG_DIR")
         .or_else(|| non_empty("XDG_CONFIG_HOME").map(|d| d.join("opencode")))
-        .or_else(|| non_empty("HOME").map(|h| h.join(".config").join("opencode")))
+        .or_else(|| rematch_core::paths::home_dir().map(|h| h.join(".config").join("opencode")))
 }
 
 /// The adapter package a plugin spec names: a directory (or a file in one) whose
@@ -688,7 +678,7 @@ fn adapter_dir(spec: &str, base: &Path) -> Option<PathBuf> {
     let dir = if p.is_dir() { p } else { p.parent()?.to_path_buf() };
     let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    (v["name"] == PACKAGE_NAME).then(|| std::fs::canonicalize(&dir).unwrap_or(dir))
+    (v["name"] == PACKAGE_NAME).then(|| rematch_core::paths::canonicalize(&dir).unwrap_or(dir))
 }
 
 /// `doctor`'s opencode block: the plugin declared in OpenCode's global config
@@ -723,7 +713,7 @@ pub fn doctor_harness(ctx: &AppCtx) -> (String, Value, Vec<String>, bool) {
     for sub in ["plugin", "plugins"] {
         for name in ["rematch.ts", "rematch.js"] {
             let p = dir.join(sub).join(name);
-            if let Some(d) = std::fs::canonicalize(&p).ok().and_then(|t| adapter_dir(&t.to_string_lossy(), &dir)) {
+            if let Some(d) = rematch_core::paths::canonicalize(&p).ok().and_then(|t| adapter_dir(&t.to_string_lossy(), &dir)) {
                 found.push((p, d));
             }
         }
@@ -764,12 +754,6 @@ mod tests {
         assert_eq!(field_of(&input, "file_path"), Some("/etc/passwd"));
         assert_eq!(field_of(&json!({"command": "ls"}), "command"), Some("ls"));
         assert_eq!(field_of(&input, "command"), None);
-    }
-
-    #[test]
-    fn liveness() {
-        assert!(pid_alive(std::process::id()));
-        assert!(!pid_alive(0));
     }
 
     #[test]

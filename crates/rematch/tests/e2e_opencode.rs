@@ -64,7 +64,7 @@ fn idle(sid: &str) -> Value {
 }
 
 fn trace(env: &Env, sid: &str) -> Vec<Value> {
-    let p = env.root.join("traces").join(format!("{sid}.jsonl"));
+    let p = env.trace_path(sid);
     std::fs::read_to_string(p).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
@@ -144,7 +144,7 @@ fn live_runs_segments_and_finalization() {
     // prompt delivered into its running run is a takeover.
     let r = send(&env, me, vec![json!({"kind": "prompt", "session": "ses_child", "parent": main, "message": {"time": {"created": 3}}, "parts": [{"type": "text", "text": "child work"}]})]);
     assert_eq!(r[0]["skipped"], "subagent");
-    assert!(!env.root.join("traces/oc:ses_child.jsonl").exists());
+    assert!(!env.trace_path("oc:ses_child").exists());
     send(
         &env,
         me,
@@ -168,7 +168,8 @@ fn live_runs_segments_and_finalization() {
     let last = recs.last().unwrap();
     assert_eq!((last["ev"].as_str(), last["flagged"].as_bool()), (Some("session_shutdown"), Some(true)));
     assert_eq!(last["reasons"], json!(["redirect:negation"]));
-    let pending: Value = serde_json::from_str(&std::fs::read_to_string(env.root.join("pending/oc:ses_main1.json")).unwrap()).unwrap();
+    let pending_file = env.root.join("pending").join(format!("{}.json", rematch_core::paths::id_file_stem("oc:ses_main1")));
+    let pending: Value = serde_json::from_str(&std::fs::read_to_string(pending_file).unwrap()).unwrap();
     assert_eq!((pending["source"].as_str(), pending["session_id"].as_str()), (Some("opencode"), Some("oc:ses_main1")));
     let other = trace(&env, "oc:ses_other");
     assert_eq!(&evs(&other)[6..], ["agent_end", "session_shutdown"], "the open run ends before the shutdown");
@@ -176,10 +177,10 @@ fn live_runs_segments_and_finalization() {
     assert_eq!(send(&env, me, vec![json!({"kind": "shutdown"})])[0]["finalized"], json!([]));
 
     // Continued later (another process): a new segment; the finished one is never appended to.
-    let frozen = std::fs::read_to_string(env.root.join("traces/oc:ses_main1.jsonl")).unwrap();
+    let frozen = std::fs::read_to_string(env.trace_path("oc:ses_main1")).unwrap();
     let r = send(&env, 4242, vec![prompt(main, 9_000, "Now add a dry-run flag to the command"), turn(main, 9_100, "stop", "Done."), idle(main)]);
     assert_eq!(r[0]["started"], "oc:ses_main1:r2");
-    assert_eq!(std::fs::read_to_string(env.root.join("traces/oc:ses_main1.jsonl")).unwrap(), frozen);
+    assert_eq!(std::fs::read_to_string(env.trace_path("oc:ses_main1")).unwrap(), frozen);
     let r2 = trace(&env, "oc:ses_main1:r2");
     assert_eq!((r2[0]["mode"].as_str(), r2[0]["session_id"].as_str()), (Some("opencode:resume"), Some("oc:ses_main1:r2")));
     assert_eq!(evs(&r2), ["session_start", "input", "turn_end", "agent_end"]);
@@ -267,7 +268,7 @@ fn approved_hooks_block_through_hook_check() {
     // Another call passes; a subagent (no trace) is never stuck-blocked.
     assert_eq!(check("ses_h", None, "cargo test -p ledger")["block"], false);
     assert_eq!(check("ses_child", Some("ses_h"), "cargo test -p payments")["block"], false);
-    assert!(!env.root.join("traces/oc:ses_child.jsonl").exists());
+    assert!(!env.trace_path("oc:ses_child").exists());
 
     // The kill switch: nothing is checked or written.
     env.run(&["off"]);

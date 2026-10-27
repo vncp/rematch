@@ -233,7 +233,8 @@ fn anchor_count_keep_deferred_while_task_locked() {
     let runs = f.env.root.join("runs").join(ANCHOR_TASK);
     std::fs::create_dir_all(&runs).unwrap();
     let lock = runs.join(".lock");
-    std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    let held = std::fs::File::create(&lock).unwrap();
+    held.lock().unwrap();
 
     let d = count_four(&f, "pass");
     assert_eq!(d["decision"], "keep", "{d}");
@@ -252,7 +253,7 @@ fn anchor_count_keep_deferred_while_task_locked() {
     assert_eq!(f.worktrees(), 1, "no worktree left");
 
     // Lock released: the next matched session decides again and the replay runs.
-    std::fs::remove_file(&lock).unwrap();
+    drop(held);
     f.env.write_trace("0199b000-0000-7000-8000-000000000005", &[&f.sibling], false);
     let c = f.run(&["count", "--editor", &script("editor-ok.sh")], "pass");
     let d = c["decisions"].as_array().unwrap().iter().find(|d| d["entry"] == f.sibling.as_str()).cloned().expect("decided");
@@ -354,7 +355,8 @@ fn anchor_promote_shared_deferred_while_task_locked_then_retried() {
     let runs = f.env.root.join("runs").join(ANCHOR_TASK);
     std::fs::create_dir_all(&runs).unwrap();
     let lock = runs.join(".lock");
-    std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+    let held = std::fs::File::create(&lock).unwrap();
+    held.lock().unwrap();
 
     let row = promote_row(&f, "pass");
     assert_eq!(f.rollouts(), 0, "no rollout while the task is locked");
@@ -366,7 +368,7 @@ fn anchor_promote_shared_deferred_while_task_locked_then_retried() {
     assert!(!runs.join("1").exists(), "no workspace materialized");
 
     // Lock released: the next pass stages a fresh copy and replays.
-    std::fs::remove_file(&lock).unwrap();
+    drop(held);
     let row = promote_row(&f, "pass");
     assert_eq!(row["anchor"]["replay"]["pass"], true, "{row}");
     assert_eq!(f.rollouts(), 1);

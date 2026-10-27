@@ -4,6 +4,7 @@
 //! - Active profile = `OMP_PROFILE` when present in the environment (empty/`"default"` selects the default profile and suppresses `PI_PROFILE`), else `PI_PROFILE`; invalid or `"default"`/empty ⇒ `None`.
 //! - `agent_dir` = `<config_root>/profiles/<name>/agent` when a named profile is active (`PI_CODING_AGENT_DIR` is ignored for named profiles); else `$PI_CODING_AGENT_DIR` when set and not equal to a profile-derived `<config_root>/profiles/<p>/agent`; else `<config_root>/agent`.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -192,6 +193,16 @@ impl RematchPaths {
     pub fn staging_branch(&self, branch: &str) -> PathBuf {
         self.staging.join(branch)
     }
+
+    /// `traces/<id>.jsonl` of a session, named by [`id_file_stem`].
+    pub fn trace_file(&self, session_id: &str) -> PathBuf {
+        self.traces.join(format!("{}.jsonl", id_file_stem(session_id)))
+    }
+
+    /// `pending/<id>.json` of a flagged session, named by [`id_file_stem`].
+    pub fn pending_file(&self, session_id: &str) -> PathBuf {
+        self.pending.join(format!("{}.json", id_file_stem(session_id)))
+    }
 }
 
 /// The user's home: `$HOME`, else (Windows, where it is usually unset) `%USERPROFILE%`.
@@ -199,7 +210,7 @@ pub fn home_dir() -> Option<PathBuf> {
     home_from(|k| std::env::var(k).ok())
 }
 
-fn home_from(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+pub(crate) fn home_from(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let non_empty = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let home = non_empty("HOME");
     #[cfg(windows)]
@@ -207,17 +218,131 @@ fn home_from(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     home.map(PathBuf::from)
 }
 
-/// `std::fs::canonicalize` without Windows' verbatim `\\?\` prefix, which git, globs,
-/// link targets and user-written paths never carry (UNC shares keep theirs).
+/// `std::fs::canonicalize` without Windows' verbatim `\\?\` prefix, which git, globs, link
+/// targets and user-written paths never carry ([`strip_verbatim`]).
 pub fn canonicalize(p: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let c = std::fs::canonicalize(p)?;
     #[cfg(windows)]
-    if let Some(rest) = c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        if !rest.starts_with(r"UNC\") {
-            return Ok(PathBuf::from(rest));
-        }
+    if let Some(plain) = c.to_str().and_then(strip_verbatim) {
+        return Ok(PathBuf::from(plain));
     }
     Ok(c)
+}
+
+/// The plain spelling of a Windows verbatim path — `\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\server\share\x` → `\\server\share\x` — when it names the same file: at most 259
+/// chars (`MAX_PATH` with its NUL), and no component that plain-path parsing would alter (a
+/// trailing `.` or space, a reserved device name, `/`). `None` otherwise (kept verbatim).
+pub fn strip_verbatim(s: &str) -> Option<String> {
+    let rest = s.strip_prefix(r"\\?\")?;
+    let (plain, path) = if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        (format!(r"\\{unc}"), unc)
+    } else {
+        let b = rest.as_bytes();
+        if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' {
+            return None;
+        }
+        (rest.to_string(), &rest[3..])
+    };
+    let altered = |c: &str| c.ends_with('.') || c.ends_with(' ') || is_reserved_name(c);
+    if plain.chars().count() > 259 || path.contains('/') || path.split('\\').any(altered) {
+        return None;
+    }
+    Some(plain)
+}
+
+/// A Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, any
+/// case, with or without an extension), which no file name may take.
+fn is_reserved_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    match base.len() {
+        3 => ["CON", "PRN", "AUX", "NUL"].iter().any(|r| base.eq_ignore_ascii_case(r)),
+        4 if base.is_ascii() => {
+            let (head, n) = base.split_at(3);
+            (head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT")) && n.as_bytes()[0].is_ascii_digit()
+        }
+        _ => false,
+    }
+}
+
+/// The portable file stem of a logical id (a session id such as `cc:<uuid>`, `oc:<id>:r2`):
+/// every byte of a char no Windows file name may hold (`<>:"/\|?*`, control chars) and of `%`
+/// becomes `%XX` (uppercase hex), as does a leading `.`, a trailing `.` or space, and the
+/// first char of a reserved device name ([`is_reserved_name`]). The result is one path
+/// component valid on every platform; [`decode_file_stem`] inverts it. The lake names its
+/// events files this way on every platform (DESIGN §19.1).
+pub fn encode_file_stem(id: &str) -> Cow<'_, str> {
+    let last = id.len().saturating_sub(1);
+    let reserved = is_reserved_name(id);
+    let escape = |i: usize, c: char| {
+        matches!(c, '%' | '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+            || (c as u32) < 0x20
+            || (i == 0 && (c == '.' || reserved))
+            || (i == last && matches!(c, '.' | ' '))
+    };
+    if !id.char_indices().any(|(i, c)| escape(i, c)) {
+        return Cow::Borrowed(id);
+    }
+    let mut out = String::with_capacity(id.len() + 8);
+    for (i, c) in id.char_indices() {
+        if escape(i, c) {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The id an [`encode_file_stem`] stem names. Decodes only a stem that is exactly the
+/// encoding of its decoded form, so a stem written raw (a lake events file exported before the
+/// codec, `cc:<uuid>`, or an id holding a literal `%41`) is returned as is and nothing is
+/// decoded twice.
+pub fn decode_file_stem(stem: &str) -> Cow<'_, str> {
+    if !stem.contains('%') {
+        return Cow::Borrowed(stem);
+    }
+    let (b, mut bytes, mut i) = (stem.as_bytes(), Vec::with_capacity(stem.len()), 0);
+    while i < b.len() {
+        let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (b[i], hex) {
+            (b'%', Some(x)) => {
+                bytes.push(x);
+                i += 3;
+            }
+            (x, _) => {
+                bytes.push(x);
+                i += 1;
+            }
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(id) if encode_file_stem(&id) == stem => Cow::Owned(id),
+        _ => Cow::Borrowed(stem),
+    }
+}
+
+/// The file stem of a session id in this machine's `traces/`, `pending/` and adapter state
+/// dirs: the id itself on Unix (the layout every existing root has), [`encode_file_stem`] on
+/// Windows, where `cc:<uuid>.jsonl` would name an NTFS alternate data stream of a file `cc`.
+pub fn id_file_stem(id: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        encode_file_stem(id)
+    } else {
+        Cow::Borrowed(id)
+    }
+}
+
+/// The session id an [`id_file_stem`] names.
+pub fn id_from_file_stem(stem: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        decode_file_stem(stem)
+    } else {
+        Cow::Borrowed(stem)
+    }
 }
 
 /// Normalize and validate an omp profile name (`@oh-my-pi/pi-utils/src/dirs.ts`
@@ -406,5 +531,117 @@ mod tests {
         assert!(RematchPaths::off_by(Some("0"), &p.off_marker));
         std::fs::write(&p.off_marker, "").unwrap();
         assert!(RematchPaths::off_by(Some("1"), &p.off_marker));
+    }
+
+    /// Every stem is one component Windows accepts: no reserved char, no device name, no
+    /// leading dot, no trailing dot or space.
+    fn windows_legal(stem: &str) -> bool {
+        !stem.is_empty()
+            && !stem.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || (c as u32) < 0x20)
+            && !stem.starts_with('.')
+            && !stem.ends_with(['.', ' '])
+            && !is_reserved_name(stem)
+    }
+
+    #[test]
+    fn file_stem_codec_round_trips_every_harness_id() {
+        let cases = [
+            ("0198a1b2-omp", "0198a1b2-omp"),
+            ("cc:11111111-2222", "cc%3A11111111-2222"),
+            ("cc:sid:agent-a12", "cc%3Asid%3Aagent-a12"),
+            ("codex:019a", "codex%3A019a"),
+            ("pi:abc:r2", "pi%3Aabc%3Ar2"),
+            ("oc:ses_1:r3", "oc%3Ases_1%3Ar3"),
+            ("50%", "50%25"),
+            ("a%41", "a%2541"),
+            ("../up", "%2E.%2Fup"),
+            ("a\\b/c", "a%5Cb%2Fc"),
+            ("con", "%63on"),
+            ("CON", "%43ON"),
+            ("nul", "%6Eul"),
+            ("Aux.json", "%41ux.json"),
+            ("com1", "%63om1"),
+            ("LPT1.x", "%4CPT1.x"),
+            ("end.", "end%2E"),
+            ("end ", "end%20"),
+            ("é:ü", "é%3Aü"),
+            ("tab\there", "tab%09here"),
+        ];
+        for (id, stem) in cases {
+            assert_eq!(encode_file_stem(id), stem, "{id:?}");
+            assert!(windows_legal(stem), "{stem:?}");
+            assert_eq!(decode_file_stem(stem), id, "{stem:?}");
+        }
+        // Unchanged ids borrow.
+        assert!(matches!(encode_file_stem("plain-id"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn decode_leaves_raw_and_non_canonical_stems_alone() {
+        // Lake events files exported before the codec keep the raw id as their name.
+        assert_eq!(decode_file_stem("cc:abc"), "cc:abc");
+        // A literal `%41` is not an encoding (`%` would be `%25`): decoded at most once.
+        assert_eq!(decode_file_stem("a%41"), "a%41");
+        assert_eq!(decode_file_stem("a%2541"), "a%41");
+        assert_eq!(decode_file_stem("cc%3aabc"), "cc%3aabc", "lowercase hex is not what encode writes");
+        assert_eq!(decode_file_stem("bad%zz"), "bad%zz");
+        assert_eq!(decode_file_stem("trail%"), "trail%");
+        assert_eq!(decode_file_stem("%FF%FE"), "%FF%FE", "invalid UTF-8 stays raw");
+    }
+
+    #[test]
+    fn native_id_files_keep_unix_names_and_encode_on_windows() {
+        let p = RematchPaths::with_roots("/r", "/a");
+        let (trace, pending) = (p.trace_file("cc:abc"), p.pending_file("cc:abc"));
+        if cfg!(windows) {
+            assert_eq!(trace, p.traces.join("cc%3Aabc.jsonl"));
+            assert_eq!(pending, p.pending.join("cc%3Aabc.json"));
+            assert_eq!(id_from_file_stem("cc%3Aabc"), "cc:abc");
+        } else {
+            assert_eq!(trace, p.traces.join("cc:abc.jsonl"));
+            assert_eq!(pending, p.pending.join("cc:abc.json"));
+            assert_eq!(id_from_file_stem("cc%3Aabc"), "cc%3Aabc");
+        }
+        assert_eq!(p.trace_file("0198-omp"), p.traces.join("0198-omp.jsonl"));
+        assert_eq!(id_from_file_stem(&id_file_stem("oc:x:r2")), "oc:x:r2");
+    }
+
+    #[test]
+    fn encoded_stems_survive_a_directory_listing() {
+        let t = tempfile::tempdir().unwrap();
+        let ids = ["cc:a", "oc:b:r2", "pi:c", "codex:d", "50%", "aux"];
+        for id in ids {
+            std::fs::write(t.path().join(format!("{}.jsonl", encode_file_stem(id))), id).unwrap();
+        }
+        let mut back: Vec<String> = std::fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| decode_file_stem(p.file_stem().unwrap().to_str().unwrap()).into_owned())
+            .collect();
+        back.sort();
+        let mut want: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(back, want);
+    }
+
+    #[test]
+    fn verbatim_prefix_stripped_only_when_the_plain_path_is_the_same_file() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\me\repo").as_deref(), Some(r"C:\Users\me\repo"));
+        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\repo").as_deref(), Some(r"\\server\share\repo"));
+        assert_eq!(strip_verbatim(r"C:\Users\me"), None, "not verbatim");
+        assert_eq!(strip_verbatim(r"\\?\Volume{1234}\x"), None, "no drive or UNC spelling");
+        assert_eq!(strip_verbatim(r"\\?\C:\dir\trailing."), None);
+        assert_eq!(strip_verbatim(r"\\?\C:\dir\nul.txt"), None);
+        assert_eq!(strip_verbatim(r"\\?\C:\a/b"), None);
+        let long = format!(r"\\?\C:\{}", "x".repeat(300));
+        assert_eq!(strip_verbatim(&long), None, "beyond MAX_PATH only the verbatim form works");
+    }
+
+    #[test]
+    fn home_is_home_then_userprofile_on_windows() {
+        assert_eq!(home_from(env(&[("HOME", "/h"), ("USERPROFILE", r"C:\Users\u")])), Some(PathBuf::from("/h")));
+        let profile_only = home_from(env(&[("USERPROFILE", r"C:\Users\u")]));
+        assert_eq!(profile_only, cfg!(windows).then(|| PathBuf::from(r"C:\Users\u")));
+        assert_eq!(home_from(env(&[("HOME", " ")])), None);
     }
 }

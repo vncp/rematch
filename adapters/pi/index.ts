@@ -29,6 +29,7 @@ import {
 	head,
 	type Hook,
 	hookFromModule,
+	idFileStem,
 	isExecutable,
 	isRecord,
 	LIMITS,
@@ -78,7 +79,7 @@ export function segmentId(base: string, n: number): string {
 /** Highest existing segment of `base` in `dir`: `{n, id}` (n = 0 when none exists). */
 export function latestSegment(dir: string, base: string): { n: number; id: string } {
 	let n = 0;
-	while (fs.existsSync(path.join(dir, `${segmentId(base, n + 1)}.jsonl`))) n++;
+	while (fs.existsSync(path.join(dir, `${idFileStem(segmentId(base, n + 1))}.jsonl`))) n++;
 	return { n, id: segmentId(base, Math.max(n, 1)) };
 }
 
@@ -217,7 +218,7 @@ export function unrecordedLoad(records: readonly Json[], loaded: readonly Loaded
 export function planTrace(dir: string, base: string, reason: string): { id: string; continues: boolean; writeStart: boolean; previous: string | null } {
 	const latest = latestSegment(dir, base);
 	if (latest.n === 0) return { id: base, continues: false, writeStart: true, previous: null };
-	const file = path.join(dir, `${latest.id}.jsonl`);
+	const file = path.join(dir, `${idFileStem(latest.id)}.jsonl`);
 	if (!finished(readTrace(file))) return { id: latest.id, continues: true, writeStart: reason !== "reload", previous: file };
 	return { id: segmentId(base, latest.n + 1), continues: false, writeStart: true, previous: file };
 }
@@ -530,7 +531,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			...base,
 			lastModel: base.lastModel ?? modelOf(ctx),
 			id: plan.id,
-			file: path.join(tracesDir, `${plan.id}.jsonl`),
+			file: path.join(tracesDir, `${idFileStem(plan.id)}.jsonl`),
 			cwd: ctx.cwd,
 			repo: null,
 			running: false,
@@ -598,7 +599,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			try {
 				const dir = path.join(root, "pending");
 				fs.mkdirSync(dir, { recursive: true });
-				fs.writeFileSync(path.join(dir, `${t.id}.json`), JSON.stringify({ session_id: t.id, flagged_at: Date.now(), reasons, trace: t.file, source: "pi" }));
+				fs.writeFileSync(path.join(dir, `${idFileStem(t.id)}.json`), JSON.stringify({ session_id: t.id, flagged_at: Date.now(), reasons, trace: t.file, source: "pi" }));
 			} catch (error) {
 				log(`pending flag write failed: ${errorText(error)}`);
 			}
@@ -609,7 +610,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	function spawnReflect(): void {
 		if (!bin || !ompAvailable()) return;
 		try {
-			const child = spawn(bin, ["reflect", "--pending"], { detached: true, stdio: "ignore", env });
+			const args = process.platform === "win32" ? ["reflect", "--pending", "--detach"] : ["reflect", "--pending"];
+			const child = spawn(bin, args, { detached: true, stdio: "ignore", env });
 			child.on("error", error => log(`reflect spawn failed: ${errorText(error)}`));
 			child.unref();
 		} catch (error) {

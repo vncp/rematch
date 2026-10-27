@@ -1,12 +1,13 @@
-//! Bounded process execution with process-group kill (DESIGN §14). Shared by the
-//! editor/classifier channel, batch rollouts and verifiers.
+//! Bounded process execution with process-tree kill (DESIGN §14). Shared by the
+//! editor/classifier channel, batch rollouts and verifiers. The tree is the child's own
+//! process group on Unix and a job object on Windows.
 
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -31,17 +32,39 @@ pub struct Bounded {
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_signal(_sig: libc::c_int) {
     CANCEL.store(true, Ordering::SeqCst);
 }
 
 /// SIGINT/SIGTERM set the cancel flag instead of killing the binary, so a running child
 /// group is torn down and the envelope reports `cancelled` (exit 130).
+#[cfg(unix)]
 pub fn install_cancel_handler() {
+    // SAFETY: the handler only stores to an atomic.
     unsafe {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
+}
+
+/// Ctrl+C / Ctrl+Break set the cancel flag instead of ending the binary, so a running child
+/// tree is torn down and the envelope reports `cancelled` (exit 130). Close, logoff and
+/// shutdown keep their default (the process ends; its job objects close and kill the trees).
+#[cfg(windows)]
+pub fn install_cancel_handler() {
+    use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    unsafe extern "system" fn on_ctrl(kind: u32) -> windows_sys::core::BOOL {
+        match kind {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                CANCEL.store(true, Ordering::SeqCst);
+                1
+            }
+            _ => 0,
+        }
+    }
+    // SAFETY: registers a handler that only stores to an atomic.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
 }
 
 pub fn cancel_requested() -> bool {
@@ -53,9 +76,9 @@ pub fn request_cancel() {
     CANCEL.store(true, Ordering::SeqCst);
 }
 
-/// Spawns `cmd` in its own process group (`process_group(0)`), stdin null, stdout/stderr
-/// piped (bounded buffers), waits ≤ `timeout`; on timeout or cancel fires SIGTERM to the
-/// group, waits 2 s, SIGKILL to the group (even if the leader exited).
+/// Spawns `cmd` as its own process tree ([`Tree`]), stdin null, stdout/stderr piped
+/// (bounded buffers), waits ≤ `timeout`; on timeout or cancel fires SIGTERM to the tree,
+/// waits 2 s, SIGKILL to the tree (even if the leader exited).
 pub fn run_bounded(cmd: Command, timeout: Duration) -> Result<Bounded> {
     run_bounded_input(cmd, timeout, None)
 }
@@ -65,13 +88,11 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
     let start = Instant::now();
     // A detached job's id must not leak into tools it runs (they would report into it).
     cmd.env_remove(crate::jobs::JOB_ID_ENV);
-    isolate(&mut cmd);
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let program = format!("{:?}", cmd.get_program());
-    let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
-    let pgid = child.id();
+    let (mut child, tree) = Tree::spawn(&mut cmd).with_context(|| format!("spawn {program}"))?;
 
     let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
     let readers = [
@@ -119,15 +140,15 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
         }
         if cancelled || start.elapsed() >= timeout {
             killed = true;
-            kill_group(pgid, &mut child, &mut status);
+            kill_tree(&tree, &mut child, &mut status);
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Collect the streams. A group member still holding the pipes after the leader is
+    // Collect the streams. A tree member still holding the pipes after the leader is
     // gone gets SIGTERM, then SIGKILL; after that round the pipes are abandoned (a member
-    // that left the group cannot be signalled through it).
+    // that left the tree cannot be signalled through it).
     let mut out = Bounded { killed, ..Default::default() };
     let mut deadline = Instant::now() + KILL_GRACE;
     // 0: nothing sent yet (or the timeout path already sent SIGTERM), 1: SIGTERM sent, 2: SIGKILL sent.
@@ -147,8 +168,8 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 match stage {
                     // Clean-up kill, not a timeout: `killed` stays the leader's outcome.
-                    0 => signal_group(pgid, false),
-                    1 => signal_group(pgid, true),
+                    0 => tree.signal(false),
+                    1 => tree.signal(true),
                     _ => break,
                 };
                 stage += 1;
@@ -157,7 +178,7 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
         }
     }
     if killed {
-        signal_group(pgid, true);
+        tree.signal(true);
     }
     out.code = status.and_then(|s| s.code());
     out.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -167,45 +188,68 @@ pub fn run_bounded_input(mut cmd: Command, timeout: Duration, input: Option<&[u8
     Ok(out)
 }
 
-/// New process group: `process_group(0)` on Unix; on Windows a new group without a console
-/// window, so the tree can be torn down via `taskkill /T`.
-fn isolate(cmd: &mut Command) {
+/// The spawned command and everything it starts. Unix: its own process group
+/// (`process_group(0)`); a member leaves only through `setsid`. Windows: a job object the
+/// child joins before its first instruction (spawned suspended, resumed once assigned), with
+/// no console window; a member leaves only by asking for breakaway. Closing the job (this
+/// value dropped, or this process ending however it ends) kills what is still in it.
+pub(crate) struct Tree {
     #[cfg(unix)]
-    cmd.process_group(0);
+    pgid: libc::pid_t,
     #[cfg(windows)]
-    {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
+    job: win::Job,
 }
 
-/// SIGTERM (`force = false`) or SIGKILL to the group led by `pgid`. Windows: `taskkill /T`
-/// on the tree rooted at `pgid` (`/F` when forced; unforced only reaches windowed processes).
-fn signal_group(pgid: u32, force: bool) {
+impl Tree {
     #[cfg(unix)]
-    unsafe {
-        libc::killpg(pgid as libc::pid_t, if force { libc::SIGKILL } else { libc::SIGTERM });
+    pub(crate) fn spawn(cmd: &mut Command) -> std::io::Result<(Child, Tree)> {
+        cmd.process_group(0);
+        let child = cmd.spawn()?;
+        let pgid = child.id() as libc::pid_t;
+        Ok((child, Tree { pgid }))
     }
+
     #[cfg(windows)]
-    {
-        let pid = pgid.to_string();
-        let mut args = vec!["/T", "/PID", pid.as_str()];
-        if force {
-            args.push("/F");
+    pub(crate) fn spawn(cmd: &mut Command) -> std::io::Result<(Child, Tree)> {
+        use windows_sys::Win32::System::JobObjects::{JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
+        Self::spawn_in_job(cmd, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    }
+
+    /// [`Tree::spawn`] into a job with these `JOB_OBJECT_LIMIT_*` flags (tests use others).
+    #[cfg(windows)]
+    pub(crate) fn spawn_in_job(cmd: &mut Command, limits: u32) -> std::io::Result<(Child, Tree)> {
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        cmd.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        let mut child = cmd.spawn()?;
+        match win::Job::adopt(&child, limits) {
+            Ok(job) => Ok((child, Tree { job })),
+            Err(e) => {
+                // Never leave a suspended child behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
         }
-        let _ = Command::new("taskkill")
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .status();
+    }
+
+    /// Unix: SIGTERM (`force = false`) or SIGKILL to the group. Windows: a windowless
+    /// console tree has no termination request it can catch, so both terminate the job.
+    pub(crate) fn signal(&self, force: bool) {
+        #[cfg(unix)]
+        // SAFETY: killpg only sends a signal.
+        unsafe {
+            libc::killpg(self.pgid, if force { libc::SIGKILL } else { libc::SIGTERM });
+        }
+        #[cfg(windows)]
+        {
+            let _ = force;
+            self.job.terminate();
+        }
     }
 }
 
-fn kill_group(pgid: u32, child: &mut std::process::Child, status: &mut Option<std::process::ExitStatus>) {
-    signal_group(pgid, false);
+fn kill_tree(tree: &Tree, child: &mut Child, status: &mut Option<std::process::ExitStatus>) {
+    tree.signal(false);
     let until = Instant::now() + KILL_GRACE;
     while Instant::now() < until {
         if let Ok(Some(s)) = child.try_wait() {
@@ -214,23 +258,167 @@ fn kill_group(pgid: u32, child: &mut std::process::Child, status: &mut Option<st
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    signal_group(pgid, true);
+    tree.signal(true);
     if status.is_none() {
         *status = child.wait().ok();
     }
 }
 
+#[cfg(windows)]
+mod win {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    /// A job object; closing it kills its remaining members when it has
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    pub(super) struct Job(OwnedHandle);
+
+    fn owned(h: HANDLE) -> io::Result<OwnedHandle> {
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a valid handle just returned to us and owned by nobody else.
+        Ok(unsafe { OwnedHandle::from_raw_handle(h) })
+    }
+
+    fn check(ok: windows_sys::core::BOOL) -> io::Result<()> {
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    impl Job {
+        /// A new job with the `limits` (`JOB_OBJECT_LIMIT_*`) holding the suspended `child`,
+        /// which is then resumed: nothing it starts runs outside the job unless it breaks away.
+        pub(super) fn adopt(child: &Child, limits: u32) -> io::Result<Job> {
+            // SAFETY: Win32 calls on handles owned here or by `child`, with pointers to locals
+            // that outlive each call.
+            unsafe {
+                let job = owned(CreateJobObjectW(std::ptr::null(), std::ptr::null()))?;
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = limits;
+                check(SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ))?;
+                check(AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()))?;
+                resume(child.id())?;
+                Ok(Job(job))
+            }
+        }
+
+        /// Every member ends (exit code 1). Fails only on a closed handle, which this
+        /// value never holds.
+        pub(super) fn terminate(&self) {
+            // SAFETY: the job handle is owned by `self`.
+            unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
+        }
+    }
+
+    /// Resumes the threads of the suspended process `pid` (a new process has one).
+    fn resume(pid: u32) -> io::Result<()> {
+        // SAFETY: Win32 calls on handles owned here, with a correctly sized THREADENTRY32.
+        unsafe {
+            let snap = owned(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0))?;
+            let mut e: THREADENTRY32 = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut resumed = 0;
+            let mut more = Thread32First(snap.as_raw_handle(), &mut e) != 0;
+            while more {
+                if e.th32OwnerProcessID == pid {
+                    let t = owned(OpenThread(THREAD_SUSPEND_RESUME, 0, e.th32ThreadID))?;
+                    if ResumeThread(t.as_raw_handle()) == u32::MAX {
+                        return Err(io::Error::last_os_error());
+                    }
+                    resumed += 1;
+                }
+                more = Thread32Next(snap.as_raw_handle(), &mut e) != 0;
+            }
+            if resumed == 0 {
+                return Err(io::Error::other(format!("no thread of process {pid} to resume")));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![cfg_attr(not(unix), allow(dead_code, unused_imports))] // helpers of Unix-only tests
     use super::*;
+
+    /// This test binary is the child process (Windows has no `sh`): [`fixture`] acts out
+    /// the mode named here and does nothing without it.
+    const MODE: &str = "REMATCH_PROC_FIXTURE";
+    /// File the `tree-*` modes write their grandchild's pid to.
+    const PID_FILE: &str = "REMATCH_PROC_FIXTURE_PID";
+
+    fn fixture_cmd(mode: &str) -> Command {
+        let mut c = Command::new(std::env::current_exe().unwrap());
+        c.args(["proc::tests::fixture", "--exact", "--ignored", "--nocapture", "--test-threads=1"]).env(MODE, mode);
+        c
+    }
+
+    #[test]
+    #[ignore = "child process of the tests below"]
+    fn fixture() {
+        let Ok(mode) = std::env::var(MODE) else { return };
+        let long = Duration::from_secs(60);
+        match mode.as_str() {
+            "echo" => {
+                println!("out");
+                eprintln!("err");
+                std::process::exit(3);
+            }
+            "cat" => {
+                std::io::copy(&mut std::io::stdin(), &mut std::io::stdout()).unwrap();
+                std::io::stdout().flush().unwrap();
+            }
+            "sleep" => std::thread::sleep(long),
+            "tree-wait" | "tree-exit" => {
+                // The grandchild inherits stdout and stderr: it holds the pipes, and outlives
+                // this process unless the tree kill reaches it.
+                #[allow(clippy::zombie_processes)]
+                let g = fixture_cmd("sleep").env_remove(PID_FILE).spawn().unwrap();
+                std::fs::write(std::env::var(PID_FILE).unwrap(), g.id().to_string()).unwrap();
+                if mode == "tree-exit" {
+                    println!("done");
+                } else {
+                    std::thread::sleep(long);
+                }
+            }
+            other => panic!("unknown fixture mode {other}"),
+        }
+        std::process::exit(0);
+    }
+
+    /// The grandchild the fixture recorded, gone within 10 s.
+    fn assert_gone(pid_file: &std::path::Path) {
+        let pid: i64 = std::fs::read_to_string(pid_file).expect("grandchild started").trim().parse().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while crate::jobs::pid_alive(pid) {
+            assert!(Instant::now() < until, "grandchild {pid} outlived its tree");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn captures_output_and_code() {
-        let mut c = Command::new("sh");
-        c.args(["-c", "echo out; echo err >&2; exit 3"]);
-        let b = run_bounded(c, Duration::from_secs(5)).unwrap();
-        assert_eq!(b.stdout, "out\n");
+        let b = run_bounded(fixture_cmd("echo"), Duration::from_secs(30)).unwrap();
+        assert!(b.stdout.ends_with("out\n"), "{:?}", b.stdout);
         assert_eq!(b.stderr, "err\n");
         assert_eq!(b.code, Some(3));
         assert!(!b.killed);
@@ -238,33 +426,50 @@ mod tests {
 
     #[test]
     fn stdin_is_piped_when_given() {
-        let mut c = Command::new("sh");
-        c.args(["-c", "cat"]);
-        let b = run_bounded_input(c, Duration::from_secs(5), Some(b"hello")).unwrap();
-        assert_eq!(b.stdout, "hello");
+        let b = run_bounded_input(fixture_cmd("cat"), Duration::from_secs(30), Some(b"hello")).unwrap();
+        assert!(b.stdout.ends_with("hello"), "{:?}", b.stdout);
     }
 
     #[test]
-    fn timeout_kills_the_whole_group() {
-        let mut c = Command::new("sh");
-        // The grandchild keeps stdout open; the group kill must still end the call.
-        c.args(["-c", "sleep 30 & sleep 30"]);
-        let t = Instant::now();
-        let b = run_bounded(c, Duration::from_millis(200)).unwrap();
+    fn timeout_kills_the_whole_tree() {
+        let t = tempfile::tempdir().unwrap();
+        let pid_file = t.path().join("grandchild");
+        let mut c = fixture_cmd("tree-wait");
+        c.env(PID_FILE, &pid_file);
+        let start = Instant::now();
+        // The grandchild keeps stdout open; the tree kill must still end the call.
+        let b = run_bounded(c, Duration::from_secs(3)).unwrap();
         assert!(b.killed);
-        assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(20), "took {:?}", start.elapsed());
+        assert_gone(&pid_file);
     }
 
-    #[cfg(unix)] // POSIX sh fixtures
     #[test]
     fn leader_exit_with_lingering_grandchild_is_bounded() {
-        let mut c = Command::new("sh");
-        c.args(["-c", "sleep 30 & echo done"]);
-        let t = Instant::now();
-        let b = run_bounded(c, Duration::from_secs(20)).unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let pid_file = t.path().join("grandchild");
+        let mut c = fixture_cmd("tree-exit");
+        c.env(PID_FILE, &pid_file);
+        let start = Instant::now();
+        let b = run_bounded(c, Duration::from_secs(30)).unwrap();
         assert_eq!(b.code, Some(0));
-        assert!(b.stdout.starts_with("done"));
+        assert!(b.stdout.contains("done\n"), "{:?}", b.stdout);
         assert!(!b.killed, "clean-up of a lingering member is not a timeout");
-        assert!(t.elapsed() < Duration::from_secs(10), "took {:?}", t.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(20), "took {:?}", start.elapsed());
+        assert_gone(&pid_file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_script_in_a_spaced_path_gets_its_arguments() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("dir with space");
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("echo args.cmd");
+        std::fs::write(&script, "@echo off\r\necho [%~1] [%~2]\r\n").unwrap();
+        let mut c = Command::new(&script);
+        c.args(["a b", "c"]);
+        let b = run_bounded(c, Duration::from_secs(30)).unwrap();
+        assert_eq!((b.code, b.stdout.as_str()), (Some(0), "[a b] [c]\r\n"), "{}", b.stderr);
     }
 }

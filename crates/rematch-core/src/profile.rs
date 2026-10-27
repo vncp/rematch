@@ -404,7 +404,7 @@ pub fn link_views(paths: &RematchPaths) -> Result<Views> {
         let o = ensure_link(paths, &policy, &root_policy)?;
         note(&mut out, o, crate::domain::POLICY_FILE.to_string());
     } else if std::fs::read_link(&root_policy).is_ok_and(|t| t.starts_with(dir(paths))) && !root_policy.exists() {
-        std::fs::remove_file(&root_policy)?;
+        crate::library::unlink(&root_policy)?;
         out.pruned.push(crate::domain::POLICY_FILE.to_string());
     }
     for (name, src) in children(&domains_dir(paths), |n, p| n.ends_with(".yml") && p.is_file()) {

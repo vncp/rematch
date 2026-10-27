@@ -251,7 +251,9 @@ fn init(ctx: &AppCtx, a: &InitArgs) -> Result<Value> {
         match &a.remote {
             Some(url) => {
                 let target = dir.to_string_lossy().to_string();
-                if let Err(e) = net(&ctx.paths.root, &["clone", "--quiet", url, &target], &budget) {
+                // No line-ending conversion: profile files are hashed and compared byte for
+                // byte across machines (Git for Windows defaults to `core.autocrlf=true`).
+                if let Err(e) = net(&ctx.paths.root, &["clone", "--quiet", "-c", "core.autocrlf=false", url, &target], &budget) {
                     let _ = std::fs::remove_dir_all(&dir);
                     bail!("clone {url}: {e}");
                 }
@@ -284,6 +286,7 @@ fn init(ctx: &AppCtx, a: &InitArgs) -> Result<Value> {
             Some(_) => {}
         }
     }
+    git(&dir, &["config", "core.autocrlf", "false"])?;
     profile::ensure_layout(&ctx.paths)?;
     let adopted = if a.adopt { adopt_all(ctx)? } else { Vec::new() };
     let remaining = budget.deadline.saturating_duration_since(Instant::now());

@@ -250,7 +250,6 @@ fn unlink_agent(paths: &RematchPaths, name: &str, dir: &Path) -> Result<()> {
     match std::fs::read_link(&link) {
         Ok(cur) if cur == dir.join(AGENT_MD) || !cur.exists() => remove_link(&link),
         Ok(_) => Ok(()),
-        Err(_) if cfg!(not(unix)) => remove_link(&link),
         Err(_) => Ok(()),
     }
 }
@@ -284,7 +283,7 @@ fn remove_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
                 std::fs::remove_file(&t)?;
             }
         }
-        std::fs::remove_file(&f)?;
+        unlink(&f)?;
     }
     Ok(())
 }
@@ -1148,14 +1147,25 @@ pub fn unlink(p: &Path) -> std::io::Result<()> {
     std::fs::remove_file(p)
 }
 
-/// Atomic per link: a hidden temporary symlink renamed over `link`, so a reader sees the old
-/// target or the new one, never a missing name.
+/// A hidden temporary symlink renamed over `link`. Unix: atomic, a reader sees the old target
+/// or the new one, never a missing name. Windows refuses to rename over a directory, which a
+/// directory symlink or junction is: an existing link there is unlinked first (never followed;
+/// a real directory or file is not removed and the rename fails), so a reader may briefly find
+/// the name missing.
 pub fn relink(target: &Path, link: &Path) -> Result<()> {
     let name = link.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let tmp = link.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
     symlink_dir(target, &tmp)?;
-    std::fs::rename(&tmp, link).map_err(|err| {
+    let r = std::fs::rename(&tmp, link);
+    #[cfg(windows)]
+    let r = match r {
+        Err(_) if std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) => {
+            unlink(link).and_then(|()| std::fs::rename(&tmp, link))
+        }
+        r => r,
+    };
+    r.map_err(|err| {
         let _ = unlink(&tmp);
         anyhow!(err).context(format!("rename {} → {}", tmp.display(), link.display()))
     })
@@ -1582,6 +1592,44 @@ mod tests {
         assert!(!x.paths.ledger_file.exists());
     }
 
+    /// Links are re-pointed, removed and uninstalled as links: never followed into their
+    /// targets, never replacing a real directory (Windows: directory symlinks, file symlinks).
+    #[test]
+    fn links_repoint_and_go_without_touching_targets() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, real) = (t.path().join("a"), t.path().join("b"), t.path().join("real"));
+        for d in [&a, &b, &real] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("SKILL.md"), d.display().to_string()).unwrap();
+        }
+        let views = t.path().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        let link = views.join("s");
+        relink(&a, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), a);
+        relink(&b, &link).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), b, "an existing directory link is re-pointed");
+        assert_eq!(std::fs::read_to_string(link.join("SKILL.md")).unwrap(), b.display().to_string());
+        // A file target gets a link that reads as the file.
+        let md = views.join("agent.md");
+        relink(&a.join("SKILL.md"), &md).unwrap();
+        relink(&b.join("SKILL.md"), &md).unwrap();
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), b.display().to_string());
+        // A real directory in the way is the user's: the rename fails and it stays whole.
+        assert!(relink(&a, &real).is_err());
+        assert!(std::fs::symlink_metadata(&real).unwrap().is_dir() && real.join("SKILL.md").is_file());
+        let names: Vec<String> = std::fs::read_dir(&views).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "no temporary link left: {names:?}");
+        // Removal unlinks; uninstalling a link dir removes the links, not what they point at.
+        unlink(&md).unwrap();
+        assert!(std::fs::symlink_metadata(&md).is_err());
+        apply_uninstall(&UninstallPlan { remove: vec![link.clone(), views.clone()], restore: Vec::new() }).unwrap();
+        assert!(!views.exists());
+        for d in [&a, &b, &real] {
+            assert_eq!(std::fs::read_to_string(d.join("SKILL.md")).unwrap(), d.display().to_string(), "{}", d.display());
+        }
+    }
+
     #[test]
     fn with_a_profile_a_kept_agent_is_copied_there_and_linked() {
         let x = env();
@@ -1900,12 +1948,10 @@ mod tests {
         e
     }
 
-    #[cfg(unix)]
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap()
     }
 
-    #[cfg(unix)]
     #[test]
     fn agents_link_while_provisional_copy_when_kept_and_roll_back() {
         let x = env();
@@ -1966,7 +2012,6 @@ mod tests {
         assert!(rollback(&x.ledger, &x.paths, "log-triage").is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn agent_links_follow_draft_activate_retire_and_kept_retire() {
         let x = env();

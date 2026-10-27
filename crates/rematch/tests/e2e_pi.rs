@@ -106,7 +106,7 @@ fn pi_history_reflects_syncs_and_counts() {
     let staged = r["history"]["sessions"].as_array().unwrap().iter().find(|x| x["session"] == sid).cloned().unwrap_or(Value::Null);
     assert_eq!((staged["outcome"].as_str(), staged["name"].as_str()), (Some("staged"), Some("run-tests-before-commit")), "{r}");
     assert!(env.calls().len() <= 3, "≤ 3 model calls per reflection: {:?}", env.calls());
-    let recs: Vec<Value> = std::fs::read_to_string(env.root.join(format!("traces/{sid}.jsonl")))
+    let recs: Vec<Value> = std::fs::read_to_string(env.trace_path(&sid))
         .unwrap()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())

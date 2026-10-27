@@ -1,7 +1,10 @@
 //! `events/{harness}/{day}/{session_id}.parquet`: one row per trace record (DESIGN §3) of a
 //! closed session, flattened; every record field without a column of its own is kept as
 //! JSON in `extra`. One column is derived, not a trace field: `tool_cmd`, a bash call's
-//! command (the `exact:` and `text:` keys' column).
+//! command (the `exact:` and `text:` keys' column). The file name is the session id through
+//! [`rematch_core::paths::encode_file_stem`] (`cc:<uuid>` → `cc%3A<uuid>`), so one lake is
+//! valid on every platform; a file exported before that codec keeps its raw-id name
+//! ([`legacy_events_path`]) and is still found, counted and imported as the same session.
 
 use std::path::{Path, PathBuf};
 
@@ -100,12 +103,42 @@ pub fn day_of(ms: i64) -> String {
 }
 
 /// `lake/events/{harness}/{day}/{session_id}.parquet` of a session starting at `start_ms`
-/// (a trace's `session_start.t`; a ledger session's `started_at`).
+/// (a trace's `session_start.t`; a ledger session's `started_at`); the name is
+/// [`rematch_core::paths::encode_file_stem`] of the id on every platform.
 pub fn events_path(lake: &Path, session_id: &str, start_ms: i64) -> PathBuf {
     lake.join("events")
         .join(harness_of(session_id))
         .join(day_of(start_ms))
-        .join(format!("{}.parquet", path_component(session_id)))
+        .join(format!("{}.parquet", rematch_core::paths::encode_file_stem(session_id)))
+}
+
+/// Where an export before the file-name codec wrote the session (`path_component` of the raw
+/// id: `cc:<uuid>.parquet`); `None` when that is the [`events_path`] name or a name this
+/// platform cannot hold (Windows: a `:` would address an NTFS stream of another file).
+pub fn legacy_events_path(lake: &Path, session_id: &str, start_ms: i64) -> Option<PathBuf> {
+    let name = path_component(session_id);
+    if name == rematch_core::paths::encode_file_stem(session_id) {
+        return None;
+    }
+    if cfg!(windows) && name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        return None;
+    }
+    Some(lake.join("events").join(harness_of(session_id)).join(day_of(start_ms)).join(format!("{name}.parquet")))
+}
+
+/// The session's events file present in `lake`: [`events_path`], else [`legacy_events_path`].
+pub fn find_events_file(lake: &Path, session_id: &str, start_ms: i64) -> Option<PathBuf> {
+    let p = events_path(lake, session_id, start_ms);
+    if p.is_file() {
+        return Some(p);
+    }
+    legacy_events_path(lake, session_id, start_ms).filter(|p| p.is_file())
+}
+
+/// The session id an events file name (`<stem>.parquet`) holds: the encoded stem decoded, a
+/// legacy raw-id name as is ([`rematch_core::paths::decode_file_stem`]).
+pub fn session_of_file(file: &str) -> String {
+    rematch_core::paths::decode_file_stem(file.strip_suffix(".parquet").unwrap_or(file)).into_owned()
 }
 
 /// The derived column: the command of a `bash` call (`input.command`), else `None`.
@@ -298,5 +331,30 @@ mod tests {
         assert_eq!(harness_of("019a"), "omp");
         assert_eq!(day_of(0), "1970-01-01");
         assert_eq!(day_of(1_761_436_800_000), "2025-10-26");
+    }
+
+    #[test]
+    fn events_file_names_are_portable_and_legacy_names_still_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let lake = dir.path();
+        let p = events_path(lake, "cc:abc", 0);
+        assert!(p.ends_with("events/claude-code/1970-01-01/cc%3Aabc.parquet"), "{}", p.display());
+        assert_eq!(session_of_file("cc%3Aabc.parquet"), "cc:abc");
+        assert_eq!(session_of_file("cc:abc.parquet"), "cc:abc", "a legacy raw-id name");
+        assert_eq!(session_of_file("a%2541.parquet"), "a%41", "decoded once");
+        assert_eq!(legacy_events_path(lake, "k-0", 0), None, "an omp id never changed name");
+        assert_eq!(find_events_file(lake, "cc:abc", 0), None);
+        let legacy = legacy_events_path(lake, "cc:abc", 0);
+        if cfg!(windows) {
+            assert_eq!(legacy, None);
+        } else {
+            let legacy = legacy.unwrap();
+            assert!(legacy.ends_with("events/claude-code/1970-01-01/cc:abc.parquet"));
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            std::fs::write(&legacy, "x").unwrap();
+            assert_eq!(find_events_file(lake, "cc:abc", 0), Some(legacy.clone()));
+            std::fs::write(&p, "y").unwrap();
+            assert_eq!(find_events_file(lake, "cc:abc", 0), Some(p.clone()), "the current name wins");
+        }
     }
 }

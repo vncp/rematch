@@ -32,7 +32,7 @@ pub fn normalize_remote(url: &str) -> Option<String> {
         }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         (strip_user_port(authority), path)
-    } else if s.starts_with('/') || s.starts_with('.') || s.starts_with('~') {
+    } else if s.starts_with('/') || s.starts_with('.') || s.starts_with('~') || (cfg!(windows) && is_windows_path(s)) {
         return file_remote(s);
     } else {
         match s.split_once(':') {
@@ -63,9 +63,23 @@ fn trim_repo_path(path: &str) -> String {
     p.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
 }
 
+/// A Windows local path git takes for a filesystem remote (`has_dos_drive_prefix`, UNC):
+/// `C:\…`, `C:/…`, `\\server\share\…`; never an scp-like `host:path`.
+fn is_windows_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || s.starts_with(r"\\")
+}
+
 fn file_remote(path: &str) -> Option<String> {
+    // Windows spellings: `\` separators, and `file:///C:/x` naming the drive path `C:/x`.
+    let path = path.trim();
+    let path: std::borrow::Cow<str> = if cfg!(windows) { path.replace('\\', "/").into() } else { path.into() };
+    let path = match path.strip_prefix('/') {
+        Some(rest) if cfg!(windows) && is_windows_path(rest) => rest,
+        _ => &path,
+    };
     let p = trim_repo_path(path);
-    let root = if path.trim().starts_with('/') { "/" } else { "" };
+    let root = if cfg!(windows) && path.starts_with("//") { "//" } else if path.starts_with('/') { "/" } else { "" };
     (!p.is_empty()).then(|| format!("file:{root}{p}"))
 }
 
@@ -260,6 +274,21 @@ mod tests {
         assert_eq!(normalize_remote("https://github.com/"), None);
         let n = normalize_remote("git@github.com:vncp/rematch.git").unwrap();
         assert_eq!(normalize_remote(&n).unwrap(), n);
+        // Drive and UNC paths are filesystem remotes on Windows (git's `has_dos_drive_prefix`);
+        // elsewhere `c:path` is scp-like, as git reads it there.
+        for (url, win) in [
+            (r"C:\repos\x.git", "file:C:/repos/x"),
+            ("C:/repos/x/", "file:C:/repos/x"),
+            ("file:///C:/repos/x.git", "file:C:/repos/x"),
+            (r"\\srv\share\x.git", "file://srv/share/x"),
+        ] {
+            if cfg!(windows) {
+                assert_eq!(normalize_remote(url).as_deref(), Some(win), "{url}");
+            } else {
+                assert!(normalize_remote(url).is_none_or(|n| !n.starts_with("file:C:")), "{url}");
+            }
+        }
+        assert_eq!(normalize_remote("c:org/repo").as_deref(), if cfg!(windows) { Some("file:c:org/repo") } else { Some("c/org/repo") });
     }
 
     #[test]
