@@ -193,8 +193,9 @@ verbatim copies ([provenance and changes](docs/research.md#5-porting-notes-what-
 
 Counters report recurrence and harm, not a controlled estimate of improvement.
 Scratch-repository demonstrations and synthetic tests are not production evidence.
-Live runs documented so far are on macOS arm64; Linux is untested. Windows (omp) builds, installs
-and passes the test suite except the tests that drive POSIX `sh` fixtures, which run on Unix only.
+Live model-backed runs documented so far are on macOS arm64. Native CI checks the Windows
+omp path and Linux; POSIX shell fixtures remain Unix-only. Pi/OpenCode host runtime
+compatibility on Windows is not yet certified.
 See [status and limits](https://vncp.github.io/rematch/background/status/) for evidence and open gaps.
 
 ## Docs

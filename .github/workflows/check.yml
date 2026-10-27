@@ -28,6 +28,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: '1.4.3'
@@ -39,7 +41,7 @@ jobs:
           New-Item -Path $key -Force | Out-Null
           New-ItemProperty -Path $key -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
       - name: Test native workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: Check without the lake feature
         run: cargo test -p rematch --no-default-features --locked
       - name: Clippy

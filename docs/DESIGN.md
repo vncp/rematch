@@ -28,6 +28,28 @@ wins (it exists only where a technical constraint was verified).
 | Agent dir resolution (`omp://config-usage.md#profiles`, `omp://extension-loading.md`, `@oh-my-pi/pi-utils/src/dirs.ts`): `PI_CONFIG_DIR` replaces `~/.omp`; `OMP_PROFILE` (when defined, including empty/`default` which selects default and suppresses `PI_PROFILE`) else `PI_PROFILE` selects `~/.omp/profiles/<name>/agent` (ignoring `PI_CODING_AGENT_DIR`); in the default profile `PI_CODING_AGENT_DIR` overrides `~/.omp/agent` (unless it equals a profile-derived agent dir inherited from `PI_PROFILE`). | `RematchPaths::resolve()` follows omp's exact precedence; `REMATCH_ROOT` stays `$REMATCH_ROOT` or `~/.rematch` (shared across profiles). `import --history` without `--sessions` imports the default agent dir plus every `<config_root>/profiles/*/agent/sessions` except profiles in `--skip-profile <name>` or `policy.json` `{"skip_profiles":[...]}`. |
 | `context` event (`pi-coding-agent/src/extensibility/shared-events.ts` `ContextEvent {messages}`; `extensions/runner.ts` `emitContext`): runs before every provider request on a `structuredClone` of the messages; each handler's returned `{messages}` feeds the next; the persisted history is untouched; each handler is bounded by a 30 s timeout (`EXTENSION_HANDLER_TIMEOUT_MS`). Message shapes (`pi-ai/src/types.ts`): `user {content: string \| blocks, synthetic?}`, `toolResult {toolCallId, toolName, content: (text\|image)[], isError}`; assistant tool calls are `{type:"toolCall", id, name, arguments}` blocks. A `CustomMessage {role:"custom", customType, content, display, details?, timestamp}` (`pi-agent-core/src/compaction/messages.ts`) is sent to the provider as a `developer` message (`convertMessageToLlm`, reached from `session/messages.ts` `convertToLlm`) | `truncate` and `retrieve` hooks rewrite only the outgoing copy: truncation replaces old `toolResult` text, retrieval appends one hidden `CustomMessage` (`customType: "com.vncp.rematch.retrieval"`). |
 
+### Native Windows portability
+
+The Windows delivery target is the omp integration. `scripts/install.ps1` builds the
+binary, creates the native file/directory links, registers the extension and installs
+`rematch.exe` in the user's `.local/bin`. Developer Mode or an elevated token is required
+for symlink creation. Install/uninstall honor `HOME`, then `USERPROFILE`.
+
+Process lifetimes use an owned Windows Job Object: the child starts suspended, joins
+the job, then resumes; timeout or cancellation terminates its descendants too.
+Detached jobs either leave a kill-on-close parent job or return an explicit refusal.
+Unix retains process groups and SIGTERM/SIGKILL. Locks use OS locks rather than pid-file
+ownership; trace writers lock a distant byte on Windows so ordinary readers are not blocked.
+
+For `.cmd`/`.bat` omp launchers, prompts travel unchanged through stdin instead of argv.
+Executable launchers and Unix retain the existing argv contract. This applies to both
+editor calls and batch rollouts; unbounded shell quoting of model-generated text is not used.
+
+The native CI workflow covers Windows and Linux, including portable process/lock tests.
+Windows also runs an isolated PowerShell install → CLI/profile/lake → uninstall smoke.
+The omp host and model provider are not exercised by that smoke: its omp shim implements
+plugin-management/version operations only. Pi/OpenCode runtime Windows parity remains unverified.
+
 ## 1. Topology
 
 ```

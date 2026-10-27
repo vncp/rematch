@@ -204,7 +204,9 @@ const APPENDERS_BYTE: u64 = 1 << 62;
 
 impl Appender {
     fn open(path: &Path) -> std::io::Result<Appender> {
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        // Windows LockFileEx requires GENERIC_READ or GENERIC_WRITE; append-only handles
+        // have FILE_APPEND_DATA instead. Read access lets LockFileEx lock this handle.
+        let file = std::fs::OpenOptions::new().create(true).read(true).append(true).open(path)?;
         #[cfg(unix)]
         file.lock()?;
         #[cfg(windows)]
