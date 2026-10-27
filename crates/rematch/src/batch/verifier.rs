@@ -305,7 +305,8 @@ mod tests {
         assert!(is_pass(&v.check(&t, d.path()).unwrap()));
         let v = parse_spec(&format!("parity:out.csv={}", sha256_hex(b"other"))).unwrap();
         assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
-        assert!(parse_spec("parity:out.csv=/no/such/file").is_err());
+        // An absolute expected file must exist now (`/no/such/file` is not absolute on Windows).
+        assert!(parse_spec(&format!("parity:out.csv={}", d.path().join("no-such-file").display())).is_err());
 
         let v = parse_spec("receipt:receipt.json").unwrap();
         assert!(!is_pass(&v.check(&t, d.path()).unwrap()));
