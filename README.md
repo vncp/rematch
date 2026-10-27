@@ -258,6 +258,8 @@ The ledger answers today's questions in milliseconds; it cannot answer *what did
 
 ## One profile, every machine
 
+> Live-verified 2026-10-26 between two Macs over a private GitHub repo: hand-written subagent prompts adopted on both (identical copies became links), a skill added on one machine appeared on the other at the next sync, a deletion propagated back, launchd syncs every 5 minutes on each.
+
 What rematch keeps on one machine should load on the next. `rematch profile init --remote <git url> --adopt` turns `~/.rematch/profile/` into a git repo of your omp setup — kept skills and agents, the skills and agents you wrote by hand (adopted as pinned entries), approved hooks, `policy.json`, per-branch `domain.yml`, improver prompts you edited, and `config/roles.yml` for the model behind each role on each machine — and links every piece back where omp and rematch read it. Another machine runs `rematch profile init --remote <git url>` once; from then on each omp process syncs in the background at session start (commit, pull with rebase, relink, push; bounded, offline is fine), keeps land in the profile, and `rematch profile install-launchd` adds a timer if you want one. A file changed on two machines stops the sync with the tree clean and a digest line naming the file. The ledger, counters, traces, staging and credentials stay per machine; history travels through the lake. Details: [Manual · Profile](docs/MANUAL.md#profile-one-setup-on-every-machine), [DESIGN §20](docs/DESIGN.md).
 
 ```
