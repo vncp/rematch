@@ -18,7 +18,8 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 | Stuck-call detection | Yes | Completed calls | Yes | Completed calls | No |
 | Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
 | Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
-| Generated subagents | Yes | Adapted copies | No native subagent definitions | Not delivered | No |
+| Generated subagents | Yes, once approved | Adapted copies, once approved | No native subagent definitions | Not delivered | No |
+| Personal system prompt (approved `AGENTS.fragment.md`) | `before_agent_start` | Session-start context | `before_agent_start` | System transform | No: skills only |
 | Digest | Notifications/dialog | Session-start message | Notifications/dialog | TUI toast or command | CLI/optional status skill |
 | User approval | Dialog or command | Command | Dialog or command | Command | CLI |
 | Detached reflection trigger | Session start | Session start | Session start | Plugin start | Manual |

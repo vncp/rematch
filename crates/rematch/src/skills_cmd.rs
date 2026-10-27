@@ -62,14 +62,18 @@ pub fn cmd_skills(ctx: &AppCtx, cmd: SkillsCmd) -> Result<Value> {
     }
 }
 
-/// The shared sync for `cwd` (matched as its repo, else itself), then the removal of the
-/// per-harness link dirs older versions kept (`claude-skills/`, `codex-skills/`). Returns the
-/// sync and the legacy dirs removed.
+/// The shared sync for `cwd` (matched as its repo, else itself), the removal of staging links
+/// of provisional agents that are not approved (`library::unlink_unapproved_agents`), then the
+/// removal of the per-harness link dirs older versions kept (`claude-skills/`, `codex-skills/`).
+/// Returns the sync and the legacy dirs removed.
 pub fn sync_cwd(ctx: &AppCtx, cwd: &Path) -> Result<(SkillsSync, Vec<PathBuf>)> {
     let repo = repo_of(cwd);
     let mut place = rematch_core::predicate::Place::locate(repo.as_deref(), cwd);
     place.domain = rematch_core::domain::place_domain(&ctx.paths, &place, &library::branch_for(repo.as_deref(), cwd));
     let s = library::sync_shared_skills(&ctx.ledger, &ctx.paths, Some(&place))?;
+    for name in library::unlink_unapproved_agents(&ctx.ledger, &ctx.paths)? {
+        eprintln!("rematch: provisional agent {name} unlinked: its AGENT.md is not approved");
+    }
     let mut removed = Vec::new();
     for name in LEGACY_LINK_DIRS {
         let dir = ctx.paths.root.join(name);
@@ -212,15 +216,18 @@ pub fn claude_agent_file(agent_md: &str) -> Result<String> {
     Ok(SkillDoc { frontmatter: fm, body: doc.body }.render())
 }
 
-/// The agent files Claude Code should load: every provisional agent (omp offers each staged
-/// one in every session through `REMATCH_ROOT/agents/`) and every kept/pinned one, as
-/// `<name>.md` → `(id, Claude Code file)`. A provisional agent wins over a kept one of its
-/// name: it is the one being measured.
+/// The agent files Claude Code should load: every approved provisional agent
+/// ([`library::agent_approved`]; omp offers each through `REMATCH_ROOT/agents/` in every
+/// session) and every kept/pinned one, as `<name>.md` → `(id, Claude Code file)`. A
+/// provisional agent wins over a kept one of its name: it is the one being measured.
 fn wanted_agents(ctx: &AppCtx) -> Result<BTreeMap<String, (EntryId, String)>> {
     let mut out = BTreeMap::new();
     for status in [Status::Kept, Status::Pinned, Status::Provisional] {
         for e in ctx.ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })? {
-            if e.kind != Kind::Agent || !library::load_entry(&e.path).is_ok_and(|x| x.id == e.id) {
+            if e.kind != Kind::Agent
+                || !library::load_entry(&e.path).is_ok_and(|x| x.id == e.id)
+                || (status == Status::Provisional && !library::agent_approved(&e))
+            {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(e.path.join(AGENT_MD)) else { continue };

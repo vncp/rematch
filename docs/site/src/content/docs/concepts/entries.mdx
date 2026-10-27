@@ -59,11 +59,12 @@ An `AGENT.md` holds `name`, `description` (what the main agent sees when decidin
 
 | Status | Where | Seen |
 |---|---|---|
-| provisional | `staging/<branch>/<name>/`, linked from `~/.rematch/agents/<name>.md` | in **every** omp session (omp reads agents only from fixed places); counted only where the repo matches |
+| provisional, **approved** | `staging/<branch>/<name>/`, linked from `~/.rematch/agents/<name>.md` | in **every** omp session (omp reads agents only from fixed places); counted only where the repo matches |
+| provisional, not approved | `staging/<branch>/<name>/` only | never: linked and copied nowhere until you approve it (digest kind `agent`) |
 | kept (after 4 clean sessions) | copied to `~/.omp/agent/agents/<name>.md`; a file of yours with that name is saved first | natively |
 | retired · dormant · stale | link or kept copy removed; entry archived | never |
 
-- A project or user agent with the same name wins over a provisional one.
+- Approval is bound to `AGENT.md` without its `rematch:` block: editing the body asks again. A project or user agent with the same name wins over a provisional one.
 - `/rematch off` does not hide provisional agents; `library disable <id>` does.
 - Claude Code gets copies in its plugin's `agents/`, refreshed at each session start. Codex does not load subagents.
 

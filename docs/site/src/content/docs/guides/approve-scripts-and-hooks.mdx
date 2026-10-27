@@ -1,21 +1,34 @@
 ---
 title: Approve scripts and hooks
-description: Approve or decline the executable changes rematch proposes, including the three built-in hooks.
+description: Approve or decline the executable changes, subagents and system-prompt text rematch proposes, including the three built-in hooks.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Skill text activates on its own; anything executable waits for you. Approve or decline each script and hook from the session-start digest or the terminal.
+Skill text activates on its own; anything executable, every provisional subagent and any text for your system prompt waits for you. Approve or decline each from the session-start digest or the terminal.
 
-<Aside type="caution" title="Nothing executable runs without approval">
-A proposed script is staged non-executable (mode 0644). A proposed hook is not installed: until you approve it, nothing of it loads or counts.
+<Aside type="caution" title="Nothing executable runs, and nothing reaches your prompt, without approval">
+A proposed script is staged non-executable (mode 0644). A proposed hook is not installed: until you approve it, nothing of it loads or counts. A provisional subagent is linked nowhere until you approve it. An `AGENTS.fragment.md` is not added to any prompt until you approve it.
 </Aside>
+
+## What waits for you
+
+The digest shows one item per entry. Its kind joins what is pending with `+`, in this order:
+
+| Kind | What it is | Shown in the diff |
+|---|---|---|
+| `scripts` | files under the entry's `scripts/` | each file |
+| `hook` | a `kind: hook` entry | the compiled module and the pass condition |
+| `agent` | a provisional subagent (`AGENT.md`) | `+++ AGENT.md` and its text |
+| `prompt` | the entry's `AGENTS.fragment.md` | `+++ AGENTS.fragment.md` and its text |
+
+An entry with a script and a fragment shows as `scripts+prompt`. Approving it approves every pending part at once; declining retires the entry. The diff is cut at 4,096 bytes.
 
 ## Approve or decline
 
 <Tabs syncKey="harness">
 <TabItem label="omp">
-At session start the digest asks once per item, with the diff and the hook's pass condition.
+At session start the digest asks once per entry, with the diff and the hook's pass condition. Approving a subagent reloads it at once.
 </TabItem>
 <TabItem label="Claude Code">
 There is no dialog. The session-start digest lists each approval with its commands, which only you can run:
@@ -40,7 +53,17 @@ rematch library decline <id>
 |---|---|
 | approve a script | it becomes mode 0755 in place |
 | approve a hook | it is compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` (data only; the extension runs it) |
+| approve a subagent | it is linked into `~/.rematch/agents/` (Claude Code: copied into the plugin's `agents/`), visible in every session and counted where its repo matches |
+| approve a fragment | the harness appends `## rematch: <name>` and the text to the system prompt of main sessions where the entry loads, within the 8 KB always-on budget |
 | decline | the entry is retired |
+
+## System-prompt text
+
+- **Only you can put it there.** rematch never writes your `AGENTS.md`; the harness appends the block to the prompt of each main session.
+- **Bound to the text.** The approval records the file's hash. Edit the fragment (or a subagent's body) and it is pending again.
+- **Disable, decline or retire removes it** from the system prompt.
+- **Where it works.** omp, Pi, OpenCode and Claude Code (through the session-start context). Codex loads skills only.
+- **Team `AGENTS.md`** is unchanged: it still reaches a repo only through [a team branch](/rematch/guides/share/).
 
 ## Hook modes
 

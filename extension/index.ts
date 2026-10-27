@@ -682,6 +682,41 @@ export function loadedEntriesOf(data: unknown, hooks: readonly Hook[]): LoadedEn
 		});
 }
 
+/** One approved personal `AGENTS.fragment.md` the binary reported for this cwd (`match.prompt_fragments`). */
+export type PromptFragment = { id: string; name: string; text: string };
+
+/** `match.prompt_fragments`, keeping only well-formed items (`{id, name, text}`, all non-empty strings). */
+export function promptFragmentsOf(data: unknown): PromptFragment[] {
+	return (isRecord(data) ? recordsOf(data.prompt_fragments) : [])
+		.filter(f => ["id", "name", "text"].every(k => typeof f[k] === "string" && (f[k] as string).trim() !== ""))
+		.map(f => ({ id: f.id as string, name: f.name as string, text: f.text as string }));
+}
+
+/**
+ * The system-prompt block of the fragments: `## rematch: <name>\n\n<text trimmed>` per fragment, the
+ * heading `ship` writes into a repo's AGENTS.md, joined with a blank line; null when there is none.
+ */
+export function renderPromptFragments(fragments: readonly PromptFragment[]): string | null {
+	if (fragments.length === 0) return null;
+	return fragments.map(f => `## rematch: ${f.name}\n\n${f.text.trim()}`).join("\n\n");
+}
+
+/**
+ * `before_agent_start.systemPrompt` (an array of strings on omp 18.13, a string on older hosts) with
+ * `block` appended: one more array element, or the string joined by a blank line; null for any other shape.
+ */
+export function withPromptBlock(systemPrompt: unknown, block: string): string | string[] | null {
+	if (Array.isArray(systemPrompt)) return [...systemPrompt, block];
+	if (typeof systemPrompt === "string") return systemPrompt === "" ? block : `${systemPrompt}\n\n${block}`;
+	return null;
+}
+
+/** `systemPrompt` with `fragments` rendered and appended; null when there is nothing to add or the prompt has an odd shape. */
+export function appendPromptFragments(systemPrompt: unknown, fragments: readonly PromptFragment[]): string | string[] | null {
+	const block = renderPromptFragments(fragments);
+	return block ? withPromptBlock(systemPrompt, block) : null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Module-level cache of `match` + `skills sync` results (factories are rebound per subagent;
 // per-session state stays in the closure). Keyed by binary + cwd and cleared when the main
@@ -767,6 +802,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
 	let tracksCalls = false;
+	/** Approved personal prompt fragments of the entries loaded for `loadedCwd`. */
+	let promptFragments: PromptFragment[] = [];
 	/** `match` saw `REMATCH_ROOT/profile/.git`: session start runs one `profile sync` (DESIGN §20). */
 	let profilePresent = false;
 	let profileSynced = false;
@@ -810,6 +847,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
 			tracksCalls = next.some(h => h.mode === "stuck");
+			promptFragments = promptFragmentsOf(data);
 		} catch (error) {
 			log("warn", `match skipped for ${cwd}: ${errorText(error)}`);
 		}
@@ -1088,7 +1126,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			"rematch control plane: traces sessions, stages provisional skills/scripts/hooks grounded in traces, keeps or retires them by counters. " +
 			"operation = binary subcommand (doctor, status, library, why, digest, match, create, improve, activate, run, transfer, ship, mark, off, on, …); " +
 			'arguments = the remaining argv as separate strings, e.g. {"operation":"library","arguments":["ls"]}. Long work returns a job id; poll with status. ' +
-			"Approving scripts/hooks and uninstalling are reserved to the user (/rematch or the session-start digest).",
+			"Approving an entry's scripts, hook, subagent or prompt fragment, and uninstalling, are reserved to the user (/rematch or the session-start digest).",
 		parameters: z.object({ operation: z.enum(OPERATIONS), arguments: z.array(z.string()).optional() }),
 		approval: (params: unknown) => {
 			const p = isRecord(params) ? params : {};
@@ -1242,6 +1280,23 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			log("warn", `retrieve hook failed: ${errorText(error)}`);
 		}
 		return messages ? { messages: messages as typeof event.messages } : undefined;
+	});
+
+	// --- personal prompt fragments: main sessions only, fail open --------------------------------
+	// Handlers chain from the current base system prompt and may re-enter, so this one adds nothing
+	// to the session: it returns the base prompt with the block appended, every time.
+	pi.on("before_agent_start", async (event, ctx) => {
+		try {
+			if (!enabled || !isMain(ctx)) return undefined;
+			const ev = event as { reason?: string; systemPrompt?: unknown };
+			if (ev.reason === "revive") return undefined;
+			if (ctx.cwd !== loadedCwd) await reload(ctx.cwd, false);
+			const systemPrompt = appendPromptFragments(ev.systemPrompt, promptFragments);
+			return systemPrompt ? ({ systemPrompt } as never) : undefined;
+		} catch (error) {
+			log("warn", `prompt fragments failed: ${errorText(error)}`);
+			return undefined;
+		}
 	});
 
 	// --- trace events: fail open -----------------------------------------------------------------

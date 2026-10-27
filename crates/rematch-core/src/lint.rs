@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::library::{primary_doc, validate_fork_path, AGENTS_FRAGMENT, AGENT_MD, SKILL_MD};
-use crate::package::{router_bytes, SkillDoc, TRIGGER_RE};
+use crate::package::{SkillDoc, TRIGGER_RE};
 use crate::types::{Entry, HookMode, HookParams, HookRule, Kind, LessonTag, LintFinding, LintReport, Severity};
 
 /// Built-in rules, used when `improver/lint.toml` is missing; every key of a present
@@ -266,16 +266,19 @@ pub struct LintContext {
     pub transfer: bool,
 }
 
-/// Always-on bytes an entry dir contributes: its SKILL.md body (the router), an
+/// Always-on bytes an entry dir contributes: its SKILL.md `description` (omp lists every
+/// skill's description in the system prompt every session) and body (the router), an
 /// agent's `description` (omp lists it in the task tool every session; the body runs
 /// only inside the subagent) and its `AGENTS.fragment.md` (AGENTS.md is always on).
+/// A SKILL.md without parseable frontmatter counts whole.
 pub fn entry_always_on_bytes(dir: &Path) -> usize {
     let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
-    let skill = read(SKILL_MD).map_or(0, |t| router_bytes(&t));
-    let agent = read(AGENT_MD)
-        .and_then(|t| SkillDoc::parse(&t).ok())
-        .and_then(|d| d.get_str("description").map(str::len))
-        .unwrap_or(0);
+    let description = |d: &SkillDoc| d.get_str("description").map_or(0, str::len);
+    let skill = read(SKILL_MD).map_or(0, |t| match SkillDoc::parse(&t) {
+        Ok(d) => description(&d) + d.body.len(),
+        Err(_) => t.len(),
+    });
+    let agent = read(AGENT_MD).and_then(|t| SkillDoc::parse(&t).ok()).map_or(0, |d| description(&d));
     let fragment = read(AGENTS_FRAGMENT).map_or(0, |t| t.len());
     skill + agent + fragment
 }
@@ -486,7 +489,8 @@ pub fn lint_entry(dir: &Path, entry: &Entry, cfg: &LintConfig, ctx: &LintContext
         }
     }
 
-    // Always-on budget (router bodies, agent descriptions and AGENTS.md fragments of the branch).
+    // Always-on budget (skill descriptions and router bodies, agent descriptions and
+    // AGENTS.md fragments of the branch).
     let mine = entry_always_on_bytes(dir);
     if mine > 0 {
         let total = mine + ctx.branch_other_bytes;
@@ -855,18 +859,28 @@ mod tests {
     #[test]
     fn always_on_budget_counts_branch() {
         let (t, e) = good();
-        let mine = router_bytes(GOOD);
+        let mine = entry_always_on_bytes(t.path());
+        let body = SkillDoc::parse(GOOD).unwrap().body.len();
+        assert_eq!(mine, "Use when editing the ledger.".len() + body, "SKILL.md description and body count");
         let ctx = LintContext { branch_other_bytes: 8192 - mine, ..Default::default() };
         assert!(lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap().ok, "exactly at budget");
         let ctx = LintContext { branch_other_bytes: 8192 - mine + 1, ..Default::default() };
         let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
         assert_eq!(rules(&r), vec![("always_on".to_string(), Severity::Error)]);
 
+        // Same body, a longer description: the description alone pushes the branch over.
+        let ctx = LintContext { branch_other_bytes: 8192 - mine, ..Default::default() };
+        let longer = GOOD.replace("description: Use when editing the ledger.", "description: Use when editing the ledger or its migrations.");
+        write(t.path(), "SKILL.md", &longer);
+        assert_eq!(SkillDoc::parse(&longer).unwrap().body.len(), body);
+        let r = lint_entry(t.path(), &e, &LintConfig::default(), &ctx).unwrap();
+        assert_eq!(rules(&r), vec![("always_on".to_string(), Severity::Error)], "description bytes count: {:?}", r.findings);
+
         let b = tempfile::tempdir().unwrap();
-        write(b.path(), "one/SKILL.md", "---\nname: one\n---\n12345");
+        write(b.path(), "one/SKILL.md", "---\nname: one\ndescription: d\n---\n12345");
         write(b.path(), "two/SKILL.md", "abc");
         write(b.path(), "self/SKILL.md", "ignored");
-        assert_eq!(branch_always_on_bytes(b.path(), &b.path().join("self")), 8);
+        assert_eq!(branch_always_on_bytes(b.path(), &b.path().join("self")), 9);
     }
 
     #[test]

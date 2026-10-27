@@ -7,9 +7,10 @@
 //!   shared skills dir `REMATCH_ROOT/skills/` (`skills_cmd::sync_cwd`), which the plugin's
 //!   `skills/` links to, copies the agent entries into the plugin's `agents/`
 //!   (`skills_cmd::sync_plugin_agents`) and returns the digest (`systemMessage` +
-//!   `additionalContext`); `UserPromptSubmit` runs an approved `retrieve` hook and returns
-//!   its units as `additionalContext`; `SessionEnd` writes `session_shutdown` and, when
-//!   flagged, `pending/<sid>.json`.
+//!   `additionalContext`) plus the approved `AGENTS.fragment.md` texts of the matched
+//!   entries (`additionalContext`, after compaction too); `UserPromptSubmit` runs an approved
+//!   `retrieve` hook and returns its units as `additionalContext`; `SessionEnd` writes
+//!   `session_shutdown` and, when flagged, `pending/<sid>.json`.
 //! * `hook-check --harness claude-code` — `PreToolUse`: the approved `block`/`stuck` hooks
 //!   matched for the cwd, evaluated against the tool input (the `stuck` run read back from
 //!   the trace). A rejection is traced as `tool_blocked` and returned as exit 2 + reason.
@@ -347,11 +348,20 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
             if reload {
                 out["hookSpecificOutput"]["reloadSkills"] = json!(true);
             }
+            // The approved fragments are personal system-prompt text: given again after a
+            // compaction, which drops the earlier context. The digest yields them the room.
+            let personal = personal_instructions(ctx, &cwd);
+            let room = CONTEXT_CHARS.saturating_sub(personal.as_ref().map_or(0, |p| p.len() + 2));
+            let mut context = Vec::new();
             if source != "compact" {
-                if let Some((user, model)) = session_digest(ctx) {
+                if let Some((user, model)) = session_digest(ctx, room.min(DIGEST_CONTEXT_CHARS)) {
                     out["systemMessage"] = json!(user);
-                    out["hookSpecificOutput"]["additionalContext"] = json!(model);
+                    context.push(model);
                 }
+            }
+            context.extend(personal);
+            if !context.is_empty() {
+                out["hookSpecificOutput"]["additionalContext"] = json!(context.join("\n\n"));
             }
             if out.as_object().is_some_and(|o| o.len() > 1) || out["hookSpecificOutput"].as_object().is_some_and(|o| o.len() > 1) {
                 reply.stdout = Some(out);
@@ -493,17 +503,41 @@ fn plugin_root_env() -> Option<PathBuf> {
 }
 
 /// Characters of the digest shown to the user (`systemMessage`) and given to Claude
-/// (`additionalContext`); Claude Code caps each at 10,000.
+/// (`additionalContext`); Claude Code caps each at [`CONTEXT_CHARS`].
 const DIGEST_MESSAGE_CHARS: usize = 4_000;
 const DIGEST_CONTEXT_CHARS: usize = 9_000;
+/// Claude Code's cap on a hook's `additionalContext` (and `systemMessage`).
+const CONTEXT_CHARS: usize = 10_000;
+
+/// The line that introduces the approved fragments in `additionalContext`.
+const PERSONAL_INSTRUCTIONS: &str = "[rematch] Personal instructions (approved):";
+
+/// The approved `AGENTS.fragment.md` texts of the entries a session in `cwd` matches
+/// (`library::prompt_fragments` over the load-time match), rendered as every harness appends
+/// them to the system prompt (`library::render_fragments`) under [`PERSONAL_INSTRUCTIONS`].
+/// `None` when there are none; a failure is logged and skipped.
+fn personal_instructions(ctx: &AppCtx, cwd: &Path) -> Option<String> {
+    let repo = repo_of(cwd);
+    let fragments = library::list_for_match(&ctx.ledger, &ctx.paths, repo.as_deref(), cwd)
+        .and_then(|m| library::prompt_fragments(&ctx.ledger, &ctx.paths, &m.entries));
+    match fragments {
+        Ok(f) if !f.is_empty() => Some(format!("{PERSONAL_INSTRUCTIONS}\n\n{}", library::render_fragments(&f))),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("rematch: personal instructions skipped: {e:#}");
+            None
+        }
+    }
+}
 
 /// The session-start digest (`rematch digest`, which advances `digest.last`, as at omp's
 /// session start): new statuses, reviews, stale entries, transfer suggestions, and the
 /// approvals waiting — as a `systemMessage` for the user and `additionalContext` for Claude.
 /// Claude Code has no dialog, so each approval names the command that grants it; the context
 /// carries each approval's reason and diff, so Claude can show them when asked. `None` when
-/// there is nothing to say; a failed digest is logged and skipped.
-fn session_digest(ctx: &AppCtx) -> Option<(String, String)> {
+/// there is nothing to say; a failed digest is logged and skipped. The approvals' diffs stop
+/// at `context_chars` of model text.
+fn session_digest(ctx: &AppCtx, context_chars: usize) -> Option<(String, String)> {
     let d = match crate::digest::cmd_digest(ctx) {
         Ok(d) => d,
         Err(e) => {
@@ -544,7 +578,7 @@ fn session_digest(ctx: &AppCtx) -> Option<(String, String)> {
             a["reason"].as_str().unwrap_or_default().trim(),
             a["diff"].as_str().unwrap_or_default().trim_end(),
         );
-        if model.len() + block.len() > DIGEST_CONTEXT_CHARS {
+        if model.len() + block.len() > context_chars {
             model.push_str("\n\n(further approvals' diffs omitted: `rematch digest` prints them)");
             break;
         }

@@ -138,6 +138,8 @@ pub fn check(ctx: &AppCtx) -> Result<Vec<SplitOutcome>> {
             updated_at: 0,
             pinned: false,
             approved_scripts: vec![],
+            approved_fragment: None,
+            approved_agent: None,
             sibling_of: Some(e.id.clone()),
             status_since: None,
             status_note: Some(format!("family split of {}: harmed on {}", e.id, harmed.0)),

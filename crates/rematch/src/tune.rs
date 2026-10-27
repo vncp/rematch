@@ -489,6 +489,8 @@ pub fn check(ctx: &AppCtx, e: &Entry, p: &TuneProposal) -> Result<Prepared> {
         updated_at: 0,
         pinned: false,
         approved_scripts: vec![],
+        approved_fragment: None,
+        approved_agent: None,
         sibling_of: Some(e.id.clone()),
         status_since: None,
         status_note: Some(p.note()),

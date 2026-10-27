@@ -26,8 +26,8 @@ The reflection uses the models you configured; `rematch doctor --text` shows whi
 |---|---|
 | `/rematch status` | entries by status, pending flags, whether it is off |
 | `/rematch why` | for the last session: entries loaded, predicate hits, redirects and their class, counters |
-| `/rematch library` | every entry with its raw counts |
-| `/rematch digest` | staged, kept or retired since you last looked; approvals waiting |
+| `/rematch library` | every entry with its raw counts, what is pending approval, whether it carries a fragment that is active in your prompt, its fork path, and whether it is ready to ship (`team` or `fork`) |
+| `/rematch digest` | staged, kept or retired since you last looked; approvals waiting (one item per entry: scripts, hook, subagent, prompt text); entries ready to ship, as `ship <scope> <name>: <detail> → /rematch ship --scope <scope> --entry <id>`, shown once |
 | `rematch doctor --text` | omp version, model roles, plugin linked, ledger state |
 
 Read `why` when something surprises you. It shows exactly why an entry loaded or not (`glob hit · predicate miss`) and what the classifier called your redirect.

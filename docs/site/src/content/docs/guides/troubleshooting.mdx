@@ -20,6 +20,7 @@ codex: ok · ~/.agents/skills/rematch → shared dir
 profile: ok · origin git@…/profile.git · 0 ahead, 0 behind (last fetch) · launchd loaded
 lake: ok · lag 0 journal row(s) · index pinned 0.1.0 · bellwether 0.1.0 (/…/bellwether)
 built-ins: ok · context-unit-retrieval provisional, awaiting approval · tool-output-truncation … · stuck-detector …
+hooks: ok · N live · M from profile (inert here) · K orphan
 role rematch-editor: … (via …)
 …
 ledger: …/ledger.sqlite (schema 2)
@@ -41,9 +42,10 @@ Set up and broken includes:
 - `claude plugin validate` failing, or a Codex link pointing elsewhere;
 - profile conflicts, or a launchd plist written but not loaded;
 - a lake index pinned to another Bellwether, or a built-in never installed;
-- an extension listed in omp's lock but not loadable.
+- an extension listed in omp's lock but not loadable;
+- an orphan hook module: a file in `~/.omp/agent/extensions/rematch-hooks/` whose entry is not live and that the profile does not hold (delete the file). A module whose entry is only in the profile, approved on another machine, is inert here and listed, not a problem.
 
-`claude plugin validate` runs when `claude` is on `PATH` (`$CLAUDE_BIN` overrides); otherwise only static checks run, and the line says so. launchd is checked with `launchctl list com.vncp.rematch.profile-sync` once the plist exists (`$LAUNCHCTL_BIN` overrides). In JSON: `ready`, `problems`, and `harnesses.{omp, claude-code, codex, profile, lake, built-ins}`, each with `status` and `problems`.
+`claude plugin validate` runs when `claude` is on `PATH` (`$CLAUDE_BIN` overrides); otherwise only static checks run, and the line says so. launchd is checked with `launchctl list com.vncp.rematch.profile-sync` once the plist exists (`$LAUNCHCTL_BIN` overrides). In JSON: `ready`, `problems`, and `harnesses.{omp, claude-code, codex, profile, lake, built-ins, hooks}`, each with `status` and `problems`; `hooks` also has `dir`, `live`, `profile` and `orphan`.
 
 ## Nothing ever gets staged
 

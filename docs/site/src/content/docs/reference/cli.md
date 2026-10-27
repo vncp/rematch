@@ -461,7 +461,7 @@ Commands:
   rollback       Restore the predecessor of a kept skill or agent; retire the current one
   pin            
   unpin          
-  approve        One-tap approval of an entry's scripts or hook (or an `export:<id>` item)
+  approve        One-tap approval of everything of an entry that waits for it — scripts, hook, provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an `export:<id>` item
   decline        Decline an approval (retires the entry; `export:<id>` only suppresses the offer)
   set-fork-path  Set the repo-relative file `ship --scope fork` writes for an entry (and, with --repo, the fork checkout it goes to)
   export         Work → home export of invariant entries
@@ -568,7 +568,7 @@ Options:
 ### rematch library approve
 
 ```text
-One-tap approval of an entry's scripts or hook (or an `export:<id>` item)
+One-tap approval of everything of an entry that waits for it — scripts, hook, provisional agent, `AGENTS.fragment.md` as personal system-prompt text — or of an `export:<id>` item
 
 Usage: rematch library approve [OPTIONS] <ID>
 

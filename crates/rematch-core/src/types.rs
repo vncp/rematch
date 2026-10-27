@@ -269,6 +269,15 @@ pub struct Entry {
     /// Scripts approved for execution (relative paths inside the entry dir).
     #[serde(default)]
     pub approved_scripts: Vec<String>,
+    /// sha256 of `AGENTS.fragment.md` when its use as personal system-prompt text was
+    /// approved (`library approve`); a fragment whose sha differs is pending again
+    /// (`library::fragment_approved`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_fragment: Option<Sha256Hex>,
+    /// sha256 of `AGENT.md` without its `rematch:` block when the provisional subagent was
+    /// approved (`library::agent_approved`); only then does it load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_agent: Option<Sha256Hex>,
     /// Set when this entry was created under an existing one in a sibling slot.
     #[serde(default)]
     pub sibling_of: Option<EntryId>,

@@ -153,11 +153,6 @@ pub fn is_package(dir: &Path) -> bool {
     dir.join("SKILL.md").is_file() && (dir.join("units").is_dir() || dir.join("facts").is_dir())
 }
 
-/// Always-on bytes of a SKILL.md: the body without frontmatter.
-pub fn router_bytes(skill_md: &str) -> usize {
-    SkillDoc::parse(skill_md).map(|d| d.body.len()).unwrap_or(skill_md.len())
-}
-
 /// A trigger line: `Use when …`, `Use this skill whenever …`, `- **Use for …`.
 pub static TRIGGER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*(?:[-*]\s+)?(?:\*\*)?use (?:this skill |it )?(?:when|whenever|for|to|if|on)\b").unwrap()
@@ -491,7 +486,6 @@ mod tests {
         assert!(SkillDoc::parse("---\nname: x\n# never closed\n").is_err());
         let e = SkillDoc::parse("---\n---\nbody").unwrap();
         assert!(e.frontmatter.is_empty() && e.body == "body");
-        assert_eq!(router_bytes("---\nname: x\n---\n12345"), 5);
     }
 
     #[test]

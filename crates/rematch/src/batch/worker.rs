@@ -805,6 +805,8 @@ impl Cycle<'_> {
             pinned: false,
             hook: lesson.editor.hook.clone(),
             approved_scripts: Vec::new(),
+            approved_fragment: None,
+            approved_agent: None,
             sibling_of: None,
             status_since: None,
             status_note: None,

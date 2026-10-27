@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import rematch, {
+	appendPromptFragments,
 	CallHistory,
 	callKey,
 	changedPaths,
@@ -15,6 +16,8 @@ import rematch, {
 	hookFromModule,
 	loadedEntriesOf,
 	loadHook,
+	promptFragmentsOf,
+	renderPromptFragments,
 	RETRIEVAL_TYPE,
 	retrievalMessage,
 	retrievalQuery,
@@ -22,6 +25,7 @@ import rematch, {
 	subpathOf,
 	truncateToolResults,
 	truncationMarker,
+	withPromptBlock,
 } from "./index.ts";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rematch-ext-test-"));
@@ -281,6 +285,8 @@ type HostState = {
 	onApprove?: () => void;
 	/** `match` reports `profile_present` (REMATCH_ROOT/profile/.git exists). */
 	profilePresent?: boolean;
+	/** `match` reports `prompt_fragments` (approved personal AGENTS.fragment.md of the loaded entries). */
+	fragments?: unknown;
 	/** Answers for `git rev-parse --show-toplevel --verify -q HEAD` and `git remote get-url origin`. */
 	git?: { top: string; head?: string; remote?: string };
 };
@@ -327,7 +333,7 @@ async function host(name: string, state: HostState) {
 			execs.push(argv);
 			switch (argv[0]) {
 				case "match":
-					return ok({ entries: state.entries, hooks: state.hooks, profile_present: state.profilePresent === true });
+					return ok({ entries: state.entries, hooks: state.hooks, profile_present: state.profilePresent === true, prompt_fragments: state.fragments });
 				case "skills":
 					return ok({ added: [], pruned: [], total: 0, dirs: state.dirs ?? [], visible: state.visible ?? [], off: false });
 				case "library":
@@ -542,5 +548,55 @@ describe("factory", () => {
 		await h.fire("session_start");
 		await h.fire("session_start");
 		expect(h.execs.filter(a => a[0] === "profile")).toEqual([["profile", "sync", "--timeout", "8"]]);
+	});
+
+	describe("personal prompt fragments", () => {
+		const fragments = [
+			{ id: "a", name: "alpha", text: "\nUse alpha.\n\n" },
+			{ id: "b", name: "beta", text: "Use beta." },
+		];
+		const block = "## rematch: alpha\n\nUse alpha.\n\n## rematch: beta\n\nUse beta.";
+		const systemPromptOf = (r: unknown): unknown => (r && typeof r === "object" && "systemPrompt" in r ? r.systemPrompt : undefined);
+
+		test("appended to an array system prompt as one extra element, and to a string with a blank line", async () => {
+			const h = await host("fragments", { entries: [{ id: "a", predicate_hit: true }], hooks: [], fragments });
+			await h.fire("session_start");
+			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: ["base one", "base two"] }))).toEqual(["base one", "base two", block]);
+			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: "base" }))).toBe(`base\n\n${block}`);
+			// A re-entry sees the same base and answers the same: nothing accumulates.
+			expect(systemPromptOf(await h.fire("before_agent_start", { systemPrompt: ["base one", "base two"] }))).toEqual(["base one", "base two", block]);
+		});
+
+		test("no fragments, a subagent, or a revive leave the prompt alone", async () => {
+			const none = await host("fragments-none", { entries: [], hooks: [] });
+			expect(await none.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
+			const malformed = await host("fragments-malformed", { entries: [], hooks: [], fragments: [{ id: "a", name: "x" }, "nope", { id: "b", name: "y", text: "  " }] });
+			expect(await malformed.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
+
+			const sub = await host("fragments-sub", { entries: [], hooks: [], fragments });
+			sub.ctx.agent = { kind: "sub", name: "worker" };
+			expect(await sub.fire("before_agent_start", { systemPrompt: ["base"] })).toBeUndefined();
+
+			const revive = await host("fragments-revive", { entries: [], hooks: [], fragments });
+			expect(await revive.fire("before_agent_start", { reason: "revive", systemPrompt: ["base"] })).toBeUndefined();
+		});
+
+		test("a cwd change re-matches before the prompt is built", async () => {
+			const h = await host("fragments-cwd", { entries: [], hooks: [], fragments });
+			h.ctx.cwd = tmp;
+			await h.fire("before_agent_start", { systemPrompt: ["base"] });
+			expect(h.matches()).toEqual([process.cwd(), tmp]);
+		});
+
+		test("helpers keep well-formed fragments, render the ship heading, and reject odd prompts", () => {
+			expect(promptFragmentsOf({ prompt_fragments: [...fragments, { id: 1, name: "n", text: "t" }] })).toEqual(fragments);
+			expect(promptFragmentsOf({})).toEqual([]);
+			expect(renderPromptFragments([])).toBeNull();
+			expect(renderPromptFragments(fragments)).toBe(block);
+			expect(withPromptBlock(42, block)).toBeNull();
+			expect(appendPromptFragments("base", fragments)).toBe(`base\n\n${block}`);
+			expect(appendPromptFragments(["base"], fragments)).toEqual(["base", block]);
+			expect(appendPromptFragments(["base"], [])).toBeNull();
+		});
 	});
 });

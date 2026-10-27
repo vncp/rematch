@@ -38,7 +38,8 @@ The editor's `entry.stems` are used only when derivation yields nothing. The rat
 | **Count-time** | a finished trace | place hit, and file extensions overlap (or the entry has none), and at least min(2, stems) stems appear in the first 5 inputs or the files read |
 
 - A hook entry is active only once its approved module exists. Before approval it contributes nothing and never counts.
-- Provisional agents are listed in every session, with `predicate_hit` set only where they would count.
+- `match` also returns `prompt_fragments`: the approved `AGENTS.fragment.md` of the listed provisional, kept or pinned entries with a predicate hit, ordered by name, capped at the 8 KB always-on budget. The harness appends them to the system prompt.
+- Provisional agents are listed in every session once approved, with `predicate_hit` set only where they would count; an unapproved one is not listed.
 - Paths are tried as given and canonicalized (macOS `/tmp` → `/private/tmp`).
 - An entry whose version was recorded at session start counts only at that version.
 

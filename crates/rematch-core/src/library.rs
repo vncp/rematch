@@ -16,13 +16,19 @@
 //! - agents (kind `agent`: `AGENT.md` + `rematch.json`) take the same locations except
 //!   kept, which is `kept-agents/<name>/` with `AGENT.md` copied to
 //!   `<agent_dir>/agents/<name>.md` (with a profile: copied to `profile/agents/<name>.md`
-//!   and linked from there); a provisional agent is also linked as
-//!   `agents/<name>.md → <entry dir>/AGENT.md`, which omp discovers through the plugin's
-//!   `extension/agents → <root>/agents` symlink. Agent predecessors live in
+//!   and linked from there); a provisional agent, once approved ([`agent_approved`]), is
+//!   also linked as `agents/<name>.md → <entry dir>/AGENT.md`, which omp discovers through
+//!   the plugin's `extension/agents → <root>/agents` symlink. Agent predecessors live in
 //!   `predecessors/.agents/<name>/<version>/` (entry names never start with `.`).
 //!
 //! `pinned` is a flag (human-owned): automatic transitions refuse pinned entries; the
 //! entry keeps its status and location. `Status::Pinned` is accepted as a status too.
+//!
+//! One-tap approvals ([`pending_parts`], [`approve`]) gate what runs or reaches a prompt
+//! beyond a skill: scripts (mode 0755 once approved), a hook (its compiled module), a
+//! provisional agent (`approved_agent`: the sha of its AGENT.md) and `AGENTS.fragment.md` as
+//! personal system-prompt text (`approved_fragment`: its sha; [`prompt_fragments`]). An edit
+//! to an approved AGENT.md or fragment makes it pending again.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -42,7 +48,9 @@ pub const REMATCH_JSON: &str = "rematch.json";
 pub const HOOKS_README: &str = "README.md";
 pub const SKILL_MD: &str = "SKILL.md";
 pub const AGENT_MD: &str = "AGENT.md";
-/// Text an entry contributes to `<repo>/AGENTS.md`, only through `ship --scope team`.
+/// Text an entry contributes to `<repo>/AGENTS.md` through `ship --scope team` and, once
+/// approved ([`fragment_approved`]), to the system prompt of main sessions where the entry
+/// matches ([`prompt_fragments`]); the user's own AGENTS.md is never written.
 pub const AGENTS_FRAGMENT: &str = "AGENTS.fragment.md";
 /// `Origin::Import { source }` of the entries the binary ships (`rematch builtins`).
 pub const BUILTIN_SOURCE: &str = "builtin";
@@ -71,12 +79,18 @@ pub fn validate_fork_path(rel: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// What a one-tap approval enables.
+/// What a one-tap approval enables (one part of an entry; [`pending_parts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Approval {
+    /// Files under `scripts/` become executable.
     Scripts,
+    /// The hook rule is compiled into `rematch-hooks/<id>.ts`.
     Hook,
+    /// A provisional subagent loads (its staging link, Claude Code's plugin copy, `match`).
+    Agent,
+    /// `AGENTS.fragment.md` joins the system prompt of main sessions the entry matches.
+    Prompt,
 }
 
 /// Legal status transitions (SPEC "Statuses"). Same-status is a no-op and legal.
@@ -254,6 +268,36 @@ fn unlink_agent(paths: &RematchPaths, name: &str, dir: &Path) -> Result<()> {
         Err(_) if cfg!(not(unix)) => remove_link(&link),
         Err(_) => Ok(()),
     }
+}
+
+/// Remove `agents/<name>.md` while it is this entry's AGENT.md (a link to it, or a copy
+/// carrying its `rematch:` block without symlinks): a provisional agent that is not, or no
+/// longer, approved. `true` when removed.
+fn unlink_unapproved_agent(paths: &RematchPaths, e: &Entry) -> Result<bool> {
+    let link = agent_link(paths, &e.name);
+    let ours = std::fs::read_link(&link).is_ok_and(|t| t == e.path.join(AGENT_MD))
+        || std::fs::read_to_string(&link)
+            .ok()
+            .and_then(|t| SkillDoc::parse(&t).ok())
+            .and_then(|d| d.rematch())
+            .is_some_and(|b| b.id == e.id);
+    if ours {
+        remove_link(&link)?;
+    }
+    Ok(ours)
+}
+
+/// Remove the staging links of provisional agents that are not approved ([`agent_approved`]):
+/// links made before approvals existed and agents whose AGENT.md changed since. `skills sync`
+/// runs it; stage and status moves gate their own entry. Returns the names unlinked.
+pub fn unlink_unapproved_agents(ledger: &Ledger, paths: &RematchPaths) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })? {
+        if e.kind == Kind::Agent && !agent_approved(&e) && unlink_unapproved_agent(paths, &e)? {
+            out.push(e.name);
+        }
+    }
+    Ok(out)
 }
 
 fn write_kept_agent(paths: &RematchPaths, e: &Entry) -> Result<()> {
@@ -466,21 +510,23 @@ pub fn content_sha256(dir: &Path) -> Result<Sha256Hex> {
             continue;
         }
         let bytes = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
-        let sha = if rel == SKILL_MD || rel == AGENT_MD {
-            match std::str::from_utf8(&bytes).ok().and_then(|t| SkillDoc::parse(t).ok()) {
-                Some(mut doc) => {
-                    doc.frontmatter.remove("rematch");
-                    sha256_hex(doc.render().as_bytes())
-                }
-                None => sha256_hex(&bytes),
-            }
-        } else {
-            sha256_hex(&bytes)
-        };
+        let sha = if rel == SKILL_MD || rel == AGENT_MD { doc_sha(&bytes) } else { sha256_hex(&bytes) };
         files.push((rel, sha));
     }
     files.sort();
     Ok(sha256_hex(serde_json::json!({ "files": files }).to_string().as_bytes()))
+}
+
+/// sha256 of a SKILL.md / AGENT.md without its `rematch:` frontmatter block (machine-local
+/// id, status, version), so a status move leaves it unchanged; unparseable text hashes whole.
+fn doc_sha(bytes: &[u8]) -> Sha256Hex {
+    match std::str::from_utf8(bytes).ok().and_then(|t| SkillDoc::parse(t).ok()) {
+        Some(mut doc) => {
+            doc.frontmatter.remove("rematch");
+            sha256_hex(doc.render().as_bytes())
+        }
+        None => sha256_hex(bytes),
+    }
 }
 
 fn persist(ledger: &Ledger, e: &Entry) -> Result<()> {
@@ -501,7 +547,8 @@ fn apply_script_modes(e: &Entry) -> Result<()> {
 /// Stage a draft or provisional entry: write its files (edits relative to the entry
 /// dir), the SKILL.md (agents: AGENT.md) frontmatter with the `rematch:` block merged,
 /// `hook.json` for hooks and `rematch.json`; scripts get mode 0644; a provisional agent
-/// gets its staging link. Re-staging the same id overwrites; a different entry already
+/// gets its staging link once approved ([`agent_approved`]; an unapproved one loses a link it
+/// had). Re-staging the same id overwrites; a different entry already
 /// at the location is an error.
 pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit]) -> Result<Entry> {
     validate_name(&entry.name)?;
@@ -573,7 +620,11 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     persist(ledger, &e)?;
     apply_script_modes(&e)?;
     if agent && e.status == Status::Provisional {
-        link_agent(paths, &e)?;
+        if agent_approved(&e) {
+            link_agent(paths, &e)?;
+        } else {
+            unlink_unapproved_agent(paths, &e)?;
+        }
     }
     sync_shared_skills(ledger, paths, None)?;
     Ok(e)
@@ -651,7 +702,7 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     apply_script_modes(&e)?;
     if agent {
         match to {
-            Status::Provisional => link_agent(paths, &e)?,
+            Status::Provisional if agent_approved(&e) => link_agent(paths, &e)?,
             Status::Kept | Status::Pinned => write_kept_agent(paths, &e)?,
             _ => {}
         }
@@ -820,14 +871,95 @@ pub fn disable(ledger: &Ledger, paths: &RematchPaths, id: &str, reason: &str) ->
     transition(ledger, paths, e, Status::Retired, Some(&format!("disabled: {reason}")))
 }
 
-/// Declined approval retires the entry (SPEC "Statuses": retired ← approval declined).
-pub fn decline(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) -> Result<Entry> {
+/// Declined approval retires the entry (SPEC "Statuses": retired ← approval declined); `what`
+/// is the parts that were pending, named in the status note.
+pub fn decline(ledger: &Ledger, paths: &RematchPaths, id: &str, what: &[Approval]) -> Result<Entry> {
     let e = get(ledger, id)?;
-    let what = match what {
-        Approval::Scripts => "scripts",
-        Approval::Hook => "hook",
+    let note = match what {
+        [] => "approval declined".to_string(),
+        parts => format!("approval declined ({})", parts_label(parts)),
     };
-    transition(ledger, paths, e, Status::Retired, Some(&format!("approval declined ({what})")))
+    transition(ledger, paths, e, Status::Retired, Some(&note))
+}
+
+/// Parts as the digest names them: `scripts`, `hook`, `agent`, `prompt` joined with `+`.
+pub fn parts_label(parts: &[Approval]) -> String {
+    parts.iter().map(crate::ledger::enum_str).collect::<Vec<_>>().join("+")
+}
+
+/// Whether rematch owns the entry's directory: it lives under REMATCH_ROOT, or it is a kept
+/// copy whose SKILL.md carries this entry's `rematch:` block. Hand-written skills registered
+/// by `improve`/`import --forge` (even under `~/.omp/agent/skills`) are not.
+pub fn owns_dir(paths: &RematchPaths, e: &Entry) -> bool {
+    if e.path.starts_with(&paths.root) {
+        return true;
+    }
+    std::fs::read_to_string(e.path.join(SKILL_MD))
+        .ok()
+        .and_then(|t| SkillDoc::parse(&t).ok())
+        .and_then(|d| d.rematch())
+        .is_some_and(|b| b.id == e.id)
+}
+
+/// Files under the entry's `scripts/` that are not in `approved_scripts`, as
+/// `(relative path with '/', file)`, sorted.
+pub fn unapproved_scripts(e: &Entry) -> Vec<(String, PathBuf)> {
+    files_under(&e.path.join("scripts"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.strip_prefix(&e.path).unwrap_or(&p).to_string_lossy().replace('\\', "/"), p))
+        .filter(|(rel, _)| !e.approved_scripts.contains(rel))
+        .collect()
+}
+
+/// sha256 of the entry's AGENT.md without its `rematch:` block (status moves rewrite that
+/// block; they do not change what was approved). `None` without the file.
+fn agent_sha(dir: &Path) -> Option<Sha256Hex> {
+    std::fs::read(dir.join(AGENT_MD)).ok().map(|b| doc_sha(&b))
+}
+
+/// sha256 of the entry's `AGENTS.fragment.md`; `None` without the file.
+fn fragment_sha(dir: &Path) -> Option<Sha256Hex> {
+    std::fs::read(dir.join(AGENTS_FRAGMENT)).ok().map(|b| sha256_hex(&b))
+}
+
+/// The entry's `AGENTS.fragment.md` is the text approved for the personal system prompt
+/// (its sha equals `approved_fragment`).
+pub fn fragment_approved(e: &Entry) -> bool {
+    e.approved_fragment.is_some() && fragment_sha(&e.path) == e.approved_fragment
+}
+
+/// The entry's AGENT.md is the one approved (`approved_agent`: its sha without the
+/// `rematch:` block).
+pub fn agent_approved(e: &Entry) -> bool {
+    e.approved_agent.is_some() && agent_sha(&e.path) == e.approved_agent
+}
+
+/// Every part of a provisional, kept or pinned entry that waits for the one-tap approval,
+/// in the order scripts, hook, agent, prompt: unapproved files under `scripts/` (rematch-owned
+/// dirs only, [`owns_dir`]), a hook without its compiled module ([`hook_active`]), a
+/// provisional agent whose AGENT.md is not approved (kept and pinned agents load as they are),
+/// and an `AGENTS.fragment.md` (rematch-owned dirs only) that is not approved. Lessons and
+/// entries that cannot load have none.
+pub fn pending_parts(paths: &RematchPaths, e: &Entry) -> Vec<Approval> {
+    let mut out = Vec::new();
+    if e.kind == Kind::Lesson || !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
+        return out;
+    }
+    let owned = owns_dir(paths, e);
+    if owned && !unapproved_scripts(e).is_empty() {
+        out.push(Approval::Scripts);
+    }
+    if !hook_active(paths, e) {
+        out.push(Approval::Hook);
+    }
+    if e.kind == Kind::Agent && e.status == Status::Provisional && !agent_approved(e) {
+        out.push(Approval::Agent);
+    }
+    if owned && e.path.join(AGENTS_FRAGMENT).is_file() && !fragment_approved(e) {
+        out.push(Approval::Prompt);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -838,9 +970,12 @@ struct ApprovalRecord<'a> {
     at: UnixMs,
 }
 
-/// One-tap approval: scripts become 0755 / the hook is compiled into
-/// `<agent_dir>/extensions/rematch-hooks/<id>.ts`. Records a receipt whose certificate
-/// is the blob of the approval record (file hashes).
+/// One-tap approval of one part ([`pending_parts`]): scripts become 0755; the hook is
+/// compiled into `<agent_dir>/extensions/rematch-hooks/<id>.ts`; an agent's AGENT.md sha is
+/// recorded and, while provisional, its staging link made; the `AGENTS.fragment.md` sha is
+/// recorded, so the fragment joins the system prompt of main sessions where the entry
+/// matches ([`prompt_fragments`]). Records a receipt whose certificate is the blob of the
+/// approval record (file hashes).
 pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) -> Result<Receipt> {
     let mut e = get(ledger, id)?;
     if matches!(e.status, Status::Retired | Status::Dormant | Status::Stale | Status::Draft) {
@@ -880,11 +1015,27 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) 
             }
             hashed.push((file.to_string_lossy().to_string(), crate::ledger::sha256_hex(module.as_bytes())));
         }
+        Approval::Agent => {
+            if e.kind != Kind::Agent {
+                bail!("entry {} is not an agent", e.id);
+            }
+            let sha = agent_sha(&e.path).ok_or_else(|| anyhow!("entry {} has no {AGENT_MD}", e.id))?;
+            hashed.push((AGENT_MD.to_string(), sha.clone()));
+            e.approved_agent = Some(sha);
+        }
+        Approval::Prompt => {
+            let sha = fragment_sha(&e.path).ok_or_else(|| anyhow!("entry {} has no {AGENTS_FRAGMENT}", e.id))?;
+            hashed.push((AGENTS_FRAGMENT.to_string(), sha.clone()));
+            e.approved_fragment = Some(sha);
+        }
     }
     let now = now_ms();
     e.updated_at = now;
     persist(ledger, &e)?;
     apply_script_modes(&e)?;
+    if what == Approval::Agent && e.status == Status::Provisional {
+        link_agent(paths, &e)?;
+    }
     let record = ApprovalRecord { entry: &e.id, what, files: hashed, at: now };
     let cert = ledger.put_blob(serde_json::to_string(&record)?.as_bytes())?;
     let receipt = Receipt { certificate: cert, entry: e.id.clone(), activation: Activation::Prompted };
@@ -957,7 +1108,9 @@ fn write_hooks_readme(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_hook(paths: &RematchPaths, id: &str) -> Result<()> {
+/// Remove an entry's compiled hook (`rematch-hooks/<id>.ts` and, with a profile, the
+/// `profile/hooks/<id>.ts` it links to): what retiring, dormancy and staleness undo.
+pub fn remove_hook(paths: &RematchPaths, id: &str) -> Result<()> {
     remove_link(&paths.hooks_dir().join(format!("{id}.ts")))?;
     remove_link(&crate::profile::hooks_dir(paths).join(format!("{id}.ts")))
 }
@@ -1015,10 +1168,10 @@ fn provisional_hit(paths: &RematchPaths, e: &Entry, place: &Place) -> bool {
 /// provisional non-agent, active ([`hook_active`]) entries' predicates match the place
 /// ([`Place::locate`]: the repo's remote and the cwd's subpath, else the repo (else cwd)
 /// against the glob; its declared domain gates entries that carry one). `entries` lists what
-/// will load — provisional entries of contributed
-/// branches, every provisional agent (omp discovers them through the plugin root in
-/// every session) and every kept/pinned entry — with their glob hit (false for an
-/// unapproved hook, which must not count). `hooks` lists approved hook modules of
+/// will load — provisional entries of contributed branches, every approved provisional agent
+/// ([`agent_approved`]; omp discovers them through the plugin root in every session) and
+/// every kept/pinned entry — with their glob hit (false for an unapproved hook, which must
+/// not count). `hooks` lists approved hook modules of
 /// loadable, matching entries. `skill_dirs` stays in the payload for compatibility;
 /// harnesses load skills from the shared dir ([`sync_shared_skills`]). `domain` is the
 /// place's declared domain (`domain::place_domain`).
@@ -1056,7 +1209,9 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         .map(|s| ledger.list_entries(&EntryFilter { status: Some(s), ..Default::default() }))
         .collect::<Result<Vec<_>>>()?
         .concat();
-    let loaded = provisional.iter().filter(|e| e.kind == Kind::Agent || branches.contains(&e.branch.as_str()));
+    let loaded = provisional
+        .iter()
+        .filter(|e| if e.kind == Kind::Agent { agent_approved(e) } else { branches.contains(&e.branch.as_str()) });
     for e in loaded.chain(kept.iter()) {
         let hit = matches_place(&e.predicate, &place) && hook_active(paths, e);
         out.entries.push(MatchedEntry {
@@ -1073,6 +1228,57 @@ pub fn list_for_match(ledger: &Ledger, paths: &RematchPaths, repo: Option<&Path>
         }
     }
     Ok(out)
+}
+
+/// An approved `AGENTS.fragment.md` of a matched entry: personal system-prompt text
+/// ([`render_fragments`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptFragment {
+    pub id: EntryId,
+    pub name: String,
+    /// The fragment, trimmed.
+    pub text: String,
+}
+
+/// The personal system-prompt text of a match: the approved ([`fragment_approved`])
+/// `AGENTS.fragment.md` of every listed entry with a predicate hit that is provisional, kept
+/// or pinned, by name. Their total text stays within the lint always-on budget
+/// (`limits.always_on_bytes` of `improver/lint.toml`, else the built-in 8192 B); a fragment
+/// that would exceed it is dropped.
+pub fn prompt_fragments(ledger: &Ledger, paths: &RematchPaths, entries: &[MatchedEntry]) -> Result<Vec<PromptFragment>> {
+    let mut out = Vec::new();
+    for me in entries {
+        if !me.predicate_hit || me.kind == Kind::Lesson || !matches!(me.status, Status::Provisional | Status::Kept | Status::Pinned) {
+            continue;
+        }
+        let Some(e) = ledger.get_entry(&me.id)? else { continue };
+        let Ok(bytes) = std::fs::read(e.path.join(AGENTS_FRAGMENT)) else { continue };
+        if e.approved_fragment.as_deref() != Some(sha256_hex(&bytes).as_str()) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes).trim().to_string();
+        if !text.is_empty() {
+            out.push(PromptFragment { id: e.id, name: e.name, text });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    let budget = crate::lint::LintConfig::load(&paths.improver.join("lint.toml")).unwrap_or_default().limits.always_on_bytes;
+    let mut used = 0;
+    out.retain(|f| {
+        let fits = used + f.text.len() <= budget;
+        if fits {
+            used += f.text.len();
+        }
+        fits
+    });
+    Ok(out)
+}
+
+/// Fragments as system-prompt text, identical in every harness: `## rematch: <name>`, a blank
+/// line and the text per fragment (the heading `ship --scope team` gives the AGENTS.md
+/// section), joined by a blank line.
+pub fn render_fragments(fragments: &[PromptFragment]) -> String {
+    fragments.iter().map(|f| format!("## rematch: {}\n\n{}", f.name, f.text.trim())).collect::<Vec<_>>().join("\n\n")
 }
 
 /// What [`sync_shared_skills`] did to `REMATCH_ROOT/skills/` (DESIGN §16 "Shared skills").
@@ -1682,7 +1888,8 @@ mod tests {
         assert_eq!(m.skill_dirs, vec![x.paths.staging.join("repo")]);
         assert!(m.entries.iter().any(|e| e.id == "h1" && e.predicate_hit), "{m:?}");
 
-        let d = decline(&x.ledger, &x.paths, "h1", Approval::Hook).unwrap();
+        let d = decline(&x.ledger, &x.paths, "h1", &[Approval::Hook]).unwrap();
+        assert_eq!(d.status_note.as_deref(), Some("approval declined (hook)"));
         assert_eq!(d.status, Status::Retired);
         assert!(!x.paths.hooks_dir().join("h1.ts").exists(), "retire removes the compiled hook");
         assert!(approve(&x.ledger, &x.paths, "h1", Approval::Hook).is_err());
@@ -1691,6 +1898,60 @@ mod tests {
         bad.hook.as_mut().unwrap().pass_condition = " ".into();
         stage(&x.ledger, &x.paths, &bad, &[]).unwrap();
         assert!(approve(&x.ledger, &x.paths, "h2", Approval::Hook).is_err());
+    }
+
+    #[test]
+    fn fragment_approval_feeds_prompt_fragments_until_the_fragment_changes() {
+        let x = env();
+        let here = |x: &Env| list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
+        let fragment = "Run the crate's tests before committing.\n\n### Why\n\nCI runs them.\n";
+        let e = stage(
+            &x.ledger,
+            &x.paths,
+            &entry("f1", "tests-first", "repo", Status::Provisional),
+            &[w("scripts/run.sh", "echo ok\n"), w(AGENTS_FRAGMENT, fragment)],
+        )
+        .unwrap();
+        let parts = pending_parts(&x.paths, &e);
+        assert_eq!((parts.clone(), parts_label(&parts)), (vec![Approval::Scripts, Approval::Prompt], "scripts+prompt".to_string()));
+        assert!(prompt_fragments(&x.ledger, &x.paths, &here(&x).entries).unwrap().is_empty(), "nothing before approval");
+
+        for part in parts {
+            approve(&x.ledger, &x.paths, "f1", part).unwrap();
+        }
+        assert_eq!(x.ledger.list_receipts(Some("f1")).unwrap().len(), 2, "one receipt per part");
+        let e = x.ledger.get_entry("f1").unwrap().unwrap();
+        assert!(pending_parts(&x.paths, &e).is_empty() && fragment_approved(&e));
+        assert_eq!(load_entry(&e.path).unwrap().approved_fragment, e.approved_fragment, "rematch.json carries it");
+        let got = prompt_fragments(&x.ledger, &x.paths, &here(&x).entries).unwrap();
+        let want = PromptFragment { id: "f1".into(), name: "tests-first".into(), text: fragment.trim().into() };
+        assert_eq!(got, vec![want.clone()]);
+        assert_eq!(render_fragments(&got), format!("## rematch: tests-first\n\n{}", fragment.trim()));
+        let elsewhere = list_for_match(&x.ledger, &x.paths, Some(Path::new("/elsewhere")), Path::new("/elsewhere")).unwrap();
+        assert!(prompt_fragments(&x.ledger, &x.paths, &elsewhere.entries).unwrap().is_empty(), "no predicate hit, no text");
+
+        // kept: the approval moves with the files
+        let kept = set_status(&x.ledger, &x.paths, "f1", Status::Kept, None).unwrap();
+        assert!(fragment_approved(&kept));
+        assert_eq!(prompt_fragments(&x.ledger, &x.paths, &here(&x).entries).unwrap(), vec![want.clone()]);
+
+        // a second approved fragment sorts by name; the budget drops what does not fit
+        let other = "Short rule.\n";
+        stage(&x.ledger, &x.paths, &entry("f2", "alpha-rule", "repo", Status::Provisional), &[w(AGENTS_FRAGMENT, other)]).unwrap();
+        approve(&x.ledger, &x.paths, "f2", Approval::Prompt).unwrap();
+        let names = |x: &Env| prompt_fragments(&x.ledger, &x.paths, &here(x).entries).unwrap().into_iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(names(&x), vec!["alpha-rule", "tests-first"]);
+        std::fs::write(x.paths.improver.join("lint.toml"), format!("[limits]\nalways_on_bytes = {}\n", other.trim().len() + 1)).unwrap();
+        assert_eq!(names(&x), vec!["alpha-rule"], "over the always-on budget: dropped");
+        std::fs::remove_file(x.paths.improver.join("lint.toml")).unwrap();
+
+        // an edit makes it pending again and drops it from the prompt
+        std::fs::write(kept.path.join(AGENTS_FRAGMENT), "Changed rule.\n").unwrap();
+        let edited = x.ledger.get_entry("f1").unwrap().unwrap();
+        assert!(!fragment_approved(&edited));
+        assert_eq!(pending_parts(&x.paths, &edited), vec![Approval::Prompt]);
+        assert_eq!(names(&x), vec!["alpha-rule"]);
+        assert!(approve(&x.ledger, &x.paths, "f1", Approval::Agent).is_err(), "not an agent");
     }
 
     #[test]
@@ -1898,6 +2159,14 @@ mod tests {
         assert_eq!(a1.path, dir);
         assert!(!dir.join("SKILL.md").exists(), "an agent entry is AGENT.md + rematch.json");
         let link = agent_link(&x.paths, "log-triage");
+        // unapproved: no staging link, not listed by match, offered for approval
+        assert!(std::fs::symlink_metadata(&link).is_err(), "a provisional agent loads only once approved");
+        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
+        assert!(m.entries.is_empty(), "{m:?}");
+        assert_eq!(pending_parts(&x.paths, &a1), vec![Approval::Agent]);
+        let rc = approve(&x.ledger, &x.paths, "a1", Approval::Agent).unwrap();
+        assert_eq!(rc.activation, Activation::Prompted);
+        assert!(pending_parts(&x.paths, &x.ledger.get_entry("a1").unwrap().unwrap()).is_empty());
         assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("AGENT.md"));
         let doc = SkillDoc::parse(&read(&link)).unwrap();
         assert_eq!(doc.get_str("name"), Some("log-triage"));
@@ -1952,12 +2221,25 @@ mod tests {
         let link = agent_link(&x.paths, "draft-agent");
         assert!(std::fs::symlink_metadata(&link).is_err(), "drafts never load");
         let p = activate_draft(&x.ledger, &x.paths, "draft-agent").unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "activated, not yet approved");
+        approve(&x.ledger, &x.paths, "d1", Approval::Agent).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), p.path.join("AGENT.md"));
         let d = set_status(&x.ledger, &x.paths, "d1", Status::Dormant, None).unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err());
         let back = set_status(&x.ledger, &x.paths, "d1", Status::Provisional, None).unwrap();
         assert_ne!(d.path, back.path);
+        assert_eq!(std::fs::read_link(&link).unwrap(), back.path.join("AGENT.md"), "the approval survives status moves");
+        // an edited AGENT.md is pending again: the next sync unlinks it, approving relinks it
+        std::fs::write(back.path.join("AGENT.md"), agent_md("draft-agent", "edited")).unwrap();
+        let edited = x.ledger.get_entry("d1").unwrap().unwrap();
+        assert!(!agent_approved(&edited));
+        assert_eq!(pending_parts(&x.paths, &edited), vec![Approval::Agent]);
+        assert_eq!(unlink_unapproved_agents(&x.ledger, &x.paths).unwrap(), vec!["draft-agent".to_string()]);
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(list_for_match(&x.ledger, &x.paths, None, Path::new("/w/repo")).unwrap().entries.is_empty());
+        approve(&x.ledger, &x.paths, "d1", Approval::Agent).unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), back.path.join("AGENT.md"));
+        assert!(unlink_unapproved_agents(&x.ledger, &x.paths).unwrap().is_empty());
         disable(&x.ledger, &x.paths, "d1", "noisy").unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err(), "retired agents unload");
 

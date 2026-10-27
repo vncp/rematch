@@ -360,10 +360,28 @@ fn scripts_wait_for_the_one_tap_approval() {
     assert_eq!(a["kind"], "scripts");
     assert!(a["diff"].as_str().unwrap().contains("cargo test"), "{a}");
     let r = env.run(&["library", "approve", &id]);
-    assert_eq!(r["receipt"]["entry"], id.as_str());
+    assert_eq!((r["receipts"][0]["entry"].as_str(), r["approved"].clone()), (Some(id.as_str()), json!(["scripts"])), "{r}");
     assert_eq!(std::fs::metadata(&script_path).unwrap().permissions().mode() & 0o777, 0o755);
     let g2 = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
     assert!(g2["approvals"].as_array().unwrap().iter().all(|a| a["id"] != id.as_str()));
+}
+
+#[test]
+fn disabling_a_foreign_entry_removes_its_compiled_hook() {
+    let env = Env::new();
+    let dir = env.agent.join("skills/ledger-helper");
+    std::fs::create_dir_all(&dir).unwrap();
+    let md = "---\nname: ledger-helper\ndescription: Use when editing the ledger module.\n---\n\nUse when editing the ledger module.\n";
+    std::fs::write(dir.join("SKILL.md"), md).unwrap();
+    let id = env.run(&["improve", "ledger-helper"])["entry"].as_str().unwrap().to_string();
+    // a module for that id (synced from another machine's profile, or left behind)
+    let hook = env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts"));
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "export default { id: \"x\", mode: \"block\" };\n").unwrap();
+    let d = env.run(&["library", "disable", &id]);
+    assert_eq!(d["entry"]["status"], "retired", "{d}");
+    assert!(!hook.exists(), "the compiled hook goes with the entry");
+    assert_eq!(std::fs::read_to_string(dir.join("SKILL.md")).unwrap(), md, "a foreign entry's files stay");
 }
 
 #[test]
@@ -487,12 +505,12 @@ fn doctor_reports_every_harness_and_ready() {
     // Nothing but omp: the others are "not set up", never problems.
     let d = doctor(&claude_ok, &launchctl_yes);
     assert_eq!(d["ready"], true, "{d}");
-    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("pi", "not set up"), ("opencode", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok")] {
+    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("pi", "not set up"), ("opencode", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok"), ("hooks", "not set up")] {
         assert_eq!(status(&d, h), s, "{h}: {d}");
     }
     let lines = text(&d);
-    let firsts: Vec<&str> = lines.iter().take(8).map(|l| l.split(':').next().unwrap()).collect();
-    assert_eq!(firsts, ["omp", "claude-code", "codex", "pi", "opencode", "profile", "lake", "built-ins"], "one line per harness, first: {lines:#?}");
+    let firsts: Vec<&str> = lines.iter().take(9).map(|l| l.split(':').next().unwrap()).collect();
+    assert_eq!(firsts, ["omp", "claude-code", "codex", "pi", "opencode", "profile", "lake", "built-ins", "hooks"], "one line per harness, first: {lines:#?}");
     assert_eq!(lines.last().unwrap(), "ready: true");
 
     // Claude Code's plugin, Codex's link, a profile, the lake.
@@ -535,6 +553,43 @@ fn doctor_reports_every_harness_and_ready() {
     assert!(problems[0].contains("claude plugin validate") && problems[0].contains("invalid manifest"), "{problems:#?}");
     assert!(problems[2].contains("launchctl load -w"), "{problems:#?}");
     assert_eq!(text(&d).last().unwrap(), "ready: false (3 problem(s))");
+}
+
+/// `doctor`'s hooks block: a compiled module no live local entry owns is an orphan (a
+/// problem); one that `profile/hooks/` also holds (approved on another machine) is
+/// information only; an approved entry's module is live.
+#[test]
+fn doctor_reports_orphan_hook_modules() {
+    let env = Env::new();
+    let hooks = env.agent.join("extensions/rematch-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::create_dir_all(env.root.join("profile/hooks")).unwrap();
+    let module = "export default { id: \"x\", mode: \"block\" };\n";
+    std::fs::write(hooks.join("README.md"), "not a module\n").unwrap();
+    std::fs::write(hooks.join("gone-entry.ts"), module).unwrap();
+    std::fs::write(hooks.join("other-machine.ts"), module).unwrap();
+    std::fs::write(env.root.join("profile/hooks/other-machine.ts"), module).unwrap();
+
+    let d = env.run(&["doctor"]);
+    let h = &d["harnesses"]["hooks"];
+    assert_eq!(h["status"], "problem", "{d}");
+    assert_eq!((h["live"].clone(), h["profile"].clone()), (json!([]), json!(["other-machine"])), "{h}");
+    assert_eq!(h["orphan"], json!([hooks.join("gone-entry.ts")]), "{h}");
+    let problems: Vec<&str> = d["problems"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    let want = format!("orphan hook module {}: no live entry; delete the file", hooks.join("gone-entry.ts").display());
+    assert!(problems.contains(&want.as_str()), "{problems:#?}");
+    assert!(!problems.iter().any(|p| p.contains("other-machine")), "a profile module is not a problem: {problems:#?}");
+
+    // the orphan deleted and a built-in hook approved: live, profile, no problem
+    std::fs::remove_file(hooks.join("gone-entry.ts")).unwrap();
+    let g = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
+    let stuck = g["approvals"].as_array().unwrap().iter().find(|a| a["name"] == "stuck-detector").expect("built-in offered")["id"].clone();
+    env.run(&["library", "approve", stuck.as_str().unwrap()]);
+    let d = env.run(&["doctor"]);
+    let h = &d["harnesses"]["hooks"];
+    assert_eq!(h["status"], "ok", "{d}");
+    assert_eq!((h["live"].clone(), h["profile"].clone(), h["orphan"].clone()), (json!([stuck]), json!(["other-machine"]), json!([])), "{h}");
+    assert!(d["lines"].as_array().unwrap().iter().any(|l| l == "hooks: ok · 1 live · 1 from profile (inert here) · 0 orphan"), "{d}");
 }
 
 #[test]

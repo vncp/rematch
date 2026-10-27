@@ -513,6 +513,18 @@ fn agent_entries_are_copied_into_the_plugin() {
     env.run(&["activate", "log-triage", "--unverified"]);
     let agents = plugin_root(&env).join("agents");
     let copy = agents.join("log-triage.md");
+    let sync = || {
+        let mut c = env.cmd(&["skills", "sync", "--harness", "claude-code"]);
+        c.env("CLAUDE_PLUGIN_ROOT", plugin_root(&env));
+        let (v, code) = env.run_cmd(c);
+        assert_eq!(code, 0, "{v}");
+        v
+    };
+
+    // A provisional agent is copied only once approved.
+    sync();
+    assert!(std::fs::symlink_metadata(&copy).is_err(), "not approved: not copied");
+    env.run(&["library", "approve", &id]);
 
     // The first session copies it as a real file in Claude Code's agent format (omp's `@smol`
     // role and tool names do not carry over as they are). Claude Code read its agents before
@@ -538,10 +550,48 @@ fn agent_entries_are_copied_into_the_plugin() {
     // in the same directory is never touched.
     std::fs::write(agents.join("mine.md"), "---\nname: mine\ndescription: the user's\n---\nbody\n").unwrap();
     env.run(&["library", "disable", &id]);
-    let mut c = env.cmd(&["skills", "sync", "--harness", "claude-code"]);
-    c.env("CLAUDE_PLUGIN_ROOT", plugin_root(&env));
-    let (v, code) = env.run_cmd(c);
-    assert_eq!(code, 0, "{v}");
+    let v = sync();
     assert_eq!(v["data"]["agents"]["pruned"], json!(["log-triage.md"]), "{v}");
     assert!(!copy.exists() && agents.join("mine.md").is_file() && !agents.join(".rematch").exists());
+}
+
+#[test]
+fn approved_fragments_reach_session_start_and_survive_compaction() {
+    let env = Env::new();
+    let d = env.run(&[
+        "create",
+        "crate-tests-first",
+        "--from",
+        "description",
+        "--description",
+        "run crate tests before committing",
+        "--editor",
+        &script("editor-fragment.sh"),
+    ]);
+    let id = d["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "crate-tests-first", "--unverified"]);
+    let heading = "[rematch] Personal instructions (approved):";
+    let context = |o: &Out| -> String {
+        let v: Value = serde_json::from_str(o.stdout.trim()).unwrap_or(Value::Null);
+        v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()
+    };
+
+    // Not approved: the digest offers it; no personal instructions.
+    let o = event(&env, "SessionStart", json!({"source":"startup"}));
+    assert!(!context(&o).contains(heading), "{}", context(&o));
+    env.run(&["library", "approve", &id]);
+    let fragment = std::fs::read_to_string(env.root.join("staging/payments/crate-tests-first/AGENTS.fragment.md")).unwrap();
+    let want = format!("{heading}\n\n## rematch: crate-tests-first\n\n{}", fragment.trim());
+
+    // A compaction drops the earlier context: the instructions come again, without a digest.
+    let reply = event(&env, "SessionStart", json!({"source":"compact"})).json();
+    assert_eq!(reply["hookSpecificOutput"]["additionalContext"], json!(want), "{reply}");
+    assert!(reply.get("systemMessage").is_none(), "{reply}");
+
+    // The next session: after the digest's context.
+    let next = "6e1d9b9f-2222-4d4d-9999-0123456789ab";
+    let p = json!({"session_id":next,"transcript_path":"","cwd":env.repo,"hook_event_name":"SessionStart","source":"startup"});
+    let o = run_hook(&env, "session-start", &p.to_string(), &[]);
+    assert!(context(&o).ends_with(&want), "{}", context(&o));
+    assert!(!env.repo.join("AGENTS.md").exists(), "the user's AGENTS.md is never written");
 }
