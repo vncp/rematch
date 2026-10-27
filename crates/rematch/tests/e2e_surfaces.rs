@@ -259,7 +259,8 @@ fn set_fork_path_then_ship_fork_writes_the_file() {
     let file = git(&fork, &["show", &format!("{branch}:src/prompts/system.md")]);
     assert!(file.starts_with("Use when committing changes to a Rust crate."), "SKILL.md body: {file}");
     assert!(!file.contains("name: crate-tests-first"), "frontmatter stripped");
-    assert_eq!(env.entry(&id)["fork_repo"], json!(fork));
+    let recorded = env.entry(&id)["fork_repo"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::canonicalize(recorded).unwrap(), std::fs::canonicalize(&fork).unwrap());
 }
 
 #[test]
