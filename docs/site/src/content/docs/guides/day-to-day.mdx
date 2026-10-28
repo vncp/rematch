@@ -4,25 +4,42 @@ description: Use your harness as usual; check, manage and stop rematch when you 
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import Diagram from '../../../components/Diagram.astro';
 
-Use omp as usual. rematch traces each session, can propose a change after you correct the agent, and keeps what sustained clean use or an authorized probe confirms. Everything on this page is optional.
+Use your harness as usual. rematch traces each session, runs your repo's fast check after file edits, can propose a change after you correct the agent, and keeps what sustained clean use or a bounded probe confirms. Everything on this page is optional.
 
 In a terminal, add `--text` for readable lines instead of JSON. How `/rematch` commands map to the CLI: [below](#omp-commands-and-the-cli).
+
+<Diagram
+	name="plugin-ui"
+	alt="omp and Pi TUI: ◆ rematch fast-check card after an edit, the alt+e review overlay with Needs you and Applied tabs, the above-editor reminder, and the footer status bar."
+	caption="In omp and Pi: every rematch surface carries <code>◆ rematch</code>, from the inline <code>fast-check</code> card to the <code>alt+e</code> review &amp; undo overlay and the footer status bar."
+/>
 
 ## What happens on its own
 
 | When | What rematch does |
 |---|---|
 | During a session | traces it; no model call |
+| After the agent edits files (`fast-check`) | runs the repo's detected fast check (`cargo check --workspace --all-targets`, `tsc`, `ruff`/`pyright`/`mypy`, `go vet` + `go build`) plus `git grep` for changed signatures in unedited files before the next model request. In omp and Pi, one `◆ rematch · fast-check` card appears in the transcript (`✓ cargo clean in 0.1s`, or the errors + callers sent to the agent; `ctrl+o` expands the exact payload); in Claude Code, `PostToolUse` shows a `◆ rematch` banner alongside `additionalContext` |
 | You correct the agent (*"no, …"*, *"revert that"*, an interrupt, ≥ 3 tool errors in any 6 consecutive results) | flags the session at exit |
-| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, ≤ 3 editor/classifier calls); when something changed since the last session (kept, retired, applied automatically, a probe verdict) one `◆ rematch` card appears in the transcript (shown, never sent to the model). While an action needs your decision a line above the editor names it, and the footer reads `◆ rematch ✓ cargo 0.4s · 6 on trial · ● 1 needs you alt+e` |
-| After the agent edits files (`fast-check`) | checks the edited files before the next model request; the result is one `◆ rematch · fast-check` card in the transcript: a single line when clean, else the errors and the unedited callers it sent to the agent (`ctrl+o` shows exactly what the agent received). The footer shows `⠋ cargo` while it runs |
-| Later matching sessions | exposes provisional trials only in matching places (`views/<key>/`) and counts `matched`, `used`, `used_clean`, `recurrence` and `harm`; a reflect pass can also run 1 authorized automatic probe. ≥ 4 clean actual uses (`accepted_in_use`) or a supporting probe (`comparative_support`) → kept; 2 recurrences, 2 harms or a regressed probe → retired |
+| Next session start / after session end | starts a reflection in the background, detached, so it runs while you work (about 20 s, ≤ 3 editor/classifier calls). Data-only hooks and read-only subagents activate automatically as scoped trials; trace-grounded automatic probes with a sealed engine verifier run in the background after sessions end (up to `probes.daily_runs`, default 3/day). When something changed since the last session, one `◆ rematch` digest card appears in the transcript (shown, never sent to the model). While an action needs your decision, a line above the editor names it (`◆ rematch ● 1 needs you: … alt+e review`) |
+| Later matching sessions | exposes provisional trials only in matching places (`views/<key>/`) and counts `matched`, `used`, `used_clean`, `recurrence` and `harm` (tool errors are blamed only on entries the session actually used). ≥ 4 clean actual uses (`accepted_in_use`) or a supporting probe (`comparative_support`) → kept; 2 recurrences, 2 harms or a regressed probe → retired |
 
 The reflection uses the models you configured; `rematch doctor --text` shows which.
 
-## Check on it
+## What you can ask your agent (or run yourself)
 
+| Goal | Ask your agent in chat, or run |
+|---|---|
+| Create and test a new skill | *"Create a rematch skill for `<task>` and eval it"*, or `/rematch create <name> …` + `/rematch eval trigger\|run <name>` |
+| Improve or split an existing skill | *"Improve the `<skill>` skill with rematch"*, or `/rematch improve <skill>` |
+| Check why a skill loaded or missed | *"Why did rematch load `<skill>`?"*, or `/rematch why` |
+| Run the repo's fast check + caller impact | `/rematch check` or `rematch check --text` |
+| Scope a noisy skill to one repository | `rematch policy scope set <skill> ~/repos/<repo>` (user-only; travels with your profile) |
+| Auto-approve scripts, agents or instructions for a repo | `rematch policy auto add scripts\|agents\|instructions <repo or **>` (user-only) |
+
+## Check on it
 | Ask | You get |
 |---|---|
 | `/rematch status` | entries by status, waiting `actions`, `applied` personal instruction blocks, active automatic `trials`, personal `instructions` exposure, latest `probes`, detached jobs, and whether rematch is off |
@@ -54,12 +71,13 @@ Most `/rematch <sub>` commands run `rematch <sub>`. These differ:
 
 ```sh
 rematch library ls --text
-rematch library pin <id>          # yours: never replaced or retired automatically
+rematch library pin <id>                        # yours: never replaced or retired automatically
 rematch library unpin <id>
-rematch library disable <id>      # retire now (archived with its evidence; never deleted)
-rematch library rollback <name>   # previous kept version back (skill or agent); the current one retires
+rematch library disable <name-or-id>            # retire now (archived with its evidence; never deleted)
+rematch library rollback <name>                 # previous kept version back (skill or agent); the current one retires
+rematch policy scope set <name> ~/repos/<repo>  # restrict a skill (provisional, kept or profile) to one repo
+rematch policy scope unset <name>               # restore global exposure for kept/profile copies
 ```
-
 See what a past session loaded, as it stood then:
 
 ```sh

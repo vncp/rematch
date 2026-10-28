@@ -39,6 +39,7 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 | [`create`](#rematch-create) | Greenfield: create an entry from sessions, a task, or a description (draft) |
 | [`improve`](#rematch-improve) | Brownfield: register, audit, split or propose a sibling for an existing skill |
 | [`activate`](#rematch-activate) | Draft → provisional |
+| [`eval`](#rematch-eval) | Skill evals: init a suite, check trigger accuracy, run side-by-side with-skill vs baseline rollouts (HTML report; `--activate` gates a draft) |
 | [`run`](#rematch-run) | Batch run with a verifier (detached; returns a job id) |
 | [`status`](#rematch-status) | Job status (or all jobs, entry counts, pending actions and automatic trials) |
 | [`library`](#rematch-library) | Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export |
@@ -82,6 +83,7 @@ Commands:
   create       Greenfield: create an entry from sessions, a task, or a description (draft)
   improve      Brownfield: register, audit, split or propose a sibling for an existing skill
   activate     Draft → provisional
+  eval         Skill evals: init a suite, check trigger accuracy, run side-by-side with-skill vs baseline rollouts (HTML report; --activate gates a draft)
   run          Batch run with a verifier (detached; returns a job id)
   status       Job status (or all jobs, entry counts, pending actions and automatic trials)
   library      Library: ls, why, disable, rollback, pin, unpin, approve, decline, inspect, set-fork-path, export, import-export
@@ -384,16 +386,17 @@ Arguments:
   <NAME>  
 
 Options:
-      --from <FROM>                [possible values: sessions, task, description]
-      --text                       Human-readable output instead of the JSON envelope
-      --cwd <DIR>                  Directory the command runs against (repo/cwd for match, digest, create, …)
-      --task <TASK>                
-      --branch <BRANCH>            
-      --description <DESCRIPTION>  
-      --files <FILES>...           
-      --ran <RAN>                  `--from sessions`: the references are sessions whose bash commands have every one of these words (comma-separated, case-folded; `--ran cargo,test` finds `cd x && cargo test --workspace`), ranked by their overlap with the request
-      --editor <EDITOR>            Scripted editor command (tests)
-  -h, --help                       Print help
+      --from <FROM>                   [possible values: sessions, task, description]
+      --text                          Human-readable output instead of the JSON envelope
+      --cwd <DIR>                     Directory the command runs against (repo/cwd for match, digest, create, …)
+      --task <TASK>                   
+      --branch <BRANCH>               
+      --description <DESCRIPTION>     
+      --files <FILES>...              
+      --ran <RAN>                     `--from sessions`: the references are sessions whose bash commands have every one of these words (comma-separated, case-folded; `--ran cargo,test` finds `cd x && cargo test --workspace`), ranked by their overlap with the request
+      --eval-prompt <EVAL_PROMPT>...  Seed `<entry>/evals/evals.json` with these case prompts (then `rematch eval trigger|run <name>`)
+      --editor <EDITOR>               Scripted editor command (tests)
+  -h, --help                          Print help
 ```
 
 ## rematch improve
@@ -431,6 +434,79 @@ Options:
       --cwd <DIR>    Directory the command runs against (repo/cwd for match, digest, create, …)
       --unverified   Accept the risk: activate without a trace
   -h, --help         Print help
+```
+
+## rematch eval
+
+```text
+Skill evals: init a suite, check trigger accuracy, run side-by-side with-skill vs baseline rollouts (HTML report; --activate gates a draft)
+
+Usage: rematch eval [OPTIONS] <COMMAND>
+
+Commands:
+  init     Create or extend <entry dir>/evals/evals.json: cases (prompt, expected_output, verifier) and trigger_eval queries (Anthropic skill-creator `evals` accepted)
+  trigger  Deterministic trigger accuracy: the predicate against trigger_eval queries and recorded sessions, unit retrieval per query, catalog and router budgets
+  run      Side-by-side rollouts per case (baseline without the entry vs with it) in fresh worktrees; HTML report under REMATCH_ROOT/evals/<name>/; --activate promotes a draft that passes the gate
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+### rematch eval init
+
+```text
+Create or extend <entry dir>/evals/evals.json: cases (prompt, expected_output, verifier) and trigger_eval queries (Anthropic skill-creator `evals` accepted)
+
+Usage: rematch eval init [OPTIONS] <ENTRY>
+
+Arguments:
+  <ENTRY>  Entry id or name (draft, provisional, kept or pinned)
+
+Options:
+      --prompt <PROMPT>...   Case prompts to add (merged; an existing prompt is not added twice)
+      --text                 Human-readable output instead of the JSON envelope
+      --cwd <DIR>            Directory the command runs against (repo/cwd for match, digest, create, …)
+      --verifier <VERIFIER>  Verifier spec for the added cases (check | tests | parity:<produced>=<expected> | receipt:<path> | <cmd>)
+  -h, --help                 Print help
+```
+
+### rematch eval trigger
+
+```text
+Deterministic trigger accuracy: the predicate against trigger_eval queries and recorded sessions, unit retrieval per query, catalog and router budgets
+
+Usage: rematch eval trigger [OPTIONS] <ENTRY>
+
+Arguments:
+  <ENTRY>  Entry id or name (draft, provisional, kept or pinned)
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+### rematch eval run
+
+```text
+Side-by-side rollouts per case (baseline without the entry vs with it) in fresh worktrees; HTML report under REMATCH_ROOT/evals/<name>/; --activate promotes a draft that passes the gate
+
+Usage: rematch eval run [OPTIONS] <ENTRY>
+
+Arguments:
+  <ENTRY>  Entry id or name (draft, provisional, kept or pinned)
+
+Options:
+      --prompt <PROMPT>...   Case prompts (instead of the suite's cases)
+      --text                 Human-readable output instead of the JSON envelope
+      --cwd <DIR>            Directory the command runs against (repo/cwd for match, digest, create, …)
+      --verifier <VERIFIER>  Verifier for cases without their own (default: the repo's detected check, else its tests)
+      --max-time <SECS>      Time cap per rollout: `180`, `90s`, `10m` (default 180 s)
+      --activate             Promote a draft to provisional when the comparison passes the gate
+  -h, --help                 Print help
 ```
 
 ## rematch run

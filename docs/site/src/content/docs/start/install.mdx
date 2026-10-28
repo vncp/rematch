@@ -80,7 +80,18 @@ You need Claude Code 2.1.285 or later and the `rematch` binary: `cargo build --r
    claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch
    ```
 
-   Expect 8 hooks; under Skills, the nine commands plus every kept skill; under Agents, the kept rematch subagents.
+   Expect 8 hooks; under Skills, the ten commands plus every kept skill; under Agents, the kept rematch subagents.
+
+3. Optional: add the `◆ rematch` footer (`✓ cargo 0.1s · 5 on trial · ● 1 needs you /rematch:rematch-review`) to `~/.claude/settings.json`:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "sh /path/to/rematch/adapters/claude-code/scripts/statusline.sh"
+     }
+   }
+   ```
 
 </Steps>
 

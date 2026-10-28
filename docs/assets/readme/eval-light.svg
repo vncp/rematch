@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 300" width="1100" height="300" role="img" aria-labelledby="title">
+<title id="title">skill creator workbench: draft, trigger check, side-by-side eval run, validation gate</title>
+<rect x="0.5" y="0.5" width="1099" height="299" rx="16" fill="#171717" stroke="#e5e5e5"/>
+<circle cx="26" cy="24" r="6" fill="#ff5f57"/><circle cx="46" cy="24" r="6" fill="#febc2e"/><circle cx="66" cy="24" r="6" fill="#28c840"/>
+<text x="550" y="29" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#9a9a9a">skill creator workbench: draft, trigger check, side-by-side eval run, validation gate</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+<text x="28" y="64" fill="#9a9a9a">$</text><text x="46" y="64" fill="#f2f2f2">rematch create ux-review --from description --description "Review UI/TUI screens for contrast, hierarchy and states" \</text>
+<text x="28" y="86" fill="#f2f2f2" xml:space="preserve">  --eval-prompt "Audit this checkout screen and report P0/P1 layout or contrast issues"</text>
+<text x="28" y="108" fill="#4ade80" xml:space="preserve">drafted ux-review at ~/.rematch/drafts/ux-review · seeded evals/evals.json (1 case, 2 trigger queries)</text>
+<text x="28" y="138" fill="#9a9a9a">$</text><text x="46" y="138" fill="#f2f2f2">rematch eval trigger ux-review --text</text>
+<text x="28" y="160" fill="#4ade80" xml:space="preserve">trigger pass 2/2 (precision 1.00, recall 1.00) · retrieved units/tui-layout.md · catalog 118/1024 B · router 1420/8192 B</text>
+<text x="28" y="190" fill="#9a9a9a">$</text><text x="46" y="190" fill="#f2f2f2">rematch eval run ux-review --activate --text</text>
+<text x="28" y="212" fill="#4ade80" xml:space="preserve">case-1: win — with_skill passed verifier (score 1.0, read ux-review) vs baseline fail · 0 regressions</text>
+<text x="28" y="234" fill="#a9abff" xml:space="preserve">activated ux-review as provisional (passed validation gate) · report: ~/.rematch/evals/ux-review/report.html</text>
+</g></svg>

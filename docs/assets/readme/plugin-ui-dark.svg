@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 480" width="1100" height="480" role="img" aria-labelledby="title">
+<title id="title">omp / Pi TUI: ◆ rematch fast-check card, review overlay (alt+e), widget and footer</title>
+<rect x="0.5" y="0.5" width="1099" height="479" rx="16" fill="#121212" stroke="#262626"/>
+<circle cx="26" cy="24" r="6" fill="#ff5f57"/><circle cx="46" cy="24" r="6" fill="#febc2e"/><circle cx="66" cy="24" r="6" fill="#28c840"/>
+<text x="550" y="29" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" fill="#9a9a9a">omp / Pi TUI: ◆ rematch fast-check card, review overlay (alt+e), widget and footer</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+<text x="28" y="64" fill="#9a9a9a" xml:space="preserve">╭─── ✎ Write: src/lib.rs · 4 lines ─────────────────────────────────────────────────────────────────────╮</text>
+<text x="28" y="86" fill="#f2f2f2" xml:space="preserve">│   1 pub fn reconcile() -&gt; String { "1".to_string() }                                                 │</text>
+<text x="28" y="108" fill="#f2f2f2" xml:space="preserve">│   3 pub fn total() -&gt; u32 { reconcile() + 1 }                                                        │</text>
+<text x="28" y="130" fill="#9a9a9a" xml:space="preserve">╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="28" y="152" fill="#a9abff" xml:space="preserve">╭─ ◆ rematch · fast-check ───────────────────────────────────────────────────────────────── cargo · 0.1s ─╮</text>
+<text x="28" y="174" fill="#f87171" xml:space="preserve">│ ✗ 2 errors → sent to the agent                                                                        │</text>
+<text x="28" y="196" fill="#f2f2f2" xml:space="preserve">│   src/lib.rs:3:25  E0308  mismatched types (expected `u32`, found `String`)                            │</text>
+<text x="28" y="218" fill="#fbbf24" xml:space="preserve">│   ↳ 1 caller in unedited files: src/api.rs:12 total()                                                 │</text>
+<text x="28" y="240" fill="#a9abff" xml:space="preserve">╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="28" y="262" fill="#4ade80" xml:space="preserve">◆ rematch · ✓ cargo clean in 0.1s</text>
+<text x="28" y="292" fill="#a9abff" xml:space="preserve">╭─ ◆ rematch · review ─────────────────────────────────────────────────────── [Needs you 1] Applied 4 ─╮</text>
+<text x="28" y="314" fill="#fbbf24" xml:space="preserve">│ ❯ ● ledger-snapshot   script · payments                                                               │</text>
+<text x="28" y="336" fill="#f2f2f2" xml:space="preserve">│   Make scripts/snapshot.sh executable · Why it waits: wrote outside its sandbox                       │</text>
+<text x="28" y="358" fill="#9a9a9a" xml:space="preserve">│   Observed: writes ~/.ledger/snapshot.csv · no network · exit 0                                       │</text>
+<text x="28" y="380" fill="#4ade80" xml:space="preserve">│   + cp ledger.csv "$HOME/.ledger/snapshot.csv"                                                       │</text>
+<text x="28" y="402" fill="#9a9a9a" xml:space="preserve">│   a approve   d decline   i full diff   ↑↓ item   tab applied   esc later                             │</text>
+<text x="28" y="424" fill="#a9abff" xml:space="preserve">╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="28" y="446" fill="#fbbf24" xml:space="preserve">◆ rematch  ● 1 needs you: ledger-snapshot (script writes ~/.ledger)   alt+e review</text>
+<text x="28" y="468" fill="#a9abff" xml:space="preserve">◆ rematch  ✓ cargo 0.1s  ·  5 on trial</text>
+</g></svg>
