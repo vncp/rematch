@@ -1165,7 +1165,7 @@ Commands:
   caps    Caps (`kept_per_domain`: kept entries per top-level domain across branches, default 8)
   scope   Place scope of a skill name: exposed only in one repo (by remote, any clone or worktree) or directory, never globally (set|unset; reserved to the user)
   probes  Automatic probe budget (`daily_runs`: probes per 24 h, default 3, 0 = off; `max_parallel`: default 1)
-  auto    Standing automatic approval rules (`surface`: scripts|agents|instructions|hooks, `scope`: `<repo path | remote | **>`). Reserved to the user
+  auto    Standing automatic approval rules (`surface`: scripts|agents|instructions, `scope`: `<repo path | remote | **>`). Reserved to the user
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1344,7 +1344,7 @@ Options:
 ### rematch policy auto
 
 ```text
-Standing automatic approval rules (`surface`: scripts|agents|instructions|hooks, `scope`: `<repo path | remote | **>`). Reserved to the user
+Standing automatic approval rules (`surface`: scripts|agents|instructions, `scope`: `<repo path | remote | **>`). Reserved to the user
 
 Usage: rematch policy auto [OPTIONS] <COMMAND>
 
@@ -1368,7 +1368,7 @@ Add a standing rule auto-approving `<surface>` in `<scope>` (`**`, a normalized 
 Usage: rematch policy auto add [OPTIONS] <SURFACE> <SCOPE>
 
 Arguments:
-  <SURFACE>  [possible values: scripts, agents, instructions, hooks]
+  <SURFACE>  [possible values: scripts, agents, instructions]
   <SCOPE>    
 
 Options:
@@ -1385,7 +1385,7 @@ Remove a standing rule for `<surface>` in `<scope>`
 Usage: rematch policy auto remove [OPTIONS] <SURFACE> <SCOPE>
 
 Arguments:
-  <SURFACE>  [possible values: scripts, agents, instructions, hooks]
+  <SURFACE>  [possible values: scripts, agents, instructions]
   <SCOPE>    
 
 Options:
