@@ -54,6 +54,9 @@ pub const REMATCH_JSON: &str = "rematch.json";
 pub const HOOKS_README: &str = "README.md";
 pub const SKILL_MD: &str = "SKILL.md";
 pub const AGENT_MD: &str = "AGENT.md";
+/// An entry's eval suite dir (`evals/evals.json`, `rematch eval`): test material, never
+/// loaded and not part of the content identity ([`content_sha256`]).
+pub const EVALS_DIR: &str = "evals";
 /// Text an entry contributes, after an exact-hash approval, to the user's personal
 /// `<agent_dir>/AGENTS.md` (`instructions`, omp) and to the system prompt of matched main
 /// sessions in harnesses without that file ([`prompt_fragments`]), or to `<repo>/AGENTS.md`
@@ -573,9 +576,10 @@ fn sync_files(e: &Entry) -> Result<()> {
 
 /// Content identity of an entry dir (ADR 001): sha256 of `{"files":[[path, sha256], …]}`
 /// over its files sorted by `/`-separated relative path, leaving out `rematch.json` (the
-/// ledger mirror), `EXPERIENCE.md` (the reflector's notes) and hidden files, with the
-/// `rematch:` frontmatter block (machine-local id, status, version) removed from the
-/// SKILL.md / AGENT.md bytes. Equal packages hash equal on every machine and status.
+/// ledger mirror), `EXPERIENCE.md` (the reflector's notes), `evals/` (the eval suite: test
+/// material, never loaded) and hidden files, with the `rematch:` frontmatter block
+/// (machine-local id, status, version) removed from the SKILL.md / AGENT.md bytes. Equal
+/// packages hash equal on every machine and status.
 pub fn content_sha256(dir: &Path) -> Result<Sha256Hex> {
     let mut files: Vec<(String, Sha256Hex)> = Vec::new();
     for p in files_under(dir)? {
@@ -585,7 +589,7 @@ pub fn content_sha256(dir: &Path) -> Result<Sha256Hex> {
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
-        if rel.iter().any(|c| c.starts_with('.')) {
+        if rel.iter().any(|c| c.starts_with('.')) || rel.first().is_some_and(|c| c == EVALS_DIR) {
             continue;
         }
         let rel = rel.join("/");
@@ -2536,7 +2540,9 @@ mod tests {
         let changed = content_sha256(&kept.path).unwrap();
         assert_ne!(changed, sha, "a unit edit changes it");
         std::fs::write(kept.path.join(crate::experience::EXPERIENCE_MD), "notes").unwrap();
-        assert_eq!(content_sha256(&kept.path).unwrap(), changed, "EXPERIENCE.md and hidden files are not content");
+        std::fs::create_dir_all(kept.path.join(EVALS_DIR)).unwrap();
+        std::fs::write(kept.path.join(EVALS_DIR).join("evals.json"), "{\"cases\":[]}").unwrap();
+        assert_eq!(content_sha256(&kept.path).unwrap(), changed, "EXPERIENCE.md, evals/ and hidden files are not content");
         // The shared dir reports what it exposes.
         let s = sync_shared_skills(&x.ledger, &x.paths).unwrap();
         assert_eq!(s.visible, vec!["h1".to_string()]);

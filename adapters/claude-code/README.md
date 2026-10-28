@@ -18,7 +18,18 @@ Every session (Claude Code loads a plugin directory under `~/.claude/skills/<nam
 ln -s /path/to/rematch/adapters/claude-code ~/.claude/skills/rematch
 ```
 
-`~/.claude/plugins/` is Claude Code's marketplace cache and settings only list `enabledPlugins` by `name@marketplace`; a marketplace install would copy the plugin and drop the `skills/` symlink, so use one of the two routes above. A `--plugin-dir` copy named `rematch` takes precedence over the `skills-dir` one for that session. Check the load with `claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch`: 8 hooks, under Skills the eight commands plus every linked skill, under Agents the rematch subagents.
+`~/.claude/plugins/` is Claude Code's marketplace cache and settings only list `enabledPlugins` by `name@marketplace`; a marketplace install would copy the plugin and drop the `skills/` symlink, so use one of the two routes above. A `--plugin-dir` copy named `rematch` takes precedence over the `skills-dir` one for that session. Check the load with `claude --plugin-dir /path/to/rematch/adapters/claude-code plugin details rematch`: 8 hooks, under Skills the ten commands plus every linked skill, under Agents the rematch subagents.
+
+Optional footer status line (shows `◆ rematch  ✓ cargo 0.1s · 5 on trial · ● 1 needs you /rematch:rematch-review` in Claude Code's footer): add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "sh /path/to/rematch/adapters/claude-code/scripts/statusline.sh"
+  }
+}
+```
 
 Skills come from the shared directory `~/.rematch/skills/` that omp and Codex read too (one link per kept entry and per provisional entry whose predicate matched a directory that was synced; [Where skills load from](https://vncp.github.io/rematch/concepts/entries/#where-skills-load-from)). The plugin's `skills/` is a symlink to it, made by the first `SessionStart`. Subagents are copied into the plugin's `agents/` (below).
 
@@ -35,7 +46,7 @@ To remove: delete the `~/.claude/skills/rematch` link (or stop passing `--plugin
 | `SessionStart` | `session_start` with the entries matched for the session's cwd; syncs the shared `~/.rematch/skills/` for that cwd (adds its matching provisional skills, keeps every other live link), links `skills/` here → that directory on the first start, and copies the subagent entries into `agents/` (asks Claude Code to re-scan skills when a link changed). Not on `compact`: the digest (below). Then starts `rematch reflect --pending`, detached |
 | `UserPromptSubmit` | `input` with the redirect pre-label (negation, revert, reprompt, interrupt, mark); with an approved `retrieve` hook, the matching units as added context |
 | `PreToolUse` | approved `block` / `stuck` hooks: a refusal exits 2 with the hook's message, and is traced |
-| `PostToolUse`, `PostToolUseFailure` | `tool_result` |
+| `PostToolUse`, `PostToolUseFailure` | `tool_result`; after mutating tool calls (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`), runs `fast-check` and returns both a visible `◆ rematch` `systemMessage` and `additionalContext` diagnostics + unedited caller references |
 | `Stop`, `StopFailure` | the run's `turn_end`s (read from the transcript) and `agent_end` |
 | `SessionEnd` | `session_shutdown`; a flagged session writes `~/.rematch/pending/cc:<id>.json` |
 
@@ -62,10 +73,12 @@ The same text, with each approval's reason and diff, goes to Claude as context, 
 Commands (each runs the binary before the prompt reaches the model and shows its output; those marked * are yours only, the model cannot invoke them):
 
 - `/rematch:rematch-status` — `rematch status`, and the skills and agents synced for this directory (`rematch skills sync --harness claude-code`).
+- `/rematch:rematch-review` — walk through waiting actions and automatic changes for this directory, inspecting each item's diff, sandbox observation, and hash-bound approve/decline/undo commands.
+- `/rematch:rematch-inspect <id>` — `rematch library inspect <id>`: full diff, reach, and bound `--sha` commands for one action.
 - `/rematch:rematch-why [cc:<id>]` — `rematch library why`.
 - `/rematch:rematch-library` — `rematch library ls`: every entry with its status and raw counters.
 - `/rematch:rematch-mark correction|preference|scope` * — `rematch mark` for this session.
-- `/rematch:rematch-approve <id>` * / `/rematch:rematch-decline <id>` * — `rematch library approve|decline` (ids from the digest).
+- `/rematch:rematch-approve <id> --sha <hash>` * / `/rematch:rematch-decline <id> --sha <hash>` * — `rematch library approve|decline` (commands printed by the digest, `/rematch:rematch-review`, or `/rematch:rematch-inspect`).
 - `/rematch:rematch-off` * / `/rematch:rematch-on` * — the kill switch (`on` also re-links the skills for this directory).
 
 `create`, `improve`, `run`, `disable`, `rollback` and the rest are shell commands (`rematch --help`). Past Claude Code sessions: `rematch import --history --harness claude-code`, then `rematch reflect --history`.
@@ -77,9 +90,10 @@ Commands (each runs the binary before the prompt reaches the model and shows its
 ```
 .claude-plugin/plugin.json   manifest
 hooks/hooks.json             the eight hooks, exec form: sh scripts/hook.sh session-start|trace-event|hook-check
-scripts/hook.sh              stdin → rematch <op> --harness claude-code --hook-output; session-start also starts reflect --pending, detached
+scripts/hook.sh              stdin → rematch <op> --harness claude-code --hook-output; session-start and session-end also start reflect --pending, detached
+scripts/statusline.sh        Claude Code statusLine command → ◆ rematch ANSI footer line
 scripts/rematch.sh           binary lookup ($REMATCH_BIN, target/{release,debug}, PATH); exports CLAUDE_PLUGIN_ROOT
-commands/rematch-*.md        the eight commands
+commands/rematch-*.md        the ten commands
 skills                       (created at first SessionStart, git-ignored) → ~/.rematch/skills
 agents/                      (created at SessionStart when an agent entry exists, git-ignored) copies + .rematch marker
 ```

@@ -410,12 +410,12 @@ export function shellWords(input: string): string[] {
 // Tool / command argv
 
 export const OPERATIONS = [
-	"doctor", "import", "reflect", "match", "digest", "record", "create", "improve", "activate", "run",
+	"doctor", "import", "reflect", "match", "digest", "record", "create", "improve", "activate", "eval", "run",
 	"status", "library", "why", "task", "transfer", "ship", "count", "mark", "off", "on", "uninstall", "builtins", "anchor", "check", "policy",
 ] as const;
 export type Operation = (typeof OPERATIONS)[number];
 
-const LONG_OPS: Record<string, true> = { reflect: true, create: true, improve: true, run: true, ship: true, import: true, anchor: true };
+const LONG_OPS: Record<string, true> = { reflect: true, create: true, improve: true, eval: true, run: true, ship: true, import: true, anchor: true };
 const READ_OPS: Record<string, true> = { doctor: true, status: true, digest: true, match: true, why: true };
 
 /**
@@ -516,6 +516,7 @@ export function approvalFor(operation: string, args: readonly string[] = []): "r
 	if (operation === "transfer") return sub === undefined || sub === "suggest" ? "read" : "exec";
 	if (operation === "builtins") return sub === "reinstall" ? "exec" : "read";
 	if (operation === "policy") return sub === undefined || sub === "show" ? "read" : "exec";
+	if (operation === "eval") return sub === "trigger" ? "read" : "exec";
 	return "exec";
 }
 
@@ -562,6 +563,7 @@ export function buildArgv(operation: string, rawArgs: readonly string[], session
 		case "match":
 		case "digest":
 		case "check":
+		case "eval":
 			return [operation, ...(hasFlag(args, "--cwd") ? args : ["--cwd", cwd, ...args])];
 		case "record":
 			return ["record", ...(hasFlag(args, "--session") || !sessionId ? args : ["--session", sessionId, ...args])];
@@ -586,7 +588,7 @@ export function changesLoaded(argv: readonly string[]): boolean {
 }
 
 export const COMMANDS = [
-	"why", "status", "library", "create", "improve", "run", "activate", "mark", "off", "on", "disable",
+	"why", "status", "library", "create", "improve", "eval", "run", "activate", "mark", "off", "on", "disable",
 	"rollback", "approve", "decline", "inspect", "review", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor", "check", "policy",
 ] as const;
 
@@ -1224,9 +1226,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let knownActions: ReviewAction[] = [];
 	/** Name, kind and status of what `match` loads here (argument completion of disable/rollback). */
 	let entryNames: { name: string; kind: string; status: string }[] = [];
-	/** Argument completion: what waits (approve, decline, inspect) or what loads here (disable, rollback), by name. */
+	/** Argument completion: what waits (approve, decline, inspect) or what loads here (disable, rollback, eval), by name. */
 	const completionNames = (sub: string) =>
-		sub === "disable" || sub === "rollback"
+		sub === "disable" || sub === "rollback" || sub === "eval"
 			? entryNames.map(e => ({ name: e.name, description: `${e.kind} · ${e.status}` }))
 			: knownActions.map(a => ({ name: a.name, description: `${kindLabel(a.kind)} · ${a.needsYou ? "needs you" : a.state}` }));
 

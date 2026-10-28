@@ -18,6 +18,7 @@ import {
 	panelResult,
 	reviewPanel,
 	reviewPanelLines,
+	summarizeEnvelope,
 	truncate,
 	type UiTheme,
 	visibleWidth,
@@ -126,6 +127,18 @@ describe("line classification", () => {
 		expect(classifyLine("provisional hook   fast-check [shared]")).toBe("trial");
 		expect(classifyLine("  help: try this")).toBe("detail");
 		expect(classifyLine("something else")).toBe("plain");
+		expect(classifyLine("win case-1: verifier: baseline fail → with-skill pass")).toBe("ok");
+		expect(classifyLine("pass should trigger, \"review the form\": triggered")).toBe("ok");
+		expect(classifyLine("regression case-2: verifier: baseline pass → with-skill fail")).toBe("error");
+		expect(classifyLine("fail should not trigger, \"write a poem\": triggered")).toBe("error");
+		expect(classifyLine("refused --activate: 1 regression(s) vs baseline")).toBe("error");
+		expect(classifyLine("activated ux-review as provisional: 1 win(s), no regression")).toBe("trial");
+		expect(classifyLine("tie case-3: no verifier verdict")).toBe("plain");
+	});
+
+	test("eval results summarize as one line", () => {
+		expect(summarizeEnvelope({ ok: true, data: { summary: { wins: 2, ties: 1, regressions: 0 }, activated: true, lines: ["a", "b"] } }).text).toBe("2 win · 1 tie · 0 regression · activated");
+		expect(summarizeEnvelope({ ok: true, data: { queries: [{ pass: true }, { pass: false }], pass_rate: 0.5, lines: ["a", "b"] } }).text).toBe("trigger pass 1/2");
 	});
 });
 
@@ -142,6 +155,7 @@ describe("width safety", () => {
 		["applied tab", w => reviewPanelLines(COLOR, w, panelKey(reviewPanel([action()], [applied()]), "tab").state)],
 		["output table", w => outputLines(COLOR, w, { ok: true, command: "library ls", data: { entries: [{ name: "fast-check", kind: "hook", status: "provisional", branch: "shared", counters: { used: 1, harm: 0 } }], actions: [] } }, "", false)],
 		["output lines", w => outputLines(COLOR, w, { ok: true, command: "why", data: {} }, "approval pending: x\n  help: y\nkept skill z", false)],
+		["eval output", w => outputLines(COLOR, w, { ok: true, command: "eval run ux-review", data: { summary: { wins: 1, ties: 0, regressions: 0 } } }, "eval run ux-review: 1 case(s) · wins 1\nwin case-1: verifier: baseline fail → with-skill pass · skill read\n  gate passed: 1 win(s), no regression\nactivated ux-review as provisional", false)],
 		["output error", w => outputLines(COLOR, w, { ok: false, command: "doctor", error: "rematch binary not found" }, "", false)],
 		["box", w => box(COLOR, w, { title: "◆ rematch", right: "since last session", body: ["a".repeat(200)] })],
 		["widget", w => [truncate(needsYouLine(COLOR, [action()], "alt+e"), w)]],
@@ -171,5 +185,11 @@ describe("completions", () => {
 		expect(commandCompletions("ap", ["approve", "activate", "why"], () => [])?.map(c => c.value)).toEqual(["approve "]);
 		expect(commandCompletions("approve led", ["approve"], () => [{ name: "ledger-snapshot", description: "" }])?.map(c => c.value)).toEqual(["approve ledger-snapshot"]);
 		expect(commandCompletions("why x", ["why"], () => [{ name: "x", description: "" }])).toBeNull();
+		const names = (sub: string) => (sub === "eval" ? [{ name: "ux-review", description: "skill · draft" }] : []);
+		expect(commandCompletions("ev", ["eval", "why"], names)?.map(c => c.value)).toEqual(["eval "]);
+		expect(commandCompletions("eval ", ["eval"], names)?.map(c => c.value)).toEqual(["eval init ", "eval trigger ", "eval run "]);
+		expect(commandCompletions("eval tr", ["eval"], names)?.map(c => c.value)).toEqual(["eval trigger "]);
+		expect(commandCompletions("eval run ux", ["eval"], names)?.map(c => c.value)).toEqual(["eval run ux-review"]);
+		expect(commandCompletions("eval nope ux", ["eval"], names)).toBeNull();
 	});
 });

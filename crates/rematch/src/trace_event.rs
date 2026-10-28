@@ -94,8 +94,9 @@ impl HookReply {
 }
 
 /// Prints an envelope of `trace-event`/`hook-check` in hook-protocol form and returns the
-/// exit code: `data.hook.stdout` (one JSON line) and `data.hook.stderr`, exit `data.hook.exit`.
-/// A failed command logs to stderr and exits 0: rematch never fails a hook.
+/// exit code: `data.hook.stdout` (one JSON line, or raw text for `StatusLine`) and
+/// `data.hook.stderr`, exit `data.hook.exit`. A failed command logs to stderr and exits 0:
+/// rematch never fails a hook.
 pub fn emit_hook(env: &Envelope) -> i32 {
     if !env.ok {
         eprintln!("rematch {}: {}", env.operation, env.error.as_deref().unwrap_or("error"));
@@ -103,7 +104,13 @@ pub fn emit_hook(env: &Envelope) -> i32 {
     }
     let hook = env.data.as_ref().and_then(|d| d.get("hook")).cloned().unwrap_or(Value::Null);
     if let Some(out) = hook.get("stdout").filter(|v| !v.is_null()) {
-        println!("{out}");
+        if let Some(s) = out.as_str() {
+            if !s.is_empty() {
+                println!("{s}");
+            }
+        } else {
+            println!("{out}");
+        }
     }
     if let Some(err) = hook.get("stderr").and_then(Value::as_str) {
         eprintln!("{err}");
@@ -366,6 +373,9 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
     let event = str_of(payload, "hook_event_name").to_string();
     if event == "PreToolUse" {
         return hook_check(ctx, a, payload);
+    }
+    if event == "StatusLine" || (event.is_empty() && (payload.get("workspace").is_some() || payload.get("cost").is_some())) {
+        return status_line(ctx, a, payload);
     }
     if ctx.paths.is_off() {
         // Staging must not load while off: the sync empties the shared dir; write nothing.
@@ -1010,13 +1020,124 @@ fn post_tool_check(
     let mut tf = TraceFile::open(ctx, sid)?;
     let before = tf.records.len();
     crate::check::push_check_ran(&mut tf, &hook.id, &spec, &rep, &union_files)?;
+    let sys_msg = format_check_system_message(spec.kind.as_str(), &rep);
     reply.stdout = Some(json!({
+        "systemMessage": sys_msg,
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": rendered,
         }
     }));
     Ok(Some((tf, before)))
+}
+
+/// Compact `◆ rematch` user-visible summary for Claude Code's `PostToolUse` `systemMessage`.
+fn format_check_system_message(kind: &str, rep: &rematch_core::check::CheckReport) -> String {
+    let secs = rep.duration_ms as f64 / 1000.0;
+    let errors = rep.diagnostics.iter().filter(|d| d.severity == "error").count();
+    let callers = rep.impact.len();
+    if rep.timed_out {
+        return format!("◆ rematch · ◷ {kind} timed out after {secs:.1}s → sent to Claude");
+    }
+    if !rep.ok || errors > 0 {
+        let n = errors.max(rep.diagnostics.len()).max(1);
+        let mut lines = vec![format!(
+            "◆ rematch · fast-check · ✗ {kind} {n} error{} in {secs:.1}s → sent to Claude",
+            if n == 1 { "" } else { "s" }
+        )];
+        for d in rep.diagnostics.iter().take(3) {
+            let code = d.code.as_deref().map(|c| format!("{c}  ")).unwrap_or_default();
+            lines.push(format!("  {}:{}:{}  {}{}", d.file, d.line, d.col, code, d.message));
+        }
+        if rep.diagnostics.len() > 3 {
+            lines.push(format!("  … {} more", rep.diagnostics.len() - 3));
+        }
+        if callers > 0 {
+            let first = &rep.impact[0];
+            lines.push(format!(
+                "  ↳ {callers} caller{} in unedited files: {}:{} {}",
+                if callers == 1 { "" } else { "s" },
+                first.file,
+                first.line,
+                first.symbol
+            ));
+        }
+        return lines.join("\n");
+    }
+    if callers > 0 {
+        let first = &rep.impact[0];
+        return format!(
+            "◆ rematch · ✓ {kind} clean in {secs:.1}s · {callers} caller{} in unedited files ({}:{} {}) → sent to Claude",
+            if callers == 1 { "" } else { "s" },
+            first.file,
+            first.line,
+            first.symbol
+        );
+    }
+    format!("◆ rematch · ✓ {kind} clean in {secs:.1}s")
+}
+
+/// Claude Code `statusLine` command (`StatusLine` event or statusLine stdin JSON): renders the
+/// ANSI footer `◆ rematch  ✓ cargo 0.4s · 5 on trial · ● 1 needs you (/rematch:rematch-review)`.
+pub fn status_line(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<Value> {
+    if ctx.paths.is_off() {
+        let reply = HookReply { stdout: Some(Value::String(String::new())), stderr: None, exit: 0 };
+        return Ok(json!({"event": "StatusLine", "off": true, "line": "", "hook": reply.json()}));
+    }
+    let cwd = payload
+        .pointer("/workspace/current_dir")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd_of(ctx, payload));
+    let sid = session_of(a, payload).ok();
+    let last_check = sid.as_deref().and_then(|s| {
+        let p = ctx.paths.trace_file(s);
+        if !p.is_file() {
+            return None;
+        }
+        trace::read_trace(&p).ok()?.into_iter().rev().find_map(|r| match r {
+            TraceRecord::CheckRan { kind, ok, errors, duration_ms, .. } => Some((kind, ok, errors, duration_ms)),
+            _ => None,
+        })
+    });
+    let repo = repo_of(&cwd);
+    let trials = library::list_for_match(&ctx.ledger, &ctx.paths, repo.as_deref(), &cwd)
+        .map(|m| m.entries.iter().filter(|e| e.status == rematch_core::types::Status::Provisional && e.predicate_hit).count())
+        .unwrap_or(0);
+    let needs_you = crate::actions::pending(ctx)
+        .map(|v| v.iter().filter(|x| x.approvable()).count())
+        .unwrap_or(0);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some((kind, ok, errors, duration_ms)) = &last_check {
+        let secs = *duration_ms as f64 / 1000.0;
+        if !*ok || *errors > 0 {
+            let n = (*errors).max(1);
+            parts.push(format!("\x1b[31m✗ {kind} {n} error{}\x1b[0m", if n == 1 { "" } else { "s" }));
+        } else {
+            parts.push(format!("\x1b[32m✓ {kind} {secs:.1}s\x1b[0m"));
+        }
+    }
+    if trials > 0 {
+        parts.push(format!("\x1b[90m{trials} on trial\x1b[0m"));
+    }
+    if needs_you > 0 {
+        parts.push(format!("\x1b[33m● {needs_you} needs you\x1b[0m \x1b[2m/rematch:rematch-review\x1b[0m"));
+    }
+    let line = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[36m◆\x1b[0m \x1b[1mrematch\x1b[0m  {}", parts.join(" \x1b[2m·\x1b[0m "))
+    };
+    let reply = HookReply { stdout: Some(Value::String(line.clone())), stderr: None, exit: 0 };
+    Ok(json!({
+        "event": "StatusLine",
+        "session": sid,
+        "trials": trials,
+        "needs_you": needs_you,
+        "line": line,
+        "hook": reply.json(),
+    }))
 }
 
 /// The parsed tail of the payload's transcript (`None` without one, or unreadable).

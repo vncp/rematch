@@ -878,9 +878,9 @@ export function classifyLine(line: string): LineClass {
 	if (/^applied automatically|^applied:/.test(l)) return "applied";
 	if (/^(kept|pinned|approved|restored)\b/.test(l)) return "kept";
 	if (/^(retired|disabled|declined|withdrew|rolled back)\b/.test(l)) return "retired";
-	if (/^(provisional|staged|draft|on trial|trial)\b/.test(l)) return "trial";
-	if (/^(✓|ok\b|clean\b|done\b)/.test(l)) return "ok";
-	if (/^(✗|error\b|failed\b)|\bfailed:/.test(l)) return "error";
+	if (/^(provisional|staged|draft|on trial|trial|activated)\b/.test(l)) return "trial";
+	if (/^(✓|ok\b|clean\b|done\b|pass\b|win\b)/.test(l)) return "ok";
+	if (/^(✗|error\b|failed\b|fail\b|regression\b|refused\b)|\bfailed:/.test(l)) return "error";
 	return "plain";
 }
 
@@ -984,6 +984,14 @@ export function summarizeEnvelope(env: Envelope): { ok: boolean; text: string } 
 	if (Array.isArray(d.actions) || Array.isArray(d.trials)) {
 		const waiting = recordsOf(d.actions).filter(a => !a.blocked && a.state === "pending").length;
 		return { ok: true, text: `${waiting} waiting · ${recordsOf(d.trials).length} on trial` };
+	}
+	if (isRecord(d.summary) && typeof d.summary.wins === "number") {
+		const s = d.summary;
+		return { ok: true, text: `${num(s.wins)} win · ${num(s.ties)} tie · ${num(s.regressions)} regression${d.activated === true ? " · activated" : ""}` };
+	}
+	if (Array.isArray(d.queries) && "pass_rate" in d) {
+		const q = recordsOf(d.queries);
+		return { ok: true, text: `trigger pass ${q.filter(x => x.pass === true).length}/${q.length}` };
 	}
 	if (typeof d.job_id === "string") return { ok: true, text: `job started (${elideIds(d.job_id)})` };
 	const lines = Array.isArray(d.lines) ? d.lines.filter((l): l is string => typeof l === "string") : [];
@@ -1104,11 +1112,13 @@ export function renderToolResult(result: { details?: unknown }, options: { expan
 export type Completion = { value: string; label: string; description?: string };
 
 const TAKES_NAME = ["approve", "decline", "inspect", "disable", "rollback"];
+const EVAL_VERBS = ["init", "trigger", "run"];
 
 /**
  * `/rematch <tab>`: the subcommands; `/rematch approve|decline|inspect|disable|rollback <tab>`:
- * the names `namesFor(subcommand)` offers (what waits, what loads here). Values are the whole
- * argument text, which the host puts in place of what was typed.
+ * the names `namesFor(subcommand)` offers (what waits, what loads here); `/rematch eval <tab>`:
+ * init|trigger|run, then `/rematch eval <verb> <tab>` the names `namesFor("eval")` offers.
+ * Values are the whole argument text, which the host puts in place of what was typed.
  */
 export function commandCompletions(
 	prefix: string,
@@ -1121,11 +1131,18 @@ export function commandCompletions(
 		const items = commands.filter(c => c.startsWith(w)).map(c => ({ value: `${c} `, label: c }));
 		return items.length > 0 ? items : null;
 	}
-	const [sub = "", partial = ""] = words;
-	if (words.length > 2 || !TAKES_NAME.includes(sub)) return null;
+	const [sub = "", second = ""] = words;
+	if (sub === "eval" && words.length === 2) {
+		const items = EVAL_VERBS.filter(v => v.startsWith(second)).map(v => ({ value: `eval ${v} `, label: v }));
+		return items.length > 0 ? items : null;
+	}
+	const evalName = sub === "eval" && words.length === 3 && EVAL_VERBS.includes(second);
+	if (!evalName && (words.length > 2 || !TAKES_NAME.includes(sub))) return null;
+	const lead = words.slice(0, -1).join(" ");
+	const partial = words.at(-1) ?? "";
 	const seen = new Set<string>();
 	const items = namesFor(sub)
 		.filter(n => n.name.startsWith(partial) && !seen.has(n.name) && seen.add(n.name))
-		.map(n => ({ value: `${sub} ${n.name}`, label: n.name, description: n.description }));
+		.map(n => ({ value: `${lead} ${n.name}`, label: n.name, description: n.description }));
 	return items.length > 0 ? items : null;
 }

@@ -36,7 +36,8 @@ What it does:
   the live hook sets, as do a session switch/branch and a changed `ctx.cwd`, so an approved hook runs at once (skill links
   added by the re-sync reach omp's skill list at its next start). Tests: `bun test extension`.
 - **Entry points**: tool `rematch {operation, arguments[]}` and `/rematch <sub> [args]`
-  (`why|status|library|create|improve|run|activate|mark|off|on|disable|rollback|approve|decline|ship|transfer|digest|doctor|uninstall|builtins|anchor`).
+  (`why|status|library|create|improve|eval|run|activate|mark|off|on|disable|rollback|approve|decline|inspect|review|ship|transfer|digest|doctor|uninstall|builtins|anchor|check|policy`;
+  `/rematch eval <tab>` completes `init|trigger|run`, then the names loaded here).
   Approving, declining, pinning, disabling or rolling back entries, approving exports, marking, `off`/`on`,
   uninstalling and `policy scope set|unset` are reserved to the user (command, digest or shell): the tool refuses them, judged on the argv the binary
   would run (global `--text`/`--cwd` anywhere), and a `tool_call` guard refuses a `bash` call that runs one directly
