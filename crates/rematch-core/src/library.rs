@@ -616,7 +616,7 @@ fn doc_sha(bytes: &[u8]) -> Sha256Hex {
     }
 }
 
-fn persist(ledger: &Ledger, e: &Entry) -> Result<()> {
+pub fn persist(ledger: &Ledger, e: &Entry) -> Result<()> {
     sync_files(e)?;
     ledger.upsert_entry(e)
 }

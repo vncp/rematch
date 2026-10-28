@@ -347,7 +347,11 @@ fn text_files(dir: &Path) -> Result<Vec<PathBuf>> {
                 stack.push(p);
             } else {
                 let r = rel(dir, &p);
-                if r != "rematch.json" && r != "EXPERIENCE.md" {
+                if r != "rematch.json"
+                    && r != "EXPERIENCE.md"
+                    && r != crate::library::EVALS_DIR
+                    && !r.starts_with(&format!("{}/", crate::library::EVALS_DIR))
+                {
                     out.push(p);
                 }
             }

@@ -192,6 +192,39 @@ fn create_eval_prompt_seeds_the_suite_that_eval_init_and_trigger_read() {
     assert!(t["lines"][0].as_str().unwrap().starts_with("trigger eval ledger-test-gate (draft)"), "{t}");
     let (v, code) = env.run_cmd(env.cmd(&["eval", "run", "no-such-skill"]));
     assert_eq!(code, 1, "{v}");
+
+    // Re-running `create` on an existing draft supersedes the old draft (no manual disable needed)
+    // and accepts explicit `--stems` / `--branch shared`, while `eval trigger --fix` applies
+    // suggested stems from missed positive queries and ignores `evals/` in identifier lint.
+    let first_id = d["id"].as_str().unwrap().to_string();
+    let d2 = env.run(&[
+        "create", "ledger-test-gate", "--from", "description", "--branch", "shared",
+        "--description", "Review resume bullets and ATS keywords",
+        "--stems", "resum,overleaf",
+        "--editor", &script("editor-ok.sh"),
+        "--eval-prompt", "Audit my Overleaf resume for ATS keyword alignment",
+    ]);
+    assert_eq!(d2["outcome"], "staged", "{d2}");
+    assert_eq!(d2["status"], "draft");
+    assert_eq!(d2["predicate"]["repo_glob"], "**", "--branch shared sets repo_glob **: {d2}");
+    assert_eq!(d2["predicate"]["stems"], json!(["resum", "overleaf"]), "{d2}");
+    assert_eq!(env.entry(&first_id)["status"], "retired", "old draft superseded: {}", env.entry(&first_id));
+
+    // Add a positive trigger query with new stems and an identifier-like string inside evals/evals.json:
+    // lint ignores evals/, and `eval trigger --fix` adds the missing stems to the predicate.
+    let suite_path = env.root.join("drafts/ledger-test-gate/evals/evals.json");
+    let mut s: Value = serde_json::from_str(&std::fs::read_to_string(&suite_path).unwrap()).unwrap();
+    s["trigger_eval"].as_array_mut().unwrap().push(json!({
+        "query": "Tailor bullet metrics for this job posting (ref 01a18195-48d1-767e-8cd4-9531b6f6061b)",
+        "should_trigger": true
+    }));
+    std::fs::write(&suite_path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
+    let before_fix = env.run(&["eval", "trigger", "ledger-test-gate"]);
+    assert_eq!(before_fix["lint"]["ok"], true, "evals/ is not linted as package text: {before_fix}");
+    assert_eq!(before_fix["false_negatives"], 1, "{before_fix}");
+    let after_fix = env.run(&["eval", "trigger", "ledger-test-gate", "--fix"]);
+    assert_eq!(after_fix["false_negatives"], 0, "eval trigger --fix added the missing stems: {after_fix}");
+    assert!(!after_fix["fixed_stems"].as_array().unwrap().is_empty(), "{after_fix}");
 }
 
 #[test]
