@@ -54,6 +54,12 @@ pub struct CreateArgs {
     /// Seed `<entry>/evals/evals.json` with these case prompts (then `rematch eval trigger|run <name>`).
     #[arg(long = "eval-prompt", num_args = 1..)]
     pub eval_prompt: Vec<String>,
+    /// Explicit predicate stems (comma-separated or repeated; default: derived from the request/editor).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub stems: Vec<String>,
+    /// Explicit predicate file extensions (comma-separated or repeated, e.g. `tex,md,pdf`; default: none for `--from description`, or derived from sessions/task).
+    #[arg(long = "exts", value_delimiter = ',', num_args = 1..)]
+    pub exts: Vec<String>,
     /// Scripted editor command (tests).
     #[arg(long)]
     pub editor: Option<String>,
@@ -106,11 +112,18 @@ pub fn cmd_create(ctx: &AppCtx, a: CreateArgs) -> Result<Value> {
         bail!("rematch is off; `rematch on` to enable");
     }
     library::validate_name(&a.name)?;
-    if ctx.ledger.list_entries(&rematch_core::ledger::EntryFilter { name: Some(a.name.clone()), ..Default::default() })?
-        .iter()
-        .any(|e| matches!(e.status, Status::Draft | Status::Provisional | Status::Kept | Status::Pinned))
-    {
-        bail!("an active entry named {} already exists (`rematch improve {}` revises it)", a.name, a.name);
+    let existing = ctx.ledger.list_entries(&rematch_core::ledger::EntryFilter { name: Some(a.name.clone()), ..Default::default() })?;
+    for e in &existing {
+        match e.status {
+            // A draft is never loaded: creating the same name again retires the old draft and replaces it.
+            Status::Draft => {
+                let _ = library::disable(&ctx.ledger, &ctx.paths, &e.id, "superseded by rematch create");
+            }
+            Status::Provisional | Status::Kept | Status::Pinned => {
+                bail!("an active entry named {} already exists (`rematch improve {}` revises it)", a.name, a.name);
+            }
+            Status::Retired | Status::Dormant | Status::Stale => {}
+        }
     }
     let mut out = match a.from {
         From::Sessions => from_sessions(ctx, &a),
@@ -443,9 +456,24 @@ fn from_description(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let repo = rematch_core::import::repo_of(&ctx.cwd);
     let paths: Vec<String> = a.files.iter().map(|p| p.to_string_lossy().to_string()).collect();
     let corpus = crate::import_cmd::stem_corpus(ctx)?;
-    let mut ranked = rank_stems(&stems_of_session(&[request_text(a)], &paths), &corpus);
+    let mut ranked = if !a.stems.is_empty() {
+        rematch_core::features::stems_of_text(&a.stems.join(" "))
+    } else {
+        rank_stems(&stems_of_session(&[request_text(a)], &paths), &corpus)
+    };
     ranked.truncate(MAX_PREDICATE_STEMS);
-    let exts = rematch_core::features::exts_of(&paths);
+    // Helper `--files` (`scripts/check.py`) are part of the skill package, not the target files
+    // the user's sessions touch: only explicit `--exts` gates a description draft by extension.
+    let exts = if !a.exts.is_empty() {
+        a.exts
+            .iter()
+            .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .take(MAX_EXTS)
+            .collect()
+    } else {
+        Vec::new()
+    };
     // No session behind a description: the cwd's place and the description's own exts/stems.
     let place = predicate::Place::locate(repo.as_deref(), &ctx.cwd);
     let domain = rematch_core::domain::domain_of(
@@ -456,7 +484,12 @@ fn from_description(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
         &ranked,
         &ctx.domain_policy()?,
     );
-    let pred = predicate::derive(repo.as_deref().map(|r| r.to_str().unwrap_or("")), &exts, &ranked, domain.as_deref());
+    let repo_root = if a.branch.as_deref() == Some(library::SHARED_BRANCH) {
+        None
+    } else {
+        repo.as_deref().map(|r| r.to_str().unwrap_or(""))
+    };
+    let pred = predicate::derive(repo_root, &exts, &ranked, domain.as_deref());
     let branch = branch_of(ctx, a)?;
     let input = json!({
         "mode": "from_description",
@@ -485,9 +518,26 @@ fn from_description(ctx: &AppCtx, a: &CreateArgs) -> Result<Value> {
     let mut budget = CallBudget::new(2);
     let p = reflect::propose(ctx, a.editor.as_deref(), &input, &spec, &mut budget)?;
     let p = match p {
-        // No trace behind a description: no evidence moment.
+        // No trace behind a description: no evidence moment. Merge editor-proposed stems with
+        // the request stems (unless `--stems` was explicitly given).
         Proposed::Candidate(mut c, r, n) => {
             c.entry.evidence.retain(|m| !m.session_id.is_empty());
+            if a.stems.is_empty() && !r.entry.as_ref().is_none_or(|er| er.stems.is_empty()) {
+                let mut merged: Vec<String> = r
+                    .entry
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|er| er.stems.iter())
+                    .flat_map(|s| rematch_core::features::stems_of_text(s))
+                    .chain(c.entry.predicate.stems.iter().cloned())
+                    .collect();
+                let mut seen = std::collections::BTreeSet::new();
+                merged.retain(|s| seen.insert(s.clone()));
+                merged.truncate(MAX_PREDICATE_STEMS);
+                if !merged.is_empty() {
+                    c.entry.predicate.stems = merged;
+                }
+            }
             Proposed::Candidate(c, r, n)
         }
         other => other,

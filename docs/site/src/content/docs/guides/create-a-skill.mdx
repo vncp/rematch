@@ -64,12 +64,17 @@ Runs the task once in batch mode (one rollout, no candidates) to obtain a trace,
 ## From a description
 
 ```sh
-rematch create <name> --from description --description "…" [--files path …] [--eval-prompt "…" …]
+rematch create <name> --from description --description "…" \
+  [--branch shared] [--stems stem1,stem2] [--exts tex,md] \
+  [--files path …] [--eval-prompt "…" …]
 ```
 
-The result is a **draft**: visible in the library, never loaded. Activate it when you are willing to test it:
+The result is a **draft**: visible in the library, never loaded. Re-running `rematch create <name> …` on an existing draft automatically retires the old draft and replaces it, so the agent can iterate on a draft without asking you to disable it first. (`--branch shared` gives the draft `repo_glob: "**"`, and `--stems` / `--exts` set explicit predicate stems and extensions.)
+
+Activate it when you are willing to test it:
 
 ```sh
+rematch eval run <name> --activate          # side-by-side baseline vs with-skill; promotes on pass
 rematch activate <name> --task <task-id>    # runs the task once with it, then provisional
 rematch activate <name> --unverified        # provisional on your say-so
 ```
@@ -85,10 +90,11 @@ No proposal exists without an execution behind it. Editing a harness without one
 ```sh
 rematch eval init <name> --prompt "Review the checkout form" --verifier tests
 rematch eval trigger <name>                  # free: predicate, retrieval, budgets
+rematch eval trigger <name> --fix            # adds suggested stems for missed positive queries & syncs draft edits
 rematch eval run <name> --activate           # rollouts: baseline vs with the skill
 ```
 
-- **`eval trigger`** checks, without a model call, each query against the skill's predicate (precision, recall, pass rate, and the stems a missed query needs), the units `retrieve` would inject for it, every recorded session the predicate would match or miss, and lint: catalog line, description and router bytes, checkable laws, the `Use when …` clause.
+- **`eval trigger`** checks, without a model call, each query against the skill's predicate (precision, recall, pass rate, and the stems a missed query needs), the units `retrieve` would inject for it, every recorded session the predicate would match or miss, and lint: catalog line, description and router bytes, checkable laws, the `Use when …` clause (`evals/` is test material and is excluded from package-text lint). Pass **`--fix`** to apply the suggested missing stems from missed positive `trigger_eval` queries (and sync any on-disk edits to the draft's `SKILL.md` / `rematch.json` into the ledger).
 - **`eval run`** runs each case twice in fresh worktrees of `--cwd`'s repo, once with the repo's harness without the entry and once with it (drafts included), judged by the case's verifier (else `--verifier`, else the repo's detected check or tests; `--max-time`, default 180 s). It writes a self-contained side-by-side report to `~/.rematch/evals/<name>/report.html` with `results.json` and the traces, and records a receipt.
 - **`--activate`** promotes a draft only when no case regressed and either a case improved on the verifier, or no with-skill verifier failed and every with-skill run completed cleanly and read the skill. The winning trace becomes its evidence.
 

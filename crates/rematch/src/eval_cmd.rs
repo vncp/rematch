@@ -94,6 +94,9 @@ pub struct InitArgs {
 pub struct TriggerArgs {
     /// Entry id or name (draft, provisional, kept or pinned).
     pub entry: String,
+    /// Apply suggested stems from missed positive trigger_eval queries and sync on-disk draft edits into the ledger.
+    #[arg(long)]
+    pub fix: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -511,15 +514,71 @@ pub struct TriggerReport {
 }
 
 pub fn cmd_trigger(ctx: &AppCtx, a: TriggerArgs) -> Result<Value> {
-    let e = resolve(ctx, &a.entry)?;
+    let mut e = resolve(ctx, &a.entry)?;
     let (read, _) = suite_location(ctx, &e);
     let suite = load_suite(&read)?.unwrap_or_default();
-    let r = trigger_check(ctx, &e, &suite)?;
-    let lines = trigger_lines(&r, &read, suite.trigger_eval.is_empty() && !suite.cases.is_empty());
+    if a.fix && crate::scope::owns_files(ctx, &e) {
+        sync_on_disk_draft_edits(ctx, &mut e)?;
+    }
+    let mut r = trigger_check(ctx, &e, &suite)?;
+    let mut fixed_stems = Vec::new();
+    if a.fix {
+        for q in &r.queries {
+            for s in &q.suggest_stems {
+                if !e.predicate.stems.iter().any(|x| norm(x) == norm(s)) && e.predicate.stems.len() < MAX_PREDICATE_STEMS {
+                    e.predicate.stems.push(s.clone());
+                    fixed_stems.push(s.clone());
+                }
+            }
+        }
+        if !fixed_stems.is_empty() || crate::scope::owns_files(ctx, &e) {
+            if e.path.is_dir() {
+                if let Ok(sha) = library::content_sha256(&e.path) {
+                    e.content_sha256 = Some(sha);
+                }
+            }
+            library::persist(&ctx.ledger, &e)?;
+            r = trigger_check(ctx, &e, &suite)?;
+        }
+    }
+    let mut lines = trigger_lines(&r, &read, suite.trigger_eval.is_empty() && !suite.cases.is_empty());
+    if !fixed_stems.is_empty() {
+        lines.insert(0, format!("applied --fix to {}: added stem(s) {} (predicate stems now {:?})", e.name, fixed_stems.join(", "), e.predicate.stems));
+    }
     let mut v = serde_json::to_value(&r)?;
     v["suite"] = json!(read);
+    v["fixed_stems"] = json!(fixed_stems);
     v["lines"] = json!(lines);
     Ok(v)
+}
+
+/// Sync on-disk edits made to a rematch-owned entry (`rematch.json` predicate/trigger_line and
+/// `SKILL.md` description) into the ledger before running `--fix`.
+fn sync_on_disk_draft_edits(ctx: &AppCtx, e: &mut Entry) -> Result<()> {
+    let json_path = e.path.join(library::REMATCH_JSON);
+    if let Ok(raw) = std::fs::read_to_string(&json_path) {
+        if let Ok(disk) = serde_json::from_str::<Entry>(&raw) {
+            if disk.id == e.id {
+                e.predicate = disk.predicate;
+                if !disk.trigger_line.trim().is_empty() {
+                    e.trigger_line = disk.trigger_line;
+                }
+            }
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(e.path.join(library::primary_doc(e.kind))) {
+        if let Ok(doc) = SkillDoc::parse(&raw) {
+            if let Some(d) = doc.get_str("description").map(str::trim).filter(|d| !d.is_empty()) {
+                e.trigger_line = d.to_string();
+            }
+        }
+    }
+    if e.path.is_dir() {
+        if let Ok(sha) = library::content_sha256(&e.path) {
+            e.content_sha256 = Some(sha);
+        }
+    }
+    library::persist(&ctx.ledger, e)
 }
 
 fn ratio(n: usize, d: usize) -> Option<f64> {
@@ -1683,7 +1742,7 @@ mod tests {
         assert_eq!(saved["trigger_eval"].as_array().unwrap().len(), 3);
         assert_eq!(library::content_sha256(&d.path).unwrap(), sha, "evals/ is not package content");
 
-        let out = cmd_trigger(&e.ctx, TriggerArgs { entry: "checkout-ux".into() }).unwrap();
+        let out = cmd_trigger(&e.ctx, TriggerArgs { entry: "checkout-ux".into(), fix: false }).unwrap();
         let q = out["queries"].as_array().unwrap();
         assert_eq!(q.len(), 3, "{out:#}");
         // Positive query: predicate hit and the checklist unit retrieved.
@@ -1717,7 +1776,7 @@ mod tests {
         let tq = out["trigger_eval"].as_array().unwrap();
         assert_eq!((tq[0]["should_trigger"].as_bool(), tq[1]["should_trigger"].as_bool()), (Some(true), Some(false)));
         // The seeded positive triggers, the seeded negative does not.
-        let out = cmd_trigger(&e.ctx, TriggerArgs { entry: "fresh-skill".into() }).unwrap();
+        let out = cmd_trigger(&e.ctx, TriggerArgs { entry: "fresh-skill".into(), fix: false }).unwrap();
         assert_eq!(out["pass_rate"].as_f64(), Some(1.0), "{out:#}");
     }
 
