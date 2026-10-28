@@ -38,16 +38,15 @@ fn reflect_stage_match_canary_count() {
     assert_eq!(e["predicate"]["file_exts"], json!(["rs"]));
     assert_eq!(e["origin"], json!({"kind": "session", "session_id": s1}));
 
-    // match --cwd <repo> contributes the staging branch dir.
+    // match --cwd <repo> contributes the staging branch dir (plus staging/shared for built-ins).
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([env.root.join("staging").join("payments")]));
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging").join("payments"), env.root.join("staging").join("shared")]));
     assert!(m["entries"].as_array().unwrap().iter().any(|x| x["id"] == id.as_str() && x["predicate_hit"] == true), "{m}");
-    // … and nothing for an unrelated directory.
+    // … and no payments dir for an unrelated directory.
     let other = env.home.join("elsewhere");
     std::fs::create_dir_all(&other).unwrap();
     let m2 = env.run(&["match", "--cwd", other.to_str().unwrap()]);
-    assert_eq!(m2["skill_dirs"], json!([]));
-
+    assert_eq!(m2["skill_dirs"], json!([env.root.join("staging").join("shared")]));
     // A second reflect is a no-op (pending consumed, sessions counted).
     let d2 = env.run(&["reflect", "--pending", "--editor", &script("editor-ok.sh")]);
     assert_eq!(d2["reflections"], json!([]), "{d2}");

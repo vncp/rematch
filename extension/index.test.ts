@@ -11,12 +11,15 @@ import rematch, {
 	callKey,
 	changedPaths,
 	changesLoaded,
+	CHECK_TYPE,
+	checkMessage,
 	FILES_CHANGED_MAX,
 	filesChanged,
 	hookFromModule,
 	loadedEntriesOf,
 	loadHook,
 	promptFragmentsOf,
+	normalizeCheckFiles,
 	renderPromptFragments,
 	RETRIEVAL_TYPE,
 	REVIEW_APPROVE,
@@ -78,8 +81,9 @@ describe("hookFromModule", () => {
 		const r = hookFromModule({ mode: "retrieve", tool: "*", params: { budget_bytes: 6000, min_overlap: 2, extra: 1 } }, "fallback");
 		expect(r.id).toBe("fallback");
 		expect(r.params).toEqual({ budget_bytes: 6000, min_overlap: 2 });
+		const c = hookFromModule({ id: "fc", mode: "check", tool: "*", params: { timeout_secs: 30, budget_bytes: 4096 } }, "fc");
+		expect([c.mode, c.params]).toEqual(["check", { timeout_secs: 30, budget_bytes: 4096 }]);
 	});
-
 	test("rejects what the binary would not have written", () => {
 		expect(() => hookFromModule(undefined, "f")).toThrow("no default export");
 		expect(() => hookFromModule({ mode: "warn", tool: "*" }, "f")).toThrow("unknown hook mode");
@@ -232,6 +236,9 @@ describe("argv and match helpers", () => {
 		expect(changesLoaded(["library", "disable", "e"])).toBe(true);
 		expect(changesLoaded(["library", "rollback", "e"])).toBe(true);
 		expect(changesLoaded(["activate", "e"])).toBe(true);
+		expect(changesLoaded(["policy", "auto", "add", "scripts", "**"])).toBe(true);
+		expect(changesLoaded(["policy", "auto", "remove", "scripts", "**"])).toBe(true);
+		expect(changesLoaded(["policy", "auto", "list"])).toBe(false);
 		expect(changesLoaded(["library", "decline", "e"])).toBe(false);
 		expect(changesLoaded(["library", "ls"])).toBe(false);
 		expect(changesLoaded(["status"])).toBe(false);
@@ -335,6 +342,10 @@ type HostState = {
 	git?: { top: string; head?: string; remote?: string };
 	/** What each review dialog answers, in order (undefined = Esc). */
 	choices?: (string | undefined)[];
+	/** What `rematch check` returns. */
+	checkData?: object;
+	/** Optional custom handler for `rematch check` calls in tests. */
+	onCheck?: (argv: string[], signal?: AbortSignal) => Promise<object>;
 };
 
 /** The `messages` a `context` handler returned (throws when it changed nothing). */
@@ -372,7 +383,7 @@ async function host(name: string, state: HostState) {
 		zod: z,
 		pi: { settings: {} as Record<string, string[] | undefined>, VERSION: "test" },
 		logger: { warn() {}, debug() {} },
-		async exec(cmd: string, argv: string[]) {
+		async exec(cmd: string, argv: string[], opts?: { signal?: AbortSignal }) {
 			if (cmd === "git" && state.git) {
 				const g = state.git;
 				if (argv[0] === "rev-parse") return { stdout: g.head ? `${g.top}\n${g.head}\n` : `${g.top}\n`, stderr: "", code: g.head ? 0 : 1, killed: false };
@@ -393,6 +404,18 @@ async function host(name: string, state: HostState) {
 					return ok({ lines: [], actions: state.actions ?? [] });
 				case "retrieve":
 					return ok({ units: [{ entry_id: "pkg", name: "ledger", path: "units/a.md", title: "A", text: "Unit text." }] });
+				case "check":
+					if (state.onCheck) return ok(await state.onCheck(argv, opts?.signal));
+					return ok(
+						state.checkData ?? {
+							detected: true,
+							ok: false,
+							kind: "cargo",
+							errors: 1,
+							duration_ms: 42,
+							rendered: "[rematch fast-check] cargo: 1 error(s) in 0.0s\nsrc/lib.rs:4:13 [E0308] mismatched types\n  help: try using a conversion method: `x.to_string()`",
+						},
+					);
 				default:
 					return ok({});
 			}
@@ -497,6 +520,124 @@ describe("factory", () => {
 		const retrievals = h.traceOf().filter(r => r.ev === "retrieval");
 		expect(retrievals).toHaveLength(1);
 		expect(retrievals[0].entry_ids).toEqual(["hook-retrieve"]);
+	});
+
+	test("fast-check: runs after file edits, injects hidden context message before next turn, records check_ran, and clears on new user input", async () => {
+		const checkFile = writeHook("hook-check", "check", { timeout_secs: 30, budget_bytes: 4096 });
+		const h = await host("fast-check", {
+			entries: [{ id: "hook-check", predicate_hit: true }],
+			hooks: [checkFile],
+		});
+		await h.fire("session_start");
+		// No edits yet -> context returns undefined and runs no check
+		expect(await h.fire("context", { messages: [user("fix the bug")] })).toBeUndefined();
+		expect(h.execs.filter(a => a[0] === "check")).toHaveLength(0);
+
+		// Non-mutating tool result -> still no check
+		await h.fire("tool_result", { toolName: "read", toolCallId: "r1", input: { path: "src/lib.rs" }, content: [], isError: false });
+		expect(await h.fire("context", { messages: [user("fix the bug")] })).toBeUndefined();
+		expect(h.execs.filter(a => a[0] === "check")).toHaveLength(0);
+
+		// Mutating tool result -> schedules check; awaiting context runs/finishes it and appends one hidden custom message
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false });
+		await h.fire("tool_result", { toolName: "write", toolCallId: "e2", input: { path: "src/helper.rs" }, content: [], isError: false });
+		const msgs = contextMessages(await h.fire("context", { messages: [user("fix the bug")] }));
+		const injected = msgs.at(-1) as Record<string, unknown>;
+		expect(injected).toMatchObject({
+			role: "custom",
+			customType: CHECK_TYPE,
+			display: false,
+		});
+		expect(String(injected.content)).toContain("src/lib.rs:4:13 [E0308] mismatched types");
+		expect(String(injected.content)).toContain("help: try using a conversion method: `x.to_string()`");
+
+		const checkArgv = h.execs.find(a => a[0] === "check") ?? [];
+		expect(checkArgv.slice(checkArgv.indexOf("--files"))).toEqual(["--files", "src/lib.rs", "src/helper.rs"]);
+
+		const checkRecs = h.traceOf().filter(r => r.ev === "check_ran");
+		expect(checkRecs).toHaveLength(1);
+		expect(checkRecs[0]).toMatchObject({
+			hook_id: "hook-check",
+			kind: "cargo",
+			ok: false,
+			errors: 1,
+			duration_ms: 42,
+			files: ["src/lib.rs", "src/helper.rs"],
+		});
+
+		// Next user input clears the previous turn's check message until another edit happens
+		await h.fire("input", { text: "thanks", source: "user" });
+		expect(await h.fire("context", { messages: [user("thanks")] })).toBeUndefined();
+	});
+
+	test("fast-check: a second edit aborts an in-flight check, restarts with the union of files, and clears lastCheckMsg when the new check yields nothing", async () => {
+		const checkFile = writeHook("hook-check-abort", "check", { timeout_secs: 30, budget_bytes: 4096 });
+		const abortedSignals: boolean[] = [];
+		let firstStarted = Promise.withResolvers<void>();
+		let releaseFirst = Promise.withResolvers<void>();
+		let callCount = 0;
+		const state: HostState = {
+			entries: [{ id: "hook-check-abort", predicate_hit: true }],
+			hooks: [checkFile],
+			git: { top: "/repo" },
+			onCheck: async (_argv, signal) => {
+				callCount++;
+				if (callCount === 1) {
+					firstStarted.resolve();
+					signal?.addEventListener("abort", () => {
+						abortedSignals.push(true);
+						releaseFirst.resolve();
+					});
+					await releaseFirst.promise;
+					return { detected: true, ok: true, kind: "cargo", errors: 0, duration_ms: 10, rendered: "✓ cargo clean in 0.1s" };
+				}
+				if (callCount === 2) {
+					return {
+						detected: true,
+						ok: false,
+						kind: "cargo",
+						errors: 1,
+						duration_ms: 20,
+						files: ["crates/a/src/lib.rs", "crates/b/src/lib.rs"],
+						rendered: "[rematch fast-check] cargo: 1 error(s) in 0.0s\ncrates/b/src/lib.rs:1:1 [E0308] mismatched types",
+					};
+				}
+				// 3rd check yields nothing (e.g. non-code edit or empty rendered)
+				return { detected: false, ok: true, rendered: null };
+			},
+		};
+		const h = await host("fast-check-abort", state);
+		h.ctx.cwd = "/repo/crates/a";
+		await h.fire("session_start");
+
+		// First edit starts after debounce
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false });
+		await firstStarted.promise;
+
+		// Second edit arrives while first check is in flight -> aborts first check and unions files
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e2", input: { path: "/repo/crates/b/src/lib.rs" }, content: [], isError: false });
+		expect(abortedSignals).toEqual([true]);
+
+		const msgs = contextMessages(await h.fire("context", { messages: [user("fix")] }));
+		const injected = msgs.at(-1) as Record<string, unknown>;
+		expect(String(injected.content)).toContain("crates/b/src/lib.rs:1:1 [E0308]");
+
+		const checkCalls = h.execs.filter(a => a[0] === "check");
+		expect(checkCalls).toHaveLength(2);
+		expect(checkCalls[1]!.slice(checkCalls[1]!.indexOf("--files"))).toEqual(["--files", "src/lib.rs", "/repo/crates/b/src/lib.rs"]);
+
+		// Only the non-aborted check recorded check_ran, with repo-top-normalized files
+		const checkRecs = h.traceOf().filter(r => r.ev === "check_ran");
+		expect(checkRecs).toHaveLength(1);
+		expect(checkRecs[0]!.files).toEqual(["crates/a/src/lib.rs", "crates/b/src/lib.rs"]);
+		expect(normalizeCheckFiles(["./src/lib.rs", "/repo/crates/b/src/lib.rs"], "/repo/crates/a", "/repo")).toEqual([
+			"crates/a/src/lib.rs",
+			"crates/b/src/lib.rs",
+		]);
+
+		// A subsequent edit whose check yields nothing overwrites (clears) lastCheckMsg
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e3", input: { path: "README.md" }, content: [], isError: false });
+		expect(await h.fire("context", { messages: [user("fix")] })).toBeUndefined();
 	});
 
 	const stuckFile = () => writeHook("hook-stuck", "stuck", { repeats: 3 });
@@ -720,13 +861,18 @@ describe("factory", () => {
 			["on", ["--text"]],
 			["mark", ["correction"]],
 			["uninstall", ["--yes"]],
+			["policy", ["auto", "add", "instructions", "**"]],
+			["policy", ["--text", "auto", "remove", "scripts", "**"]],
+			["policy", ["auto", "list"]],
+			["policy", ["probes", "--daily", "0"]],
+			["policy", ["--text", "probes", "--max-parallel=4"]],
 		];
 		for (const [op, args] of refused) {
 			const r = await h.tool(op, args);
 			expect(r.ok, `${op} ${args.join(" ")}`).toBe(false);
 			expect(r.error, `${op} ${args.join(" ")}`).toContain("reserved to the user");
 		}
-		expect(h.execs.filter(a => ["library", "off", "on", "mark", "uninstall"].includes(a[0] ?? "") && a[1] !== "ls"), "none reached the binary").toEqual([]);
+		expect(h.execs.filter(a => ["library", "off", "on", "mark", "uninstall", "policy"].includes(a[0] ?? "") && a[1] !== "ls"), "none reached the binary").toEqual([]);
 		expect((await h.tool("library", ["--text", "ls"])).ok).toBe(true);
 		expect((await h.tool("library", ["inspect", "e1"])).ok).toBe(true);
 		// The model's shell: the same parser, before any hook, and while rematch is off.
@@ -735,9 +881,14 @@ describe("factory", () => {
 		expect(h.toolCall({ command: "rematch --text mark --class correction" })).toContain("reserved to the user");
 		expect(h.toolCall({ command: "rematch policy scope set bellwether-dev ~/repos/bellwether" })).toContain("reserved to the user");
 		expect(h.toolCall({ command: "rematch --cwd /w policy scope unset bellwether-dev" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch policy auto add instructions **" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch --text policy auto remove scripts **" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch policy probes --daily 0" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch --cwd /w policy probes --max-parallel=8" })).toContain("reserved to the user");
+		expect(h.toolCall({ command: "rematch policy probes" })).toBeUndefined();
 		expect(h.toolCall({ command: "rematch policy show" })).toBeUndefined();
 		expect(h.toolCall({ command: "rematch --text library ls" })).toBeUndefined();
-		expect(h.traceOf().filter(r => r.ev === "tool_blocked").map(r => r.hook_id)).toEqual(Array(5).fill("rematch:user-only"));
+		expect(h.traceOf().filter(r => r.ev === "tool_blocked").map(r => r.hook_id)).toEqual(Array(9).fill("rematch:user-only"));
 		await h.command("off");
 		expect(h.toolCall({ command: "sh -c 'rematch --cwd /w on'" })).toContain("reserved to the user");
 	});
@@ -785,4 +936,122 @@ describe("factory", () => {
 			expect(appendPromptFragments(["base"], [])).toBeNull();
 		});
 	});
+});
+
+describe("omp CLI smoke with fakeai/fake-model", () => {
+	const ompCli = path.join(os.homedir(), ".local/share/omp-lean/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js");
+	const rematchBin = path.resolve(import.meta.dir, "..", "target/debug/rematch");
+	const testIfOmp = fs.existsSync(ompCli) && fs.existsSync(rematchBin) ? test : test.skip;
+
+	testIfOmp("scripted edit introducing a Cargo error injects fast-check diagnostic before next turn", async () => {
+		const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "rematch-omp-smoke-")));
+		const home = path.join(work, "home");
+		const agent = path.join(home, ".omp", "agent");
+		const root = path.join(work, "rematch");
+		const repo = path.join(work, "payments");
+		fs.mkdirSync(agent, { recursive: true });
+		fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+		fs.writeFileSync(path.join(repo, "Cargo.toml"), '[package]\nname = "payments"\nversion = "0.1.0"\nedition = "2021"\n');
+		fs.writeFileSync(path.join(repo, "src/lib.rs"), "pub fn reconcile() {}\n");
+
+		const requests: { messages: { role: string; content: unknown }[] }[] = [];
+		let callNum = 0;
+		const replies = [
+			{ tool: { name: "write", args: { path: "src/lib.rs", content: 'pub fn reconcile() -> String { "bad" }\n' } } },
+			{ text: "Fixed the type error." },
+		];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async req => {
+				const body = (await req.json()) as { messages: { role: string; content: unknown }[]; tools?: unknown[] };
+				if (Array.isArray(body.tools) && body.tools.length > 0) requests.push(body);
+				const reply = Array.isArray(body.tools) && body.tools.length > 0 ? (replies.shift() ?? { text: "ok" }) : { text: "short summary" };
+				const id = `call_${++callNum}`;
+				const chunk = (delta: object, finish: string | null = null) =>
+					`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 1, model: "fake-model", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+				let sse = chunk({ role: "assistant", content: "" });
+				if ("text" in reply && reply.text) sse += chunk({ content: reply.text });
+				if ("tool" in reply && reply.tool) {
+					sse += chunk({
+						tool_calls: [{ index: 0, id, type: "function", function: { name: reply.tool.name, arguments: JSON.stringify(reply.tool.args) } }],
+					});
+				}
+				sse += chunk({}, "tool" in reply && reply.tool ? "tool_calls" : "stop");
+				sse += `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 1, model: "fake-model", choices: [], usage: { prompt_tokens: 50, completion_tokens: 10, total_tokens: 60 } })}\n\ndata: [DONE]\n\n`;
+				return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+			},
+		});
+
+		try {
+			fs.writeFileSync(
+				path.join(agent, "models.json"),
+				JSON.stringify({
+					providers: {
+						fakeai: {
+							baseUrl: `http://127.0.0.1:${server.port}/v1`,
+							api: "openai-completions",
+							apiKey: "test-key",
+							models: [{ id: "fake-model", name: "Fake", contextWindow: 64000, maxTokens: 2000 }],
+						},
+					},
+				}),
+			);
+			const env: Record<string, string> = {
+				PATH: process.env.PATH ?? "/usr/bin:/bin",
+				HOME: home,
+				USER: process.env.USER ?? "",
+				RUSTUP_HOME: process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"),
+				CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"),
+				PI_CONFIG_DIR: path.join(home, ".omp"),
+				PI_CODING_AGENT_DIR: agent,
+				OMP_PROFILE: "default",
+				REMATCH_ROOT: root,
+				REMATCH_BIN: rematchBin,
+				REMATCH_MACHINE: "omp-smoke",
+				PI_OFFLINE: "1",
+				PI_TELEMETRY: "0",
+				PI_SKIP_VERSION_CHECK: "1",
+			};
+			// Ensure builtins are installed and compiled
+			const b = Bun.spawnSync([rematchBin, "builtins", "ls"], { cwd: repo, env });
+			expect(b.exitCode).toBe(0);
+
+			const extPath = path.resolve(import.meta.dir, "index.ts");
+			const proc = Bun.spawn(
+				[
+					process.execPath,
+					ompCli,
+					"-e",
+					extPath,
+					"--no-extensions",
+					"--no-rules",
+					"--no-session",
+					"--model",
+					"fakeai/fake-model",
+					"-p",
+					"update reconcile in src/lib.rs",
+				],
+				{ cwd: repo, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+			expect(code, stderr).toBe(0);
+			expect(requests.length).toBeGreaterThanOrEqual(2);
+			const secondText = requests[1]!.messages
+				.map(m =>
+					typeof m.content === "string"
+						? m.content
+						: Array.isArray(m.content)
+							? m.content.map((p: { text?: string }) => p.text ?? "").join("")
+							: JSON.stringify(m.content ?? ""),
+				)
+				.join("\n");
+			expect(secondText).toContain("src/lib.rs:1:");
+			expect(secondText).toContain("E0308");
+			expect(secondText).toContain("to_string");
+		} finally {
+			server.stop(true);
+			fs.rmSync(work, { recursive: true, force: true });
+		}
+	}, 60_000);
 });

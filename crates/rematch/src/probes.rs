@@ -1,35 +1,34 @@
-//! Bounded automatic probes (DESIGN §7 "Comparative support"): one engine-run reference /
-//! candidate comparison per provisional entry version, on a task the user authorized for
-//! automatic replay.
+//! Bounded automatic probes (DESIGN §7 "Comparative support", §18): one engine-run reference /
+//! candidate comparison per provisional entry version, in detached `reflect --pending` after a
+//! session ends.
 //!
-//! Evidence semantics. A probe runs the authorized task twice through the existing batch
-//! substrate (omp, a fresh git worktree of the repo's HEAD, skills overlay, memory off):
-//! the baseline loads the kept/pinned library only, the candidate the same library plus
-//! the entry. Task, prompt, verifier, tools, model, seed and base commit are identical; the
-//! verifier is the task's, fixed when the user authorized it, so a candidate can neither
-//! choose nor edit it. The outcome ([`ComparativeOutcome`]) is engine-classified from the
-//! two verdicts: `supports` (candidate passed where baseline failed, or scored higher) can
-//! keep the entry when no recurrence or harm was recorded (`counters::keep_reason`),
-//! `regresses` retires it, `tie`/`cost_worse` decide nothing (observational acceptance may
-//! still keep it), `incomplete` (a failed, killed or model-drifted rollout, or a moved
-//! base) never promotes. Support is under those conditions in omp only — never general
-//! correctness, and never evidence about a host-specific surface.
+//! Evidence semantics. A probe runs a task twice through the existing batch substrate (omp, a
+//! fresh git worktree of the repo's HEAD, skills overlay, memory off): the baseline loads the
+//! kept/pinned library only, the candidate the same library plus the entry. Task, prompt,
+//! verifier, tools, model, seed and base commit are identical; the verifier is fixed by the
+//! engine or user, so a candidate can neither choose nor edit it. The outcome
+//! ([`ComparativeOutcome`]) is engine-classified from the two verdicts: `supports` (candidate
+//! passed where baseline failed, or scored higher) immediately keeps the entry when no
+//! recurrence or harm was recorded (`counters::keep_reason`), `regresses` immediately retires
+//! it, `tie`/`cost_worse` decide nothing (observational acceptance may still keep it),
+//! `incomplete` (a failed, killed or model-drifted rollout, or a moved base) never promotes.
 //!
 //! Eligibility. Skills, rules and facts whose files the omp substrate materializes (no
 //! `AGENTS.fragment.md`, no `scripts/`); hooks, agents, scripts and instruction fragments are
-//! host- or execution-specific and stay on the observed-use path. The task must be
-//! authorized ([`ReplayAuthorization`] bound to its exact definition), its repo a clean git
-//! work tree, and the entry's predicate must place-match it. Missing authorization surfaces
-//! a reviewable `probe:<entry id>` action: an existing task of the repo, else a suggested one
-//! grounded in the originating trace (its task prompt; its observed test command as the
-//! verifier, a plain test-runner invocation only). Suggested tasks get the tools
-//! `read,grep,glob,edit,write` (no shell, no network). A worktree is isolation from the
-//! active checkout, not an OS sandbox.
+//! host- or execution-specific and stay on the observed-use path. Probes run **automatically**,
+//! without a `probe:` approval, when the task replays a recorded session of that repo in an
+//! isolated worktree (`suggest_for` trace grounding), the verifier is engine-chosen and sealed
+//! (the repo's detected fast check, detected test runner, or an observed plain test-runner
+//! command), and the run fits the budget (`policy.json` `probes.daily_runs`, default 3;
+//! `probes.max_parallel`, default 1; per-rollout time cap ≤ [`PROBE_MAX_TIME_SECS`]). The
+//! `probe:<entry id>` review action is kept only for probes that use a user-supplied task/verifier
+//! or exceed rollout caps (one-tap hash-bound review).
 //!
 //! Caps: [`PROBE_ROLLOUTS`] rollouts per probe, each ≤ [`PROBE_MAX_TIME_SECS`] (+ the
-//! rollout kill grace), [`PROBES_PER_PASS`] per reflect pass, [`PROBES_PER_DAY`] per 24 h, no
-//! editor or other model calls, one probe per (entry, version, content); a global lock and the
-//! task's run lock; SIGINT/SIGTERM cancel the running rollout (recorded `incomplete`).
+//! rollout kill grace), [`PROBES_PER_PASS`] per reflect pass (or `probes.max_parallel`),
+//! `probes.daily_runs` (default [`PROBES_PER_DAY`]) per 24 h (`0` = off), no editor or other
+//! model calls, one probe per (entry, version, content); a global lock and the task's run lock;
+//! SIGINT/SIGTERM cancel the running rollout (recorded `incomplete`).
 
 use std::path::{Path, PathBuf};
 
@@ -49,7 +48,7 @@ use crate::app::AppCtx;
 use crate::batch::rollout::{run_rollout, Rollout, RolloutSummary};
 use crate::batch::substrate::{read_entry_files, BaseLibrary, CandidateTree, OmpSubstrate, Substrate, TreeEntry};
 use crate::batch::tasks::{is_git_repo, list_tasks, save_task, task_runs_dir, validate_id, ReplayAuthorization, Task};
-use crate::batch::verifier::{is_pass, parse_spec, score_of, TestVerifier, Verifier};
+use crate::batch::verifier::{default_spec_for, is_pass, parse_spec, resolve_spec_for_task, score_of, Verifier};
 use crate::config::{resolve_role, ROLE_SOLVER};
 use crate::envelope::Cancelled;
 use crate::jobs::LockFile;
@@ -60,10 +59,10 @@ pub const PROBE_ROLLOUTS: u32 = 2;
 /// Host `--max-time` per rollout (the task's own when lower). The engine's outer deadline
 /// adds `batch::rollout::KILL_GRACE` before tearing the process tree down.
 pub const PROBE_MAX_TIME_SECS: u64 = 300;
-/// Probes one reflect pass runs.
+/// Default probes one reflect pass runs (overridden by `policy.json` `probes.max_parallel`).
 pub const PROBES_PER_PASS: usize = 1;
-/// Probes started in any 24 hours.
-pub const PROBES_PER_DAY: usize = 4;
+/// Default probes started in any 24 hours (`policy.json` `probes.daily_runs`).
+pub const PROBES_PER_DAY: usize = rematch_core::domain::DEFAULT_PROBE_DAILY_RUNS;
 /// The execution harness every probe runs in.
 pub const HARNESS: &str = "omp";
 /// Tools of a suggested task with an editable scope: no shell, no network.
@@ -285,7 +284,12 @@ fn line_of(r: &ProbeRecord) -> String {
         ProbeStatus::Incomplete => "comparison incomplete",
     };
     let on = r.task.as_deref().map(|t| format!(" on task {t} ({})", r.harness)).unwrap_or_default();
-    format!("probe {} v{}: {what}{on}: {}", r.name, r.version, r.reason)
+    let undo = match r.status {
+        ProbeStatus::Supports => format!(" (`rematch library disable {}` or `rematch library rollback {}`)", r.entry, r.name),
+        ProbeStatus::Regresses => format!(" (`rematch library why` / `rematch library disable {}`)", r.entry),
+        _ => String::new(),
+    };
+    format!("probe {} v{}: {what}{on}: {}{undo}", r.name, r.version, r.reason)
 }
 
 // ------------------------------------------------------------------------------------
@@ -364,6 +368,56 @@ fn started_last_day(ctx: &AppCtx) -> usize {
         .filter(|r| r.source == "probe" && r.spent() && ctx.now - r.at < DAY_MS)
         .count()
 }
+fn probe_limits(ctx: &AppCtx) -> (usize, usize) {
+    match ctx.domain_policy() {
+        Ok(p) => (p.probe_daily_runs(), p.probe_max_parallel()),
+        Err(_) => (PROBES_PER_DAY, PROBES_PER_PASS),
+    }
+}
+
+/// Active-session staleness window: an unshut trace segment with no record within 30 minutes
+/// (by its latest record timestamp, else file mtime) is treated as crashed/abandoned so it
+/// cannot block automatic probes forever.
+pub const ACTIVE_SESSION_TTL_MS: i64 = 30 * 60 * 1000;
+
+/// Whether any traced session currently has an unfinished segment (no `session_shutdown` after
+/// its last `session_start`) with activity within [`ACTIVE_SESSION_TTL_MS`]. Probes run only
+/// after a session ends, never while a user's session is active.
+pub fn has_active_session(ctx: &AppCtx) -> bool {
+    let Ok(rd) = std::fs::read_dir(&ctx.paths.traces) else { return false };
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if p.extension().is_some_and(|x| x == "jsonl") {
+            if let Ok(records) = trace::read_trace(&p) {
+                let last_start = records.iter().rposition(|r| matches!(r, TraceRecord::SessionStart { .. }));
+                if let Some(idx) = last_start {
+                    if !records[idx..].iter().any(|r| matches!(r, TraceRecord::SessionShutdown { .. })) {
+                        let last_t = records[idx..]
+                            .iter()
+                            .map(TraceRecord::t)
+                            .max()
+                            .filter(|t| *t > 0)
+                            .or_else(|| {
+                                std::fs::metadata(&p)
+                                    .ok()?
+                                    .modified()
+                                    .ok()?
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_millis() as i64)
+                            })
+                            .unwrap_or(0);
+                        if last_t > 0 && ctx.now.saturating_sub(last_t) <= ACTIVE_SESSION_TTL_MS {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 
 // ------------------------------------------------------------------------------------
 // the pass (`reflect --pending`, detached)
@@ -377,6 +431,13 @@ pub fn pass(ctx: &AppCtx, lines: &mut Vec<String>) -> Result<(Vec<EntryId>, Valu
 
 /// [`pass`] with an explicit omp binary.
 pub fn pass_with(ctx: &AppCtx, lines: &mut Vec<String>, omp_bin: &Path) -> Result<(Vec<EntryId>, Value)> {
+    if ctx.paths.is_off() {
+        return Ok((Vec::new(), json!({"skipped": "rematch is off", "ran": [], "entries": []})));
+    }
+    if has_active_session(ctx) {
+        return Ok((Vec::new(), json!({"skipped": "an active session is running; probes run only after a session ends", "ran": [], "entries": []})));
+    }
+    let (daily_cap, pass_cap) = probe_limits(ctx);
     let Some(_lock) = LockFile::acquire({
         std::fs::create_dir_all(dir(ctx))?;
         dir(ctx).join(".lock")
@@ -393,45 +454,53 @@ pub fn pass_with(ctx: &AppCtx, lines: &mut Vec<String>, omp_bin: &Path) -> Resul
         }
         let rec = match unsupported(ctx, e) {
             Some(why) => ProbeRecord::new(e, ProbeStatus::Skipped, why, ctx.now),
-            None => match covering_tasks(ctx, e, true)?.into_iter().next() {
-                None => {
-                    let s = suggest_for(ctx, e)?;
-                    let reason = match &s {
-                        Some(s) if s.declined_at.is_some() => {
-                            ProbeRecord::new(e, ProbeStatus::Skipped, "replay declined for this repo; observed-use path", ctx.now)
-                        }
-                        Some(s) => ProbeRecord::new(
-                            e,
-                            ProbeStatus::AwaitingAuthorization,
-                            match &s.blocked {
-                                Some(b) => format!("no authorized task covers its repo; suggested replay blocked: {b}"),
-                                None => format!("no authorized task covers its repo; review `rematch library inspect {PROBE}{}`", e.id),
-                            },
-                            ctx.now,
-                        ),
-                        None => ProbeRecord::new(e, ProbeStatus::Skipped, "no authorized task and no originating trace to ground a replay in", ctx.now),
-                    };
-                    reason
-                }
-                Some(task) if ran.len() >= PROBES_PER_PASS => ProbeRecord {
-                    task: Some(task.id),
-                    ..ProbeRecord::new(e, ProbeStatus::Skipped, format!("pass cap ({PROBES_PER_PASS}) reached; next pass"), ctx.now)
-                },
-                Some(task) if started_last_day(ctx) >= PROBES_PER_DAY => ProbeRecord {
-                    task: Some(task.id),
-                    ..ProbeRecord::new(e, ProbeStatus::Skipped, format!("daily cap ({PROBES_PER_DAY} probes per 24 h) reached"), ctx.now)
-                },
-                Some(task) => match replayable_repo(&task.repo) {
-                    Err(why) => ProbeRecord { task: Some(task.id), ..ProbeRecord::new(e, ProbeStatus::Skipped, why, ctx.now) },
-                    Ok(head) => {
-                        let r = run_probe(ctx, e, &task, &head, omp_bin)?;
-                        if r.spent() {
-                            ran.push(e.id.clone());
-                        }
-                        r
+            None if daily_cap == 0 => {
+                ProbeRecord::new(e, ProbeStatus::Skipped, "automatic probes off (`policy.json` `probes.daily_runs = 0`)", ctx.now)
+            }
+            None => {
+                let auth_task = covering_tasks(ctx, e, true)?.into_iter().next();
+                let suggestion = if auth_task.is_none() { suggest_for(ctx, e)? } else { None };
+                let candidate_task: Option<Task> = match (&auth_task, &suggestion) {
+                    (Some(t), _) => Some(t.clone()),
+                    (None, Some(s)) if s.auto_eligible() => Some(s.task.clone()),
+                    _ => None,
+                };
+                match (candidate_task, suggestion) {
+                    (None, Some(s)) if s.declined_at.is_some() => {
+                        ProbeRecord::new(e, ProbeStatus::Skipped, "replay declined for this repo; observed-use path", ctx.now)
                     }
-                },
-            },
+                    (None, Some(s)) => ProbeRecord::new(
+                        e,
+                        ProbeStatus::AwaitingAuthorization,
+                        match &s.blocked {
+                            Some(b) => format!("no authorized task covers its repo; suggested replay blocked: {b}"),
+                            None => format!("user-supplied task/verifier or rollout cap requires review: `rematch library inspect {PROBE}{}`", e.id),
+                        },
+                        ctx.now,
+                    ),
+                    (None, None) => {
+                        ProbeRecord::new(e, ProbeStatus::Skipped, "no authorized task and no originating trace to ground a replay in", ctx.now)
+                    }
+                    (Some(task), _) if ran.len() >= pass_cap => ProbeRecord {
+                        task: Some(task.id),
+                        ..ProbeRecord::new(e, ProbeStatus::Skipped, format!("pass cap ({pass_cap}) reached; next pass"), ctx.now)
+                    },
+                    (Some(task), _) if started_last_day(ctx) >= daily_cap => ProbeRecord {
+                        task: Some(task.id),
+                        ..ProbeRecord::new(e, ProbeStatus::Skipped, format!("daily cap ({daily_cap} probes per 24 h) reached"), ctx.now)
+                    },
+                    (Some(task), _) => match replayable_repo(&task.repo) {
+                        Err(why) => ProbeRecord { task: Some(task.id), ..ProbeRecord::new(e, ProbeStatus::Skipped, why, ctx.now) },
+                        Ok(head) => {
+                            let r = run_probe(ctx, e, &task, &head, omp_bin)?;
+                            if r.spent() {
+                                ran.push(e.id.clone());
+                            }
+                            r
+                        }
+                    },
+                }
+            }
         };
         let changed = record_of(ctx, &e.id).is_none_or(|old| (old.status, &old.reason, old.version) != (rec.status, &rec.reason, rec.version));
         if changed {
@@ -442,7 +511,7 @@ pub fn pass_with(ctx: &AppCtx, lines: &mut Vec<String>, omp_bin: &Path) -> Resul
         }
         report.push(json!({"entry": rec.entry, "name": rec.name, "status": rec.status, "reason": rec.reason, "task": rec.task}));
     }
-    let summary = json!({"ran": ran, "entries": report, "caps": caps()});
+    let summary = json!({"ran": ran, "entries": report, "caps": caps_for(ctx)});
     Ok((ran, summary))
 }
 
@@ -451,7 +520,20 @@ pub fn caps() -> Value {
         "rollouts_per_probe": PROBE_ROLLOUTS,
         "host_max_time_secs_per_rollout": PROBE_MAX_TIME_SECS,
         "outer_deadline_margin_secs": crate::batch::rollout::KILL_GRACE.as_secs(),
-        "per_pass": PROBES_PER_PASS, "per_day": PROBES_PER_DAY, "editor_calls": 0,
+        "per_pass": PROBES_PER_PASS, "per_day": PROBES_PER_DAY, "max_parallel": PROBES_PER_PASS,
+        "daily_runs": PROBES_PER_DAY, "editor_calls": 0,
+        "solver_calls": "only inside the two omp rollouts", "per_entry_version": 1, "harness": HARNESS,
+    })
+}
+
+pub fn caps_for(ctx: &AppCtx) -> Value {
+    let (daily, parallel) = probe_limits(ctx);
+    json!({
+        "rollouts_per_probe": PROBE_ROLLOUTS,
+        "host_max_time_secs_per_rollout": PROBE_MAX_TIME_SECS,
+        "outer_deadline_margin_secs": crate::batch::rollout::KILL_GRACE.as_secs(),
+        "per_pass": parallel, "per_day": daily, "max_parallel": parallel,
+        "daily_runs": daily, "editor_calls": 0,
         "solver_calls": "only inside the two omp rollouts", "per_entry_version": 1, "harness": HARNESS,
     })
 }
@@ -462,7 +544,7 @@ fn run_probe(ctx: &AppCtx, e: &Entry, task: &Task, base_head: &str, omp_bin: &Pa
     let mut rec = ProbeRecord::new(e, ProbeStatus::Incomplete, "", ctx.now);
     rec.task = Some(task.id.clone());
     rec.base_head = Some(base_head.to_string());
-    let verifier_spec = task.verifier.clone().filter(|v| !v.trim().is_empty());
+    let verifier_spec = resolve_spec_for_task(task).map(|(v, _)| v);
     let Some(spec) = verifier_spec else {
         rec.status = ProbeStatus::Skipped;
         rec.reason = format!("task {} has no verifier", task.id);
@@ -515,7 +597,7 @@ fn run_probe(ctx: &AppCtx, e: &Entry, task: &Task, base_head: &str, omp_bin: &Pa
     // Seal the judge: a rollout that changed a verifier input voids the comparison.
     let tampered: Vec<(String, Vec<String>)> = rollouts
         .iter()
-        .map(|r| (r.label.clone(), task.seal_violations(&r.install.worktree)))
+        .map(|r| (r.label.clone(), r.seal_violations.clone()))
         .filter(|(_, t)| !t.is_empty())
         .collect();
     for r in &rollouts {
@@ -544,7 +626,7 @@ fn run_probe(ctx: &AppCtx, e: &Entry, task: &Task, base_head: &str, omp_bin: &Pa
     rec.status = ProbeStatus::of(outcome);
     rec.reason = reason;
     let blob = json!({
-        "kind": "probe", "record": &rec, "caps": caps(),
+        "kind": "probe", "record": &rec, "caps": caps_for(ctx),
         "task": {"id": task.id, "repo": task.repo, "prompt_sha256": rematch_core::ledger::sha256_hex(task.prompt.as_bytes()),
                  "tools": task.tools, "fingerprint": task.fingerprint()},
     });
@@ -626,7 +708,7 @@ pub fn record_batch_comparison(
 ) -> Result<ProbeRecord> {
     let touched: Vec<String> = [reference, winner]
         .iter()
-        .flat_map(|r| task.seal_violations(&r.install.worktree).into_iter().map(move |p| format!("{}: {p}", r.label)))
+        .flat_map(|r| r.seal_violations.iter().map(move |p| format!("{}: {p}", r.label)))
         .collect();
     let (outcome, reason) = if !task.sealable() {
         (ComparativeOutcome::Incomplete, format!("unsealed judge: task {} declares no editable paths and its tools can write", task.id))
@@ -671,6 +753,24 @@ pub struct Suggestion {
     pub at: UnixMs,
 }
 
+impl Suggestion {
+    /// Whether this suggestion can run automatically without a `probe:` approval:
+    /// it replays a recorded session of the repo (`!existing` and `prompt_source` from a trace)
+    /// in an isolated worktree, its verifier is engine-chosen and sealed (`detected: …` or
+    /// `observed: …` plain test runner), its workspace is sealable, and its rollout time cap fits
+    /// [`PROBE_MAX_TIME_SECS`].
+    pub fn auto_eligible(&self) -> bool {
+        self.declined_at.is_none()
+            && self.blocked.is_none()
+            && !self.existing
+            && self.prompt_source.starts_with("trace ")
+            && (self.verifier_source.starts_with("detected:") || self.verifier_source.starts_with("observed:"))
+            && self.task.verifier.as_ref().is_some_and(|v| !v.trim().is_empty())
+            && self.task.sealable()
+            && self.task.max_time_secs <= PROBE_MAX_TIME_SECS
+    }
+}
+
 /// The suggestion for `e`, built once (an existing unauthorized task of its repo, else one
 /// grounded in its originating trace); `None` when nothing grounds a replay.
 pub fn suggest_for(ctx: &AppCtx, e: &Entry) -> Result<Option<Suggestion>> {
@@ -682,22 +782,29 @@ pub fn suggest_for(ctx: &AppCtx, e: &Entry) -> Result<Option<Suggestion>> {
         return Ok(None);
     }
     let s = match covering_tasks(ctx, e, false)?.into_iter().next() {
-        Some(task) => Suggestion {
-            entry: e.id.clone(),
-            blocked: if task.verifier.is_none() {
-                Some(format!("task {} has no verifier: `rematch task add {} … --verifier <cmd>`", task.id, task.id))
-            } else if !task.sealable() {
-                Some(format!("task {} declares no editable paths and its tools can write, so its judge cannot be sealed: `rematch task add {} … --editable <path>` (or `--tools read,grep,glob` for a read-only task)", task.id, task.id))
-            } else {
-                None
-            },
-            verifier_source: "task".into(),
-            prompt_source: "task".into(),
-            task,
-            existing: true,
-            declined_at: None,
-            at: ctx.now,
-        },
+        Some(mut task) => {
+            let resolved = resolve_spec_for_task(&task);
+            let verifier_source = resolved.as_ref().map(|(_, src)| src.clone()).unwrap_or_else(|| "none".into());
+            if task.verifier.is_none() {
+                task.verifier = resolved.map(|(v, _)| v);
+            }
+            Suggestion {
+                entry: e.id.clone(),
+                blocked: if task.verifier.is_none() {
+                    Some(format!("task {} has no verifier: `rematch task add {} … --verifier <cmd>`", task.id, task.id))
+                } else if !task.sealable() {
+                    Some(format!("task {} declares no editable paths and its tools can write, so its judge cannot be sealed: `rematch task add {} … --editable <path>` (or `--tools read,grep,glob` for a read-only task)", task.id, task.id))
+                } else {
+                    None
+                },
+                verifier_source,
+                prompt_source: "task".into(),
+                task,
+                existing: true,
+                declined_at: None,
+                at: ctx.now,
+            }
+        }
         None => match from_trace(ctx, e)? {
             Some(s) => s,
             None => return Ok(None),
@@ -743,8 +850,14 @@ fn from_trace(ctx: &AppCtx, e: &Entry) -> Result<Option<Suggestion>> {
     let observed = session.commands.iter().rev().find(|c| is_test_command(c)).cloned();
     let (verifier, verifier_source, blocked) = match observed {
         Some(c) => (Some(format!("script:{c}")), format!("observed: {c}"), None),
-        None if TestVerifier::detect(&repo).is_some() => (Some("tests".to_string()), "detected: tests".to_string(), None),
-        None => (None, "none".to_string(), Some("no test command observed and no test runner detected; define a verifier with `rematch task add`".to_string())),
+        None => match default_spec_for(&repo) {
+            Some((spec, source)) => (Some(spec), source, None),
+            None => (
+                None,
+                "none".to_string(),
+                Some("no test command observed and no fast check or test runner detected; define a verifier with `rematch task add`".to_string()),
+            ),
+        },
     };
     // Solution scope: the files the originating session changed, minus verifier inputs.
     let repo_s = repo.to_string_lossy().replace('\\', "/");
@@ -862,6 +975,7 @@ pub fn pending_actions(ctx: &AppCtx) -> Result<Vec<Action>> {
     let Ok(rd) = std::fs::read_dir(dir(ctx).join("suggestions")) else { return Ok(out) };
     let mut sugs: Vec<Suggestion> = rd.flatten().filter_map(|e| read_json(&e.path())).collect();
     sugs.sort_by(|a, b| a.at.cmp(&b.at).then(a.entry.cmp(&b.entry)));
+    let (daily_cap, _) = probe_limits(ctx);
     for s in sugs.into_iter().filter(|s| s.declined_at.is_none()) {
         let Some(e) = ctx.ledger.get_entry(&s.entry)? else { continue };
         if e.status != Status::Provisional || record_of(ctx, &e.id).is_some_and(|r| r.spent() && r.binds(&e)) {
@@ -872,6 +986,15 @@ pub fn pending_actions(ctx: &AppCtx) -> Result<Vec<Action>> {
         }
         // Refresh: the user may have fixed the task the suggestion names since it was cached.
         let Some(s) = suggest_for(ctx, &e)?.filter(|s| s.declined_at.is_none()) else { continue };
+        // Trace-grounded tasks with engine-chosen sealed verifiers run automatically inside the
+        // daily budget; only user-supplied verifiers, blocked tasks, or tasks exceeding caps
+        // surface a `probe:` review item.
+        if s.auto_eligible() && daily_cap > 0 {
+            continue;
+        }
+        if daily_cap == 0 && s.auto_eligible() {
+            continue;
+        }
         let id = format!("{PROBE}{}", e.id);
         let sha = spec_sha(&s, &e);
         let mut a = Action::new(&id, "probe", surface_of(e.kind), &e.name);
@@ -924,7 +1047,11 @@ pub fn approve_action(ctx: &AppCtx, id: &str, sha: Option<&str>) -> Result<Value
         Some(_) => {}
     }
     let mut task = if s.existing {
-        crate::batch::tasks::load_task(ctx, &s.task.id)?
+        let mut t = crate::batch::tasks::load_task(ctx, &s.task.id)?;
+        if t.verifier.is_none() {
+            t.verifier = s.task.verifier.clone();
+        }
+        t
     } else {
         s.task.clone()
     };
@@ -1031,7 +1158,8 @@ mod tests {
                 "{{\"seq\":0,\"t\":1,\"ev\":\"session_start\",\"session_id\":\"{sid}\",\"cwd\":{r},\"repo\":{r}}}\n\
                  {{\"seq\":1,\"t\":2,\"ev\":\"input\",\"text\":\"Make the check pass in the build script\",\"prelabel\":\"none\"}}\n\
                  {{\"seq\":2,\"t\":3,\"ev\":\"tool_result\",\"tool\":\"bash\",\"call_id\":\"c\",\"input\":{{\"command\":\"make test\"}},\"is_error\":true}}\n\
-                 {{\"seq\":3,\"t\":4,\"ev\":\"input\",\"text\":\"No, the check still fails\",\"prelabel\":\"negation\"}}\n",
+                 {{\"seq\":3,\"t\":4,\"ev\":\"input\",\"text\":\"No, the check still fails\",\"prelabel\":\"negation\"}}\n\
+                 {{\"seq\":4,\"t\":5,\"ev\":\"session_shutdown\",\"reasons\":[\"redirect:negation\"],\"flagged\":true}}\n",
                 r = serde_json::to_string(&repo).unwrap()
             );
             std::fs::create_dir_all(&e.ctx.paths.traces).unwrap();
@@ -1086,36 +1214,16 @@ mod tests {
         }
 
         #[test]
-        fn authorized_probe_runs_once_and_supports_a_keep() {
+        fn grounded_probe_runs_automatically_without_approval_and_supports_keep_or_retires_regression() {
             let e = env();
             let cand = staged(&e, "check-marker", &[]);
             let mut lines = Vec::new();
 
-            // Unauthorized: a grounded replay authorization appears; nothing runs.
-            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
-            assert!(ran.is_empty());
-            assert_eq!(record_of(&e.ctx, &cand.id).unwrap().status, ProbeStatus::AwaitingAuthorization);
-            let actions = pending_actions(&e.ctx).unwrap();
-            assert_eq!(actions.len(), 1, "{actions:?}");
-            let a = &actions[0];
-            assert_eq!(a.id, format!("probe:{}", cand.id));
-            assert!(a.approvable(), "{a:?}");
-            assert!(a.diff.contains("Make the check pass in the build script"), "prompt from the trace: {}", a.diff);
-            assert!(a.diff.contains("observed: make test"), "verifier from the observed command: {}", a.diff);
-            assert!(a.diff.contains(SUGGESTED_TOOLS));
-
-            // The user approves the exact reviewed snapshot; a missing, short or stale hash is refused.
-            let sha = a.sha256.clone().unwrap();
-            assert_eq!(a.commands.approve_argv.as_ref().unwrap().last(), Some(&sha), "approve argv carries the full hash");
-            let err = format!("{:#}", approve_action(&e.ctx, &a.id, None).unwrap_err());
-            assert!(err.contains("library inspect"), "{err}");
-            assert!(approve_action(&e.ctx, &a.id, Some(&sha[..12])).is_err(), "a prefix is no review");
-            approve_action(&e.ctx, &a.id, Some(&sha)).unwrap();
-            assert!(pending_actions(&e.ctx).unwrap().is_empty(), "authorized: no action left");
-
-            // Next pass: baseline without the candidate fails, candidate passes.
+            // A trace-grounded task with an engine-chosen sealed verifier runs automatically
+            // without any `probe:` approval action.
             let (ran, report) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
             assert_eq!(ran, vec![cand.id.clone()], "{report:#}");
+            assert!(pending_actions(&e.ctx).unwrap().is_empty(), "no approval action needed");
             let rec = record_of(&e.ctx, &cand.id).unwrap();
             assert_eq!(rec.status, ProbeStatus::Supports, "{rec:#?}");
             assert_eq!((rec.baseline.as_ref().unwrap().pass, rec.candidate.as_ref().unwrap().pass), (false, true));
@@ -1144,6 +1252,217 @@ mod tests {
             assert_eq!(r.reason, RetentionReason::ComparativeSupport);
             assert_eq!(r.probe.as_deref(), Some(rec.id.as_str()));
             assert_eq!(r.content_sha256, cand.content_sha256);
+
+            // Now commit `.rematch-marker` so the baseline passes, and stage a candidate that
+            // deletes `.rematch-marker` (`rematch-test-regress`): the automatic probe records
+            // `Regresses` and immediately retires the candidate.
+            sh(&e.repo, ": > .rematch-marker && git add .rematch-marker && git commit -qm marker");
+            let reg_skill = "---\nname: break-marker\ndescription: Use when finishing a build script task in this repository.\n---\n\nUse when finishing a build script task in this repository.\n\n## Laws\n- MUST rematch-test-regress before yielding.\n";
+            let reg = staged(&e, "break-marker", &[("SKILL.md", reg_skill)]);
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert_eq!(ran, vec![reg.id.clone()]);
+            let rec_reg = record_of(&e.ctx, &reg.id).unwrap();
+            assert_eq!(rec_reg.status, ProbeStatus::Regresses, "{rec_reg:#?}");
+            let entry_reg = e.ctx.ledger.get_entry(&reg.id).unwrap().unwrap();
+            let c_reg = e.ctx.ledger.counters(&reg.id).unwrap();
+            let ev_reg = evidence_for(&e.ctx, &entry_reg).unwrap();
+            assert_eq!(rematch_core::counters::decide(&entry_reg, &c_reg, Some(&ev_reg), e.ctx.now), Decision::Retire);
+            crate::reflect::apply_decision(&e.ctx, &entry_reg, Decision::Retire, &c_reg, Some(&ev_reg), Some("false")).unwrap();
+            let retired = e.ctx.ledger.get_entry(&reg.id).unwrap().unwrap();
+            assert_eq!(retired.status, Status::Retired);
+            assert!(retired.status_note.as_deref().unwrap_or("").contains("bounded comparison regressed"));
+
+            // Both automatic probe verdicts appear in the digest under `applied_automatically`
+            // with their undo command (`library rollback <name>` when there is a predecessor,
+            // else `library disable <id>`).
+            let digest = crate::digest::cmd_digest(&e.ctx).unwrap();
+            let auto = digest["applied_automatically"].as_array().unwrap();
+            assert!(
+                auto.iter().any(|x| x["id"] == cand.id && x["why"] == "comparative_support" && x["undo"] == format!("rematch library disable {}", cand.id)),
+                "{auto:#?}"
+            );
+            assert!(
+                auto.iter().any(|x| x["id"] == reg.id && x["why"] == "probe_regressed" && x["undo"] == format!("rematch library disable {}", reg.id)),
+                "{auto:#?}"
+            );
+            // When a comparative-support keep replaced a predecessor, undo is `rematch library rollback <name>`.
+            let mut kept_with_pred = e.ctx.ledger.get_entry(&cand.id).unwrap().unwrap();
+            kept_with_pred.predecessor = Some("prev-entry-id".into());
+            crate::reflect::save_entry(&e.ctx, &kept_with_pred).unwrap();
+            let auto2 = crate::actions::applied_automatically(&e.ctx).unwrap();
+            assert!(
+                auto2.iter().any(|x| x.id == cand.id && x.undo == "rematch library rollback check-marker"),
+                "{auto2:#?}"
+            );
+        }
+
+        #[test]
+        fn detected_fast_check_verifier_grounds_and_runs_automatically() {
+            let e = env();
+            sh(
+                &e.repo,
+                "mkdir -p src && printf '[package]\\nname = \"demo\"\\nversion = \"0.1.0\"\\nedition = \"2021\"\\n' > Cargo.toml && \
+                 printf 'include!(\"../.rematch-marker\");\\n' > src/lib.rs && git add Cargo.toml src/lib.rs && git commit -qm cargo",
+            );
+            rematch_core::check::clear_detect_cache();
+            let cand = staged(&e, "detected-check-skill", &[]);
+            let sid = match &cand.origin {
+                Origin::Session { session_id } => session_id.clone(),
+                _ => unreachable!(),
+            };
+            let mut s = e.ctx.ledger.get_session(&sid).unwrap().unwrap();
+            s.commands.clear(); // No observed test command: must fall back to detected fast check (`check`).
+            e.ctx.ledger.upsert_session(&s).unwrap();
+
+            let sug = suggest_for(&e.ctx, &cand).unwrap().unwrap();
+            assert_eq!(sug.task.verifier.as_deref(), Some("check"), "{sug:?}");
+            assert_eq!(sug.verifier_source, "detected: check (cargo)");
+            assert!(sug.auto_eligible(), "{sug:?}");
+            assert!(pending_actions(&e.ctx).unwrap().is_empty(), "detected fast check needs no approval");
+
+            let mut lines = Vec::new();
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert_eq!(ran, vec![cand.id.clone()]);
+            let rec = record_of(&e.ctx, &cand.id).unwrap();
+            assert_eq!(rec.verifier.as_deref(), Some("check"));
+            assert_eq!(rec.status, ProbeStatus::Supports, "baseline fails cargo check, candidate creates .rematch-marker and passes: {rec:#?}");
+            let entry = e.ctx.ledger.get_entry(&cand.id).unwrap().unwrap();
+            let c = e.ctx.ledger.counters(&cand.id).unwrap();
+            let ev = evidence_for(&e.ctx, &entry).unwrap();
+            crate::reflect::apply_decision(&e.ctx, &entry, Decision::Keep, &c, Some(&ev), Some("false")).unwrap();
+            let kept = e.ctx.ledger.get_entry(&cand.id).unwrap().unwrap();
+            assert_eq!(kept.status, Status::Kept);
+            assert_eq!(kept.retention.unwrap().reason, RetentionReason::ComparativeSupport);
+
+            // Commit `.rematch-marker` so baseline passes `cargo check`, then stage a regressing candidate.
+            sh(&e.repo, ": > .rematch-marker && git add .rematch-marker && git commit -qm marker");
+            let reg_skill = "---\nname: break-check\ndescription: Use when finishing a build script task in this repository.\n---\n\nUse when finishing a build script task in this repository.\n\n## Laws\n- MUST rematch-test-regress before yielding.\n";
+            let reg = staged(&e, "break-check", &[("SKILL.md", reg_skill)]);
+            let sid_reg = match &reg.origin {
+                Origin::Session { session_id } => session_id.clone(),
+                _ => unreachable!(),
+            };
+            let mut s_reg = e.ctx.ledger.get_session(&sid_reg).unwrap().unwrap();
+            s_reg.commands.clear();
+            e.ctx.ledger.upsert_session(&s_reg).unwrap();
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert_eq!(ran, vec![reg.id.clone()]);
+            let rec_reg = record_of(&e.ctx, &reg.id).unwrap();
+            assert_eq!(rec_reg.verifier.as_deref(), Some("check"));
+            assert_eq!(rec_reg.status, ProbeStatus::Regresses, "{rec_reg:#?}");
+            let entry_reg = e.ctx.ledger.get_entry(&reg.id).unwrap().unwrap();
+            let c_reg = e.ctx.ledger.counters(&reg.id).unwrap();
+            let ev_reg = evidence_for(&e.ctx, &entry_reg).unwrap();
+            crate::reflect::apply_decision(&e.ctx, &entry_reg, Decision::Retire, &c_reg, Some(&ev_reg), Some("false")).unwrap();
+            assert_eq!(e.ctx.ledger.get_entry(&reg.id).unwrap().unwrap().status, Status::Retired);
+        }
+
+        #[test]
+        fn user_verifier_probe_requires_one_tap_hash_bound_approval() {
+            let e = env();
+            crate::batch::tasks::cmd_task_add(
+                &e.ctx,
+                crate::batch::tasks::TaskAddArgs {
+                    id: "user-task".into(),
+                    repo: e.repo.clone(),
+                    prompt: "Make the check pass in the build script".into(),
+                    verifier: Some("script:make test".into()),
+                    max_time: Some("30s".into()),
+                    tools: Some(SUGGESTED_TOOLS.into()),
+                    seeds: vec![],
+                    editable: vec![".rematch-marker".into()],
+                },
+            )
+            .unwrap();
+            let cand = staged(&e, "check-marker", &[]);
+            let mut lines = Vec::new();
+
+            // User-defined task/verifier is not auto-eligible: it produces a one-tap review item.
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert!(ran.is_empty());
+            assert_eq!(record_of(&e.ctx, &cand.id).unwrap().status, ProbeStatus::AwaitingAuthorization);
+            let actions = pending_actions(&e.ctx).unwrap();
+            assert_eq!(actions.len(), 1, "{actions:?}");
+            let a = &actions[0];
+            assert_eq!(a.id, format!("probe:{}", cand.id));
+            assert!(a.approvable(), "{a:?}");
+            let sha = a.sha256.clone().unwrap();
+            assert!(approve_action(&e.ctx, &a.id, None).is_err());
+            assert!(approve_action(&e.ctx, &a.id, Some(&sha[..12])).is_err());
+            approve_action(&e.ctx, &a.id, Some(&sha)).unwrap();
+            assert!(pending_actions(&e.ctx).unwrap().is_empty());
+
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert_eq!(ran, vec![cand.id.clone()]);
+            assert_eq!(record_of(&e.ctx, &cand.id).unwrap().status, ProbeStatus::Supports);
+        }
+
+        #[test]
+        fn daily_cap_stops_fourth_probe_and_off_or_active_session_stops_all() {
+            let e = env();
+            let c1 = staged(&e, "cand-one", &[]);
+            let c2 = staged(&e, "cand-two", &[]);
+            let c3 = staged(&e, "cand-three", &[]);
+            let c4 = staged(&e, "cand-four", &[]);
+            let mut lines = Vec::new();
+
+            // While an active session is open (no session_shutdown after session_start, recent record), no probe runs.
+            let open_trace = e.ctx.paths.trace_file("0199d000-0000-7000-8000-999999999999");
+            std::fs::write(
+                &open_trace,
+                format!(
+                    "{{\"seq\":0,\"t\":{},\"ev\":\"session_start\",\"session_id\":\"0199d000-0000-7000-8000-999999999999\",\"cwd\":{r},\"repo\":{r}}}\n",
+                    e.ctx.now,
+                    r = serde_json::to_string(&e.repo.to_string_lossy().to_string()).unwrap()
+                ),
+            )
+            .unwrap();
+            let (ran, rep) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert!(ran.is_empty(), "{rep:#}");
+            assert!(rep["skipped"].as_str().unwrap_or("").contains("active session"), "{rep:#}");
+            std::fs::remove_file(&open_trace).unwrap();
+
+            // A stale crashed trace (no session_shutdown, last record older than 30 minutes) is ignored.
+            let crashed_trace = e.ctx.paths.trace_file("0199d000-0000-7000-8000-888888888888");
+            std::fs::write(
+                &crashed_trace,
+                format!(
+                    "{{\"seq\":0,\"t\":{},\"ev\":\"session_start\",\"session_id\":\"0199d000-0000-7000-8000-888888888888\",\"cwd\":{r},\"repo\":{r}}}\n",
+                    e.ctx.now - ACTIVE_SESSION_TTL_MS - 1_000,
+                    r = serde_json::to_string(&e.repo.to_string_lossy().to_string()).unwrap()
+                ),
+            )
+            .unwrap();
+            assert!(!has_active_session(&e.ctx), "stale crashed trace must not block probes");
+            std::fs::remove_file(&crashed_trace).unwrap();
+
+            // When rematch is off, no probe runs.
+            std::fs::write(&e.ctx.paths.off_marker, "").unwrap();
+            let (ran, rep) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert!(ran.is_empty(), "{rep:#}");
+            assert_eq!(rep["skipped"], "rematch is off");
+            std::fs::remove_file(&e.ctx.paths.off_marker).unwrap();
+
+            // Default daily cap is 3 probes/day (max_parallel 1 per pass): 3 passes run c1, c2, c3,
+            // and the 4th is stopped by the daily cap.
+            for expected in [&c1.id, &c2.id, &c3.id] {
+                let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+                assert_eq!(&ran, std::slice::from_ref(expected));
+            }
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert!(ran.is_empty());
+            let r4 = record_of(&e.ctx, &c4.id).unwrap();
+            assert_eq!(r4.status, ProbeStatus::Skipped);
+            assert!(r4.reason.contains("daily cap (3 probes per 24 h) reached"), "{}", r4.reason);
+
+            // `rematch policy probes --daily 0` turns automatic probes off.
+            crate::policy_cmd::cmd_policy(&e.ctx, crate::policy_cmd::PolicyCmd::Probes { daily: Some(0), max_parallel: None }).unwrap();
+            let c5 = staged(&e, "cand-five", &[]);
+            let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            assert!(ran.is_empty());
+            let r5 = record_of(&e.ctx, &c5.id).unwrap();
+            assert_eq!(r5.status, ProbeStatus::Skipped);
+            assert!(r5.reason.contains("probes.daily_runs = 0"), "{}", r5.reason);
         }
 
         #[test]
@@ -1157,11 +1476,8 @@ mod tests {
             assert!(r.reason.contains("scripts") || r.reason.contains("unapproved"), "{}", r.reason);
             assert!(pending_actions(&e.ctx).unwrap().is_empty(), "no replay offered for executable parts");
 
-            // A plain skill in a dirty repo: authorized, but skipped with the reason.
+            // A plain skill in a dirty repo: skipped with the reason.
             let plain = staged(&e, "plain-skill", &[]);
-            pass_with(&e.ctx, &mut lines, Path::new("/nonexistent/omp")).unwrap();
-            let a = pending_actions(&e.ctx).unwrap().into_iter().find(|a| a.id.ends_with(&plain.id)).unwrap();
-            approve_action(&e.ctx, &a.id, a.sha256.as_deref()).unwrap();
             std::fs::write(e.repo.join("build.sh"), "echo dirty\n").unwrap();
             let (ran, _) = pass_with(&e.ctx, &mut lines, Path::new("/nonexistent/omp")).unwrap();
             assert!(ran.is_empty());
@@ -1230,10 +1546,6 @@ mod tests {
             let skill = "---\nname: tamper\ndescription: Use when finishing a build script task in this repository.\n---\n\nUse when finishing a build script task in this repository.\n\n## Laws\n- MUST create the rematch-test-marker file and rematch-test-mutate the data before yielding.\n";
             let cand = staged(&e, "tamper", &[("SKILL.md", skill)]);
             let mut lines = Vec::new();
-            pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
-            let a = pending_actions(&e.ctx).unwrap().into_iter().find(|a| a.id.ends_with(&cand.id)).unwrap();
-            assert!(a.diff.contains("editable: .rematch-marker"), "{}", a.diff);
-            approve_action(&e.ctx, &a.id, a.sha256.as_deref()).unwrap();
             let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
             assert_eq!(ran, vec![cand.id.clone()], "spent once");
             let rec = record_of(&e.ctx, &cand.id).unwrap();
@@ -1258,11 +1570,9 @@ mod tests {
             s.files_changed = vec![("Makefile".into(), "x".into())];
             e.ctx.ledger.upsert_session(&s).unwrap();
             let mut lines = Vec::new();
-            pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
-            let a = pending_actions(&e.ctx).unwrap().into_iter().find(|a| a.id.ends_with(&cand.id)).unwrap();
-            assert!(a.approvable(), "a read-only review task is eligible: {a:?}");
-            assert!(a.diff.contains(&format!("tools: {READ_ONLY_TOOLS}")) && a.diff.contains("read-only task"), "{}", a.diff);
-            approve_action(&e.ctx, &a.id, a.sha256.as_deref()).unwrap();
+            let sug = suggest_for(&e.ctx, &cand).unwrap().unwrap();
+            assert_eq!(sug.task.tools.as_deref(), Some(READ_ONLY_TOOLS));
+            assert!(sug.task.seal_scope().contains("read-only task"));
             // The candidate's rollout writes `.rematch-marker` anyway (fake omp ignores tools).
             let (ran, _) = pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
             assert_eq!(ran, vec![cand.id.clone()]);
@@ -1300,10 +1610,10 @@ mod tests {
         fn declining_keeps_the_repo_on_the_observed_use_path() {
             let e = env();
             let cand = staged(&e, "check-marker", &[]);
-            let mut lines = Vec::new();
-            pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
+            suggest_for(&e.ctx, &cand).unwrap();
             decline_action(&e.ctx, &format!("probe:{}", cand.id)).unwrap();
             assert!(pending_actions(&e.ctx).unwrap().is_empty());
+            let mut lines = Vec::new();
             let other = staged(&e, "another-skill", &[]);
             pass_with(&e.ctx, &mut lines, &fake_omp()).unwrap();
             let r = record_of(&e.ctx, &other.id).unwrap();

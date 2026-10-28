@@ -31,6 +31,7 @@ In omp, most `/rematch <command>` invocations run the same command; the exceptio
 | [`match`](#rematch-match) | Staging dirs, entries and hooks that load for a directory |
 | [`skills`](#rematch-skills) | The shared skill directory every harness loads (REMATCH_ROOT/skills): sync |
 | [`retrieve`](#rematch-retrieve) | Units of the loaded skill packages that match a query (the `retrieve` context hook) |
+| [`check`](#rematch-check) | Detect and run the repo's fast check (Cargo, tsc, ruff, pyright, mypy, Go) plus unedited caller impact |
 | [`digest`](#rematch-digest) | Session-start digest: new statuses, approvals, review list, transfers |
 | [`record`](#rematch-record) | Append an event for a session (marks); the trace file stays the primary input |
 | [`trace-event`](#rematch-trace-event) | Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters) |
@@ -73,6 +74,7 @@ Commands:
   match        Staging dirs, entries and hooks that load for a directory
   skills       The shared skill directory every harness loads (REMATCH_ROOT/skills): sync
   retrieve     Units of the loaded skill packages that match a query (the `retrieve` context hook)
+  check        Detect and run the repo's fast check (Cargo, tsc, ruff, pyright, mypy, Go) plus unedited caller impact
   digest       Session-start digest: new statuses, approvals, review list, transfers
   record       Append an event for a session (marks); the trace file stays the primary input
   trace-event  Harness hook payload on stdin → DESIGN §3 trace records (Claude Code, OpenCode adapters)
@@ -262,6 +264,23 @@ Options:
       --min-overlap <MIN_OVERLAP>  Distinct query stems a unit must share to be returned [default: 2]
       --entries <ENTRIES>          Comma-separated entry ids the caller loaded; units of other entries are never returned
   -h, --help                       Print help
+```
+
+## rematch check
+
+```text
+Detect and run the repo's fast check (Cargo, tsc, ruff, pyright, mypy, Go) plus unedited caller impact
+
+Usage: rematch check [OPTIONS]
+
+Options:
+      --files [<FILE>...]            Changed files to scope the check and impact analysis to
+      --text                         Human-readable output instead of the JSON envelope
+      --cwd <DIR>                    Directory the command runs against (repo/cwd for match, digest, create, …)
+      --detect-only                  Detect the repo's check spec without running it
+      --timeout <TIMEOUT>            Timeout in seconds (default 30) [default: 30]
+      --budget-bytes <BUDGET_BYTES>  Byte budget for the rendered context message (default 4096) [default: 4096]
+  -h, --help                         Print help
 ```
 
 ## rematch digest
@@ -1145,6 +1164,8 @@ Commands:
   domain  Declare (set) or remove (unset) the domain of a repo remote (or remote glob, or a repo path)
   caps    Caps (`kept_per_domain`: kept entries per top-level domain across branches, default 8)
   scope   Place scope of a skill name: exposed only in one repo (by remote, any clone or worktree) or directory, never globally (set|unset; reserved to the user)
+  probes  Automatic probe budget (`daily_runs`: probes per 24 h, default 3, 0 = off; `max_parallel`: default 1)
+  auto    Standing automatic approval rules (`surface`: scripts|agents|instructions|hooks, `scope`: `<repo path | remote | **>`). Reserved to the user
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1298,6 +1319,87 @@ Usage: rematch policy scope unset [OPTIONS] <NAME>
 
 Arguments:
   <NAME>  
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+### rematch policy probes
+
+```text
+Automatic probe budget (`daily_runs`: probes per 24 h, default 3, 0 = off; `max_parallel`: default 1)
+
+Usage: rematch policy probes [OPTIONS]
+
+Options:
+      --daily <DAILY>                Probes started per 24 hours (`0` turns automatic probes off)
+      --text                         Human-readable output instead of the JSON envelope
+      --cwd <DIR>                    Directory the command runs against (repo/cwd for match, digest, create, …)
+      --max-parallel <MAX_PARALLEL>  Concurrent probe runs (default 1)
+  -h, --help                         Print help
+```
+
+### rematch policy auto
+
+```text
+Standing automatic approval rules (`surface`: scripts|agents|instructions|hooks, `scope`: `<repo path | remote | **>`). Reserved to the user
+
+Usage: rematch policy auto [OPTIONS] <COMMAND>
+
+Commands:
+  add     Add a standing rule auto-approving `<surface>` in `<scope>` (`**`, a normalized remote, or a repo path)
+  remove  Remove a standing rule for `<surface>` in `<scope>`
+  list    List the standing automatic approval rules
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+#### rematch policy auto add
+
+```text
+Add a standing rule auto-approving `<surface>` in `<scope>` (`**`, a normalized remote, or a repo path)
+
+Usage: rematch policy auto add [OPTIONS] <SURFACE> <SCOPE>
+
+Arguments:
+  <SURFACE>  [possible values: scripts, agents, instructions, hooks]
+  <SCOPE>    
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+#### rematch policy auto remove
+
+```text
+Remove a standing rule for `<surface>` in `<scope>`
+
+Usage: rematch policy auto remove [OPTIONS] <SURFACE> <SCOPE>
+
+Arguments:
+  <SURFACE>  [possible values: scripts, agents, instructions, hooks]
+  <SCOPE>    
+
+Options:
+      --text       Human-readable output instead of the JSON envelope
+      --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
+  -h, --help       Print help
+```
+
+#### rematch policy auto list
+
+```text
+List the standing automatic approval rules
+
+Usage: rematch policy auto list [OPTIONS]
 
 Options:
       --text       Human-readable output instead of the JSON envelope

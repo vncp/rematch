@@ -36,6 +36,8 @@ pub struct Rollout {
     pub killed: bool,
     /// sha256 of `events.jsonl` in the ledger's blob store.
     pub events_blob: String,
+    /// Sealed paths the rollout itself changed before the verifier ran (`Task::seal_violations`).
+    pub seal_violations: Vec<String>,
 }
 
 /// Behavioral summary recorded in job progress and the receipt.
@@ -140,6 +142,10 @@ pub fn run_rollout(
         .unwrap_or_else(|| format!("batch-{}-{seed}-{label}", task.id));
     let session = fold_trace(&records, &session_id);
 
+    // Check sealed paths before running the verifier so build artifacts created by the
+    // verifier itself (`cargo check` writing `Cargo.lock` / `target/`) are not attributed to
+    // the rollout.
+    let seal_violations = task.seal_violations(&install.worktree);
     let verdict = match (&error, verifier) {
         (_, None) => None,
         (Some(e), Some(_)) if !b.killed => Some(Verdict::Fail { score: None, detail: format!("rollout invalid: {e}") }),
@@ -157,6 +163,7 @@ pub fn run_rollout(
         elapsed_ms: b.elapsed_ms,
         killed: b.killed,
         events_blob,
+        seal_violations,
     })
 }
 

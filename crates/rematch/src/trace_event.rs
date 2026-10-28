@@ -34,7 +34,10 @@ use rematch_core::import::{args_hash, is_injected_frame, repo_of, TRACE_DELIVERA
 use rematch_core::import_claude;
 use rematch_core::library::{self, MatchResult};
 use rematch_core::trace::{self, flag_reasons, AgentInfo, LoadedEntry, RetrievedUnit, TraceRecord};
-use rematch_core::types::{HookMode, Kind, ModelRef, DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS};
+use rematch_core::types::{
+    HookMode, Kind, ModelRef, DEFAULT_CHECK_BUDGET_BYTES, DEFAULT_CHECK_TIMEOUT_SECS,
+    DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS,
+};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
@@ -376,7 +379,8 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
     let subagent = payload.get("agent_id").is_some_and(|v| !v.is_null());
     let mut reply = HookReply::default();
     let mut tf = TraceFile::open(ctx, &sid)?;
-    let before = tf.records.len();
+    let mut written: Vec<String> = Vec::new();
+    let mut before = tf.records.len();
     let mut extra = json!({});
     match event.as_str() {
         "SessionStart" => {
@@ -476,7 +480,47 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
                     None => claude_skill_entry(ctx, &cwd, name),
                 };
             }
+            let mut edited_files: Vec<PathBuf> = Vec::new();
+            if !failed {
+                if let TraceRecord::ToolResult { tool, input, path, .. } = &rec {
+                    let t = tool.to_ascii_lowercase();
+                    if trace::MUTATING_TOOLS.contains(&t.as_str()) {
+                        let mut raw = Vec::new();
+                        if let Some(p) = path {
+                            raw.push(p.clone());
+                        }
+                        for p in trace::tool_input_files(&t, input) {
+                            if !raw.contains(&p) {
+                                raw.push(p);
+                            }
+                        }
+                        for p in raw {
+                            let resolved = if Path::new(&p).is_absolute() { PathBuf::from(&p) } else { cwd.join(&p) };
+                            if !edited_files.contains(&resolved) {
+                                edited_files.push(resolved);
+                            }
+                        }
+                    }
+                }
+            }
             tf.push(rec)?;
+            if !failed && !edited_files.is_empty() {
+                push_pending_check_files(ctx, &sid, &edited_files)?;
+                written.extend(tf.records[before..].iter().map(|r| r.ev().to_string()));
+                drop(tf);
+                let mut next_tf = post_tool_check(ctx, &sid, &cwd, &mut reply)?;
+                tf = match next_tf.take() {
+                    Some((t, b)) => {
+                        before = b;
+                        t
+                    }
+                    None => {
+                        let t = TraceFile::open(ctx, &sid)?;
+                        before = t.records.len();
+                        t
+                    }
+                };
+            }
         }
         "Stop" | "StopFailure" if !subagent => {
             ensure_started(ctx, &mut tf, &sid, &cwd, payload)?;
@@ -501,7 +545,7 @@ pub fn trace_event(ctx: &AppCtx, a: &TraceEventArgs, payload: &Value) -> Result<
         }
         _ => {}
     }
-    let written: Vec<&str> = tf.records[before..].iter().map(TraceRecord::ev).collect();
+    written.extend(tf.records[before..].iter().map(|r| r.ev().to_string()));
     let mut out = json!({"event": event, "session": sid, "trace": tf.path, "records": written, "hook": reply.json()});
     if let (Some(o), Value::Object(x)) = (out.as_object_mut(), extra) {
         o.extend(x);
@@ -883,6 +927,98 @@ fn retrieve(ctx: &AppCtx, tf: &mut TraceFile, cwd: &Path, text: &str, reply: &mu
     Ok(())
 }
 
+/// Per-session lock and pending-files state for Claude Code `PostToolUse` checks.
+fn check_lock_path(ctx: &AppCtx, sid: &str) -> PathBuf {
+    ctx.paths.traces.join(format!("{}.check.lock", rematch_core::paths::id_file_stem(sid)))
+}
+
+fn check_pending_path(ctx: &AppCtx, sid: &str) -> PathBuf {
+    ctx.paths.traces.join(format!("{}.check.pending", rematch_core::paths::id_file_stem(sid)))
+}
+
+/// Append `files` into the session's pending-check file (held under the trace lock).
+fn push_pending_check_files(ctx: &AppCtx, sid: &str, files: &[PathBuf]) -> Result<()> {
+    std::fs::create_dir_all(&ctx.paths.traces)?;
+    let p = check_pending_path(ctx, sid);
+    let mut list: Vec<PathBuf> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    for f in files {
+        if !list.contains(f) {
+            list.push(f.clone());
+        }
+    }
+    std::fs::write(&p, serde_json::to_string(&list)?)?;
+    Ok(())
+}
+
+/// Atomically drain the session's pending-check files under the trace lock.
+fn take_pending_check_files(ctx: &AppCtx, sid: &str) -> Result<Vec<PathBuf>> {
+    let _tf = TraceFile::open(ctx, sid)?;
+    let p = check_pending_path(ctx, sid);
+    let list: Vec<PathBuf> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(list)
+}
+
+/// The active `check` hook on `PostToolUse`: acquires the per-session check lock (waiting if a
+/// check is in flight, without holding the trace lock), drains the union of pending edited files,
+/// runs once, records `check_ran` in the trace, and returns the rendered message as
+/// `hookSpecificOutput.additionalContext` only from the hook that ran it.
+fn post_tool_check(
+    ctx: &AppCtx,
+    sid: &str,
+    cwd: &Path,
+    reply: &mut HookReply,
+) -> Result<Option<(TraceFile, usize)>> {
+    let loaded = load(ctx, cwd)?;
+    let Some(hook) = loaded.hooks.iter().find(|h| h.mode == HookMode::Check) else {
+        return Ok(None);
+    };
+    if !hook.applies_to("edit") && !hook.applies_to("*") {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&ctx.paths.traces)?;
+    let _check_lock = Appender::open(&check_lock_path(ctx, sid))?;
+    let union_files = take_pending_check_files(ctx, sid)?;
+    if union_files.is_empty() {
+        // An earlier waiter already drained and ran the check covering our edit.
+        return Ok(None);
+    }
+    let repo_top = rematch_core::check::find_repo_top(cwd);
+    let Some(spec) = rematch_core::check::detect_for_files(&repo_top, &union_files) else {
+        return Ok(None);
+    };
+    let timeout_secs = hook.param("timeout_secs", DEFAULT_CHECK_TIMEOUT_SECS).max(1);
+    let budget_bytes = hook.param("budget_bytes", DEFAULT_CHECK_BUDGET_BYTES) as usize;
+    let rep = crate::check::run_with_impact(
+        &spec,
+        &union_files,
+        std::time::Duration::from_secs(u64::from(timeout_secs)),
+        budget_bytes,
+    );
+    let rendered = rep.rendered.clone().unwrap_or_default();
+    if rendered.is_empty() {
+        return Ok(None);
+    }
+    let mut tf = TraceFile::open(ctx, sid)?;
+    let before = tf.records.len();
+    crate::check::push_check_ran(&mut tf, &hook.id, &spec, &rep, &union_files)?;
+    reply.stdout = Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": rendered,
+        }
+    }));
+    Ok(Some((tf, before)))
+}
+
 /// The parsed tail of the payload's transcript (`None` without one, or unreadable).
 fn transcript_tail(payload: &Value) -> Option<import_claude::ClaudeSession> {
     match str_of(payload, "transcript_path") {
@@ -1185,5 +1321,89 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(10)).expect("the second appender gets the lock once the first drops");
         waiter.join().unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{}\n{\"b\":1}\n");
+    }
+
+    #[test]
+    fn post_tool_check_coalesces_pending_files_under_session_lock() {
+        let t = tempfile::tempdir().unwrap();
+        let paths = rematch_core::paths::RematchPaths::with_roots(t.path().join("rematch"), t.path().join("agent"));
+        paths.ensure_dirs().unwrap();
+        let ledger = rematch_core::ledger::Ledger::open(&paths.ledger_file).unwrap();
+        let repo = t.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(repo.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(repo.join("src/b.rs"), "pub fn b() -> i32 { \"bad\" }\n").unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub mod a;\npub mod b;\n").unwrap();
+        rematch_core::check::clear_detect_cache();
+        let ctx = AppCtx { paths, ledger, now: 1000, cwd: repo.clone(), text: false };
+        crate::builtins::ensure(&ctx).unwrap();
+
+        let sid = "cc:s-coalesce";
+        {
+            let mut tf = TraceFile::open(&ctx, sid).unwrap();
+            push_pending_check_files(&ctx, sid, &[repo.join("src/a.rs")]).unwrap();
+            push_pending_check_files(&ctx, sid, &[repo.join("src/b.rs"), repo.join("src/a.rs")]).unwrap();
+            let seq = tf.seq();
+            tf.push(TraceRecord::SessionStart {
+                seq,
+                t: 1000,
+                session_id: sid.into(),
+                branch_hint: "repo".into(),
+                cwd: repo.to_string_lossy().into_owned(),
+                repo: Some(repo.to_string_lossy().into_owned()),
+                model: None,
+                mode: "claude-code".into(),
+                agent: None,
+                omp_version: "cc".into(),
+                loaded_entries: Vec::new(),
+                hooks_loaded: Vec::new(),
+                staging_dirs: Vec::new(),
+                repo_remote: None,
+                subpath: None,
+                head_sha: None,
+                visible_entries: Vec::new(),
+                instructions_exposed: Vec::new(),
+                exposure_view: None,
+            })
+            .unwrap();
+        }
+
+        // Hold the session check lock as if an earlier check is in flight; spawn a waiter that
+        // waits on the lock, then runs once over the union of pending files.
+        let held = Appender::open(&check_lock_path(&ctx, sid)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_c = ctx.paths.root.clone();
+        let agent_c = ctx.paths.agent_dir.clone();
+        let repo_c = repo.clone();
+        let worker = std::thread::spawn(move || {
+            let p = rematch_core::paths::RematchPaths::with_roots(root_c, agent_c);
+            let l = rematch_core::ledger::Ledger::open(&p.ledger_file).unwrap();
+            let c = AppCtx { paths: p, ledger: l, now: 1001, cwd: repo_c.clone(), text: false };
+            let mut reply = HookReply::default();
+            let _ = post_tool_check(&c, sid, &repo_c, &mut reply).unwrap();
+            tx.send(reply.stdout).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "waiter blocks while check lock is held");
+        drop(held);
+        let first_stdout = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+        worker.join().unwrap();
+        assert!(first_stdout.is_some(), "the hook that runs the check returns the result");
+        assert!(first_stdout.unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("E0308"));
+
+        // A second waiter after the union was drained sees an empty pending list and returns nothing.
+        let mut second_reply = HookReply::default();
+        assert!(post_tool_check(&ctx, sid, &repo, &mut second_reply).unwrap().is_none());
+        assert!(second_reply.stdout.is_none());
+
+        let recs = trace::read_trace(&ctx.paths.trace_file(sid)).unwrap();
+        let checks: Vec<_> = recs
+            .iter()
+            .filter_map(|r| match r {
+                TraceRecord::CheckRan { files, errors, .. } => Some((files.clone(), *errors)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, vec![(vec!["src/a.rs".to_string(), "src/b.rs".to_string()], 1)]);
     }
 }

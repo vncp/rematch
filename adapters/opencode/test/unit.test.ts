@@ -70,6 +70,11 @@ describe("approval guard (the shared parser OpenCode's tool.execute.before runs 
 			"rematch --cwd=/w library export --approve-all",
 			"rematch policy scope set bellwether-dev ~/repos/bellwether",
 			"rematch --text policy scope unset bellwether-dev",
+			"rematch policy auto add instructions **",
+			"rematch --cwd /w policy auto remove scripts **",
+			"rematch --text policy auto list",
+			"rematch policy probes --daily 0",
+			"rematch --cwd /w policy probes --max-parallel=4",
 		]) {
 			expect([c, userOnlyShellReason(c)]).toEqual([c, expect.stringContaining("reserved to the user")]);
 		}
@@ -78,7 +83,7 @@ describe("approval guard (the shared parser OpenCode's tool.execute.before runs 
 		for (const c of [
 			"rematch status", "rematch library ls", "rematch library why oc:ses_1", "echo approve on", "rematch digest", "git log --oneline",
 			"rematch --cwd library status", "rematch library export --entry 01a", 'git commit -m "let rematch off the hook"', "echo rematch off",
-			"rematch policy show", "rematch policy domain set github.com/acme/web web",
+			"rematch policy show", "rematch policy probes", "rematch policy domain set github.com/acme/web web",
 		]) {
 			expect([c, userOnlyShellReason(c)]).toEqual([c, null]);
 		}

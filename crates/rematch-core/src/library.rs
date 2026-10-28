@@ -77,6 +77,83 @@ pub fn primary_doc(kind: Kind) -> &'static str {
     }
 }
 
+/// omp / host tool names that are strictly read-only: a provisional subagent whose `tools:`
+/// frontmatter is a non-empty subset of this set is exposed in matching places without approval.
+pub const READ_ONLY_AGENT_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "find",
+    "lsp",
+    "lsp_diagnostics",
+    "lsp_hover",
+    "lsp_goto_definition",
+    "lsp_find_references",
+    "lsp_document_symbols",
+    "lsp_workspace_symbols",
+    "lsp_call_hierarchy",
+    "lsp_code_actions",
+    "web_search",
+    "fetch",
+    "web_fetch",
+];
+
+/// Tools listed in an `AGENT.md` `tools:` frontmatter (comma-separated string or YAML sequence).
+/// `None` when the frontmatter cannot be read or carries no `tools` key (which inherits the
+/// session's tools and is therefore write-capable).
+pub fn agent_tools_of(dir: &Path) -> Option<Vec<String>> {
+    use serde_yaml::Value as Y;
+    let text = std::fs::read_to_string(dir.join(AGENT_MD)).ok()?;
+    let doc = SkillDoc::parse(&text).ok()?;
+    let raw: Vec<String> = match doc.frontmatter.get("tools")? {
+        Y::String(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        Y::Sequence(xs) => xs.iter().filter_map(Y::as_str).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+        _ => return None,
+    };
+    (!raw.is_empty()).then_some(raw)
+}
+
+/// Whether a subagent's `AGENT.md` declares a non-empty `tools:` list that is a subset of
+/// [`READ_ONLY_AGENT_TOOLS`].
+pub fn agent_is_read_only(e: &Entry) -> bool {
+    if e.kind != Kind::Agent {
+        return false;
+    }
+    agent_tools_of(&e.path).is_some_and(|tools| {
+        !tools.is_empty()
+            && tools.iter().all(|t| READ_ONLY_AGENT_TOOLS.iter().any(|ro| ro.eq_ignore_ascii_case(t)))
+    })
+}
+
+/// Every `HookMode` variant (`block`, `stuck`, `truncate`, `retrieve`, `check`) compiles to a
+/// data-only module that the rematch extension evaluates: no arbitrary code runs.
+pub fn is_data_only_hook(e: &Entry) -> bool {
+    e.kind == Kind::Hook && e.hook.is_some()
+}
+
+/// Compile and write `e`'s data-only hook module into `<agent_dir>/extensions/rematch-hooks/<id>.ts`
+/// (or into `profile/hooks/<id>.ts` linked from there when a profile is present). Returns the
+/// `(module_path, sha256)` written.
+pub fn compile_hook(paths: &RematchPaths, e: &Entry) -> Result<(PathBuf, Sha256Hex)> {
+    let module = hook_module(e)?;
+    let dir = paths.hooks_dir();
+    std::fs::create_dir_all(&dir)?;
+    write_hooks_readme(&dir)?;
+    let file = dir.join(format!("{}.ts", e.id));
+    if crate::profile::present(paths) {
+        let target = crate::profile::hooks_dir(paths).join(format!("{}.ts", e.id));
+        std::fs::create_dir_all(crate::profile::hooks_dir(paths))?;
+        std::fs::write(&target, &module)?;
+        remove_link(&file)?;
+        symlink_file(&target, &file)?;
+    } else {
+        remove_link(&file)?;
+        std::fs::write(&file, &module)?;
+    }
+    let sha = crate::ledger::sha256_hex(module.as_bytes());
+    Ok((file, sha))
+}
+
 /// `fork_path` (the file `ship --scope fork` writes) is repo-relative without traversal.
 pub fn validate_fork_path(rel: &str) -> Result<PathBuf> {
     let p = PathBuf::from(rel);
@@ -626,6 +703,12 @@ pub fn stage(ledger: &Ledger, paths: &RematchPaths, entry: &Entry, files: &[Edit
     }
     e.status_since.get_or_insert(now);
     persist(ledger, &e)?;
+    if matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
+        if is_data_only_hook(&e) {
+            compile_hook(paths, &e)?;
+        }
+        e = apply_entry_auto(ledger, paths, e)?;
+    }
     apply_script_modes(&e)?;
     if agent && e.status == Status::Provisional {
         if agent_approved(&e) {
@@ -707,10 +790,19 @@ fn transition(ledger: &Ledger, paths: &RematchPaths, mut e: Entry, to: Status, n
     e.status_note = note.map(str::to_string);
     e.updated_at = now;
     persist(ledger, &e)?;
+    if matches!(to, Status::Provisional | Status::Kept | Status::Pinned) {
+        if is_data_only_hook(&e) {
+            compile_hook(paths, &e)?;
+        }
+        e = apply_entry_auto(ledger, paths, e)?;
+    }
     apply_script_modes(&e)?;
     if agent {
         match to {
             Status::Provisional if agent_approved(&e) => link_agent(paths, &e)?,
+            Status::Provisional => {
+                unlink_unapproved_agent(paths, &e)?;
+            }
             Status::Kept | Status::Pinned => write_kept_agent(paths, &e)?,
             _ => {}
         }
@@ -940,15 +1032,62 @@ pub fn fragment_approved(e: &Entry) -> bool {
 /// The entry's AGENT.md is the one approved (`approved_agent`: its sha without the
 /// `rematch:` block).
 pub fn agent_approved(e: &Entry) -> bool {
-    e.approved_agent.is_some() && agent_sha(&e.path) == e.approved_agent
+    (e.approved_agent.is_some() && agent_sha(&e.path) == e.approved_agent) || agent_is_read_only(e)
+}
+
+/// Apply automatic entry approvals on stage or status transition: read-only subagent exposure,
+/// standing `policy.json` `auto` rules for `agents`, `scripts`, and `instructions`.
+pub fn apply_entry_auto(ledger: &Ledger, paths: &RematchPaths, mut e: Entry) -> Result<Entry> {
+    if !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) || e.kind == Kind::Lesson {
+        return Ok(e);
+    }
+    let rules = crate::domain::load_auto_rules(paths).unwrap_or_default();
+    if e.kind == Kind::Agent && e.status == Status::Provisional {
+        let sha = agent_sha(&e.path);
+        if e.approved_agent != sha || sha.is_none() {
+            let approver = if agent_is_read_only(&e) {
+                Some("read-only".to_string())
+            } else {
+                crate::domain::matching_auto_rule(&rules, crate::domain::AutoSurface::Agents, &e.predicate)
+                    .map(|r| format!("rule:{}:{}", r.surface.as_str(), r.scope))
+            };
+            if let Some(why) = approver {
+                if approve_with(ledger, paths, &e.id, Approval::Agent, Some(&why), None).is_ok() {
+                    e = get(ledger, &e.id)?;
+                }
+            }
+        }
+    }
+    let owned = owns_dir(paths, &e);
+    if owned && !unapproved_scripts(&e).is_empty() {
+        if let Some(r) = crate::domain::matching_auto_rule(&rules, crate::domain::AutoSurface::Scripts, &e.predicate) {
+            let why = format!("rule:{}:{}", r.surface.as_str(), r.scope);
+            if approve_with(ledger, paths, &e.id, Approval::Scripts, Some(&why), None).is_ok() {
+                e = get(ledger, &e.id)?;
+            }
+        } else {
+            let _ = crate::sandbox::run_entry_scripts(ledger, &e);
+        }
+    }
+    if owned
+        && e.path.join(AGENTS_FRAGMENT).is_file()
+        && crate::domain::matching_auto_rule(&rules, crate::domain::AutoSurface::Instructions, &e.predicate).is_some()
+    {
+        // Over budget or unwritable: the fragment stays a review item (`instructions:<id>`).
+        if let Err(err) = crate::instructions::apply_auto_rules(ledger, paths) {
+            eprintln!("rematch: auto rule for {} not applied: {err:#}", e.name);
+        }
+        e = get(ledger, &e.id)?;
+    }
+    Ok(e)
 }
 
 /// Every part of a provisional, kept or pinned entry that waits for the one-tap approval,
 /// in the order scripts, hook, agent, prompt: unapproved files under `scripts/` (rematch-owned
-/// dirs only, [`owns_dir`]), a hook without its compiled module ([`hook_active`]), a
-/// provisional agent whose AGENT.md is not approved (kept and pinned agents load as they are),
-/// and an `AGENTS.fragment.md` (rematch-owned dirs only) that is not approved. Lessons and
-/// entries that cannot load have none.
+/// dirs only, [`owns_dir`]), a hook that is not data-only and lacks its compiled module, a
+/// provisional write-capable agent whose AGENT.md is not approved (read-only, kept and pinned
+/// agents load as they are), and an `AGENTS.fragment.md` (rematch-owned dirs only) that is not
+/// approved. Lessons and entries that cannot load have none.
 pub fn pending_parts(paths: &RematchPaths, e: &Entry) -> Vec<Approval> {
     let mut out = Vec::new();
     if e.kind == Kind::Lesson || !matches!(e.status, Status::Provisional | Status::Kept | Status::Pinned) {
@@ -958,7 +1097,7 @@ pub fn pending_parts(paths: &RematchPaths, e: &Entry) -> Vec<Approval> {
     if owned && !unapproved_scripts(e).is_empty() {
         out.push(Approval::Scripts);
     }
-    if !hook_active(paths, e) {
+    if e.kind == Kind::Hook && !is_data_only_hook(e) && !hook_active(paths, e) {
         out.push(Approval::Hook);
     }
     if e.kind == Kind::Agent && e.status == Status::Provisional && !agent_approved(e) {
@@ -970,21 +1109,44 @@ pub fn pending_parts(paths: &RematchPaths, e: &Entry) -> Vec<Approval> {
     out
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ApprovalRecord<'a> {
-    entry: &'a str,
-    what: Approval,
-    files: Vec<(String, String)>,
-    at: UnixMs,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub entry: String,
+    pub what: Approval,
+    pub files: Vec<(String, String)>,
+    pub at: UnixMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<serde_json::Value>,
 }
 
-/// One-tap approval of one part ([`pending_parts`]): scripts become 0755; the hook is
-/// compiled into `<agent_dir>/extensions/rematch-hooks/<id>.ts`; an agent's AGENT.md sha is
-/// recorded and, while provisional, its staging link made; the `AGENTS.fragment.md` sha is
-/// recorded, so the fragment joins the system prompt of main sessions where the entry
-/// matches ([`prompt_fragments`]). Records a receipt whose certificate is the blob of the
-/// approval record (file hashes).
+/// Latest [`ApprovalRecord`] recorded for `(entry_id, what)`.
+pub fn latest_approval_record(ledger: &Ledger, entry_id: &str, what: Approval) -> Option<ApprovalRecord> {
+    let receipts = ledger.list_receipts(Some(entry_id)).ok()?;
+    for r in receipts.into_iter().rev() {
+        let Some(blob) = ledger.get_blob(&r.receipt.certificate).ok().flatten() else { continue };
+        let Ok(rec) = serde_json::from_slice::<ApprovalRecord>(&blob) else { continue };
+        if rec.what == what {
+            return Some(rec);
+        }
+    }
+    None
+}
 pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) -> Result<Receipt> {
+    approve_with(ledger, paths, id, what, None, None)
+}
+
+/// [`approve`] recording an optional `approver` (`"read-only"`, `"rule:…"`)
+/// and `observed` sandbox evidence in the receipt certificate blob.
+pub fn approve_with(
+    ledger: &Ledger,
+    paths: &RematchPaths,
+    id: &str,
+    what: Approval,
+    approver: Option<&str>,
+    observed: Option<serde_json::Value>,
+) -> Result<Receipt> {
     let mut e = get(ledger, id)?;
     if matches!(e.status, Status::Retired | Status::Dormant | Status::Stale | Status::Draft) {
         bail!("entry {} is {:?}; only loadable entries can be approved", e.id, e.status);
@@ -1005,23 +1167,8 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) 
             }
         }
         Approval::Hook => {
-            let module = hook_module(&e)?;
-            let dir = paths.hooks_dir();
-            std::fs::create_dir_all(&dir)?;
-            write_hooks_readme(&dir)?;
-            let file = dir.join(format!("{}.ts", e.id));
-            // With a profile the module is written there and linked (DESIGN §20).
-            if crate::profile::present(paths) {
-                let target = crate::profile::hooks_dir(paths).join(format!("{}.ts", e.id));
-                std::fs::create_dir_all(crate::profile::hooks_dir(paths))?;
-                std::fs::write(&target, &module)?;
-                remove_link(&file)?;
-                symlink_file(&target, &file)?;
-            } else {
-                remove_link(&file)?;
-                std::fs::write(&file, &module)?;
-            }
-            hashed.push((file.to_string_lossy().to_string(), crate::ledger::sha256_hex(module.as_bytes())));
+            let (file, sha) = compile_hook(paths, &e)?;
+            hashed.push((file.to_string_lossy().to_string(), sha));
         }
         Approval::Agent => {
             if e.kind != Kind::Agent {
@@ -1051,7 +1198,14 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, id: &str, what: Approval) 
     if what == Approval::Agent && e.status == Status::Provisional {
         link_agent(paths, &e)?;
     }
-    let record = ApprovalRecord { entry: &e.id, what, files: hashed, at: now };
+    let record = ApprovalRecord {
+        entry: e.id.clone(),
+        what,
+        files: hashed,
+        at: now,
+        approver: approver.map(str::to_string),
+        observed,
+    };
     let cert = ledger.put_blob(serde_json::to_string(&record)?.as_bytes())?;
     let receipt = Receipt { certificate: cert, entry: e.id.clone(), activation: Activation::Prompted };
     ledger.insert_receipt(&receipt)?;
@@ -1174,7 +1328,7 @@ pub struct MatchResult {
 /// A hook entry is active only while its approved module exists: before approval
 /// nothing of it runs, so it neither contributes its branch dir nor counts.
 pub fn hook_active(paths: &RematchPaths, e: &Entry) -> bool {
-    e.kind != Kind::Hook || paths.hooks_dir().join(format!("{}.ts", e.id)).is_file()
+    !paths.is_off() && (e.kind != Kind::Hook || paths.hooks_dir().join(format!("{}.ts", e.id)).is_file())
 }
 
 /// A provisional, non-agent, active entry whose predicate place matches `place`
@@ -1407,11 +1561,12 @@ impl SkillsSync {
     }
 }
 
-/// An entry the shared dir may link: rematch-owned (its dir holds its own `rematch.json`, so a
-/// user skill registered in place is never linked), with a `SKILL.md`, not an agent (reached
-/// through `agents/`) or a lesson (a library record), and a hook only once approved.
+/// An entry the shared dir or a view may link as a skill: rematch-owned (its dir holds its own
+/// `rematch.json`, so a user skill registered in place is never linked), with a `SKILL.md`, not
+/// an agent (reached through `agents/`), a lesson (a library record), or a hook (reached
+/// through `rematch-hooks/`).
 fn shareable(paths: &RematchPaths, e: &Entry) -> bool {
-    !matches!(e.kind, Kind::Agent | Kind::Lesson)
+    !matches!(e.kind, Kind::Agent | Kind::Lesson | Kind::Hook)
         && hook_active(paths, e)
         && e.path.join(SKILL_MD).is_file()
         && load_entry(&e.path).is_ok_and(|x| x.id == e.id)
@@ -1684,6 +1839,8 @@ pub fn sync_shared_skills(ledger: &Ledger, paths: &RematchPaths) -> Result<Skill
         crate::project_views::prune_copies(paths, |id| may_load.iter().any(|x| x == id))?;
     }
     sync_agent_links(ledger, paths)?;
+    sync_hook_modules(ledger, paths)?;
+    let _ = crate::instructions::apply_auto_rules(ledger, paths);
     // A read-only or locked personal AGENTS.md never blocks a keep, retire or stage; edited
     // blocks are already reported as conflicts (`instructions-conflict:<name>` actions).
     if let Err(e) = crate::instructions::sync(ledger, paths) {
@@ -1750,6 +1907,38 @@ pub fn sync_agent_links(ledger: &Ledger, paths: &RematchPaths) -> Result<()> {
     for e in ledger.list_entries(&EntryFilter { status: Some(Status::Provisional), ..Default::default() })? {
         if e.kind == Kind::Agent && agent_approved(&e) && std::fs::symlink_metadata(agent_link(paths, &e.name)).is_err() && check_agent_link(paths, &e.name, &e.path.join(AGENT_MD)).is_ok() {
             link_agent(paths, &e)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ensure `rematch-hooks/` matches on/off and live data-only hook entries: while off, remove
+/// every compiled hook module in `paths.hooks_dir()`; while on, compile any live data-only hook
+/// whose module is missing.
+pub fn sync_hook_modules(ledger: &Ledger, paths: &RematchPaths) -> Result<()> {
+    let dir = paths.hooks_dir();
+    if paths.is_off() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(()) };
+        for l in rd.flatten() {
+            let name = l.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".ts") {
+                remove_link(&l.path())?;
+            }
+        }
+        return Ok(());
+    }
+    let profile = crate::profile::present(paths);
+    for status in [Status::Provisional, Status::Kept, Status::Pinned] {
+        for e in ledger.list_entries(&EntryFilter { status: Some(status), ..Default::default() })? {
+            if !is_data_only_hook(&e) {
+                continue;
+            }
+            let file = dir.join(format!("{}.ts", e.id));
+            let need = !file.is_file()
+                || (profile && !std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink()));
+            if need {
+                let _ = compile_hook(paths, &e);
+            }
         }
     }
     Ok(())
@@ -2142,7 +2331,7 @@ mod tests {
             &x.ledger,
             &x.paths,
             &e,
-            &[w("SKILL.md", &skill("ledger-skill")), w("scripts/check.sh", "cargo test\n"), w("units/a.md", "unit")],
+            &[w("SKILL.md", &skill("ledger-skill")), w("scripts/check.sh", "#!/bin/sh\necho x > \"$HOME/outside.txt\"\n"), w("units/a.md", "unit")],
         )
         .unwrap();
         let dir = x.paths.staging.join("repo/ledger-skill");
@@ -2400,11 +2589,16 @@ mod tests {
     #[test]
     fn approve_scripts_and_hooks_then_decline() {
         let x = env();
-        stage(&x.ledger, &x.paths, &entry("s1", "scripted", "repo", Status::Provisional), &[w("scripts/run.sh", "echo ok\n")]).unwrap();
+        stage(
+            &x.ledger,
+            &x.paths,
+            &entry("s1", "scripted", "repo", Status::Provisional),
+            &[w("scripts/run.sh", "#!/bin/sh\necho x > \"$HOME/outside.txt\"\n")],
+        )
+        .unwrap();
         let rc = approve(&x.ledger, &x.paths, "s1", Approval::Scripts).unwrap();
         assert_eq!(rc.activation, Activation::Prompted);
         assert!(x.ledger.get_blob(&rc.certificate).unwrap().is_some());
-        assert_eq!(x.ledger.list_receipts(Some("s1")).unwrap().len(), 1);
         let e = x.ledger.get_entry("s1").unwrap().unwrap();
         assert_eq!(e.approved_scripts, vec!["scripts/run.sh".to_string()]);
         #[cfg(unix)]
@@ -2415,13 +2609,9 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode(&dm.path.join("scripts/run.sh")), 0o755);
 
+        // Data-only hooks compile and become active automatically on stage.
         stage(&x.ledger, &x.paths, &hook_entry("h1"), &[]).unwrap();
         assert!(x.paths.staging.join("repo/hook-h1/hook.json").is_file());
-        // unapproved: nothing of the hook loads or counts
-        let m = list_for_match(&x.ledger, &x.paths, Some(Path::new("/w/repo")), Path::new("/w/repo")).unwrap();
-        assert!(m.skill_dirs.is_empty() && m.hooks.is_empty(), "{m:?}");
-        assert!(m.entries.iter().all(|e| e.id != "h1"), "{m:?}");
-        approve(&x.ledger, &x.paths, "h1", Approval::Hook).unwrap();
         let module = std::fs::read_to_string(x.paths.hooks_dir().join("h1.ts")).unwrap();
         assert!(module.contains("export default {"));
         assert!(module.contains(r#"mode: "block","#), "{module}");
@@ -2443,8 +2633,7 @@ mod tests {
 
         let mut bad = hook_entry("h2");
         bad.hook.as_mut().unwrap().pass_condition = " ".into();
-        stage(&x.ledger, &x.paths, &bad, &[]).unwrap();
-        assert!(approve(&x.ledger, &x.paths, "h2", Approval::Hook).is_err());
+        assert!(stage(&x.ledger, &x.paths, &bad, &[]).is_err(), "invalid hook fails to compile on stage");
     }
 
     #[test]
@@ -2456,7 +2645,7 @@ mod tests {
             &x.ledger,
             &x.paths,
             &entry("f1", "tests-first", "repo", Status::Provisional),
-            &[w("scripts/run.sh", "echo ok\n"), w(AGENTS_FRAGMENT, fragment)],
+            &[w("scripts/run.sh", "#!/bin/sh\necho x > \"$HOME/outside.txt\"\n"), w(AGENTS_FRAGMENT, fragment)],
         )
         .unwrap();
         let parts = pending_parts(&x.paths, &e);
@@ -2466,7 +2655,7 @@ mod tests {
         for part in parts {
             approve(&x.ledger, &x.paths, "f1", part).unwrap();
         }
-        assert_eq!(x.ledger.list_receipts(Some("f1")).unwrap().len(), 2, "one receipt per part");
+        assert!(x.ledger.list_receipts(Some("f1")).unwrap().len() >= 2, "receipts per part (+ optional sandbox dry run)");
         let e = x.ledger.get_entry("f1").unwrap().unwrap();
         assert!(pending_parts(&x.paths, &e).is_empty() && fragment_approved(&e));
         assert_eq!(load_entry(&e.path).unwrap().approved_fragment, e.approved_fragment, "rematch.json carries it");
@@ -2971,5 +3160,26 @@ mod tests {
         assert!(native.is_file());
         set_status(&x.ledger, &x.paths, "k1", Status::Stale, None).unwrap();
         assert!(!native.exists(), "a stale kept agent leaves omp's agent dir");
+    }
+
+    #[test]
+    fn read_only_agent_is_exposed_without_approval_while_write_agent_stays_pending() {
+        let x = env();
+        let ro_md = "---\nname: ro-triage\ndescription: Use for reading logs.\ntools: [read, grep, glob, lsp_diagnostics, web_search]\n---\nRead the log.\n";
+        let rw_md = "---\nname: rw-fixer\ndescription: Use for fixing logs.\ntools: [read, edit, bash]\n---\nFix the log.\n";
+        let ro = stage(&x.ledger, &x.paths, &agent_entry("a-ro", "ro-triage"), &[w("AGENT.md", ro_md)]).unwrap();
+        let rw = stage(&x.ledger, &x.paths, &agent_entry("a-rw", "rw-fixer"), &[w("AGENT.md", rw_md)]).unwrap();
+        assert!(agent_is_read_only(&ro));
+        assert!(!agent_is_read_only(&rw));
+        assert!(agent_approved(&ro), "read-only agent is approved automatically");
+        assert!(!agent_approved(&rw), "write-capable agent stays unapproved");
+        assert!(pending_parts(&x.paths, &ro).is_empty());
+        assert_eq!(pending_parts(&x.paths, &rw), vec![Approval::Agent]);
+        assert!(std::fs::read_link(agent_link(&x.paths, "ro-triage")).is_ok(), "read-only agent linked on stage");
+        assert!(std::fs::symlink_metadata(agent_link(&x.paths, "rw-fixer")).is_err(), "write agent not linked");
+        let exp = agent_exposure(&x.ledger, &x.paths, &Place::path("/w/repo"), Path::new("/w/repo")).unwrap();
+        assert_eq!(exp.exposed, vec!["ro-triage".to_string()]);
+        let rec = latest_approval_record(&x.ledger, "a-ro", Approval::Agent).expect("approval receipt");
+        assert_eq!(rec.approver.as_deref(), Some("read-only"));
     }
 }

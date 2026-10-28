@@ -32,10 +32,14 @@ const proj = path.join(T, "work/payments");
 for (const d of [home, ...Object.values(xdg), path.join(T, "tmp"), proj]) fs.mkdirSync(d, { recursive: true });
 
 // No omp on PATH: the plugin must not start a reflection that would call a real model.
-const basePath = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", path.dirname(process.execPath)].join(":");
+const cargoBinDir = path.join(os.homedir(), ".cargo/bin");
+const basePath = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", cargoBinDir, path.dirname(process.execPath)].join(":");
 const env: Record<string, string> = {
 	PATH: basePath,
 	HOME: home,
+	USER: process.env.USER ?? "",
+	RUSTUP_HOME: process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"),
+	CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"),
 	...xdg,
 	TMPDIR: path.join(T, "tmp"),
 	REMATCH_ROOT: root,
@@ -83,20 +87,17 @@ const trace = (sid: string): Loose[] => {
 };
 const evs = (recs: Loose[]) => recs.map(r => r.ev);
 
-// --- rematch: a provisional skill, an approved block hook, the built-ins (unapproved) ---------
+// --- rematch: a provisional skill, an auto-activated block hook, and the built-ins ------------
 spawnSync("git", ["init", "-q"], { cwd: proj, env });
 fs.writeFileSync(path.join(proj, "README.md"), "payments\n");
 const skill = rematch(["create", "run-tests-before-commit", "--from", "description", "--description", "Run the crate tests before committing", "--editor", editorSkill]);
 rematch(["activate", "run-tests-before-commit", "--unverified"]);
 const hook = rematch(["create", "no-recursive-delete", "--from", "description", "--description", "Never rm -rf in the shell", "--editor", editorHook]);
 rematch(["activate", "no-recursive-delete", "--unverified"]);
-const approved = approveAction(hook.data.id);
-check(approved.ok, "block hook approved by the user (CLI)", approved);
 const builtins = rematch(["builtins", "ls"]).data.builtins as Loose[];
 const stuck = builtins.find(b => b.name === "stuck-detector")?.id as string;
-// An approved `retrieve` hook, and a unit in the skill package that matches the first prompt.
+// The built-in `retrieve` hook (auto-activated), and a unit in the skill package that matches the first prompt.
 const retrieveHook = builtins.find(b => b.name === "context-unit-retrieval")?.id as string;
-approveAction(retrieveHook);
 const unit = path.join(root, "staging/payments/run-tests-before-commit/units/ledger-migration.md");
 fs.mkdirSync(path.dirname(unit), { recursive: true });
 fs.writeFileSync(unit, "# Ledger migration\n\nRun the ledger migration tests before you commit the crate changes.\n");
@@ -121,6 +122,10 @@ const SCRIPT: Record<string, Record<string, unknown>[]> = {
 	"second served prompt": [{ text: "second answer" }],
 	"unrelated later prompt": [{ text: "later answer" }],
 	"fragment carrying prompt": [{ text: "tests first, noted" }],
+	"introduce type error prompt": [
+		{ tool: "write", args: { filePath: path.join(proj, "src/lib.rs"), content: 'pub fn reconcile() -> String { "bad" }\n' } },
+		{ text: "fixed the type error" },
+	],
 };
 const textOf = (c: unknown): string =>
 	typeof c === "string" ? c : Array.isArray(c) ? c.map(x => (typeof x === "string" ? x : (x?.text ?? ""))).join("") : "";
@@ -178,7 +183,7 @@ fs.writeFileSync(
 					models: { scripted: { name: "scripted", tool_call: true, limit: { context: 100000, output: 4000 } } },
 				},
 			},
-			permission: { bash: "allow", read: "allow", skill: "allow", external_directory: "allow" },
+			permission: { bash: "allow", read: "allow", edit: "allow", write: "allow", skill: "allow", external_directory: "allow" },
 		},
 		null,
 		1,
@@ -206,8 +211,8 @@ check(a.length > 0, "plugin loaded: trace oc:<session> written", { s1, traces: f
 const start = a[0] ?? {};
 check(start.ev === "session_start" && start.mode === "opencode" && /^opencode\b/.test(start.omp_version), "session_start from the plugin", start);
 check((start.loaded_entries ?? []).some((e: Loose) => e.id === skill.data.id && e.version >= 1 && e.sha), "skill entry loaded with version and sha", start.loaded_entries);
-check((start.hooks_loaded ?? []).includes(hook.data.id), "approved block hook loaded", start.hooks_loaded);
-check(!(start.hooks_loaded ?? []).includes(stuck), "unapproved built-in not loaded", start.hooks_loaded);
+check((start.hooks_loaded ?? []).includes(hook.data.id), "data-only block hook loaded automatically", start.hooks_loaded);
+check((start.hooks_loaded ?? []).includes(stuck), "built-in stuck-detector hook loaded automatically", start.hooks_loaded);
 check((start.visible_entries ?? []).includes(skill.data.id), "skill visible through this directory's view", start.visible_entries);
 check(/^payments-[0-9a-f]{16}$/.test(String(start.exposure_view)) && (start.staging_dirs ?? []).every((d: string) => d.startsWith(path.join(root, "views"))), "OpenCode was given this directory's view, not the shared dir", start);
 check(!fs.existsSync(path.join(root, "skills", "run-tests-before-commit")), "the provisional skill is not in the shared dir");
@@ -226,7 +231,7 @@ check(rmPart?.is_error === true && String(rmPart.content_head).includes("rm -rf 
 const selfApprove = tools.find(r => String(r.input?.command).includes("library approve"));
 check(selfApprove?.is_error === true && String(selfApprove.content_head).includes("reserved to the user"), "model's self-approval refused, global flags first", selfApprove);
 const hooksDir = path.join(home, ".omp/agent/extensions/rematch-hooks");
-check(fs.existsSync(path.join(hooksDir, `${hook.data.id}.ts`)) && !fs.existsSync(path.join(hooksDir, `${stuck}.ts`)), "stuck-detector still unapproved (no compiled module)");
+check(fs.existsSync(path.join(hooksDir, `${hook.data.id}.ts`)) && fs.existsSync(path.join(hooksDir, `${stuck}.ts`)), "data-only hooks compiled automatically");
 const status = tools.find(r => r.tool === "rematch" && r.input?.operation === "status");
 check(status?.is_error === false && /"(?:entries|actions)"/.test(String(status.content_head)), "read-only rematch tool answered", status);
 const toolApprove = tools.find(r => r.tool === "rematch" && r.input?.operation === "approve");
@@ -323,6 +328,20 @@ check(
 	sentRecs,
 );
 
+
+// --- E: post-edit fast-check injects Cargo diagnostic into the next request's system prompt and records check_ran
+fs.mkdirSync(path.join(proj, "src"), { recursive: true });
+fs.writeFileSync(path.join(proj, "Cargo.toml"), '[package]\nname = "payments"\nversion = "0.1.0"\nedition = "2021"\n');
+fs.writeFileSync(path.join(proj, "src/lib.rs"), "pub fn reconcile() {}\n");
+await run(["run", "introduce type error prompt"]);
+const sCheck = sessionIds().at(-1) as string;
+check(
+	systems.some(s => s.includes("src/lib.rs:1:") && s.includes("E0308") && s.includes("to_string")),
+	"fast-check diagnostic reached the system prompt after write",
+	systems.at(-1)?.slice(-600),
+);
+const checkRecs = trace(`oc:${sCheck}`).filter(r => r.ev === "check_ran");
+check(checkRecs.length === 1 && checkRecs[0].kind === "cargo" && checkRecs[0].ok === false, "check_ran recorded for fast-check", checkRecs);
 // --- count: each finished segment folded once ---------------------------------------------
 const c1 = rematch(["count"]);
 const folded: string[] = c1.data.folded ?? [];

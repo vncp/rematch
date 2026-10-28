@@ -110,12 +110,9 @@ fn two_machines_share_one_profile() {
     assert_eq!(link(&a.root.join("policy.json")), pa.join("config/policy.json"));
     assert!(std::fs::read_to_string(pa.join("config/policy.json")).unwrap().contains('4'));
 
-    // An approved hook lands in the profile, linked from rematch-hooks/.
+    // A compiled data-only hook lands in the profile, linked from rematch-hooks/.
     let builtins = on(&a, A, &["builtins", "ls"]);
     let hook_id = builtins["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
-    let review = on(&a, A, &["library", "inspect", &hook_id]);
-    let argv: Vec<String> = serde_json::from_value(review["action"]["commands"]["approve_argv"].clone()).unwrap();
-    on(&a, A, &argv.iter().map(String::as_str).collect::<Vec<_>>());
     let hook_file = format!("{hook_id}.ts");
     assert_eq!(link(&a.agent.join("extensions/rematch-hooks").join(&hook_file)), pa.join("hooks").join(&hook_file));
 

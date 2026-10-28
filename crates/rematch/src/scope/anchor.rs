@@ -259,7 +259,8 @@ fn receipt_lists(r: &Value, id: &str) -> bool {
     listed("staged") || listed("next_run") || loaded_by_reference
 }
 
-/// The task's own verifier, else the one its last `run` used (`receipt.json` job spec).
+/// The task's own verifier, else the one its last `run` used (`receipt.json` job spec),
+/// else the repository's default (`check`, then `tests`).
 fn verifier_spec(ctx: &AppCtx, task: &Task) -> Option<String> {
     let own = task.verifier.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     own.or_else(|| {
@@ -269,6 +270,7 @@ fn verifier_spec(ctx: &AppCtx, task: &Task) -> Option<String> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     })
+    .or_else(|| crate::batch::verifier::default_spec_for(&task.repo).map(|(v, _)| v))
 }
 
 /// `status_note` of an entry retired by a failed anchor replay.

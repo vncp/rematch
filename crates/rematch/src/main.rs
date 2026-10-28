@@ -5,6 +5,7 @@ pub mod actions;
 pub mod app;
 pub mod batch;
 pub mod builtins;
+pub mod check;
 pub mod config;
 pub mod create;
 pub mod digest;
@@ -71,6 +72,8 @@ enum Cmd {
     },
     /// Units of the loaded skill packages that match a query (the `retrieve` context hook).
     Retrieve(retrieve::RetrieveArgs),
+    /// Detect and run the repo's fast check (Cargo, tsc, ruff, pyright, mypy, Go) plus unedited caller impact.
+    Check(check::CheckArgs),
     /// Session-start digest: new statuses, approvals, review list, transfers.
     Digest,
     /// Append an event for a session (marks); the trace file stays the primary input.
@@ -155,6 +158,7 @@ impl Cmd {
             Cmd::Skills { .. } => "skills",
             Cmd::Digest => "digest",
             Cmd::Retrieve(_) => "retrieve",
+            Cmd::Check(_) => "check",
             Cmd::Record(_) => "record",
             Cmd::TraceEvent(_) => "trace-event",
             Cmd::HookCheck(_) => "hook-check",
@@ -195,6 +199,7 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Skills { cmd } => skills_cmd::cmd_skills(ctx, cmd),
         Cmd::Digest => digest::cmd_digest(ctx),
         Cmd::Retrieve(a) => retrieve::cmd_retrieve(ctx, a),
+        Cmd::Check(a) => check::cmd_check(ctx, a),
         Cmd::Record(a) => reflect::cmd_record(ctx, a),
         Cmd::TraceEvent(a) => trace_event::cmd_trace_event(ctx, a),
         Cmd::HookCheck(a) => trace_event::cmd_hook_check(ctx, a),

@@ -117,6 +117,9 @@ function env(): Record<string, string> {
 		PI_OFFLINE: "1",
 		PI_TELEMETRY: "0",
 		PI_SKIP_VERSION_CHECK: "1",
+		USER: process.env.USER ?? "",
+		RUSTUP_HOME: process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"),
+		CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"),
 	};
 	return e;
 }
@@ -154,7 +157,7 @@ function writeHookEditor(): string {
 	return p;
 }
 
-/** A provisional skill package with a unit, the approved retrieve builtin, an unapproved block hook. */
+/** A provisional skill package with a unit, the auto-activated retrieve builtin, and an unactivated draft block hook. */
 function stage(): { skill: string; retrieve: string; hook: string } {
 	const skill = cli("create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes", "--editor", EDITOR_OK).id as string;
 	cli("activate", "ledger-test-gate", "--unverified");
@@ -163,9 +166,7 @@ function stage(): { skill: string; retrieve: string; hook: string } {
 	fs.writeFileSync(unit, "# Ledger reconciliation\n\nRun the reconciliation migration before the ledger tests.\n");
 	const builtins = (cli("builtins", "ls").builtins as Json[]).find(b => b.name === "context-unit-retrieval")!;
 	const retrieve = builtins.id as string;
-	approveAction(retrieve);
 	const hook = cli("create", "no-secrets-read", "--from", "description", "--description", "never read the secrets file", "--editor", writeHookEditor()).id as string;
-	cli("activate", "no-secrets-read", "--unverified");
 	return { skill, retrieve, hook };
 }
 
@@ -272,8 +273,11 @@ async function rpc(...extra: string[]) {
 const systemOf = (r: Req) => text(r.messages.find(m => m.role === "system" || m.role === "developer")?.content);
 
 describe("stock Pi over RPC with a scripted model", () => {
-	test("skills, retrieval, tracing, user-only approval, approve → reload → block, steer, mark, flagged shutdown", async () => {
+	test("skills, retrieval, tracing, user-only approval, activate → reload → block, steer, mark, flagged shutdown", async () => {
 		const { skill, retrieve, hook } = stage();
+		const fragId = cli("create", "crate-tests-first", "--from", "description", "--description", "run crate tests before committing", "--editor", EDITOR_FRAGMENT).id as string;
+		cli("activate", "crate-tests-first", "--unverified");
+		const fragAction = `instructions:${fragId}`;
 		const hookFile = path.join(home, ".omp", "agent", "extensions", "rematch-hooks", `${hook}.ts`);
 		// The skill as Pi lists it: under this place's view (`skills sync --harness pi`), not the shared dir.
 		const view = (cli("skills", "sync", "--harness", "pi", "--cwd", repo).dirs as string[])[0]!;
@@ -283,8 +287,8 @@ describe("stock Pi over RPC with a scripted model", () => {
 			{ tool: { name: "read", args: { path: skillMd } } },
 			{ tool: { name: "bash", args: { command: "exit 3" } } },
 			// The user's decisions, refused with the global flags first (clap accepts them anywhere).
-			{ tool: { name: "rematch", args: { operation: "library", arguments: ["--text", "approve", hook] } } },
-			{ tool: { name: "bash", args: { command: `rematch --cwd ${repo} --text library approve ${hook}` } } },
+			{ tool: { name: "rematch", args: { operation: "library", arguments: ["--text", "approve", fragAction] } } },
+			{ tool: { name: "bash", args: { command: `rematch --cwd ${repo} --text library approve ${fragAction}` } } },
 			{ text: "Committed after the ledger tests." },
 			{ tool: { name: "read", args: { path: "secrets.txt" } } },
 			{ tool: { name: "bash", args: { command: "sleep 3" } } },
@@ -294,13 +298,15 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const pi = await rpc();
 		try {
 			await pi.prompt("commit the ledger reconciliation migration change to the crate");
-			expect(fs.existsSync(hookFile)).toBe(false); // neither the tool nor bash approved it
+			expect(fs.existsSync(hookFile)).toBe(false); // draft not yet activated
 			// Typed without a hash: the action's dialog, whose Approve carries the reviewed snapshot.
-			const approving = pi.command(`/rematch approve ${hook}`);
+			const approving = pi.command(`/rematch approve ${fragAction}`);
 			const ask = await pi.wait(r => r.type === "extension_ui_request" && r.method === "select");
 			expect(ask.options).toEqual(["Approve", "Decline", "Inspect", "Later"]);
-			await pi.respond(ask.id, { value: "Approve" });
+			await pi.respond(ask.id, { value: "Later" });
 			await approving;
+			// Activating the data-only block hook compiles and loads it automatically without approval!
+			await pi.command("/rematch activate no-secrets-read --unverified");
 			expect(fs.existsSync(hookFile)).toBe(true);
 			const second = pi.prompt("no, read the secrets file first");
 			// Steer while `sleep 3` runs: Pi queues it, the adapter traces a takeover.
@@ -325,7 +331,7 @@ describe("stock Pi over RPC with a scripted model", () => {
 		const recs = readTrace(files[0]!);
 		expect(recs.map(r => r.seq)).toEqual(recs.map((_, i) => i));
 		const starts = recs.filter(r => r.ev === "session_start");
-		expect(starts.map(r => r.mode)).toEqual(["pi:startup", "pi:approve"]);
+		expect(starts.map(r => r.mode)).toEqual(["pi:startup", "pi:reload"]);
 		expect(starts[1]!.hooks_loaded).toEqual(expect.arrayContaining([retrieve, hook]));
 		expect((starts[1]!.loaded_entries as Json[]).find(e => e.id === hook)).toMatchObject({ version: 1 });
 		expect(recs.findIndex(r => r === starts[1])).toBeLessThan(recs.findIndex(r => r.ev === "tool_blocked" && r.hook_id === hook));
@@ -336,8 +342,7 @@ describe("stock Pi over RPC with a scripted model", () => {
 		expect((start.loaded_entries as Json[]).map(e => e.id)).toContain(skill);
 		expect((start.loaded_entries as Json[]).find(e => e.id === skill)).toMatchObject({ version: 1 });
 		expect((start.loaded_entries as Json[]).map(e => e.id)).not.toContain(retrieve);
-		expect(start.hooks_loaded).toEqual([retrieve]);
-		// This place's view (kept library + its provisional entries), never the shared dir of every repo's trials.
+		expect(start.hooks_loaded).toContain(retrieve);
 		expect((start.staging_dirs as string[]).map(d => path.relative(root, d).split(path.sep).slice(0, 1).concat(path.basename(d)))).toEqual([["views", "skills"]]);
 		expect(String(start.exposure_view)).toMatch(/^payments-[0-9a-f]{16}$/);
 		expect(start.visible_entries).toContain(skill);
@@ -563,5 +568,48 @@ describe("abort is not a takeover", () => {
 		fs.renameSync(path.join(root, "traces", traces()[0]!), path.join(t, "live.jsonl"));
 		const imported = cli("import", "--history", "--harness", "pi", "--sessions", path.join(agent, "sessions"));
 		expect((imported.history_pi as Json).redirects).toBe(0);
+	}, 60_000);
+});
+
+describe("fast-check in real Pi", () => {
+	test("an edit introducing a Cargo type error injects the diagnostic into the next model request and records check_ran", async () => {
+		fs.writeFileSync(path.join(repo, "Cargo.toml"), '[package]\nname = "payments"\nversion = "0.1.0"\nedition = "2021"\n');
+		fs.writeFileSync(path.join(repo, "src", "lib.rs"), "pub fn reconcile() {}\n");
+		const fc = (cli("builtins", "ls").builtins as Json[]).find(b => b.name === "fast-check")!;
+		if (fc.approved !== true) {
+			try {
+				approveAction(fc.id as string);
+			} catch {
+				cli("library", "approve", fc.id as string, "--what", "hook");
+			}
+		}
+
+		model = new FakeModel([
+			{
+				tool: {
+					name: "write",
+					args: { path: "src/lib.rs", content: 'pub fn reconcile() -> String { "bad" }\n' },
+				},
+			},
+			{ text: "Fixed the type error." },
+		]);
+		writeModels(model);
+		const out = await print("update reconcile in src/lib.rs");
+		expect(out.code).toBe(0);
+		expect(model.requests.length).toBeGreaterThanOrEqual(2);
+		const secondReq = model.requests[1]!;
+		const allText = secondReq.messages.map(m => text(m.content)).join("\n");
+		expect(allText).toContain("src/lib.rs:1:");
+		expect(allText).toContain("E0308");
+		expect(allText).toContain("to_string");
+
+		const recs = readTrace(traces()[0]!);
+		const checkRecs = recs.filter(r => r.ev === "check_ran");
+		expect(checkRecs).toHaveLength(1);
+		expect(checkRecs[0]).toMatchObject({
+			hook_id: fc.id,
+			kind: "cargo",
+			ok: false,
+		});
 	}, 60_000);
 });

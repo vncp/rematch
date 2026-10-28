@@ -265,9 +265,11 @@ pub fn cmd_status(ctx: &AppCtx, job: Option<&str>) -> Result<Value> {
     // What waits for the user and what runs as an automatic trial, independent of the digest.
     let actions = crate::actions::pending(ctx)?;
     let applied = crate::actions::applied(ctx)?;
+    let auto_applied = crate::actions::applied_automatically(ctx)?;
     let trials = crate::actions::trials(ctx)?;
     let mut head: Vec<String> = actions.iter().map(crate::actions::Action::line).collect();
     head.extend(crate::actions::applied_line(&applied));
+    head.extend(auto_applied.iter().map(crate::actions::AutoApplied::line));
     if !trials.is_empty() {
         head.push(format!(
             "{} automatic trial(s) running: {} (`rematch library ls`; `rematch library disable <id>` stops one)",
@@ -286,6 +288,7 @@ pub fn cmd_status(ctx: &AppCtx, job: Option<&str>) -> Result<Value> {
         "off": ctx.paths.is_off(),
         "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
         "applied": applied.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied_automatically": auto_applied,
         "trials": trials,
         "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
         "probes": probes,

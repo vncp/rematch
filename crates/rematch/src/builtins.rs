@@ -5,11 +5,11 @@
 //! Each is a provisional `kind: hook` entry in branch `shared` with repo glob `**` and no
 //! exts/stems (it matches every session), origin `Import { source: "builtin" }` and
 //! `redirect_class: None` (recurrence = a correction or preference redirect while it ran,
-//! never a scope one; `counters::recurred`). They arrive
-//! unapproved: the digest offers each as a one-tap approval and nothing of them loads,
-//! runs or counts until the user approves (`library::hook_active`). After that they are
-//! kept or retired by their counters like any entry; a retired or declined built-in is
-//! never re-staged automatically (`rematch builtins reinstall` does it on request).
+//! never a scope one; `counters::recurred`). Because they are data-only hooks, `library::stage`
+//! compiles their modules at stage time so they activate automatically as scoped provisional
+//! trials (`library::hook_active`) without a separate approval action. They are kept or retired
+//! by their counters like any entry; a retired or disabled built-in is never re-staged
+//! automatically (`rematch builtins reinstall` does it on request).
 //!
 //! `ensure` runs from `AppCtx::open_with` after the improver install and costs one file
 //! read when nothing changed: `builtins.version` holds the hash of the shipped specs.
@@ -72,6 +72,14 @@ pub fn specs() -> Vec<Builtin> {
          re-running a command after any other call (an edit, a read) passes.",
     );
     stuck.repeats = Some(3);
+    let mut check = rule(
+        HookMode::Check,
+        "rematch: compiler/type/lint diagnostics and unedited caller references after file edits.",
+        "A turn that edits no files, or a repo with no detected check, runs nothing and injects nothing; \
+         a check is bounded to 30 seconds and 4096 bytes of injected context.",
+    );
+    check.timeout_secs = Some(30);
+    check.budget_bytes = Some(4096);
     vec![
         Builtin {
             name: "context-unit-retrieval",
@@ -107,12 +115,24 @@ pub fn specs() -> Vec<Builtin> {
                    ## Pitfalls\n\
                    - When blocked, change the arguments, use a different tool, or ask the user; retrying the same call is blocked again.\n",
         },
+        Builtin {
+            name: "fast-check",
+            decision: "D23",
+            trigger_line: "Use when editing code in a repository with a compiler or linter: runs a scoped fast check after edits and injects diagnostics and unedited caller references.",
+            hook: check,
+            laws: "## Laws\n\
+                   - After file-editing tool calls finish, the harness runs the repo's detected fast check (`rematch check`: Cargo, tsc, ruff, pyright, mypy, or Go) scoped to the edited files, plus `git grep` references for any function or type whose signature or name changed in `git diff`.\n\
+                   - Before the next model request, at most one compact message (≤ 4096 bytes) is injected: compiler/linter errors and `help:` suggestions first, then caller references in unedited files (capped at 20 lines), or a one-line `✓ <check> clean in Xs` receipt.\n\
+                   - Nothing runs and nothing is injected on turns that do not edit files.\n\n\
+                   ## Pitfalls\n\
+                   - When the injected check already reports `✓ <check> clean`, avoid re-running the same check manually unless you edited again or need full test execution.\n",
+        },
     ]
 }
 
 fn skill_md(b: &Builtin) -> String {
     format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{trigger}\n\nBuilt-in rematch entry ({decision}). It runs only after a one-tap approval and is kept or retired by its counters like any entry.\n\n{laws}",
+        "---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\n{trigger}\n\nBuilt-in rematch entry ({decision}). It activates automatically as a provisional trial and is kept or retired by its counters like any entry.\n\n{laws}",
         name = b.name,
         description = serde_json::to_string(b.trigger_line).unwrap_or_default(),
         trigger = b.trigger_line,
@@ -243,7 +263,7 @@ pub fn cmd_builtins(ctx: &AppCtx, cmd: BuiltinsCmd) -> Result<Value> {
                     continue;
                 }
                 let e = stage(ctx, b, existing.last())?;
-                lines.push(format!("{}: staged v{} (awaiting approval)", b.name, e.version));
+                lines.push(format!("{}: staged v{} (active provisional trial)", b.name, e.version));
                 out.push(json!({"name": b.name, "action": "staged", "id": e.id, "version": e.version}));
             }
             Ok(json!({"builtins": out, "lines": lines}))
@@ -275,64 +295,65 @@ mod tests {
         let c = ctx(t.path());
         ensure(&c).unwrap();
         let first = builtins(&c);
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
         for e in &first {
             assert_eq!((e.kind, e.status, e.branch.as_str(), e.predicate.repo_glob.as_str()), (Kind::Hook, Status::Provisional, "shared", "**"));
             assert!(e.predicate.file_exts.is_empty() && e.predicate.stems.is_empty() && e.redirect_class.is_none());
             assert!(e.path.join("hook.json").is_file() && e.path.join("SKILL.md").is_file());
             let rep = lint_entry(&e.path, e, &LintConfig::default(), &LintContext::default()).unwrap();
             assert!(rep.ok, "{}: {:?}", e.name, rep.findings);
+            assert!(library::hook_active(&c.paths, e), "{} should be active on stage", e.name);
         }
         // second run, and a run after the marker is gone: no duplicates
         ensure(&c).unwrap();
         std::fs::remove_file(c.paths.root.join("builtins.version")).unwrap();
         ensure(&c).unwrap();
-        assert_eq!(builtins(&c).len(), 3);
+        assert_eq!(builtins(&c).len(), 4);
 
-        // a declined built-in stays retired; reinstall stages v2 on request only
+        // a disabled built-in stays retired; reinstall stages v2 on request only
         let stuck = first.iter().find(|e| e.name == "stuck-detector").unwrap();
-        library::decline(&c.ledger, &c.paths, &stuck.id, &[library::Approval::Hook]).unwrap();
+        library::disable(&c.ledger, &c.paths, &stuck.id, "test").unwrap();
         std::fs::remove_file(c.paths.root.join("builtins.version")).unwrap();
         ensure(&c).unwrap();
-        assert_eq!(builtins(&c).iter().filter(|e| e.status == Status::Provisional).count(), 2);
+        assert_eq!(builtins(&c).iter().filter(|e| e.status == Status::Provisional).count(), 3);
         let r = cmd_builtins(&c, BuiltinsCmd::Reinstall { names: vec![] }).unwrap();
         let actions: Vec<(&str, &str)> =
             r["builtins"].as_array().unwrap().iter().map(|x| (x["name"].as_str().unwrap(), x["action"].as_str().unwrap())).collect();
-        assert_eq!(actions, vec![("context-unit-retrieval", "live"), ("tool-output-truncation", "live"), ("stuck-detector", "staged")]);
+        assert_eq!(
+            actions,
+            vec![
+                ("context-unit-retrieval", "live"),
+                ("tool-output-truncation", "live"),
+                ("stuck-detector", "staged"),
+                ("fast-check", "live"),
+            ]
+        );
         let v2 = builtins(&c).into_iter().find(|e| e.name == "stuck-detector" && e.status == Status::Provisional).unwrap();
         assert_eq!((v2.version, v2.predecessor.as_deref()), (2, Some(stuck.id.as_str())));
         assert!(cmd_builtins(&c, BuiltinsCmd::Reinstall { names: vec!["nope".into()] }).is_err());
 
         let ls = cmd_builtins(&c, BuiltinsCmd::Ls).unwrap();
-        assert!(ls["builtins"].as_array().unwrap().iter().all(|x| x["approved"] == false && x["status"] == "provisional"), "{ls}");
+        assert!(ls["builtins"].as_array().unwrap().iter().all(|x| x["approved"] == true && x["status"] == "provisional"), "{ls}");
     }
 
     #[test]
-    fn builtins_are_approvals_and_inert_until_approved() {
+    fn builtins_activate_automatically_on_stage_and_are_listed_under_applied_automatically() {
         let t = tempfile::tempdir().unwrap();
         let c = ctx(t.path());
         ensure(&c).unwrap();
         let approvals = crate::digest::pending_approvals(&c).unwrap();
-        let names: Vec<&str> = approvals.iter().map(|a| a["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["context-unit-retrieval", "tool-output-truncation", "stuck-detector"], "{approvals:?}");
-        assert!(approvals.iter().all(|a| a["kind"] == "hook"));
-        let retr = &approvals[0];
-        assert!(retr["diff"].as_str().unwrap().contains(r#"mode: "retrieve","#), "{retr}");
-        assert!(retr["reason"].as_str().unwrap().contains("Pass condition:"), "{retr}");
+        assert!(approvals.is_empty(), "data-only built-ins need no approval action: {approvals:?}");
 
-        // unapproved: nothing loads (no shared dir, no hit, no hook module)
-        let m = library::list_for_match(&c.ledger, &c.paths, None, t.path()).unwrap();
-        assert!(m.skill_dirs.is_empty() && m.hooks.is_empty() && m.entries.is_empty(), "{m:?}");
-
-        // approve one: its module is data-only, the shared dir loads, it counts
-        let id = approvals[2]["id"].as_str().unwrap();
-        library::approve(&c.ledger, &c.paths, id, library::Approval::Hook).unwrap();
         let m = library::list_for_match(&c.ledger, &c.paths, None, t.path()).unwrap();
         assert_eq!(m.skill_dirs, vec![c.paths.staging.join("shared")]);
-        assert_eq!(m.hooks, vec![c.paths.hooks_dir().join(format!("{id}.ts"))]);
-        let hits: Vec<(&str, bool)> = m.entries.iter().map(|e| (e.name.as_str(), e.predicate_hit)).collect();
-        assert_eq!(hits, vec![("stuck-detector", true)], "unapproved built-ins are in no place's view: they do not load");
+        assert_eq!(m.hooks.len(), 4, "{m:?}");
+        assert_eq!(m.entries.len(), 4, "{m:?}");
+        assert!(m.entries.iter().all(|e| e.predicate_hit));
+
         let digest = crate::digest::cmd_digest(&c).unwrap();
-        assert_eq!(digest["approvals"].as_array().unwrap().len(), 2, "{digest}");
+        assert!(digest["approvals"].as_array().unwrap().is_empty(), "{digest}");
+        let auto = digest["applied_automatically"].as_array().unwrap();
+        assert_eq!(auto.len(), 4, "{auto:?}");
+        assert!(auto.iter().all(|a| a["why"] == "data-only" && a["undo"].as_str().unwrap().starts_with("rematch library disable ")));
     }
 }

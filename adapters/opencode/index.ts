@@ -18,6 +18,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import {
+	changedPaths,
+	CHECK_DEBOUNCE_MS,
 	decode,
 	type Envelope,
 	errorText,
@@ -186,7 +188,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	}
 
 	/** One bounded `rematch` call; never throws. */
-	function call(argv: string[], stdin: Json | null, timeoutMs: number): Promise<Envelope> {
+	function call(argv: string[], stdin: Json | null, timeoutMs: number, signal?: AbortSignal): Promise<Envelope> {
 		const operation = argv[0] ?? "";
 		const { promise, resolve } = Promise.withResolvers<Envelope>();
 		let stdout = "";
@@ -199,22 +201,28 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 			resolve({ ok: false, operation, error: errorText(error) });
 			return promise;
 		}
-		const timer = setTimeout(() => {
+		const kill = () => {
 			killed = true;
 			child.kill("SIGKILL");
-		}, timeoutMs);
+		};
+		const timer = setTimeout(kill, timeoutMs);
+		if (signal?.aborted) kill();
+		signal?.addEventListener("abort", kill, { once: true });
 		child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
 		child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-		child.on("error", error => {
+		const done = (code: number | null, err?: unknown) => {
 			clearTimeout(timer);
-			resolve({ ok: false, operation, error: errorText(error) });
-		});
-		child.on("close", code => {
-			clearTimeout(timer);
+			signal?.removeEventListener("abort", kill);
+			if (err !== undefined) {
+				resolve({ ok: false, operation, error: errorText(err) });
+				return;
+			}
 			const env = decode({ stdout, stderr, code: code ?? 1, killed } as never, operation);
-			if (!env.ok) log("warn", `${operation} failed: ${env.error}${stderr ? `: ${stderr.slice(0, 400)}` : ""}`);
+			if (!env.ok && !signal?.aborted) log("warn", `${operation} failed: ${env.error}${stderr ? `: ${stderr.slice(0, 400)}` : ""}`);
 			resolve(env);
-		});
+		};
+		child.on("error", error => done(1, error));
+		child.on("close", code => done(code));
 		child.stdin?.on("error", () => {});
 		child.stdin?.end(stdin ? JSON.stringify(stdin) : "");
 		return promise;
@@ -225,8 +233,41 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 	let truncateRules: TruncateRule[] = [];
 	/** An approved `retrieve` hook applies here: units go into each request's system prompt. */
 	let retrieves = false;
+	/** An active `check` hook applies here: compiler/type/lint diagnostics run after file edits. */
+	let checks = false;
+	let checkTimeoutMs = 35_000;
 	/** `retrieve` context per session for the current prompt (null: no units); dropped on new input and on every hook reload. */
 	const retrieved = new Map<string, string | null>();
+	/** Per session: files edited in the current turn awaiting `fast-check`, debounce timer, in-flight promise, and last rendered message. */
+	type SessionCheck = {
+		pendingFiles: Set<string>;
+		timer: NodeJS.Timeout | undefined;
+		abort: AbortController | null;
+		promise: Promise<string | null> | null;
+		dirty: boolean;
+		lastMessage: string | null;
+	};
+	const sessionChecks = new Map<string, SessionCheck>();
+	const checkStateOf = (sid: string): SessionCheck => {
+		let st = sessionChecks.get(sid);
+		if (!st) {
+			st = { pendingFiles: new Set(), timer: undefined, abort: null, promise: null, dirty: false, lastMessage: null };
+			sessionChecks.set(sid, st);
+		}
+		return st;
+	};
+	const clearSessionCheck = (sid: string) => {
+		const st = sessionChecks.get(sid);
+		if (!st) return;
+		st.pendingFiles.clear();
+		clearTimeout(st.timer);
+		st.timer = undefined;
+		st.abort?.abort();
+		st.abort = null;
+		st.promise = null;
+		st.dirty = false;
+		st.lastMessage = null;
+	};
 	let skillsPaths: string[] = [];
 	/** This directory's view (`load.dirs`: the kept library plus this directory's provisional entries); what `config` gives OpenCode. */
 	let viewDirs: string[] = [];
@@ -257,16 +298,22 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		callTools = tools;
 		truncateRules = rules;
 		retrieves = load.hooks.some(h => isRecord(h) && h.mode === "retrieve");
+		const checkHook = load.hooks.find(h => isRecord(h) && h.mode === "check");
+		checks = checkHook !== undefined;
+		const cp = isRecord(checkHook) && isRecord(checkHook.params) ? checkHook.params : {};
+		checkTimeoutMs = (typeof cp.timeout_secs === "number" ? Math.max(1, cp.timeout_secs) + 5 : 35) * 1000;
 		// Approvals, declines and the switch change what runs: no cached units survive them.
 		retrieved.clear();
+		for (const sid of sessionChecks.keys()) clearSessionCheck(sid);
 	}
 
-	async function control(events: Json[], timeoutMs = 8000): Promise<Json[]> {
-		if (isOff()) return [];
+	async function control(events: Json[], timeoutMs = 8000, signal?: AbortSignal): Promise<Json[]> {
+		if (isOff() || signal?.aborted) return [];
 		const env = await call(
 			["trace-event", "--harness", "opencode"],
 			{ pid: process.pid, directory: input.directory, skills_paths: skillsPaths, events },
 			timeoutMs,
+			signal,
 		);
 		return env.ok && isRecord(env.data) && Array.isArray(env.data.events) ? env.data.events.filter(isRecord) : [];
 	}
@@ -279,6 +326,18 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		else await loadFragments();
 	}
 
+	function spawnReflect() {
+		if (isOff() || !(process.env.OMP_BIN || which("omp"))) return;
+		try {
+			const args = process.platform === "win32" ? ["reflect", "--pending", "--detach"] : ["reflect", "--pending"];
+			const child = spawn(bin, args, { detached: true, stdio: "ignore" });
+			child.on("error", error => log("warn", `reflect spawn failed: ${errorText(error)}`));
+			child.unref();
+		} catch (error) {
+			log("warn", `reflect spawn failed: ${errorText(error)}`);
+		}
+	}
+
 	// The shared dir is linked for this directory before OpenCode scans skills (lazily, after
 	// plugin init); segments left open by a process that died are finalized first.
 	if (!isOff()) {
@@ -287,16 +346,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		await loadFragments();
 		// Reflection makes its model calls through omp; detached, one run at a time (the
 		// binary's pending/.lock), never inside the OpenCode process.
-		if (process.env.OMP_BIN || which("omp")) {
-			try {
-				const args = process.platform === "win32" ? ["reflect", "--pending", "--detach"] : ["reflect", "--pending"];
-				const child = spawn(bin, args, { detached: true, stdio: "ignore" });
-				child.on("error", error => log("warn", `reflect spawn failed: ${errorText(error)}`));
-				child.unref();
-			} catch (error) {
-				log("warn", `reflect spawn failed: ${errorText(error)}`);
-			}
-		}
+		spawnReflect();
 	}
 
 	// --- sessions -----------------------------------------------------------------------------
@@ -364,6 +414,68 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		const q = queues.get(sid);
 		while (q?.busy) await q.busy;
 	}
+	function startSessionCheck(sid: string): Promise<string | null> {
+		const st = checkStateOf(sid);
+		clearTimeout(st.timer);
+		st.timer = undefined;
+		st.abort?.abort();
+		const ctrl = new AbortController();
+		st.abort = ctrl;
+		st.dirty = false;
+		const files = [...st.pendingFiles];
+		const runPromise = (async () => {
+			if (!checks || isOff() || files.length === 0) {
+				if (!ctrl.signal.aborted && st.abort === ctrl) {
+					st.lastMessage = null;
+					st.promise = null;
+				}
+				return st.lastMessage;
+			}
+			const info = await sessionInfo(sid);
+			if (info.parent || ctrl.signal.aborted) return null;
+			await drain(sid);
+			if (ctrl.signal.aborted) return null;
+			const [r] = await control(
+				[{ kind: "check", session: sid, directory: info.directory, version: info.version, files }],
+				checkTimeoutMs,
+				ctrl.signal,
+			);
+			if (ctrl.signal.aborted || st.abort !== ctrl) return st.lastMessage;
+			const msg = isRecord(r) && typeof r.context === "string" && r.context.trim() !== "" ? r.context : null;
+			st.lastMessage = msg;
+			st.promise = null;
+			return st.lastMessage;
+		})();
+		st.promise = runPromise;
+		return runPromise;
+	}
+	function scheduleSessionCheck(sid: string, files: readonly string[]) {
+		if (!checks || isOff() || files.length === 0) return;
+		const st = checkStateOf(sid);
+		for (const f of files) st.pendingFiles.add(f);
+		st.dirty = true;
+		st.lastMessage = null;
+		st.abort?.abort();
+		st.abort = null;
+		st.promise = null;
+		clearTimeout(st.timer);
+		st.timer = setTimeout(() => {
+			st.timer = undefined;
+			void startSessionCheck(sid);
+		}, CHECK_DEBOUNCE_MS);
+		st.timer.unref?.();
+	}
+	async function awaitSessionCheck(sid: string): Promise<string | null> {
+		if (!checks || isOff()) return null;
+		const st = sessionChecks.get(sid);
+		if (!st) return null;
+		if (st.dirty || st.timer !== undefined) {
+			await startSessionCheck(sid);
+		} else if (st.promise) {
+			await st.promise.catch(() => null);
+		}
+		return st.lastMessage;
+	}
 
 	// Streaming assistant text per message (part id → latest text), sent with its `turn`.
 	const texts = new Map<string, Map<string, string>>();
@@ -420,6 +532,11 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 							if (sentTools.has(part.id)) return;
 							sentTools.add(part.id);
 							enqueue(part.sessionID, { kind: "tool", part });
+							if (state.status === "completed") {
+								const toolName = typeof part.tool === "string" ? part.tool : "";
+								const touched = changedPaths(toolName, state.input);
+								if (touched.length > 0) scheduleSessionCheck(part.sessionID, touched);
+							}
 						}
 						return;
 					}
@@ -462,6 +579,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 				const sid = inp.sessionID;
 				const command = pendingCommand.get(sid) ?? null;
 				pendingCommand.delete(sid);
+				clearSessionCheck(sid);
 				enqueue(sid, { kind: "prompt", message: out.message, parts: out.parts, command, agent: inp.agent ?? null });
 				if (interactive && !digestShown && !isOff()) {
 					digestShown = true;
@@ -526,7 +644,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 		"experimental.chat.system.transform": async (inp, out) => {
 			try {
 				const sid = inp.sessionID;
-				if (!sid || isOff() || (!retrieves && promptFragments.length === 0)) return;
+				if (!sid || isOff() || (!retrieves && !checks && promptFragments.length === 0)) return;
 				const info = await sessionInfo(sid);
 				if (info.parent) return;
 				const block = renderPromptFragments(promptFragments);
@@ -539,18 +657,23 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 						enqueue(sid, { kind: "fragments", fragments: promptFragments.map(f => ({ id: f.id, name: f.name, sha: f.sha })), bytes: Buffer.byteLength(block, "utf8") });
 					}
 				}
-				if (!retrieves) return;
-				let context = retrieved.get(sid);
-				if (context === undefined) {
-					// The prompt's `chat.message` was enqueued before this request was prepared: draining
-					// puts it in the trace, so the query is this prompt's.
-					await drain(sid);
-					const [r] = await control([{ kind: "retrieve", session: sid, directory: info.directory, version: info.version }], 3000);
-					const value = retrievalCacheValue(r);
-					if (value !== undefined) retrieved.set(sid, value);
-					context = value ?? null;
+				if (retrieves) {
+					let context = retrieved.get(sid);
+					if (context === undefined) {
+						// The prompt's `chat.message` was enqueued before this request was prepared: draining
+						// puts it in the trace, so the query is this prompt's.
+						await drain(sid);
+						const [r] = await control([{ kind: "retrieve", session: sid, directory: info.directory, version: info.version }], 3000);
+						const value = retrievalCacheValue(r);
+						if (value !== undefined) retrieved.set(sid, value);
+						context = value ?? null;
+					}
+					if (context) out.system.push(context);
 				}
-				if (context) out.system.push(context);
+				if (checks) {
+					const checkCtx = await awaitSessionCheck(sid);
+					if (checkCtx) out.system.push(checkCtx);
+				}
 			} catch (error) {
 				log("warn", `system prompt additions failed open: ${errorText(error)}`);
 			}
@@ -581,6 +704,7 @@ export const RematchPlugin: Plugin = async (input: PluginInput) => {
 			try {
 				await Promise.all([...queues.keys()].map(drain));
 				await control([{ kind: "shutdown" }], 4000);
+				spawnReflect();
 			} catch (error) {
 				log("warn", `shutdown failed: ${errorText(error)}`);
 			}

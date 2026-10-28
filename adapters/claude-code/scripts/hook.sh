@@ -5,9 +5,11 @@
 # hook: every error exits 0; only an intentional hook-check block (exit 2, the reason on
 # stderr, nothing on stdout) passes through.
 #
-# `session-start` is `trace-event`, then `rematch reflect --pending` started in the
-# background, as the omp extension does at session start: detached (own process group, no
-# stdio), so it never delays the hook and outlives the session; the binary's `pending/.lock`
+# `session-start` and `session-end` are `trace-event`, then `rematch reflect --pending`
+# started in the background, as the omp extension does at session start and shutdown:
+# detached (own process group, no stdio), so it never delays the hook and outlives the
+# session; the binary's `pending/.lock` keeps it to one run at a time, and `probes::pass`
+# runs only after a session ends (no active session trace).
 # keeps it to one run at a time. It starts after the `session_start` record is written, so a
 # resumed session's trace is unfinished again and is not counted half-way. The reflection's
 # model calls go through omp, so nothing is started without it ($OMP_BIN, else `omp` on
@@ -17,7 +19,7 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 reflect=
 case "$op" in
 	trace-event | hook-check) ;;
-	session-start)
+	session-start | session-end)
 		op=trace-event
 		if [ -n "${OMP_BIN:-}" ]; then
 			[ -x "$OMP_BIN" ] && reflect=1

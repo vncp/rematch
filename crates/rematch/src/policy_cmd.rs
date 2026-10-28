@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Subcommand, ValueEnum};
 use rematch_core::domain::{
-    common_domain, normalize_domain, session_domain, top_domain, DomainDecl, DomainMatch, DomainPolicy, PlaceScope, POLICY_FILE,
+    common_domain, normalize_domain, session_domain, top_domain, AutoRule, AutoSurface, DomainDecl, DomainMatch, DomainPolicy, PlaceScope, ProbePolicy, POLICY_FILE,
 };
 use rematch_core::identity;
 use rematch_core::import::repo_of;
@@ -52,6 +52,20 @@ pub enum PolicyCmd {
     Scope {
         #[command(subcommand)]
         cmd: ScopeCmd,
+    },
+    /// Automatic probe budget (`daily_runs`: probes per 24 h, default 3, 0 = off; `max_parallel`: default 1).
+    Probes {
+        /// Probes started per 24 hours (`0` turns automatic probes off).
+        #[arg(long = "daily")]
+        daily: Option<usize>,
+        /// Concurrent probe runs (default 1).
+        #[arg(long = "max-parallel")]
+        max_parallel: Option<usize>,
+    },
+    /// Standing automatic approval rules (`surface`: scripts|agents|instructions, `scope`: `<repo path | remote | **>`). Reserved to the user.
+    Auto {
+        #[command(subcommand)]
+        cmd: AutoCmd,
     },
 }
 
@@ -97,6 +111,39 @@ pub enum CapsCmd {
 pub enum Cap {
     #[value(name = "kept_per_domain")]
     KeptPerDomain,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceArg {
+    Scripts,
+    Agents,
+    Instructions,
+}
+
+impl From<SurfaceArg> for AutoSurface {
+    fn from(a: SurfaceArg) -> Self {
+        match a {
+            SurfaceArg::Scripts => AutoSurface::Scripts,
+            SurfaceArg::Agents => AutoSurface::Agents,
+            SurfaceArg::Instructions => AutoSurface::Instructions,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AutoCmd {
+    /// Add a standing rule auto-approving `<surface>` in `<scope>` (`**`, a normalized remote, or a repo path).
+    Add {
+        surface: SurfaceArg,
+        scope: String,
+    },
+    /// Remove a standing rule for `<surface>` in `<scope>`.
+    Remove {
+        surface: SurfaceArg,
+        scope: String,
+    },
+    /// List the standing automatic approval rules.
+    List,
 }
 
 /// `REMATCH_ROOT/policy.json`, or with a profile the file its link points to
@@ -231,6 +278,43 @@ pub fn cmd_policy(ctx: &AppCtx, cmd: PolicyCmd) -> Result<Value> {
         }
         PolicyCmd::Scope { cmd: ScopeCmd::Set { name, target, subpath } } => scope_set(ctx, &path, &name, &target, subpath.as_deref()),
         PolicyCmd::Scope { cmd: ScopeCmd::Unset { name } } => scope_unset(ctx, &path, &name),
+        PolicyCmd::Probes { daily, max_parallel } => {
+            if daily.is_none() && max_parallel.is_none() {
+                let p = ctx.domain_policy()?;
+                return Ok(json!({
+                    "path": path,
+                    "probes": {"daily_runs": p.probe_daily_runs(), "max_parallel": p.probe_max_parallel()},
+                    "lines": [format!("probes: daily_runs {}, max_parallel {}", p.probe_daily_runs(), p.probe_max_parallel())],
+                }));
+            }
+            if matches!(max_parallel, Some(0)) {
+                bail!("max_parallel must be ≥ 1");
+            }
+            let mut m = read_policy(&path)?;
+            let mut probes: ProbePolicy = match m.get("probes") {
+                None | Some(Value::Null) => ProbePolicy::default(),
+                Some(v) => serde_json::from_value(v.clone()).context("policy.json probes")?,
+            };
+            if let Some(d) = daily {
+                probes.daily_runs = Some(d);
+            }
+            if let Some(mp) = max_parallel {
+                probes.max_parallel = Some(mp);
+            }
+            m.insert("probes".into(), serde_json::to_value(&probes)?);
+            write_policy(&path, &m)?;
+            let line = if probes.daily_runs() == 0 {
+                format!("probes: daily_runs = 0 (automatic probes off), max_parallel = {}", probes.max_parallel())
+            } else {
+                format!("probes: daily_runs = {}, max_parallel = {}", probes.daily_runs(), probes.max_parallel())
+            };
+            Ok(json!({
+                "path": path,
+                "probes": {"daily_runs": probes.daily_runs(), "max_parallel": probes.max_parallel()},
+                "lines": [line],
+            }))
+        }
+        PolicyCmd::Auto { cmd } => auto_cmd(ctx, &path, cmd),
     }
 }
 
@@ -397,6 +481,105 @@ fn scope_unset(ctx: &AppCtx, path: &Path, name: &str) -> Result<Value> {
     Ok(json!({"path": path, "name": name, "removed": old, "restored": restored, "views": profile_views, "lines": lines}))
 }
 
+fn resolve_auto_scope(ctx: &AppCtx, raw: &str) -> Result<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        bail!("empty scope");
+    }
+    if t == ANY_REPO || t == "*" {
+        return Ok(ANY_REPO.to_string());
+    }
+    let path = crate::app::absolute(&ctx.cwd.join(t))?;
+    if path.is_dir() {
+        if let Some(top) = repo_of(&path) {
+            if let Some(remote) = identity::repo_remote_of(&top) {
+                return Ok(remote);
+            }
+            return Ok(top.to_string_lossy().to_string());
+        }
+        return Ok(path.to_string_lossy().to_string());
+    }
+    if t.contains(['*', '?', '[']) {
+        return Ok(t.to_string());
+    }
+    Ok(identity::normalize_remote(t).unwrap_or_else(|| t.to_string()))
+}
+
+fn auto_rules_of(m: &Map<String, Value>) -> Result<Vec<AutoRule>> {
+    match m.get("auto") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(v) => serde_json::from_value(v.clone()).context("policy.json auto"),
+    }
+}
+
+/// Re-apply standing `auto` rules across existing loadable entries in the ledger.
+fn reapply_auto(ctx: &AppCtx) -> Result<Vec<String>> {
+    let mut applied = Vec::new();
+    for st in [Status::Provisional, Status::Kept, Status::Pinned] {
+        for e in ctx.ledger.list_entries(&EntryFilter { status: Some(st), ..Default::default() })? {
+            let before = (e.approved_scripts.clone(), e.approved_agent.clone(), e.approved_fragment.clone());
+            let next = library::apply_entry_auto(&ctx.ledger, &ctx.paths, e)?;
+            if (next.approved_scripts, next.approved_agent, next.approved_fragment) != before {
+                applied.push(next.name);
+            }
+        }
+    }
+    for (e, _) in rematch_core::instructions::apply_auto_rules(&ctx.ledger, &ctx.paths)? {
+        if !applied.contains(&e.name) {
+            applied.push(e.name);
+        }
+    }
+    library::sync_shared_skills(&ctx.ledger, &ctx.paths)?;
+    Ok(applied)
+}
+
+fn auto_cmd(ctx: &AppCtx, path: &Path, cmd: AutoCmd) -> Result<Value> {
+    match cmd {
+        AutoCmd::List => {
+            let rules = ctx.domain_policy()?.auto;
+            let lines: Vec<String> = if rules.is_empty() {
+                vec!["auto: none".into()]
+            } else {
+                rules.iter().map(|r| format!("auto {} {}", r.surface.as_str(), r.scope)).collect()
+            };
+            Ok(json!({"path": path, "auto": rules, "lines": lines}))
+        }
+        AutoCmd::Add { surface, scope } => {
+            let surface: AutoSurface = surface.into();
+            let resolved = resolve_auto_scope(ctx, &scope)?;
+            let rule = AutoRule { surface, scope: resolved.clone() };
+            let mut m = read_policy(path)?;
+            let mut rules = auto_rules_of(&m)?;
+            if !rules.contains(&rule) {
+                rules.push(rule.clone());
+            }
+            m.insert("auto".into(), serde_json::to_value(&rules)?);
+            write_policy(path, &m)?;
+            let applied = reapply_auto(ctx)?;
+            let mut lines = vec![format!("added auto rule: {} {}", surface.as_str(), resolved)];
+            if !applied.is_empty() {
+                lines.push(format!("auto-approved: {}", applied.join(", ")));
+            }
+            Ok(json!({"path": path, "added": rule, "auto": rules, "applied": applied, "lines": lines}))
+        }
+        AutoCmd::Remove { surface, scope } => {
+            let surface: AutoSurface = surface.into();
+            let resolved = resolve_auto_scope(ctx, &scope)?;
+            let mut m = read_policy(path)?;
+            let mut rules = auto_rules_of(&m)?;
+            let before = rules.len();
+            rules.retain(|r| !(r.surface == surface && (r.scope == resolved || r.scope == scope.trim())));
+            if rules.len() == before {
+                bail!("no auto rule for {} {}", surface.as_str(), resolved);
+            }
+            m.insert("auto".into(), serde_json::to_value(&rules)?);
+            write_policy(path, &m)?;
+            let lines = vec![format!("removed auto rule: {} {}", surface.as_str(), resolved)];
+            Ok(json!({"path": path, "auto": rules, "lines": lines}))
+        }
+    }
+}
+
 fn show(ctx: &AppCtx, path: &Path) -> Result<Value> {
     let raw = read_policy(path)?;
     let p = ctx.domain_policy()?;
@@ -416,15 +599,25 @@ fn show(ctx: &AppCtx, path: &Path) -> Result<Value> {
         lines.push(format!("domain {d} ← branches/{b}/domain.yml"));
     }
     lines.push(format!("caps: kept_per_domain {}", p.kept_per_domain()));
+    lines.push(format!(
+        "probes: daily_runs {}{}, max_parallel {}",
+        p.probe_daily_runs(),
+        if p.probe_daily_runs() == 0 { " (off)" } else { "" },
+        p.probe_max_parallel()
+    ));
     if p.scopes.is_empty() {
         lines.push("scopes: none (every kept skill is global)".into());
     }
     for (name, s) in &p.scopes {
         lines.push(format!("scope {name} → {} only", s.label()));
     }
+    for r in &p.auto {
+        lines.push(format!("auto {} {}", r.surface.as_str(), r.scope));
+    }
     Ok(json!({
         "path": path, "policy": Value::Object(raw), "declared": p.declared, "branch_domains": p.branch_domains,
-        "kept_per_domain": p.kept_per_domain(), "scopes": p.scopes, "lines": lines,
+        "kept_per_domain": p.kept_per_domain(), "probes": {"daily_runs": p.probe_daily_runs(), "max_parallel": p.probe_max_parallel()},
+        "scopes": p.scopes, "auto": p.auto, "lines": lines,
     }))
 }
 
@@ -622,5 +815,59 @@ mod tests {
         assert_eq!(out["restored"][0], json!(shared_link.display().to_string()), "{out}");
         assert!(std::fs::read_link(&shared_link).is_ok(), "global again");
         assert!(cmd_policy(ctx, PolicyCmd::Scope { cmd: ScopeCmd::Unset { name: "bellwether-dev".into() } }).is_err());
+    }
+
+    #[test]
+    fn policy_auto_add_remove_list_and_auto_approves_instructions_within_budget() {
+        let t = env();
+        let ctx = &t.ctx;
+        // Stage an entry with AGENTS.fragment.md before the rule exists: it starts pending.
+        let e = stage(ctx, &entry("e-frag", "tests-first", "quant"), &[(library::AGENTS_FRAGMENT, "Run crate tests first.\n")]);
+        assert!(!library::fragment_approved(&ctx.ledger.get_entry(&e.id).unwrap().unwrap()));
+        assert_eq!(crate::actions::pending(ctx).unwrap().iter().filter(|a| a.id == format!("instructions:{}", e.id)).count(), 1);
+
+        // `policy auto add instructions **` auto-applies the fragment within budget and records the rule as approver.
+        let out = run(
+            ctx,
+            PolicyCmd::Auto {
+                cmd: AutoCmd::Add {
+                    surface: SurfaceArg::Instructions,
+                    scope: "**".into(),
+                },
+            },
+        );
+        assert_eq!(out["applied"], json!(["tests-first"]), "{out}");
+        let updated = ctx.ledger.get_entry(&e.id).unwrap().unwrap();
+        assert!(library::fragment_approved(&updated));
+        let personal = rematch_core::instructions::target(&ctx.paths);
+        assert!(std::fs::read_to_string(&personal).unwrap().contains("Run crate tests first."));
+        let recs = rematch_core::instructions::records(&ctx.ledger, &ctx.paths).unwrap();
+        assert_eq!(recs.last().and_then(|r| r.approver.as_deref()), Some("rule:instructions:**"));
+        let auto_list = crate::actions::applied_automatically(ctx).unwrap();
+        assert!(
+            auto_list.iter().any(|a| a.id == "instructions-applied:tests-first" && a.why == "rule" && a.rule.as_deref() == Some("instructions:**")),
+            "{auto_list:?}"
+        );
+
+        let listed = run(ctx, PolicyCmd::Auto { cmd: AutoCmd::List });
+        assert_eq!(listed["auto"], json!([{"surface": "instructions", "scope": "**"}]));
+
+        // A fragment that exceeds limits.always_on_bytes is NOT auto-applied even with the rule.
+        std::fs::create_dir_all(&ctx.paths.improver).unwrap();
+        std::fs::write(ctx.paths.improver.join("lint.toml"), "[limits]\nalways_on_bytes = 90\n").unwrap();
+        let over = stage(ctx, &entry("e-over", "too-big-rule", "quant"), &[(library::AGENTS_FRAGMENT, &"Very long instruction line.\n".repeat(10))]);
+        assert!(!library::fragment_approved(&ctx.ledger.get_entry(&over.id).unwrap().unwrap()), "over budget fragment must not auto-apply");
+        std::fs::remove_file(ctx.paths.improver.join("lint.toml")).unwrap();
+
+        let removed = run(
+            ctx,
+            PolicyCmd::Auto {
+                cmd: AutoCmd::Remove {
+                    surface: SurfaceArg::Instructions,
+                    scope: "**".into(),
+                },
+            },
+        );
+        assert_eq!(removed["auto"], json!([]));
     }
 }

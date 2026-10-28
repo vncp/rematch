@@ -104,11 +104,12 @@ describe("hooks and authority", () => {
 	});
 
 	test("the model cannot approve, decline, withdraw, mark or switch rematch off", () => {
-		for (const [op, args] of [["library", ["approve", "e1"]], ["library", ["decline", "e1"]], ["library", ["disable", "e1"]], ["library", ["rollback", "e1"]], ["library", ["export", "--entry", "e1", "--approve"]], ["library", ["export", "--approve-all"]], ["off", []], ["on", []], ["mark", ["correction"]], ["uninstall", []], ["library", ["--text", "approve", "e1"]], ["library", ["--cwd", "/x", "disable", "e1"]], ["library", ["--cwd=/x", "--text", "rollback", "e1"]], ["library", ["--text", "export", "--approve-all"]], ["off", ["--text"]]] as const) {
+		for (const [op, args] of [["library", ["approve", "e1"]], ["library", ["decline", "e1"]], ["library", ["disable", "e1"]], ["library", ["rollback", "e1"]], ["library", ["export", "--entry", "e1", "--approve"]], ["library", ["export", "--approve-all"]], ["off", []], ["on", []], ["mark", ["correction"]], ["uninstall", []], ["library", ["--text", "approve", "e1"]], ["library", ["--cwd", "/x", "disable", "e1"]], ["library", ["--cwd=/x", "--text", "rollback", "e1"]], ["library", ["--text", "export", "--approve-all"]], ["off", ["--text"]], ["policy", ["auto", "add", "instructions", "**"]], ["policy", ["auto", "remove", "scripts", "**"]], ["policy", ["--text", "auto", "list"]], ["policy", ["probes", "--daily", "0"]], ["policy", ["--text", "probes", "--max-parallel=4"]]] as const) {
 			expect(refusedForModel(op, args)).toContain("reserved to the user");
 		}
 		expect(refusedForModel("library", ["ls"])).toBeNull();
 		expect(refusedForModel("status", [])).toBeNull();
+		expect(refusedForModel("policy", ["probes"])).toBeNull();
 		// The forms clap accepts: global flags before and after `library`, `--x=y`, paths, quotes, env, sh -c.
 		for (const cmd of [
 			"rematch library approve e1",
@@ -134,6 +135,11 @@ describe("hooks and authority", () => {
 			"{ rematch on; }",
 			"rematch --cwd /w policy scope set bellwether-dev github.com/vncp/bellwether --subpath crates",
 			"rematch policy --text scope unset bellwether-dev",
+			"rematch policy auto add instructions **",
+			"rematch --cwd /w policy --text auto remove scripts **",
+			"rematch policy auto list",
+			"rematch policy probes --daily 0",
+			"rematch --cwd /w policy --text probes --max-parallel=4",
 		]) {
 			expect([cmd, userOnlyShellReason(cmd)]).toEqual([cmd, expect.stringContaining("reserved to the user")]);
 		}
@@ -147,6 +153,7 @@ describe("hooks and authority", () => {
 			"rematch-lint library approve e1",
 			"rematch library export --entry e1",
 			"rematch policy show",
+			"rematch policy probes",
 		]) {
 			expect([cmd, userOnlyShellReason(cmd)]).toEqual([cmd, null]);
 		}

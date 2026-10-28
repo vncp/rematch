@@ -18,6 +18,7 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 | Stuck-call detection | Yes | Completed calls | Yes | Completed calls | No |
 | Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
 | Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
+| Post-edit fast check (`fast-check`) | Before next request (`context`) | `PostToolUse` `additionalContext` | Before next request (`context`) | Experimental system transform | No (post-hoc only) |
 | Generated subagents | Yes, once approved | Adapted copies, once approved | No native subagent definitions | Not delivered | No |
 | Personal instructions (approved `AGENTS.fragment.md`) | Marked block in `<agent_dir>/AGENTS.md`, loaded natively; no runtime insertion | Runtime: session-start context | Runtime: `before_agent_start` | Runtime: system transform | No: skills only |
 | Digest and waiting actions | Toasts, footer status, review dialog | Session-start message | Notifications, review dialog | TUI toast or `/rematch-digest` | CLI/optional status skill |

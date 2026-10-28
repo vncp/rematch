@@ -37,7 +37,10 @@ use rematch_core::import::{args_hash, repo_of, TRACE_INPUT_TEXT_CHARS};
 use rematch_core::import_opencode::{self as oc, UserText};
 use rematch_core::library::{self, MatchResult};
 use rematch_core::trace::{flag_reasons, AgentInfo, LoadedEntry, RetrievedUnit, TraceRecord};
-use rematch_core::types::{HookMode, Kind, ModelRef, DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS};
+use rematch_core::types::{
+    HookMode, Kind, ModelRef, DEFAULT_CHECK_BUDGET_BYTES, DEFAULT_CHECK_TIMEOUT_SECS,
+    DEFAULT_RETRIEVE_BUDGET_BYTES, DEFAULT_RETRIEVE_MIN_OVERLAP, DEFAULT_STUCK_REPEATS,
+};
 use serde_json::{json, Value};
 
 use crate::app::AppCtx;
@@ -419,7 +422,7 @@ fn event(ctx: &AppCtx, env: &Env, ev: &Value) -> Result<Value> {
         "reconcile" => Ok(json!({"kind": kind, "finalized": settle(ctx, None)?})),
         "shutdown" => Ok(json!({"kind": kind, "finalized": settle(ctx, Some(env.pid))?})),
         "digest" => Ok(json!({"kind": kind, "digest": digest(ctx)?})),
-        "prompt" | "tool" | "turn" | "idle" | "retrieve" | "fragments" => session_event(ctx, env, ev, kind),
+        "prompt" | "tool" | "turn" | "idle" | "retrieve" | "check" | "fragments" => session_event(ctx, env, ev, kind),
         other => bail!("unknown OpenCode event kind {other:?}"),
     }
 }
@@ -500,6 +503,22 @@ fn session_event(ctx: &AppCtx, env: &Env, ev: &Value, kind: &str) -> Result<Valu
                 }
             }
         }
+        "check" => {
+            let cwd = env.cwd(ctx, ev);
+            let files: Vec<PathBuf> = ev["files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|p| if Path::new(p).is_absolute() { PathBuf::from(p) } else { cwd.join(p) })
+                .collect();
+            if !files.is_empty() {
+                if let Some(out) = run_check_event(ctx, &mut tf, &cwd, &files)? {
+                    extra = out;
+                }
+            }
+        }
         _ => unreachable!("session_event kinds"),
     }
     let written: Vec<&str> = tf.records[before..].iter().map(TraceRecord::ev).collect();
@@ -576,7 +595,7 @@ fn digest(ctx: &AppCtx) -> Result<Value> {
     // Actions first: they wait for the user; the lines are news.
     let mut toast = String::new();
     if !actions.is_empty() {
-        toast.push_str(&format!("{} action(s) waiting (nothing changes until you decide):\n", actions.len()));
+        toast.push_str(&format!("{} action(s) waiting for your review (low-risk items apply automatically):\n", actions.len()));
     }
     for a in actions.iter().take(3) {
         toast.push_str(&format!("{}\n", a["line"].as_str().unwrap_or_default()));
@@ -651,6 +670,37 @@ fn retrieve(ctx: &AppCtx, tf: &mut TraceFile, cwd: &Path) -> Result<Option<Strin
         "[rematch] Units of skills loaded in this session that match the current request, retrieved by the harness (the whole skill: the `skill` tool).\n\n{}",
         body.join("\n\n")
     )))
+}
+
+/// An active `check` hook under OpenCode (`check` event): runs `rematch check` scoped to `files`,
+/// records `check_ran` in the trace, and returns `{context, ok, errors, check_kind, duration_ms}`
+/// (`None` when nothing ran or nothing is worth inserting).
+fn run_check_event(ctx: &AppCtx, tf: &mut TraceFile, cwd: &Path, files: &[PathBuf]) -> Result<Option<Value>> {
+    let loaded = load(ctx, cwd)?;
+    let Some(hook) = loaded.hooks.iter().find(|h| h.mode == HookMode::Check) else {
+        return Ok(None);
+    };
+    if !hook.applies_to("edit") && !hook.applies_to("*") {
+        return Ok(None);
+    }
+    let repo_top = rematch_core::check::find_repo_top(cwd);
+    let Some(spec) = rematch_core::check::detect_for_files(&repo_top, files) else {
+        return Ok(None);
+    };
+    let timeout_secs = hook.param("timeout_secs", DEFAULT_CHECK_TIMEOUT_SECS).max(1);
+    let budget_bytes = hook.param("budget_bytes", DEFAULT_CHECK_BUDGET_BYTES) as usize;
+    let rep = crate::check::run_with_impact(
+        &spec,
+        files,
+        std::time::Duration::from_secs(u64::from(timeout_secs)),
+        budget_bytes,
+    );
+    let errors = rep.diagnostics.iter().filter(|d| d.severity == "error").count();
+    let Some(rendered) = rep.rendered.clone().filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    crate::check::push_check_ran(tf, &hook.id, &spec, &rep, files)?;
+    Ok(Some(json!({"context": rendered, "ok": rep.ok, "errors": errors, "check_kind": spec.kind.as_str(), "duration_ms": rep.duration_ms})))
 }
 
 // ---- hook-check ----

@@ -185,6 +185,8 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
     // Ship candidates are actions now (`ship-team:`/`fork:`); `ship_ready` stays as data.
     let ship_ready = crate::scope::ship::ready(ctx)?;
     lines.extend(actions.iter().map(crate::actions::Action::line));
+    let auto_applied = crate::actions::applied_automatically(ctx)?;
+    lines.extend(auto_applied.iter().map(crate::actions::AutoApplied::line));
     // Probe outcomes recorded since the last digest (`rematch status` lists the latest of each).
     let probes = crate::probes::statuses(ctx)?;
     lines.extend(probes.iter().filter(|p| p["at"].as_i64().is_some_and(|t| t > last)).filter_map(|p| p["line"].as_str().map(str::to_string)));
@@ -210,6 +212,7 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
         "approvals": approvals,
         "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
         "applied": crate::actions::applied(ctx)?.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied_automatically": auto_applied,
         "trials": crate::actions::trials(ctx)?,
         "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
         "ship_ready": ship_ready,

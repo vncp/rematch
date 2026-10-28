@@ -1,42 +1,44 @@
 ---
 title: Automatic probes
-description: Authorize bounded reference/candidate comparisons in omp when a task is safely replayable, without blocking real-use retention.
+description: Bounded reference/candidate comparisons in omp run automatically when a trace-grounded task and sealed engine verifier fit the budget.
 ---
 
 import { Steps, Aside } from '@astrojs/starlight/components';
 
-By default, a provisional entry earns `kept` through sustained clean use in your normal sessions (`accepted_in_use`). When a task is safely replayable with a mechanical verifier, you can also authorize a **bounded automatic probe** to compare the baseline library against the candidate in omp (`comparative_support`, [D31](/rematch/background/decisions/)).
+By default, a provisional entry earns `kept` either through sustained clean use in your normal sessions (`accepted_in_use`) or through a **bounded automatic probe** that compares the baseline library against the candidate in omp (`comparative_support`, [D31](/rematch/background/decisions/)).
 
-Probes are optional: if no probe is available, safe or authorized, the entry stays on the observed-use path and can still reach `kept` after four clean completed uses.
+Probes run **automatically, without a `probe:` approval**, whenever the task replays a recorded session of that repo in an isolated worktree, the verifier is engine-chosen and sealed (the repo's detected fast check `check`, detected test suite `tests`, or an observed plain test-runner command), and the run fits the budget (`probes.daily_runs`, default 3/day). The `probe:<entry-id>` review item appears only when a probe would use a user-supplied task/verifier or exceed rollout caps.
 
 ## How a probe works
 
-During detached `reflect --pending`, after `count` folds finished traces, rematch checks provisional entries for probe eligibility:
+In detached `reflect --pending` after a session ends (never while an active session is running, and never when rematch is `off`), rematch checks provisional entries for probe eligibility:
 
 <Steps>
 
-1. **Offer a replay authorization (`probe:<entry-id>`).**
-   If an eligible entry has no authorized task that covers it, rematch writes a suggestion to `~/.rematch/probes/suggestions/<entry-id>.json` and adds `probe:<entry-id>` to the persistent action queue (`status`, `digest`, `library ls`). The suggestion uses an existing task of the repo, or builds one from the originating trace: task id `probe-<name>-<short entry id>-v<version>`, the prompt before the correction, the last plain test-runner command observed in the session (else detected `tests`) as the verifier, and the files the session changed (minus protected ones) as `--editable`, with tools `read,grep,glob,edit,write`. A session that wrote no files gets a read-only task (`--tools read,grep,glob`, nothing editable). A suggestion with no usable verifier shows as blocked, with the `task add` command that fixes it, and refreshes once you define the task.
+1. **Ground the task and sealed verifier (`suggest_for`).**
+   For an eligible provisional entry, rematch grounds a replay in the originating trace: task id `probe-<name>-<short entry id>-v<version>`, the prompt before the correction, the last plain test-runner command observed in the session (else the repo's detected fast check `check`, then detected `tests`) as the verifier, and the files the session changed (minus protected ones) as `--editable`, with tools `read,grep,glob,edit,write`. A session that wrote no files gets a read-only task (`--tools read,grep,glob`, nothing editable).
 
-2. **Review and authorize the exact task.**
-   Inspect the full specification—repository, prompt, verifier and where it came from, tools, editable paths, time cap, seed and caps—then approve it like any action: Approve in `/rematch review` (omp, Pi), or the approve command `inspect` prints, which carries the reviewed hash:
+2. **Run automatically when engine-chosen and within budget (or surface `probe:<entry-id>` for user-verifier tasks).**
+   When the task is trace-grounded, its verifier is engine-chosen and sealed, and the run fits `policy.json` `probes` (`daily_runs`, default 3; `max_parallel`, default 1; per-rollout time cap ≤ 300 s), rematch runs the probe automatically without waiting for approval.
+
+   If the probe uses a user-supplied task/verifier (`rematch task add`) or exceeds caps, rematch adds a one-tap hash-bound `probe:<entry-id>` action to the persistent action queue (`status`, `digest`, `library ls`):
 
    ```sh
    rematch library inspect probe:<entry-id> --text
    rematch library approve probe:<entry-id> --sha <hash>   # as printed by inspect
    ```
 
-   The hash covers the whole task definition, the task id, the seal scope, the caps and the harness. If the task changes after you looked, the approval is refused until you inspect it again. Declining (also with the printed `--sha`) records the repository in `~/.rematch/probes/declined-repos.json`; its entries stay on the observed-use path.
+   Declining (`rematch library decline probe:<entry-id> --sha <hash>`) records the repository in `~/.rematch/probes/declined-repos.json`; its entries stay on the observed-use path.
 
 3. **Run two isolated rollouts in detached `reflect --pending`.**
-   On the next reflect pass, rematch runs the authorized task twice through omp in fresh detached `HEAD` git worktrees:
+   Rematch runs the task twice through omp in fresh detached `HEAD` git worktrees:
    - **baseline:** your `kept` and `pinned` library for that repo (no other provisional trials);
    - **candidate:** the same baseline plus the provisional entry.
 
    Task, prompt, fixed verifier, tools, solver model, first seed and base `HEAD` commit are held identical.
 
-4. **Check the seal, attribute and decide.**
-   After both rollouts finish, rematch checks that the repo's `HEAD` did not move, that neither rollout modified any path outside the task's declared `editable` scope or any protected verifier/test file, and that the candidate rollout actually read the entry. The engine records the result in `~/.rematch/probes/records/<entry-id>.json` and applies the decision rule.
+4. **Check the seal, attribute and apply the verdict immediately.**
+   After both rollouts finish, rematch checks that the repo's `HEAD` did not move, that neither rollout modified any path outside the task's declared `editable` scope or any protected verifier/test file, and that the candidate rollout actually read the entry. Verdicts apply immediately (`supports` → keep as `comparative_support`; `regresses` → retire; `tie`/`incomplete` → fall back to `accepted_in_use`) and appear in the next digest under **applied automatically** with an undo command (`rematch library rollback <name>` or `rematch library disable <id>`).
 
 </Steps>
 
@@ -69,18 +71,26 @@ Each rollout runs in a fresh detached `HEAD` worktree so your active checkout is
 | `cost_worse` | tied verdict/score, but the candidate had more tool errors or > 1.5× the tokens | no decision; observational use still decides |
 | `incomplete` | a rollout failed, timed out, drifted model, moved `HEAD`, or touched a sealed path | never promotes; the entry continues on the observed-use path |
 
-## Hard caps
+## Budget and hard caps
 
 | Cap | Value |
 |---|---|
 | Execution harness | omp only (`rematch-solver` → `default`) |
+| When probes run | Detached in the background after a session ends (`reflect --pending`); never during an active session; stopped when rematch is `off` |
 | Rollouts per probe | 2 (1 baseline, 1 candidate) |
 | Host `--max-time` per rollout | ≤ 300 s (or the task's `--max-time` when lower), plus a 60 s engine outer deadline margin |
 | Editor model calls | 0 (solver model calls happen only inside the two omp rollouts) |
-| Probes per `reflect --pending` pass | ≤ 1 |
-| Probes per 24 hours | ≤ 4 |
+| Concurrent probes (`probes.max_parallel`) | 1 (default; configurable in `policy.json`) |
+| Daily budget (`probes.daily_runs`) | 3 per 24 hours (default; `rematch policy probes --daily N`, `0` = off) |
 | Evaluations per `(entry, version, content_sha256)` | 1 |
 | Concurrency locks | global `~/.rematch/probes/.lock` + per-task `~/.rematch/runs/<task>/.lock` |
+
+Configure the daily probe budget or turn automatic probes off:
+
+```sh
+rematch policy probes --daily 3          # default: up to 3 automatic probes per 24h
+rematch policy probes --daily 0          # turn automatic probes off
+```
 
 ## Define or update a probe task by hand
 

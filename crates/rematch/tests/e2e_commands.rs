@@ -96,7 +96,7 @@ fn import_forge_registers_without_touching_the_checkout() {
 
     // Brownfield registrations add no staging dir and lessons never appear as loaded entries.
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([]));
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/shared")]));
     assert!(m["entries"].as_array().unwrap().iter().all(|x| x["name"] != l["name"]), "{m}");
 }
 
@@ -108,7 +108,7 @@ fn import_forge_migrate_copies_skills_into_staging_so_the_forge_can_go() {
     std::fs::create_dir_all(ux.join("scripts")).unwrap();
     std::fs::create_dir_all(ux.join("references")).unwrap();
     std::fs::write(ux.join("SKILL.md"), "---\nname: forge-ux\ndescription: UI gates. Use when reviewing user interfaces.\n---\n# forge-ux\n\nRun scripts/check.py.\n").unwrap();
-    std::fs::write(ux.join("scripts/check.py"), "print('ok')\n").unwrap();
+    std::fs::write(ux.join("scripts/check.py"), "#!/bin/sh\necho x > \"$HOME/outside.txt\"\n").unwrap();
     std::fs::write(ux.join("references/gates.md"), "# gates\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(ux.join("scripts/check.py"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -136,7 +136,7 @@ fn import_forge_migrate_copies_skills_into_staging_so_the_forge_can_go() {
     // Now the forge is gone: the skill still loads from staging for any repo.
     std::fs::remove_dir_all(&forge).unwrap();
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/forge")]));
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/forge"), env.root.join("staging/shared")]));
 }
 
 fn sha2_digest(b: &[u8]) -> impl std::fmt::LowerHex {
@@ -158,7 +158,7 @@ fn create_description_is_a_draft_until_activated() {
     let skill = std::fs::read_to_string(draft.join("SKILL.md")).unwrap();
     assert!(skill.contains("name: ledger-test-gate"), "user's name wins: {skill}");
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([]), "drafts never load");
+    assert!(!m["entries"].as_array().unwrap().iter().any(|e| e["name"] == "ledger-test-gate"), "drafts never load: {m}");
     let (v, code) = env.run_cmd(env.cmd(&["activate", "ledger-test-gate"]));
     assert_eq!(code, 2, "needs --task or --unverified: {v}");
     let a = env.run(&["activate", "ledger-test-gate", "--unverified"]);
@@ -511,7 +511,7 @@ fn doctor_reports_every_harness_and_ready() {
     // Nothing but omp: the others are "not set up", never problems.
     let d = doctor(&claude_ok, &launchctl_yes);
     assert_eq!(d["ready"], true, "{d}");
-    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("pi", "not set up"), ("opencode", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok"), ("hooks", "not set up")] {
+    for (h, s) in [("omp", "ok"), ("claude-code", "not set up"), ("codex", "not set up"), ("pi", "not set up"), ("opencode", "not set up"), ("profile", "not set up"), ("lake", "not set up"), ("built-ins", "ok"), ("hooks", "ok")] {
         assert_eq!(status(&d, h), s, "{h}: {d}");
     }
     let lines = text(&d);
@@ -579,23 +579,20 @@ fn doctor_reports_orphan_hook_modules() {
     let d = env.run(&["doctor"]);
     let h = &d["harnesses"]["hooks"];
     assert_eq!(h["status"], "problem", "{d}");
-    assert_eq!((h["live"].clone(), h["profile"].clone()), (json!([]), json!(["other-machine"])), "{h}");
+    assert_eq!((h["live"].as_array().unwrap().len(), h["profile"].clone()), (4, json!(["other-machine"])), "{h}");
     assert_eq!(h["orphan"], json!([hooks.join("gone-entry.ts")]), "{h}");
     let problems: Vec<&str> = d["problems"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     let want = format!("orphan hook module {}: no live entry; delete the file", hooks.join("gone-entry.ts").display());
     assert!(problems.contains(&want.as_str()), "{problems:#?}");
     assert!(!problems.iter().any(|p| p.contains("other-machine")), "a profile module is not a problem: {problems:#?}");
 
-    // the orphan deleted and a built-in hook approved: live, profile, no problem
+    // the orphan deleted: 4 live built-in hooks, 1 profile, no problem
     std::fs::remove_file(hooks.join("gone-entry.ts")).unwrap();
-    let g = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
-    let stuck = g["approvals"].as_array().unwrap().iter().find(|a| a["name"] == "stuck-detector").expect("built-in offered")["id"].clone();
-    env.approve(stuck.as_str().unwrap());
     let d = env.run(&["doctor"]);
     let h = &d["harnesses"]["hooks"];
     assert_eq!(h["status"], "ok", "{d}");
-    assert_eq!((h["live"].clone(), h["profile"].clone(), h["orphan"].clone()), (json!([stuck]), json!(["other-machine"]), json!([])), "{h}");
-    assert!(d["lines"].as_array().unwrap().iter().any(|l| l == "hooks: ok · 1 live · 1 from profile (inert here) · 0 orphan"), "{d}");
+    assert_eq!((h["live"].as_array().unwrap().len(), h["profile"].clone(), h["orphan"].clone()), (4, json!(["other-machine"]), json!([])), "{h}");
+    assert!(d["lines"].as_array().unwrap().iter().any(|l| l == "hooks: ok · 4 live · 1 from profile (inert here) · 0 orphan"), "{d}");
 }
 
 #[test]

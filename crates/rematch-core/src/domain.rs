@@ -33,6 +33,10 @@ pub const DEFAULT_DOMAIN_RULES_TOML: &str = include_str!("../../../improver/doma
 /// Kept entries per top-level domain across every branch (DESIGN §8) unless
 /// `policy.json` `caps.kept_per_domain` says otherwise.
 pub const DEFAULT_KEPT_PER_DOMAIN: usize = 8;
+/// Automatic probe runs per 24 hours unless `policy.json` `probes.daily_runs` says otherwise.
+pub const DEFAULT_PROBE_DAILY_RUNS: usize = 3;
+/// Concurrent probe runs unless `policy.json` `probes.max_parallel` says otherwise.
+pub const DEFAULT_PROBE_MAX_PARALLEL: usize = 1;
 
 /// Where a `policy.json` domain declaration applies. An absent field matches anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +64,86 @@ pub struct PolicyCaps {
     pub kept_per_domain: Option<usize>,
 }
 
+/// `policy.json` `probes` budget (`rematch policy probes --daily N`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_runs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<usize>,
+}
+
+impl ProbePolicy {
+    pub fn daily_runs(&self) -> usize {
+        self.daily_runs.unwrap_or(DEFAULT_PROBE_DAILY_RUNS)
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        self.max_parallel.unwrap_or(DEFAULT_PROBE_MAX_PARALLEL).max(1)
+    }
+}
+
+/// Surface a `policy.json` `auto` rule may approve automatically (`rematch policy auto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSurface {
+    Scripts,
+    Agents,
+    Instructions,
+}
+
+impl AutoSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoSurface::Scripts => "scripts",
+            AutoSurface::Agents => "agents",
+            AutoSurface::Instructions => "instructions",
+        }
+    }
+}
+
+/// One `policy.json` `auto` rule (`rematch policy auto add|remove|list`): standing user rule
+/// auto-approving `surface` in `scope` (`**`, a normalized remote or remote glob, or a path).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRule {
+    pub surface: AutoSurface,
+    pub scope: String,
+}
+
+impl AutoRule {
+    pub fn label(&self) -> String {
+        format!("{} {}", self.surface.as_str(), self.scope)
+    }
+
+    /// Whether this standing rule covers an entry whose predicate is `p`.
+    pub fn matches_predicate(&self, p: &crate::types::Predicate) -> bool {
+        let s = self.scope.trim();
+        if s.is_empty() {
+            return false;
+        }
+        if s == crate::predicate::ANY_REPO || s == "*" {
+            return true;
+        }
+        if let Some(remote) = p.repo_remote.as_deref() {
+            if remote_matches(s, remote) {
+                return true;
+            }
+        }
+        if let Some(lit) = crate::predicate::literal_path(&p.repo_glob) {
+            let path_str = lit.to_string_lossy();
+            if path_str == s || matches_repo_glob(s, &path_str) || matches_repo_glob(&crate::predicate::escape_glob(s), &path_str) {
+                return true;
+            }
+            if let Some(remote) = crate::identity::repo_remote_of(&lit) {
+                if remote_matches(s, &remote) {
+                    return true;
+                }
+            }
+        }
+        p.repo_glob == s || p.repo_glob == crate::predicate::escape_glob(s)
+    }
+}
+
 /// The parts of `policy.json` this module reads (other keys belong to other readers).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct PolicyPart {
@@ -69,6 +153,10 @@ struct PolicyPart {
     caps: PolicyCaps,
     #[serde(default)]
     scopes: Scopes,
+    #[serde(default)]
+    probes: ProbePolicy,
+    #[serde(default)]
+    auto: Vec<AutoRule>,
 }
 
 /// One `policy.json` `scopes` item (`rematch policy scope set`): the only place where a skill
@@ -176,6 +264,16 @@ pub fn load_scopes(paths: &RematchPaths) -> Result<Scopes> {
     Ok(read_policy_part(paths)?.scopes)
 }
 
+/// `policy.json` `auto` standing rules (file read only; empty without the file).
+pub fn load_auto_rules(paths: &RematchPaths) -> Result<Vec<AutoRule>> {
+    Ok(read_policy_part(paths)?.auto)
+}
+
+/// First standing `auto` rule matching `(surface, entry.predicate)`.
+pub fn matching_auto_rule<'a>(rules: &'a [AutoRule], surface: AutoSurface, p: &crate::types::Predicate) -> Option<&'a AutoRule> {
+    rules.iter().find(|r| r.surface == surface && r.matches_predicate(p))
+}
+
 /// `[[ext]]` row: any of `exts` scores for `domain`'s top level.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtRule {
@@ -245,6 +343,10 @@ pub struct DomainPolicy {
     pub caps: PolicyCaps,
     /// `policy.json` `scopes` ([`PlaceScope`]), by skill name.
     pub scopes: Scopes,
+    /// `policy.json` `probes` ([`ProbePolicy`]).
+    pub probes: ProbePolicy,
+    /// `policy.json` `auto` ([`AutoRule`]).
+    pub auto: Vec<AutoRule>,
 }
 
 impl DomainPolicy {
@@ -264,11 +366,21 @@ impl DomainPolicy {
             rules: DomainRules::load(&paths.improver.join(DOMAIN_RULES_FILE))?,
             caps: part.caps,
             scopes: part.scopes,
+            probes: part.probes,
+            auto: part.auto,
         })
     }
 
     pub fn kept_per_domain(&self) -> usize {
         self.caps.kept_per_domain.unwrap_or(DEFAULT_KEPT_PER_DOMAIN)
+    }
+
+    pub fn probe_daily_runs(&self) -> usize {
+        self.probes.daily_runs()
+    }
+
+    pub fn probe_max_parallel(&self) -> usize {
+        self.probes.max_parallel()
     }
 
     /// The first declaration matching the place, if any.
