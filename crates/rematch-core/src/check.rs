@@ -1132,8 +1132,13 @@ mod tests {
         assert_eq!(diags[1].file, "src/util.ts");
         assert_eq!(diags[1].code.as_deref(), Some("TS2304"));
 
-        let ruff_out = r#"[{"code":"F401","filename":"/repo/app/main.py"," fix":null,"location":{"column":8,"row":3},"message":"`os` imported but unused","fix":{"applicability":"safe","edits":[{"content":"","end_location":{"column":1,"row":4},"location":{"column":1,"row":3}}],"message":"Remove unused import: `os`"}}]"#;
-        let r_diags = parse_ruff_json(ruff_out, Path::new("/repo"));
+        // An absolute path on this platform (`/repo` is not absolute on Windows).
+        let repo = std::env::temp_dir().join("repo");
+        let ruff_out = serde_json::json!([{"code": "F401", "filename": repo.join("app").join("main.py"),
+            "location": {"column": 8, "row": 3}, "message": "`os` imported but unused",
+            "fix": {"applicability": "safe", "edits": [{"content": "", "end_location": {"column": 1, "row": 4}, "location": {"column": 1, "row": 3}}], "message": "Remove unused import: `os`"}}])
+        .to_string();
+        let r_diags = parse_ruff_json(&ruff_out, &repo);
         assert_eq!(r_diags.len(), 1);
         assert_eq!(r_diags[0].file, "app/main.py");
         assert_eq!(r_diags[0].line, 3);
