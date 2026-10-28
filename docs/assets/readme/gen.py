@@ -247,7 +247,7 @@ def terminal(theme, name, title, lines, h):
          f'<text x="550" y="29" text-anchor="middle" font-family="{FONT}" font-size="13" fill="{t["term_dim"]}">{esc(title)}</text>\n'
          f'<g font-family="{MONO}" font-size="13.5">\n')
     y = 64
-    colors = {"prompt": t["term_ink"], "out": t["term_ink"], "dim": t["term_dim"], "ok": "#4ade80", "warn": "#fbbf24", "accent": "#a9abff"}
+    colors = {"prompt": t["term_ink"], "out": t["term_ink"], "dim": t["term_dim"], "ok": "#4ade80", "warn": "#fbbf24", "bad": "#f87171", "accent": "#a9abff"}
     for kind, line in lines:
         if kind == "prompt":
             s += f'<text x="28" y="{y}" fill="{t["term_dim"]}">$</text><text x="46" y="{y}" fill="{colors[kind]}">{esc(line)}</text>\n'
@@ -282,14 +282,50 @@ WHY_LINES = [
     ("prompt", "rematch library why 01a17614-a543-77f3-8ad1-d28bbdc2c2fe --text"),
     ("out", "session 01a17614 · github-copilot/gemini-4-argon · 4 turns · 4 tool calls (0 errors, 0 clusters) · 0 takeovers"),
     ("ok", "loaded src-lib-public-functions (provisional): glob hit · predicate hit · this session recurrence 0 harm 0"),
-    ("accent", "  total matched 1 recurrence 0 harm 0"),
+    ("accent", "  total matched 1 · used 1 (1 clean) · recurrence 0 · harm 0"),
     ("gap", ""),
     ("prompt", "rematch library ls --text"),
-    ("out", "provisional skill  src-lib-public-functions [rematch-e2e-repo] matched 1 · recurrence 0 · harm 0"),
+    ("out", "provisional skill  src-lib-public-functions [rematch-e2e-repo] matched 1 · used 1 (1 clean) · recurrence 0 · harm 0"),
     ("gap", ""),
     ("prompt", "rematch digest --cwd . --text"),
     ("out", "staged skill src-lib-public-functions in rematch-e2e-repo: Use when adding or modifying public functions in src/lib.py."),
     ("dim", "approvals: none pending"),
+]
+
+PLUGIN_UI_LINES = [
+    ("dim", "╭─── ✎ Write: src/lib.rs · 4 lines ─────────────────────────────────────────────────────────────────────╮"),
+    ("out", "│   1 pub fn reconcile() -> String { \"1\".to_string() }                                                 │"),
+    ("out", "│   3 pub fn total() -> u32 { reconcile() + 1 }                                                        │"),
+    ("dim", "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"),
+    ("accent", "╭─ ◆ rematch · fast-check ───────────────────────────────────────────────────────────────── cargo · 0.1s ─╮"),
+    ("bad", "│ ✗ 2 errors → sent to the agent                                                                        │"),
+    ("out", "│   src/lib.rs:3:25  E0308  mismatched types (expected `u32`, found `String`)                            │"),
+    ("warn", "│   ↳ 1 caller in unedited files: src/api.rs:12 total()                                                 │"),
+    ("accent", "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"),
+    ("ok", "◆ rematch · ✓ cargo clean in 0.1s"),
+    ("gap", ""),
+    ("accent", "╭─ ◆ rematch · review ─────────────────────────────────────────────────────── [Needs you 1] Applied 4 ─╮"),
+    ("warn", "│ ❯ ● ledger-snapshot   script · payments                                                               │"),
+    ("out", "│   Make scripts/snapshot.sh executable · Why it waits: wrote outside its sandbox                       │"),
+    ("dim", "│   Observed: writes ~/.ledger/snapshot.csv · no network · exit 0                                       │"),
+    ("ok", "│   + cp ledger.csv \"$HOME/.ledger/snapshot.csv\"                                                       │"),
+    ("dim", "│   a approve   d decline   i full diff   ↑↓ item   tab applied   esc later                             │"),
+    ("accent", "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"),
+    ("warn", "◆ rematch  ● 1 needs you: ledger-snapshot (script writes ~/.ledger)   alt+e review"),
+    ("accent", "◆ rematch  ✓ cargo 0.1s  ·  5 on trial"),
+]
+
+EVAL_LINES = [
+    ("prompt", "rematch create ux-review --from description --description \"Review UI/TUI screens for contrast, hierarchy and states\" \\"),
+    ("out", "  --eval-prompt \"Audit this checkout screen and report P0/P1 layout or contrast issues\""),
+    ("ok", "drafted ux-review at ~/.rematch/drafts/ux-review · seeded evals/evals.json (1 case, 2 trigger queries)"),
+    ("gap", ""),
+    ("prompt", "rematch eval trigger ux-review --text"),
+    ("ok", "trigger pass 2/2 (precision 1.00, recall 1.00) · retrieved units/tui-layout.md · catalog 118/1024 B · router 1420/8192 B"),
+    ("gap", ""),
+    ("prompt", "rematch eval run ux-review --activate --text"),
+    ("ok", "case-1: win — with_skill passed verifier (score 1.0, read ux-review) vs baseline fail · 0 regressions"),
+    ("accent", "activated ux-review as provisional (passed validation gate) · report: ~/.rematch/evals/ux-review/report.html"),
 ]
 
 
@@ -301,6 +337,8 @@ def main():
         (OUT / f"lifecycle-{theme}.svg").write_text(lifecycle(theme))
         (OUT / f"reflect-{theme}.svg").write_text(terminal(theme, "reflect", "a reflection, from a real session (gemini-4-argon editor)", REFLECT_LINES, 420))
         (OUT / f"why-{theme}.svg").write_text(terminal(theme, "why", "the next matched session, counted", WHY_LINES, 320))
+        (OUT / f"plugin-ui-{theme}.svg").write_text(terminal(theme, "plugin-ui", "omp / Pi TUI: ◆ rematch fast-check card, review overlay (alt+e), widget and footer", PLUGIN_UI_LINES, 480))
+        (OUT / f"eval-{theme}.svg").write_text(terminal(theme, "eval", "skill creator workbench: draft, trigger check, side-by-side eval run, validation gate", EVAL_LINES, 300))
 
 
 if __name__ == "__main__":

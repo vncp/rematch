@@ -15,7 +15,7 @@ Every automatic adoption is listed in `applied_automatically` of `rematch status
 
 ## The review flow
 
-1. **See what waits.** omp and Pi show `rematch: N waiting · /rematch review` at session start; Claude Code and OpenCode list the waiting actions at session start; `rematch status --text` lists them anywhere.
+1. **See what waits.** omp and Pi show `◆ rematch ● N needs you: … alt+e review` above the editor; Claude Code and OpenCode list the waiting actions at session start (and in Claude Code's optional `scripts/statusline.sh` footer); `rematch status --text` lists them anywhere.
 2. **Inspect.** `library inspect <id>` shows the whole proposal: what it writes or runs, where (target and per-host reach), its scope, the reason, the full diff, and the exact approve and decline commands.
 3. **Approve or decline.** Both commands carry `--sha <hash>`: the 64-hex hash of the snapshot you just reviewed (`review_sha256`). The review dialog and the listed commands supply it, so you never copy it by hand in omp or Pi.
 
@@ -49,27 +49,27 @@ A `blocked` action names why it cannot be approved and the command that fixes it
 
 <Tabs syncKey="harness">
 <TabItem label="omp">
-At session start, news arrives as toasts and the footer shows `rematch: N waiting · /rematch review`. Run `/rematch review` or press `alt+e` for one dialog per waiting action:
+While an action waits, a line above the editor names it (`◆ rematch ● 1 needs you: … alt+e review`). Press `alt+e` or run `/rematch review` to open the `◆ rematch · review` overlay:
 
-- **Approve** / **Decline** run the action's own command, hash included.
-- **Inspect** shows the full `library inspect` output inside the dialog (never in the conversation) and asks again.
-- **Later** (or `Esc`) leaves it waiting.
+- **Needs you** shows what approving does, why it waits, the script's sandbox dry-run observation (writes, network, exit), and the colored diff: `a` approve, `d` decline (both pass the bound `--sha` automatically), `i` full diff, `↑↓` item, `esc` later. Edited-block conflicts (`instructions-conflict:<name>`) use the same panel (`a` restore rematch's text, `d` keep yours).
+- **Applied** (`tab`) lists every automatic trial and probe verdict with why it applied and `u` to undo (`y` confirms).
 
-`/rematch approve <id>` or `/rematch decline <id>` without a hash opens that action's dialog. Blocked actions and edited-block conflicts get no dialog: their reason is shown with `rematch library inspect <id>`, and you run the command that inspect prints.
+Outside the TUI (RPC/print), `/rematch review` steps through one dialog per action (`Approve` / `Decline` / `Inspect` / `Later`).
 </TabItem>
 <TabItem label="Pi">
-The same as omp: `/rematch review` steps through each waiting action with `Approve` / `Decline` / `Inspect` / `Later`, and `/rematch approve|decline <id>` without a hash opens that action's dialog.
+Shares omp's `extension/ui.ts` review overlay (`/rematch review`), needs-you line above the editor, and footer (`◆ rematch ✓ cargo 0.4s · N on trial`). In RPC mode, `/rematch review` falls back to one dialog per action.
 </TabItem>
 <TabItem label="Claude Code">
-There is no dialog. The session-start message lists every waiting action, every session, with its full commands:
+Hooks cannot open a modal dialog, so the session-start message and `/rematch:rematch-review` list every waiting action with its full hash-bound commands:
 
 ```text
+/rematch:rematch-review
 /rematch:rematch-approve <action-id> --sha <hash>
 /rematch:rematch-decline <action-id> --sha <hash>
 /rematch:rematch-inspect <action-id>
 ```
 
-Run them yourself; Claude cannot. Claude's context gets each action's kind, name, summary and commands, never its diff.
+Run `approve` or `decline` yourself; Claude cannot. With `scripts/statusline.sh` configured in `~/.claude/settings.json`, the footer also shows `● N needs you /rematch:rematch-review`.
 </TabItem>
 <TabItem label="OpenCode">
 A startup toast lists the first waiting actions with their commands; `/rematch-digest` lists them all, and `/rematch-inspect <action-id>` prints one with its exact commands:

@@ -4,19 +4,37 @@ description: Create a new skill from past sessions, from one run of a task, or f
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import Diagram from '../../../components/Diagram.astro';
 
-Create a skill on purpose instead of waiting for a correction. Pick the source by what you have: matching past sessions, a task you can run, or only a description.
+Create a skill on purpose instead of waiting for a correction. The simplest way is to ask your agent in normal chat; you can also run the commands yourself.
 
-## Choose the source
+## Simplest way: ask your agent in chat
+
+Inside omp, Pi, Claude Code or OpenCode, tell your agent what skill you want:
+
+> *"Create a rematch skill for UX review of checkout and settings screens, and eval it."*
+
+Because your agent has the `rematch` tool (and `rematch` on `PATH`), it runs the workflow for you:
+
+1. **If you already did the work in ≥ 3 past sessions:** it runs `rematch create <name> --from sessions` to distill the skill from your recorded traces.
+2. **If it is a brand-new capability:** it runs `rematch create <name> --from description --description "…" --eval-prompt "…"`, checks trigger and `units/` retrieval accuracy for free (`rematch eval trigger <name>`), and runs side-by-side baseline vs. with-skill rollouts behind the validation gate (`rematch eval run <name> --activate`).
+3. **If the new skill includes a write-capable script or personal `AGENTS.md` text:** only that part waits for you (`◆ rematch ● 1 needs you`, press `alt+e` → `a`).
+
+<Diagram
+	name="eval"
+	alt="Terminal: rematch create ux-review --from description with --eval-prompt, rematch eval trigger ux-review, and rematch eval run ux-review --activate writing report.html and promoting the draft."
+	caption="Creating a draft skill with an eval suite, checking trigger & unit retrieval for free, and promoting it through <code>eval run --activate</code>."
+/>
+
+## Choose the source (CLI or `/rematch create`)
 
 | You have | Source | Result |
 |---|---|---|
 | ≥ 3 past sessions that match the name or description | [sessions](#from-sessions), no rollout | provisional |
 | a registered task | [task](#from-a-task), one rollout | provisional |
-| only a description | [description](#from-a-description), no rollout | draft |
+| only a description | [description](#from-a-description), no rollout | draft (promote with `eval run --activate`) |
 
-In omp, each command below also runs as `/rematch create …`.
-
+In omp and Pi, each command below also runs as `/rematch create …` and `/rematch eval …` (with tab completion).
 ## From sessions
 
 ```sh
