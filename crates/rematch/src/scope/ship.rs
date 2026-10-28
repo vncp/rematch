@@ -584,8 +584,9 @@ fn ship_team(ctx: &AppCtx, e: &Entry, repo: &Path, args: &ShipArgs) -> Result<Sh
 }
 
 /// Counters "at creation": the entry's predicate evaluated over the ledger sessions
-/// that ended before it existed (same recurrence/harm rules as `counters::fold_session`),
-/// per family — the baseline the after-numbers are compared to.
+/// that ended before it existed, per family — the baseline the after-numbers are compared to.
+/// Recurrence follows `counters::fold_session`; harm is the session's own (error cluster or
+/// takeover), since nothing could use the entry before it existed.
 pub fn before_numbers(ctx: &AppCtx, e: &Entry) -> Result<Numbers> {
     let mut n = Numbers::default();
     for s in ctx.ledger.list_sessions(&SessionFilter::default())? {
@@ -597,7 +598,7 @@ pub fn before_numbers(ctx: &AppCtx, e: &Entry) -> Result<Numbers> {
         }
         let fam = s.family.clone().unwrap_or_else(|| Family(rematch_core::counters::UNKNOWN_FAMILY.into()));
         let r = recurred(e, &s) as u32;
-        let h = harmed(&s, false) as u32;
+        let h = harmed(&s, true, false) as u32;
         n.matched += 1;
         n.recurrence += r;
         n.harm += h;

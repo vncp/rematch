@@ -18,7 +18,7 @@ Tokens and turns are recorded for `why` but never gated on: they vary tenfold wi
 | **used_clean** | `used` in that session, with `recurrence == 0` and `harm == 0` | qualifies for `accepted_in_use` at ≥ 4 |
 | **use_unknown** | completion cannot be told: no run-end evidence (legacy counter rows, adapters that record no `agent_end`) or an imported transcript, whose run end the importer synthesizes rather than reads | reported honestly; never counted as positive |
 | **recurrence** | a redirect of the entry's motivating class happened (`correction` or `preference` when the entry has no specific class; never `scope`) | retire at 2 |
-| **harm** | a new tool-error cluster, an interrupt (takeover), or you disabled the entry | retire at 2 |
+| **harm** | you disabled the entry, or the session used the entry and had a new tool-error cluster or an interrupt (takeover); an entry that only matched is never blamed | retire at 2 |
 
 Each counter also keeps a per-model-family breakdown ([models](/rematch/concepts/loop/#models)).
 

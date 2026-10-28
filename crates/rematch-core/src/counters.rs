@@ -160,9 +160,12 @@ pub fn recurred(entry: &Entry, s: &SessionRecord) -> bool {
     s.redirects.iter().any(|r| class_recurs(entry.redirect_class, redirect_class_of(r.class, &r.prelabel)))
 }
 
-/// Harm: a tool-error cluster, a takeover (interrupt), or the user disabling the entry.
-pub fn harmed(s: &SessionRecord, disabled: bool) -> bool {
-    s.error_clusters > 0 || s.takeovers > 0 || disabled
+/// Harm: a tool-error cluster or a takeover (interrupt) in a session that actually used the
+/// entry, or the user disabling the entry. A session's errors are never blamed on an entry
+/// that only matched it: an always-on hook matches every session, and would otherwise be
+/// retired by any two long sessions with tool errors it had nothing to do with.
+pub fn harmed(s: &SessionRecord, used: bool, disabled: bool) -> bool {
+    disabled || (used && (s.error_clusters > 0 || s.takeovers > 0))
 }
 
 /// Whether a `block` hook fired in `s` and was followed in the same session by a user
@@ -217,18 +220,19 @@ pub fn fold_session(
         if !count_match(&e.predicate, &place, &s.exts, &s.stems) {
             continue;
         }
+        let used = actual_use(e, s).is_some();
         let row = CounterRow {
             entry_id: e.id.clone(),
             session_id: s.id.clone(),
             family: family.clone(),
             matched: 1,
             recurrence: recurred(e, s) as u32,
-            harm: (harmed(s, disabled.contains(&e.id)) || block_hook_harmed(e, s)) as u32,
+            harm: (harmed(s, used, disabled.contains(&e.id)) || block_hook_harmed(e, s)) as u32,
             tokens: s.tokens_in + s.tokens_out,
             turns: s.turns,
             ts: s.ended_at.unwrap_or(s.started_at),
             // Use in a session whose completion is unknown stays unknown (`None`), never positive.
-            used: match (actual_use(e, s).is_some(), completed_work(s)) {
+            used: match (used, completed_work(s)) {
                 (false, _) | (true, Some(false)) => Some(0),
                 (true, Some(true)) => Some(1),
                 (true, None) => None,
@@ -630,13 +634,14 @@ mod tests {
         other.predicate.file_exts = vec!["py".into()];
         l.upsert_entry(&other).unwrap();
 
-        // session 1: hit, a negation (→ correction) and an error cluster
+        // session 1: hit and read, a negation (→ correction) and an error cluster
         let mut s1 = session("s1", "repo", 1_000);
         s1.cwd = "/w/repo/crates".into();
         s1.repo = None;
         s1.exts = vec!["rs".into()];
         s1.stems = vec!["ledger".into(), "migrat".into(), "x".into()];
         s1.loaded_entries = vec!["e1".into(), "e2".into()];
+        s1.skill_reads = vec!["ledger-skill".into()];
         s1.redirects = vec![red("negation", None)];
         s1.error_clusters = 1;
         s1.tokens_in = 10;
@@ -671,8 +676,18 @@ mod tests {
         s4.loaded_entries = vec!["e2".into()];
         assert!(fold_session(&l, &s4, &[e.clone()], &[]).unwrap().is_empty());
 
+        // session 5: matched with an error cluster and a takeover, but never used: no harm
+        let mut s5 = session("s5", "repo", 4_000);
+        s5.exts = vec!["rs".into()];
+        s5.stems = vec!["ledger".into(), "migrat".into()];
+        s5.loaded_entries = vec!["e1".into()];
+        s5.error_clusters = 2;
+        s5.takeovers = 1;
+        let rows = fold_session(&l, &s5, &[e.clone()], &[]).unwrap();
+        assert_eq!((rows[0].matched, rows[0].harm), (1, 0), "a session's errors are not blamed on an entry it never used");
+
         let c = l.counters("e1").unwrap();
-        assert_eq!((c.matched, c.recurrence, c.harm), (2, 1, 2));
+        assert_eq!((c.matched, c.recurrence, c.harm), (3, 1, 2));
         assert_eq!(decide(&l.get_entry("e1").unwrap().unwrap(), &c, None, 3_000), Decision::Retire);
     }
 
