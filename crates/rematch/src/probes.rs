@@ -1274,15 +1274,19 @@ mod tests {
 
             // Both automatic probe verdicts appear in the digest under `applied_automatically`
             // with their undo command (`library rollback <name>` when there is a predecessor,
-            // else `library disable <id>`).
+            // else `library disable <name>` of the one live entry of that name); a retirement has
+            // no undo argv.
             let digest = crate::digest::cmd_digest(&e.ctx).unwrap();
             let auto = digest["applied_automatically"].as_array().unwrap();
             assert!(
-                auto.iter().any(|x| x["id"] == cand.id && x["why"] == "comparative_support" && x["undo"] == format!("rematch library disable {}", cand.id)),
+                auto.iter().any(|x| x["id"] == cand.id
+                    && x["why"] == "comparative_support"
+                    && x["undo"] == format!("rematch library disable {}", cand.name)
+                    && x["undo_argv"] == json!(["library", "disable", cand.name])),
                 "{auto:#?}"
             );
             assert!(
-                auto.iter().any(|x| x["id"] == reg.id && x["why"] == "probe_regressed" && x["undo"] == format!("rematch library disable {}", reg.id)),
+                auto.iter().any(|x| x["id"] == reg.id && x["why"] == "probe_regressed" && x["undo"] == format!("rematch library disable {}", reg.id) && x["undo_argv"].is_null()),
                 "{auto:#?}"
             );
             // When a comparative-support keep replaced a predecessor, undo is `rematch library rollback <name>`.

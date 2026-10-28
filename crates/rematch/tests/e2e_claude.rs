@@ -167,7 +167,9 @@ fn hooks_trace_flag_reflect_and_link() {
         .to_string();
     let shown = reply["systemMessage"].as_str().unwrap();
     assert!(shown.starts_with("rematch digest\n- staged hook context-unit-retrieval in shared"), "{shown}");
-    assert!(shown.contains(&"applied automatically: hook stuck-detector (stuck)".to_string()) && shown.contains(&format!("undo: `rematch library disable {stuck}`")), "{shown}");
+    // Undone by name; the hook's module path (its id) is not in the line.
+    assert!(shown.contains("applied automatically: hook stuck-detector (stuck) (data-only) — undo: `rematch library disable stuck-detector`"), "{shown}");
+    assert!(!shown.contains(&stuck), "{shown}");
     assert!(!shown.contains("action(s) waiting for you"), "{shown}");
     let context = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains(shown) && context.contains("never run `rematch library approve`"), "{context}");

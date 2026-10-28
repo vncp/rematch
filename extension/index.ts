@@ -12,6 +12,27 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExecResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import {
+	actionTitle,
+	checkingMessage,
+	checkStateOf,
+	commandCompletions,
+	contextTheme,
+	digestRows,
+	digestText,
+	kindLabel,
+	type OutputDetails,
+	renderCheckMessage,
+	renderDigestMessage,
+	renderOutputMessage,
+	renderToolCall,
+	renderToolResult,
+	reviewPanel,
+	reviewPanelComponent,
+	StatusBoard,
+	themeOf,
+	whyItWaits,
+} from "./ui.ts";
 
 // ---------------------------------------------------------------------------------------------
 // Paths, kill switch, binary resolution
@@ -596,6 +617,14 @@ export type ReviewAction = {
 	reload: string | null;
 	approve: string[] | null;
 	decline: string[] | null;
+	/** Waits for the user's decision: pending, approvable (a blocked action needs something else first). */
+	needsYou: boolean;
+	/** The entry's place (a repo key or `shared`), when the action is an entry's. */
+	place: string | null;
+	reason: string;
+	diff: string;
+	/** What a staged script did in its sandbox dry run (`{writes_outside, network, exit_code, …}`). */
+	observed: Json | null;
 };
 
 /** `digest.actions` as review items (every pending, blocked and conflict action, whatever `digest.last` says). */
@@ -604,28 +633,58 @@ export function reviewActionsOf(data: unknown): ReviewAction[] {
 		const a = stringsOf(v);
 		return a.length > 0 && a[0] === "library" ? a : null;
 	};
+	const text = (v: unknown) => (typeof v === "string" ? v : "");
 	return (isRecord(data) ? recordsOf(data.actions) : [])
 		.filter(a => typeof a.id === "string")
 		.map(a => {
 			const c = isRecord(a.commands) ? a.commands : {};
-			return {
+			const action = {
 				id: a.id as string,
-				kind: typeof a.kind === "string" ? a.kind : "entry",
-				name: typeof a.name === "string" ? a.name : (a.id as string),
-				summary: typeof a.summary === "string" ? a.summary : "",
-				state: typeof a.state === "string" ? a.state : "pending",
+				kind: text(a.kind) || "entry",
+				name: text(a.name) || (a.id as string),
+				summary: text(a.summary),
+				state: text(a.state) || "pending",
 				blocked: typeof a.blocked === "string" ? a.blocked : null,
 				reload: typeof a.reload === "string" ? a.reload : null,
 				approve: argv(c.approve_argv),
 				decline: argv(c.decline_argv),
+				place: typeof a.place === "string" ? a.place : null,
+				reason: text(a.reason),
+				diff: text(a.diff),
+				observed: isRecord(a.observed) ? a.observed : null,
+			};
+			return { ...action, needsYou: action.state === "pending" && action.approve !== null && action.blocked === null };
+		});
+}
+
+/** One automatic change (`applied_automatically`), with the argv that undoes it when one does. */
+export type AutoApplied = { id: string; name: string; kind: string; what: string; why: string; rule: string | null; undo_argv: string[] | null };
+
+export function autoAppliedOf(data: unknown): AutoApplied[] {
+	return (isRecord(data) ? recordsOf(data.applied_automatically) : [])
+		.filter(a => typeof a.id === "string" && typeof a.name === "string")
+		.map(a => {
+			const undo = stringsOf(a.undo_argv);
+			return {
+				id: a.id as string,
+				name: a.name as string,
+				kind: typeof a.kind === "string" ? a.kind : "entry",
+				what: typeof a.what === "string" ? a.what : "",
+				why: typeof a.why === "string" ? a.why : "",
+				rule: typeof a.rule === "string" ? a.rule : null,
+				undo_argv: undo[0] === "library" ? undo : null,
 			};
 		});
 }
 
-/** Footer status: how many actions wait, and where to review them; undefined when none. */
-export function pendingStatus(actions: readonly ReviewAction[]): string | undefined {
-	if (actions.length === 0) return undefined;
-	return `rematch: ${actions.length} waiting · /rematch review`;
+/**
+ * The id of the action a typed `/rematch approve|decline|inspect <target>` means: the target when
+ * it is an action's id, else the id of the one action of that name; the target itself otherwise.
+ */
+export function actionIdOf(target: string, actions: readonly ReviewAction[]): string {
+	if (actions.some(a => a.id === target)) return target;
+	const named = actions.filter(a => a.name === target);
+	return named.length === 1 ? (named[0] as ReviewAction).id : target;
 }
 
 export const REVIEW_APPROVE = "Approve";
@@ -653,14 +712,18 @@ export function reviewEffects(kind: string): { approve: string | null; decline: 
 	}
 }
 
-/** The choices of one action: approve/decline only when the binary offers that exact command; Later always (and Esc means Later). */
+/**
+ * The choices of one action, for hosts without the review panel: approve/decline only when the
+ * binary offers that exact command, described in words (the bound argv and its hash stay behind
+ * the choice); Later always (and Esc means Later).
+ */
 export function reviewChoices(a: ReviewAction): { label: string; description?: string }[] {
 	const out: { label: string; description?: string }[] = [];
 	const effects = reviewEffects(a.kind);
-	if (a.approve && !a.blocked) out.push({ label: REVIEW_APPROVE, description: effects.approve ?? a.approve.slice(1).join(" ") });
+	if (a.approve && !a.blocked) out.push({ label: REVIEW_APPROVE, description: effects.approve ?? actionTitle(a) });
 	if (a.decline) out.push({ label: REVIEW_DECLINE, description: effects.decline });
-	out.push({ label: REVIEW_INSPECT, description: `rematch library inspect ${a.id}` });
-	out.push({ label: REVIEW_LATER, description: "keep it pending; nothing changes" });
+	out.push({ label: REVIEW_INSPECT, description: "show the full text and diff" });
+	out.push({ label: REVIEW_LATER, description: "keep it waiting; nothing changes" });
 	return out;
 }
 
@@ -888,8 +951,9 @@ export const CHECK_TYPE = "com.vncp.rematch.check";
 export const CHECK_DEBOUNCE_MS = 50;
 
 /**
- * The one message `check` appends after file edits: an omp/Pi `CustomMessage` (`role: "custom"`,
- * hidden), carrying diagnostics, unedited caller impact references, or `✓ <check> clean in Xs`.
+ * The hidden message `check` adds to a request after file edits (Pi): an `CustomMessage`
+ * (`role: "custom"`, not displayed), carrying diagnostics, unedited caller impact references, or
+ * `✓ <check> clean in Xs`. omp delivers the same content as one displayed aside instead.
  */
 export function checkMessage(rendered: string, details: Json = {}, timestamp = Date.now()): Json {
 	return {
@@ -900,6 +964,17 @@ export function checkMessage(rendered: string, details: Json = {}, timestamp = D
 		content: rendered,
 		details,
 	};
+}
+
+/** `/rematch …` output in the transcript; `details` is the binary's envelope plus the command typed. */
+export const OUTPUT_TYPE = "rematch";
+/** The session-start digest card: shown in the transcript, never sent to the model. */
+export const DIGEST_TYPE = "rematch.digest";
+
+/** `messages` without the custom messages of `types` (rematch's view-only cards); null when none was there. */
+export function withoutViews(messages: readonly unknown[], types: ReadonlySet<string>): unknown[] | null {
+	const kept = messages.filter(m => !(isRecord(m) && m.role === "custom" && typeof m.customType === "string" && types.has(m.customType)));
+	return kept.length === messages.length ? null : kept;
 }
 
 /** Normalize edited file paths relative to `repoTop` (forward slashes, no `./` prefix) for `check_ran`. */
@@ -936,6 +1011,13 @@ export function loadedEntriesOf(data: unknown, hooks: readonly Hook[]): LoadedEn
 			if (typeof e.sha === "string" && e.sha) out.sha = e.sha;
 			return out;
 		});
+}
+
+/** Names of the entries on trial here: provisional entries of a `match` result that load for this place. */
+export function trialsHere(data: unknown): string[] {
+	return (isRecord(data) ? recordsOf(data.entries) : [])
+		.filter(e => e.status === "provisional" && e.predicate_hit !== false && typeof e.name === "string")
+		.map(e => e.name as string);
 }
 
 /** One approved personal `AGENTS.fragment.md` the binary reported for this cwd (`match.prompt_fragments`); `sha` is the approved hash, recorded when a host sends it (`fragments_sent`). */
@@ -1077,6 +1159,11 @@ export function shadowedByCustomDirs(view: ReadonlyMap<string, string>, customDi
 // ---------------------------------------------------------------------------------------------
 // Factory
 
+/** omp's review shortcut, named in the footer, the widget and the digest card. */
+const REVIEW_KEY = "alt+e";
+/** Custom messages omp shows but never sends: the digest card. */
+const VIEW_ONLY: ReadonlySet<string> = new Set([DIGEST_TYPE]);
+
 type SessionTrace = {
 	id: string;
 	file: string;
@@ -1122,6 +1209,26 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			return { ok: false, operation, error: errorText(error) };
 		}
 	}
+
+	/** Footer status and needs-you widget (what waits, trials here, the last check). */
+	const board = new StatusBoard(REVIEW_KEY);
+	/** Show the board; a host without the methods (or a closed UI) only loses the display. */
+	const showBoard = (ctx: ExtensionContext) => {
+		try {
+			if (ctx.hasUI) board.show(ctx);
+		} catch (error) {
+			log("debug", `status failed: ${errorText(error)}`);
+		}
+	};
+	/** The actions of the last digest, for `/rematch approve <name>` and argument completion. */
+	let knownActions: ReviewAction[] = [];
+	/** Name, kind and status of what `match` loads here (argument completion of disable/rollback). */
+	let entryNames: { name: string; kind: string; status: string }[] = [];
+	/** Argument completion: what waits (approve, decline, inspect) or what loads here (disable, rollback), by name. */
+	const completionNames = (sub: string) =>
+		sub === "disable" || sub === "rollback"
+			? entryNames.map(e => ({ name: e.name, description: `${e.kind} · ${e.status}` }))
+			: knownActions.map(a => ({ name: a.name, description: `${kindLabel(a.kind)} · ${a.needsYou ? "needs you" : a.state}` }));
 
 	// --- loaded state: skill dirs + hooks matched for `loadedCwd` --------------------------------
 	// Matched at load time for process.cwd(); re-matched when a main session's cwd changes, when the
@@ -1206,11 +1313,15 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			loadedEntries = loadedEntriesOf(data, next);
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
-			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve" || h.mode === "check");
+			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
 			checkHooks = next.filter(h => h.mode === "check");
 			tracksCalls = next.some(h => h.mode === "stuck");
 			instructionsExposed = recordsOf(isRecord(data.instructions) ? data.instructions.exposed : undefined);
+			board.trials = trialsHere(data);
+			entryNames = recordsOf(data.entries)
+				.filter(e => typeof e.name === "string")
+				.map(e => ({ name: e.name as string, kind: typeof e.kind === "string" ? e.kind : "entry", status: typeof e.status === "string" ? e.status : "" }));
 		} catch (error) {
 			log("warn", `match skipped for ${cwd}: ${errorText(error)}`);
 		}
@@ -1253,13 +1364,20 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let lastTracedUnits = "";
 	/** The appended retrieval message, reused while the unit contents are unchanged. */
 	let lastInjected: { content: string; message: Json } | null = null;
-	/** Files edited in the current turn awaiting `fast-check`, plus any in-flight/settled check message. */
+	/** Files edited since the last input, checked together by the next `fast-check` run. */
 	const pendingCheckFiles = new Set<string>();
-	let checkDebounceTimer: NodeJS.Timeout | undefined;
+	/** Bumped by every edit and input: a check run whose generation moved on is superseded. */
+	let checkGeneration = 0;
 	let checkAbort: AbortController | null = null;
-	let checkPromise: Promise<Json | null> | null = null;
-	let checkDirty = false;
-	let lastCheckMsg: Json | null = null;
+	/** The kind the last check reported (`cargo`, `tsc`, …), named while the next one runs. */
+	let lastCheckKind: string | null = null;
+	/** Drop pending files and supersede any running check (a new input, a new session). */
+	const resetChecks = () => {
+		pendingCheckFiles.clear();
+		checkGeneration++;
+		checkAbort?.abort();
+		checkAbort = null;
+	};
 	// `agent` is absent on hosts older than the identity API: treat those as main.
 	const isMain = (ctx: ExtensionContext) => ctx.agent?.kind !== "sub";
 	const sessionIdOf = (ctx: ExtensionContext): string | null => {
@@ -1403,55 +1521,91 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		spawnReflect();
 	}
 
-	/** News as toasts, and the actions waiting as a persistent footer status (never a dialog: the session is not blocked). */
-	function presentDigest(ctx: ExtensionContext, env: Envelope): ReviewAction[] {
-		const lines = stringsOf(env.data?.lines);
-		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
-		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
+	/**
+	 * What a digest says, shown without toasts: the footer status and the needs-you widget always;
+	 * with `card` (session start) one transcript card when something changed since the last
+	 * digest, appended without starting a turn and never sent to the model (`context` strips it).
+	 */
+	function presentDigest(ctx: ExtensionContext, env: Envelope, card: boolean): ReviewAction[] {
 		const actions = reviewActionsOf(env.data);
-		try {
-			ctx.ui.setStatus("rematch", pendingStatus(actions));
-		} catch (error) {
-			log("debug", `setStatus failed: ${errorText(error)}`);
+		knownActions = actions;
+		board.needs = actions;
+		board.applied = autoAppliedOf(env.data);
+		showBoard(ctx);
+		if (card) {
+			const { rows, news } = digestRows(env.data, actions, REVIEW_KEY, board.trials);
+			try {
+				if (news) pi.sendMessage({ customType: DIGEST_TYPE, content: digestText(rows), display: true, details: { rows } });
+			} catch (error) {
+				log("warn", `digest card failed: ${errorText(error)}`);
+			}
 		}
-		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for your review — /rematch review (alt+e); low-risk items are applied automatically and waiting items wait for your decision`, "info");
 		return actions;
 	}
 
-	async function showDigest(ctx: ExtensionContext, quietWhenEmpty: boolean): Promise<ReviewAction[]> {
+	async function showDigest(ctx: ExtensionContext, opts: { card: boolean; quiet: boolean }): Promise<ReviewAction[]> {
 		if (!ctx.hasUI) return [];
 		const env = await call(["digest", "--cwd", ctx.cwd], { timeout: 10_000 });
 		if (!env.ok) {
-			if (!quietWhenEmpty) ctx.ui.notify(`rematch: digest failed: ${env.error}`, "warning");
+			if (!opts.quiet) ctx.ui.notify(`rematch: digest failed: ${env.error}`, "warning");
 			return [];
 		}
-		const empty = stringsOf(env.data?.lines).length === 0 && recordsOf(env.data?.actions).length === 0;
-		if (empty && !quietWhenEmpty) ctx.ui.notify("rematch: nothing new", "info");
-		return presentDigest(ctx, env);
+		return presentDigest(ctx, env, opts.card);
 	}
 
 	/**
-	 * One dialog per waiting action: Approve / Decline run exactly the command the binary offers
-	 * (with the hash shown); Inspect shows the whole text in the dialog (never in the conversation)
-	 * and asks again; Later or Esc leaves it pending. Blocked and conflict actions are shown with
-	 * their reason and commands, no dialog.
+	 * Review what waits (`needs`) and, in the panel, what was applied automatically (`applied`).
+	 * Approve / Decline / Undo run exactly the argv the binary offers (the reviewed hash with it);
+	 * Esc or Later leaves everything as it is. Hook modules and agent links change at once; skills
+	 * and personal text load from the next session.
 	 */
-	async function review(ctx: ExtensionContext, actions: readonly ReviewAction[]): Promise<void> {
+	async function review(ctx: ExtensionContext, needs: readonly ReviewAction[], applied: readonly AutoApplied[]): Promise<void> {
 		if (!ctx.hasUI) return;
+		const panel = ctx.mode === "tui" && typeof ctx.ui.custom === "function";
+		const changed = panel ? await reviewInPanel(ctx, needs, applied) : await reviewInDialogs(ctx, needs);
+		if (changed) {
+			await reload(ctx.cwd, true);
+			await showDigest(ctx, { card: false, quiet: true });
+		}
+	}
+
+	/** The review panel (TUI): both tabs, results inline; true when something changed. */
+	async function reviewInPanel(ctx: ExtensionContext, needs: readonly ReviewAction[], applied: readonly AutoApplied[]): Promise<boolean> {
+		if (needs.length === 0 && applied.length === 0) {
+			ctx.ui.notify("rematch: nothing waits for you", "info");
+			return false;
+		}
+		return ctx.ui.custom<boolean>(
+			(tui, theme, _keybindings, done) =>
+				reviewPanelComponent(themeOf(theme), tui, reviewPanel(needs, applied), async effect => {
+					const r = await call(effect.argv);
+					return { ok: r.ok, error: r.error };
+				}, done),
+			{ overlay: true },
+		);
+	}
+
+	/**
+	 * Without the panel (RPC): one dialog per action, described in words; Inspect shows the whole
+	 * text in the dialog (never in the conversation) and asks again. An action that offers neither
+	 * approve nor decline is shown as a warning.
+	 */
+	async function reviewInDialogs(ctx: ExtensionContext, needs: readonly ReviewAction[]): Promise<boolean> {
 		let changed = false;
-		for (const a of actions) {
+		for (const a of needs) {
 			if (!(a.approve && !a.blocked) && !a.decline) {
-				ctx.ui.notify(`rematch: ${a.kind} ${a.name}: ${a.summary}${a.blocked ? ` — ${a.blocked}` : ""} (rematch library inspect ${a.id})`, "warning");
+				ctx.ui.notify(`rematch: ${a.name}: ${whyItWaits(a)}`, "warning");
 				continue;
 			}
-			let title = `rematch: ${a.kind} ${a.name} — ${a.summary}`;
+			const heading = `rematch · ${kindLabel(a.kind)} ${a.name}`;
+			let title = `${heading}\n${actionTitle(a)} (${whyItWaits(a)})`;
 			let choice: string | undefined;
 			for (;;) {
 				choice = await ctx.ui.select(title, reviewChoices(a));
 				if (choice !== REVIEW_INSPECT) break;
 				const inspected = await call(["library", "inspect", a.id]);
 				const text = inspected.ok ? stringsOf(inspected.data?.lines).join("\n") : (inspected.error ?? "");
-				title = `rematch: ${a.kind} ${a.name}\n\n${text}`;
+				title = `${heading}\n\n${text}`;
 			}
 			const argv = reviewArgv(a, choice);
 			if (!argv) continue;
@@ -1460,11 +1614,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			const verb = choice === REVIEW_APPROVE ? "approved" : "declined";
 			ctx.ui.notify(`rematch: ${verb} ${a.name}${r.ok ? (a.reload ? ` (${a.reload})` : "") : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
 		}
-		// Hook modules and agent links change now; skills and personal text load from the next session.
-		if (changed) {
-			await reload(ctx.cwd, true);
-			await showDigest(ctx, true);
-		}
+		return changed;
 	}
 
 	async function startSession(ctx: ExtensionContext, withDigest: boolean): Promise<void> {
@@ -1474,18 +1624,13 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		lastRetrieval = null;
 		lastTracedUnits = "";
 		lastInjected = null;
-		pendingCheckFiles.clear();
-		clearTimeout(checkDebounceTimer);
-		checkDebounceTimer = undefined;
-		checkAbort?.abort();
-		checkAbort = null;
-		checkPromise = null;
-		checkDirty = false;
-		lastCheckMsg = null;
+		resetChecks();
+		board.check = null;
 		await openTrace(ctx);
 		spawnReflect();
+		showBoard(ctx);
 		// Dialogs may outlive the handler budget: present detached, never throwing.
-		if (withDigest) void showDigest(ctx, true).catch(error => log("warn", `digest failed: ${errorText(error)}`));
+		if (withDigest) void showDigest(ctx, { card: true, quiet: true }).catch(error => log("warn", `digest failed: ${errorText(error)}`));
 	}
 
 	/** Event handlers fail open: tracing must never disturb the session. */
@@ -1564,6 +1709,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			const p = isRecord(params) ? params : {};
 			return approvalFor(typeof p.operation === "string" ? p.operation : "", stringsOf(p.arguments));
 		},
+		renderCall: renderToolCall,
+		renderResult: renderToolResult,
 		async execute(_id, rawParams, signal, _onUpdate, ctx) {
 			// The host validated the call against `parameters` before execute.
 			const params = rawParams as { operation: Operation; arguments?: string[] };
@@ -1583,23 +1730,26 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	pi.registerCommand("rematch", {
 		description: `rematch: /rematch ${COMMANDS.join("|")} [args]`,
+		getArgumentCompletions: prefix => commandCompletions(prefix, COMMANDS, completionNames),
 		handler: async (raw, ctx) => {
 			let value: Envelope;
+			let words: string[] = [];
 			try {
-				const words = shellWords(raw ?? "");
+				words = shellWords(raw ?? "");
 				if (words[0] === "review" && ctx.hasUI && enabled) {
-					// The dialog review: Approve / Decline / Inspect / Later per action, nothing on Esc.
-					await review(ctx, await showDigest(ctx, true));
+					// The review: panel in the TUI, a dialog per action elsewhere; nothing changes on Esc.
+					await review(ctx, await showDigest(ctx, { card: false, quiet: true }), board.applied);
 					return;
 				}
 				const target = reviewTarget(words);
 				if (target && ctx.hasUI) {
-					// A typed approve/decline without a hash: this action's dialog, which carries it.
-					const inspected = await call(["library", "inspect", target]);
+					// A typed approve/decline without a hash: this action's review, which carries it.
+					const inspected = await call(["library", "inspect", actionIdOf(target, knownActions)]);
 					if (!inspected.ok) throw new Error(inspected.error ?? `no action ${target}`);
-					await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }));
+					await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }), []);
 					return;
 				}
+				if (words[0] === "inspect" && words[1]) words[1] = actionIdOf(words[1], knownActions);
 				const { operation, args } = commandToOperation(words);
 				if (!enabled && !["on", "status", "doctor", "library", "why"].includes(operation)) {
 					throw new Error(hardOff ? "rematch is off (REMATCH=0)" : "rematch is off; /rematch on to enable");
@@ -1611,27 +1761,37 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 					finalArgs = [...args, "--yes"];
 				}
 				value = await runOperation(operation, finalArgs, ctx);
+				if (value.ok && operation === "digest" && ctx.hasUI) presentDigest(ctx, value, false);
 			} catch (error) {
 				value = { ok: false, error: errorText(error) };
 			}
 			const lines = stringsOf(value.ok ? value.data?.lines : undefined);
 			const content = lines.length > 0 ? lines.join("\n") : JSON.stringify(value, null, 2);
+			const details: OutputDetails = { ...value, command: words.join(" ") || "library ls" };
 			try {
-				pi.sendMessage({ customType: "rematch", content, display: true, details: value });
+				pi.sendMessage({ customType: OUTPUT_TYPE, content, display: true, details });
 			} catch (error) {
 				log("warn", `sendMessage failed: ${errorText(error)}`);
 			}
 		},
 	});
 
+	// Transcript cards: the check (omp's aside), the session-start digest and `/rematch` output.
+	if (typeof pi.registerMessageRenderer === "function") {
+		pi.registerMessageRenderer(CHECK_TYPE, renderCheckMessage);
+		pi.registerMessageRenderer(DIGEST_TYPE, renderDigestMessage);
+		pi.registerMessageRenderer(OUTPUT_TYPE, renderOutputMessage);
+	}
+
 	if (hardOff) return;
 
 	// Registering a shortcut also makes the TUI load this extension eagerly (DESIGN §0).
-	pi.registerShortcut("alt+e", {
-		description: "rematch: digest and review what waits for you",
+	pi.registerShortcut(REVIEW_KEY, {
+		description: "rematch: review what waits for you and what was applied automatically",
 		handler: async ctx => {
 			try {
-				await review(ctx, await showDigest(ctx, false));
+				const needs = await showDigest(ctx, { card: false, quiet: false });
+				await review(ctx, needs, board.applied);
 			} catch (error) {
 				log("warn", `shortcut failed: ${errorText(error)}`);
 			}
@@ -1721,8 +1881,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		return lastInjected.message;
 	}
 
-	/** Run `rematch check` for `files`, record `check_ran` in the trace, and build the hidden context message. */
-	async function executeCheck(files: readonly string[], cwd: string, isMainSession: boolean, signal: AbortSignal): Promise<Json | null> {
+	/** Run `rematch check` for `files` and record `check_ran`: the text the agent gets and its details, or null (nothing ran, nothing to say). */
+	async function executeCheck(files: readonly string[], cwd: string, signal: AbortSignal): Promise<{ rendered: string; details: Json } | null> {
 		const hook = checkHooks[0];
 		if (!hook || files.length === 0) return null;
 		const timeoutSecs = Math.max(1, Math.floor(hook.params.timeout_secs ?? 30));
@@ -1735,7 +1895,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		if (signal.aborted || !env.ok || !isRecord(env.data)) return null;
 		const rendered = typeof env.data.rendered === "string" ? env.data.rendered.trim() : "";
 		if (!rendered) return null;
-		if (env.data.detected === true && trace && isMainSession) {
+		if (env.data.detected === true && trace) {
 			const serverFiles = stringsOf(env.data.files);
 			const normFiles = serverFiles.length > 0 ? serverFiles : normalizeCheckFiles(files, cwd, trace.repo);
 			write("check_ran", {
@@ -1748,76 +1908,78 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				files: normFiles,
 			});
 		}
-		return checkMessage(rendered, {
+		const details = {
 			hook_id: hook.id,
 			kind: env.data.kind ?? null,
 			ok: env.data.ok === true,
 			errors: env.data.errors ?? 0,
 			duration_ms: env.data.duration_ms ?? 0,
-		});
+			timed_out: env.data.timed_out === true,
+		};
+		return { rendered, details };
 	}
 
-	function startPendingCheck(cwd: string, isMainSession: boolean): Promise<Json | null> {
-		clearTimeout(checkDebounceTimer);
-		checkDebounceTimer = undefined;
-		checkAbort?.abort();
-		const ctrl = new AbortController();
-		checkAbort = ctrl;
-		checkDirty = false;
-		const files = [...pendingCheckFiles];
-		const runPromise = executeCheck(files, cwd, isMainSession, ctrl.signal).then(msg => {
-			if (!ctrl.signal.aborted && checkAbort === ctrl) {
-				lastCheckMsg = msg;
-				checkPromise = null;
-			}
-			return lastCheckMsg;
-		});
-		checkPromise = runPromise;
-		return runPromise;
-	}
-
-	function scheduleCheck(paths: readonly string[], cwd: string, isMainSession: boolean): void {
+	/**
+	 * `fast-check` after a successful edit of a main session. Debounced, so the edits of one batch
+	 * are checked together (every file edited since the last input), and awaited here, so the
+	 * batch ends after the check as the next request used to wait for it. The result goes out as
+	 * ONE displayed message delivered as an aside: the agent loop injects it at the batch boundary,
+	 * before the next model request, and the transcript shows that same message as the check card.
+	 * The agent receives the diagnostics once per check run; no display copy exists to re-send.
+	 * A later edit (or input) supersedes a running check, whose result is dropped.
+	 */
+	async function checkAfterEdit(paths: readonly string[], ctx: ExtensionContext): Promise<void> {
 		if (checkHooks.length === 0 || paths.length === 0) return;
 		for (const p of paths) pendingCheckFiles.add(p);
-		checkDirty = true;
-		lastCheckMsg = null;
+		const generation = ++checkGeneration;
 		checkAbort?.abort();
 		checkAbort = null;
-		checkPromise = null;
-		clearTimeout(checkDebounceTimer);
-		checkDebounceTimer = setTimeout(() => {
-			checkDebounceTimer = undefined;
-			void startPendingCheck(cwd, isMainSession);
-		}, CHECK_DEBOUNCE_MS);
-		checkDebounceTimer.unref?.();
+		await Bun.sleep(CHECK_DEBOUNCE_MS);
+		if (generation !== checkGeneration) return;
+		const ctrl = new AbortController();
+		checkAbort = ctrl;
+		const before = board.check;
+		const working = ctx.hasUI && ctx.mode === "tui" && typeof ctx.ui.setWorkingMessage === "function";
+		board.check = { state: "running", kind: lastCheckKind };
+		showBoard(ctx);
+		if (working) ctx.ui.setWorkingMessage(checkingMessage(contextTheme(ctx), lastCheckKind));
+		let result: { rendered: string; details: Json } | null = null;
+		try {
+			result = await executeCheck([...pendingCheckFiles], ctx.cwd, ctrl.signal);
+		} finally {
+			if (checkAbort === ctrl) checkAbort = null;
+			if (working) ctx.ui.setWorkingMessage();
+		}
+		// Superseded: the later run reports. Nothing to say (no checker here): the footer keeps the last result.
+		if (generation !== checkGeneration || ctrl.signal.aborted) return;
+		board.check = result ? checkStateOf(result.details, result.rendered) : before;
+		if (board.check?.state === "done" && board.check.kind) lastCheckKind = board.check.kind;
+		showBoard(ctx);
+		if (!result) return;
+		pi.sendMessage({ customType: CHECK_TYPE, content: result.rendered, display: true, details: result.details }, { deliverAs: "aside" });
 	}
 
-	async function awaitCheckMessage(cwd: string, isMainSession: boolean): Promise<Json | null> {
-		if (checkHooks.length === 0) return null;
-		if (checkDirty || checkDebounceTimer !== undefined) {
-			await startPendingCheck(cwd, isMainSession);
-		} else if (checkPromise) {
-			await checkPromise.catch(() => null);
-		}
-		return lastCheckMsg;
-	}
-	// --- context hooks (truncate, retrieve): fail open, outgoing request only ---------------------
+	// --- context: the digest card out, then truncate + retrieve: fail open, outgoing request only ---
 	pi.on("context", async (event, ctx) => {
-		if (!enabled) return undefined;
+		// The digest card is shown, never sent.
+		let messages: unknown[] | null = withoutViews(event.messages, VIEW_ONLY);
+		const reply = () => (messages ? { messages: messages as typeof event.messages } : undefined);
+		if (!enabled) return reply();
 		// A main session that moved to another cwd loads that cwd's entries and hooks first.
 		if (isMain(ctx) && ctx.cwd !== loadedCwd) await reload(ctx.cwd, false);
-		if (contextHooks.length === 0) return undefined;
-		let messages: unknown[] | null = null;
+		if (contextHooks.length === 0) return reply();
 		try {
-			messages = truncateToolResults(event.messages, contextHooks);
-			const cut = messages ? messages.filter((m, i) => m !== event.messages[i]).length : 0;
+			const base = messages ?? event.messages;
+			const cutMessages = truncateToolResults(base, contextHooks);
+			const cut = cutMessages ? cutMessages.filter((m, i) => m !== base[i]).length : 0;
 			const sig = `${cut}`;
-			if (messages && trace && isMain(ctx) && sig !== lastTruncation) {
+			if (cutMessages && trace && isMain(ctx) && sig !== lastTruncation) {
 				lastTruncation = sig;
 				for (const h of contextHooks.filter(h => h.mode === "truncate")) {
 					write("hook_applied", { hook_id: h.id, mode: "truncate", detail: `${cut} tool result(s) cut in the outgoing request` });
 				}
 			}
+			messages = cutMessages ?? messages;
 		} catch (error) {
 			log("warn", `truncate hook failed: ${errorText(error)}`);
 		}
@@ -1827,13 +1989,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		} catch (error) {
 			log("warn", `retrieve hook failed: ${errorText(error)}`);
 		}
-		try {
-			const checkMsg = await awaitCheckMessage(ctx.cwd, isMain(ctx));
-			if (checkMsg) messages = [...(messages ?? event.messages), checkMsg];
-		} catch (error) {
-			log("warn", `check hook failed: ${errorText(error)}`);
-		}
-		return messages ? { messages: messages as typeof event.messages } : undefined;
+		return reply();
 	});
 
 	// --- trace events: fail open -----------------------------------------------------------------
@@ -1887,14 +2043,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				skills_invoked: skillsInvoked(text),
 			});
 			trace.lastInput = text;
-			pendingCheckFiles.clear();
-			clearTimeout(checkDebounceTimer);
-			checkDebounceTimer = undefined;
-			checkAbort?.abort();
-			checkAbort = null;
-			checkPromise = null;
-			checkDirty = false;
-			lastCheckMsg = null;
+			resetChecks();
 			if (label === "none") return;
 			trace.reasons.add(label.startsWith("mark:") ? label : `redirect:${label}`);
 			try {
@@ -1907,7 +2056,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	pi.on(
 		"tool_result",
-		guard("tool_result", (event: { toolName: string; toolCallId: string; input: unknown; content: unknown; isError: boolean }, ctx) => {
+		guard("tool_result", async (event: { toolName: string; toolCallId: string; input: unknown; content: unknown; isError: boolean }, ctx) => {
 			if (!enabled || !trace || !isMain(ctx)) return;
 			const input = event.input ?? null;
 			const rawPath = isRecord(input) ? (input.path ?? input.file_path) : undefined;
@@ -1929,7 +2078,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (!isError) {
 				const touched = changedPaths(event.toolName, input);
 				for (const p of touched) trace.changed.add(p);
-				if (touched.length > 0) scheduleCheck(touched, ctx.cwd, isMain(ctx));
+				if (touched.length > 0) await checkAfterEdit(touched, ctx);
 			}
 		}),
 	);

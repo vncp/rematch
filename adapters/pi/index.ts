@@ -42,7 +42,12 @@ import {
 	markClass,
 	OPERATIONS,
 	type Operation,
-	pendingStatus,
+	OUTPUT_TYPE,
+	DIGEST_TYPE,
+	autoAppliedOf,
+	actionIdOf,
+	trialsHere,
+	withoutViews,
 	prelabel,
 	RETRIEVAL_TYPE,
 	type RetrievedUnit,
@@ -77,6 +82,20 @@ import {
 	truncateToolResults,
 	blockReason,
 } from "../../extension/index.ts";
+import {
+	commandCompletions,
+	digestRows,
+	digestText,
+	renderCheckMessage,
+	renderDigestMessage,
+	renderOutputMessage,
+	renderToolCall,
+	renderToolResult,
+	reviewPanel,
+	reviewPanelComponent,
+	StatusBoard,
+	themeOf,
+} from "../../extension/ui.ts";
 
 type Json = Record<string, unknown>;
 type ModelRef = { provider: string; id: string };
@@ -331,7 +350,10 @@ export function ompAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
 // ---------------------------------------------------------------------------------------------
 // Messages
 
-export const OUTPUT_TYPE = "rematch";
+/** Pi's transcript copy of a check result: shown, never sent (the hidden `checkMessage` is what the agent gets). */
+export const CHECK_VIEW_TYPE = "rematch.check";
+/** Custom messages Pi shows but never sends: `/rematch` output, the digest card, the check card. */
+const VIEW_ONLY: ReadonlySet<string> = new Set([OUTPUT_TYPE, DIGEST_TYPE, CHECK_VIEW_TYPE]);
 
 /**
  * The one message `retrieve` appends: a Pi `CustomMessage`, which Pi's `convertToLlm` sends as a
@@ -453,6 +475,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
 			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve" || h.mode === "check");
+			board.trials = trialsHere(data);
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
 			checkHooks = next.filter(h => h.mode === "check");
 			promptFragments = promptFragmentsOf(data);
@@ -646,47 +669,73 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	}
 
 	// --- digest (UI only: never in the provider context) -----------------------------------------
-	async function showDigest(ctx: ExtensionContext): Promise<ReviewAction[]> {
+	/** Footer status and needs-you widget (Pi has no review shortcut: `/rematch review`). */
+	const board = new StatusBoard(null);
+	/** The actions of the last digest, for `/rematch approve <name>` and argument completion. */
+	let knownActions: ReviewAction[] = [];
+
+	/** Footer, widget and (`card`, session start) one digest card when something changed; no toasts. */
+	async function showDigest(ctx: ExtensionContext, card = false): Promise<ReviewAction[]> {
 		if (!ctx.hasUI) return [];
 		const env = await call(["digest", "--cwd", ctx.cwd], { timeout: 10_000 });
 		if (!env.ok) return [];
-		const lines = stringsOf(env.data?.lines);
-		for (const line of lines.slice(0, 5)) ctx.ui.notify(`rematch: ${line}`, "info");
-		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
 		const actions = reviewActionsOf(env.data);
-		ctx.ui.setStatus("rematch", pendingStatus(actions));
-		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for your review — /rematch review; low-risk items are applied automatically and waiting items wait for your decision`, "info");
+		knownActions = actions;
+		board.needs = actions;
+		board.applied = autoAppliedOf(env.data);
+		board.show(ctx);
+		if (card) {
+			const { rows, news } = digestRows(env.data, actions, null, board.trials);
+			if (news) pi.sendMessage({ customType: DIGEST_TYPE, content: digestText(rows), display: true, details: { rows } }, { triggerTurn: false });
+		}
 		return actions;
 	}
 
-	/** Approve / Decline / Inspect / Later per action (Esc = Later); blocked and conflict actions are shown, not asked. `true` when something changed. */
-	async function review(ctx: ExtensionContext, actions: readonly ReviewAction[]): Promise<boolean> {
+	/** The review panel in the TUI (both tabs, results inline), else the dialogs below. `true` when something changed. */
+	async function review(ctx: ExtensionContext, actions: readonly ReviewAction[], applied = board.applied): Promise<boolean> {
+		const changed =
+			ctx.mode === "tui"
+				? actions.length + applied.length > 0 &&
+					(await ctx.ui.custom<boolean>(
+						(tui, theme, _keybindings, done) =>
+							reviewPanelComponent(themeOf(theme), tui, reviewPanel(actions, applied), async effect => {
+								const r = await call(effect.argv);
+								return { ok: r.ok, error: r.error };
+							}, done),
+						{ overlay: true },
+					))
+				: await reviewInDialogs(ctx, actions);
+		// An approved hook runs from the next call; its skill links reach the list at the next /reload.
+		if (changed) {
+			await reloadMatch(ctx.cwd);
+			await creditLoaded(ctx, "pi:approve");
+		}
+		return changed;
+	}
+
+	/** Approve / Decline / Inspect / Later per action (Esc = Later); blocked and conflict actions are shown, not asked. */
+	async function reviewInDialogs(ctx: ExtensionContext, actions: readonly ReviewAction[]): Promise<boolean> {
 		let changed = false;
 		for (const a of actions) {
 			if (!(a.approve && !a.blocked) && !a.decline) {
-				ctx.ui.notify(`rematch: ${a.kind} ${a.name}: ${a.summary}${a.blocked ? ` — ${a.blocked}` : ""} (rematch library inspect ${a.id})`, "warning");
+				ctx.ui.notify(`rematch: ${a.name}: ${a.blocked ?? a.summary}`, "warning");
 				continue;
 			}
 			const choices = reviewChoices(a);
 			const legend = choices.map(c => `${c.label}: ${c.description ?? ""}`).join("\n");
-			let title = `rematch: ${a.kind} ${a.name} — ${a.summary}\n${legend}`;
+			let title = `rematch · ${a.name} — ${a.summary}\n${legend}`;
 			let choice: string | undefined;
 			for (;;) {
 				choice = await ctx.ui.select(title, choices.map(c => c.label));
 				if (choice !== REVIEW_INSPECT) break;
 				const inspected = await call(["library", "inspect", a.id]);
-				title = `rematch: ${a.kind} ${a.name}\n\n${inspected.ok ? stringsOf(inspected.data?.lines).join("\n") : (inspected.error ?? "")}\n\n${legend}`;
+				title = `rematch · ${a.name}\n\n${inspected.ok ? stringsOf(inspected.data?.lines).join("\n") : (inspected.error ?? "")}\n\n${legend}`;
 			}
 			const argv = reviewArgv(a, choice);
 			if (!argv) continue;
 			const r = await call(argv);
 			if (r.ok) changed = true;
 			ctx.ui.notify(`rematch: ${choice === REVIEW_APPROVE ? "approved" : "declined"} ${a.name}${r.ok ? (a.reload ? ` (${a.reload})` : "") : ` (failed: ${r.error})`}`, r.ok ? "info" : "warning");
-		}
-		// An approved hook runs from the next call; its skill links reach the list at the next /reload.
-		if (changed) {
-			await reloadMatch(ctx.cwd);
-			await creditLoaded(ctx, "pi:approve");
 		}
 		return changed;
 	}
@@ -748,6 +797,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			required: ["operation"],
 			additionalProperties: false,
 		} as never,
+		renderCall: renderToolCall,
+		renderResult: renderToolResult,
 		async execute(_id, rawParams, signal, _onUpdate, ctx) {
 			const params = rawParams as { operation: Operation; arguments?: string[] };
 			let value: Envelope;
@@ -783,6 +834,8 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	pi.registerCommand("rematch", {
 		description: `rematch: /rematch ${COMMANDS.join("|")} [args]`,
+		getArgumentCompletions: (prefix: string) =>
+			commandCompletions(prefix, COMMANDS, () => knownActions.map(a => ({ name: a.name, description: a.needsYou ? "needs you" : a.state }))),
 		handler: async (raw: string, ctx: ExtensionCommandContext) => {
 			let value: Envelope | null;
 			let reloadAfter = false;
@@ -800,12 +853,12 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				const target = reviewTarget(shellWords(raw ?? ""));
 				if (target && ctx.hasUI) {
 					// A typed approve/decline without a hash: this action's dialog, which carries it.
-					const inspected = await call(["library", "inspect", target]);
+					const inspected = await call(["library", "inspect", actionIdOf(target, knownActions)]);
 					if (!inspected.ok) throw new Error(inspected.error ?? `no action ${target}`);
-					reloadAfter = await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }));
+					reloadAfter = await review(ctx, reviewActionsOf({ actions: [inspected.data?.action] }), []);
 					value = null;
 				} else if ((operation === "digest" || shellWords(raw ?? "")[0] === "review") && ctx.hasUI) {
-					// Lines as notifications; actions on `/rematch review` as Approve/Decline/Inspect/Later dialogs.
+					// The footer and widget update; `/rematch review` opens the panel (TUI) or one dialog per action.
 					const actions = await showDigest(ctx);
 					reloadAfter = shellWords(raw ?? "")[0] === "review" ? await review(ctx, actions) : false;
 					value = null;
@@ -824,6 +877,11 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (reloadAfter) await ctx.reload();
 		},
 	});
+
+	// Transcript cards: the check view copy, the session-start digest and `/rematch` output.
+	pi.registerMessageRenderer(CHECK_VIEW_TYPE, renderCheckMessage);
+	pi.registerMessageRenderer(DIGEST_TYPE, renderDigestMessage);
+	pi.registerMessageRenderer(OUTPUT_TYPE, renderOutputMessage);
 
 	if (hardOff) return;
 
@@ -929,13 +987,22 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				files: normFiles,
 			});
 		}
-		return checkMessage(rendered, {
+		const details = {
 			hook_id: hook.id,
 			kind: env.data.kind ?? null,
 			ok: env.data.ok === true,
 			errors: env.data.errors ?? 0,
 			duration_ms: env.data.duration_ms ?? 0,
-		});
+			timed_out: env.data.timed_out === true,
+		};
+		// The card: a view copy, appended at the end of the turn and stripped from every request
+		// (`context`); the agent gets the hidden `checkMessage` once per request, as before.
+		try {
+			pi.sendMessage({ customType: CHECK_VIEW_TYPE, content: rendered, display: true, details }, { triggerTurn: false });
+		} catch (error) {
+			log(`check card failed: ${errorText(error)}`);
+		}
+		return checkMessage(rendered, details);
 	}
 
 	function startPendingCheck(cwd: string, signal?: AbortSignal): Promise<Json | null> {
@@ -987,9 +1054,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 
 	// --- context: our transcript output out, then truncate + retrieve (fail open) ------------------
 	pi.on("context", async (event, ctx) => {
-		let messages: unknown[] | null = null;
-		const own = event.messages.filter(m => !(isRecord(m) && m.role === "custom" && m.customType === OUTPUT_TYPE));
-		if (own.length !== event.messages.length) messages = own;
+		let messages: unknown[] | null = withoutViews(event.messages, VIEW_ONLY);
 		if (enabled && contextHooks.length > 0) {
 			try {
 				messages = truncateToolResults(messages ?? event.messages, contextHooks) ?? messages;
@@ -1067,7 +1132,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (event.reason === "reload") return;
 			spawnReflect();
 			// Dialogs may outlive the handler: presented detached, never throwing.
-			void showDigest(ctx).catch(error => log(`digest failed: ${errorText(error)}`));
+			void showDigest(ctx, true).catch(error => log(`digest failed: ${errorText(error)}`));
 			const g = globalThis as Record<symbol, unknown>;
 			if (profilePresent && !g[PROFILE_SYNCED]) {
 				g[PROFILE_SYNCED] = true;

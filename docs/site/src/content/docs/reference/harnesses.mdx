@@ -18,10 +18,10 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 | Stuck-call detection | Yes | Completed calls | Yes | Completed calls | No |
 | Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
 | Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
-| Post-edit fast check (`fast-check`) | Before next request (`context`) | `PostToolUse` `additionalContext` | Before next request (`context`) | Experimental system transform | No (post-hoc only) |
+| Post-edit fast check (`fast-check`) | After each edit batch, before the next request: one displayed aside (the card is what the agent receives) | `PostToolUse` `additionalContext` | Before next request (`context`, hidden); a display-only card at turn end | Experimental system transform | No (post-hoc only) |
 | Generated subagents | Yes, once approved | Adapted copies, once approved | No native subagent definitions | Not delivered | No |
 | Personal instructions (approved `AGENTS.fragment.md`) | Marked block in `<agent_dir>/AGENTS.md`, loaded natively; no runtime insertion | Runtime: session-start context | Runtime: `before_agent_start` | Runtime: system transform | No: skills only |
-| Digest and waiting actions | Toasts, footer status, review dialog | Session-start message | Notifications, review dialog | TUI toast or `/rematch-digest` | CLI/optional status skill |
+| Digest and waiting actions | `◆ rematch` footer, needs-you line above the editor, a session-start card when something changed, review panel (`alt+e`) with an Applied tab and undo; transcript cards for checks and `/rematch` output | Session-start message | Same footer, line, cards and panel as omp (`/rematch review`; dialogs in RPC) | TUI toast or `/rematch-digest` | CLI/optional status skill |
 | User approval (`--sha` bound) | Dialog supplies the hash; or the command | Command printed with its hash | Dialog supplies the hash; or the command | Command printed with its hash | CLI |
 | Detached reflection trigger | Session start | Session start | Session start | Plugin start | Manual |
 | History importer | Yes | Yes | Native session files | Read-only SQLite store | Rollout files |
@@ -30,6 +30,8 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 **Verified targets:** omp 18.12.6, Claude Code 2.1.285, `@earendil-works/pi-coding-agent` 1.4.0, and `opencode-ai` / `@opencode-ai/plugin` 1.19.4. Old Pi package names and OpenCode 2 are not tested compatibility targets.
 
 Pi and OpenCode acceptance tests launch their **real pinned runtimes** with a local scripted model and isolated state. This proves adapter behavior, not cloud-provider performance or a measured improvement in the agent.
+
+**Look in a terminal UI.** omp and Pi share one renderer (`extension/ui.ts`, host theme colors, every line within the terminal width); RPC and print modes get plain text and the review falls back to one dialog per action. Claude Code, OpenCode and Codex keep their host's own text surfaces.
 
 ## Commands per harness
 

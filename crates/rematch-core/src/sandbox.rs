@@ -82,6 +82,59 @@ impl ScriptDryRun {
     }
 }
 
+impl SandboxReport {
+    /// What the dry run showed, for host UIs: the runner, whether every script ran clean, the
+    /// first non-zero exit code (`0` when all exited 0, `null` when one was killed or none ran),
+    /// the paths a script tried to write outside its sandbox (the sandbox `$HOME` shown as `~`),
+    /// whether one tried the network, and each script's exit and verdict.
+    pub fn observed(&self) -> serde_json::Value {
+        let mut writes: Vec<String> = Vec::new();
+        let mut network = false;
+        for v in self.scripts.iter().flat_map(|s| s.violations.iter()) {
+            if let Some(p) = blocked_write(v) {
+                if !writes.contains(&p) {
+                    writes.push(p);
+                }
+            }
+            let l = v.to_ascii_lowercase();
+            network |= l.contains("network") || l.contains("could not resolve host") || l.contains("failed to connect");
+        }
+        let exit_code = self.scripts.iter().map(|s| s.exit_code).find(|c| *c != Some(0)).unwrap_or(Some(0));
+        serde_json::json!({
+            "runner": self.scripts.first().map(|s| s.runner.as_str()).unwrap_or("unsupported"),
+            "clean": self.clean,
+            "exit_code": exit_code,
+            "writes_outside": writes,
+            "network": network,
+            "scripts": self.scripts.iter().map(|s| serde_json::json!({"script": s.script, "exit_code": s.exit_code, "clean": s.clean})).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The path of a denied write in a violation line (`mkdir: /x/.ledger: Operation not permitted`,
+/// `attempted write to /x`), else `None`.
+fn blocked_write(violation: &str) -> Option<String> {
+    if let Some(target) = violation.strip_prefix("attempted write to ") {
+        return Some(target.trim().to_string());
+    }
+    let l = violation.to_ascii_lowercase();
+    if !(l.contains("operation not permitted") || l.contains("permission denied") || l.contains("read-only file system")) {
+        return None;
+    }
+    violation
+        .split(": ")
+        .map(|s| s.trim().trim_matches(['"', '\'']))
+        .find(|s| s.starts_with('/') || s.starts_with("~/") || *s == "~")
+        .map(str::to_string)
+}
+
+/// `text` with every occurrence of the sandbox's `$HOME` (`homes`, longest first) shown as `~`.
+fn home_relative(text: &str, homes: &[&Path]) -> String {
+    let mut keys: Vec<String> = homes.iter().map(|h| h.to_string_lossy().into_owned()).filter(|h| !h.is_empty()).collect();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    keys.iter().fold(text.to_string(), |out, k| out.replace(k.as_str(), "~"))
+}
+
 /// Whether the current platform has a working script sandbox runner (`sandbox-exec` on macOS,
 /// `bwrap` on Linux).
 pub fn available_runner() -> Option<&'static str> {
@@ -259,8 +312,10 @@ pub fn dry_run_script(rel: &str, script_path: &Path) -> ScriptDryRun {
 
     let out = child.wait_with_output().ok();
     let exit_code = if timed_out { None } else { out.as_ref().and_then(|o| o.status.code()) };
-    let stdout = out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    let stderr = out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_default();
+    // The sandbox `$HOME` is a throwaway dir: what a script tried there reads as `~/…`.
+    let homes = [probe.as_path(), probe_tmp.path()];
+    let stdout = home_relative(&out.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default(), &homes);
+    let stderr = home_relative(&out.as_ref().map(|o| String::from_utf8_lossy(&o.stderr).into_owned()).unwrap_or_default(), &homes);
 
     let temp_writes = collect_files(&scratch);
     let mut violations = extract_violations(&stderr, &String::from_utf8_lossy(&bytes));

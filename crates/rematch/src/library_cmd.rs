@@ -30,7 +30,8 @@ pub enum LibraryCmd {
         #[arg(long, value_name = "TS")]
         asof: Option<String>,
     },
-    /// Retire an entry now (user disable; counts as harm for that session).
+    /// Retire an entry now (user disable; counts as harm for that session). `id` is an entry id
+    /// or the name of exactly one live entry.
     Disable {
         id: String,
         #[arg(long, default_value = "user request")]
@@ -85,7 +86,7 @@ pub fn cmd_library(ctx: &AppCtx, cmd: LibraryCmd) -> Result<Value> {
         LibraryCmd::Why { session, asof } => why(ctx, session.as_deref(), asof.as_deref()),
         LibraryCmd::Disable { id, reason } => {
             let before = exposed(ctx);
-            let e = get(ctx, &id)?;
+            let e = get_live(ctx, &id)?;
             let e = if is_foreign(ctx, &e) {
                 let mut u = e.clone();
                 u.pinned = false;
@@ -181,6 +182,24 @@ fn not_an_action(ctx: &AppCtx, id: &str, verb: &str, err: anyhow::Error) -> anyh
 
 fn get(ctx: &AppCtx, id: &str) -> Result<Entry> {
     ctx.ledger.find_entry(id)?.ok_or_else(|| anyhow!("no entry {id:?}"))
+}
+
+/// An entry by id, else the one live (not retired) entry of that name; a name several live
+/// entries share is refused with their ids. A name no live entry has falls back to [`get`].
+fn get_live(ctx: &AppCtx, id_or_name: &str) -> Result<Entry> {
+    if let Some(e) = ctx.ledger.get_entry(id_or_name)? {
+        return Ok(e);
+    }
+    let mut live = crate::actions::live_named(ctx, id_or_name)?;
+    match live.len() {
+        0 => get(ctx, id_or_name),
+        1 => Ok(live.remove(0)),
+        _ => bail!(
+            "{id_or_name:?} names {} live entries ({}); pass one id",
+            live.len(),
+            live.iter().map(|e| format!("{} in {}", e.id, e.branch)).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// Personal-instruction blocks in the personal `AGENTS.md` now: `(name, fragment sha)`.

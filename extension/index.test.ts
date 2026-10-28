@@ -373,6 +373,8 @@ async function host(name: string, state: HostState) {
 	const execs: string[][] = [];
 	const statuses: (string | undefined)[] = [];
 	const titles: string[] = [];
+	/** Every `pi.sendMessage(message, options)`, in order. */
+	const sent: { message: Record<string, unknown>; options?: Record<string, unknown> }[] = [];
 	const handlers = new Map<string, Handler>();
 	let command: Handler | null = null;
 	let shortcut: Handler | null = null;
@@ -433,7 +435,9 @@ async function host(name: string, state: HostState) {
 			shortcut = (_event, ctx) => spec.handler(ctx);
 		},
 		appendEntry() {},
-		sendMessage() {},
+		sendMessage(message: Record<string, unknown>, options?: Record<string, unknown>) {
+			sent.push({ message, options });
+		},
 	};
 	try {
 		await rematch(pi as never);
@@ -492,6 +496,7 @@ async function host(name: string, state: HostState) {
 		matches: () => execs.filter(a => a[0] === "match").map(a => a[2]),
 		settings: pi.pi.settings,
 		statuses,
+		sent,
 		titles,
 		root,
 	};
@@ -522,59 +527,52 @@ describe("factory", () => {
 		expect(retrievals[0].entry_ids).toEqual(["hook-retrieve"]);
 	});
 
-	test("fast-check: runs after file edits, injects hidden context message before next turn, records check_ran, and clears on new user input", async () => {
+	const checks = (h: { sent: { message: Record<string, unknown>; options?: Record<string, unknown> }[] }) => h.sent.filter(s => s.message.customType === CHECK_TYPE);
+
+	test("fast-check: the edits of a batch are checked once, delivered as one displayed aside (the card is the injection), check_ran recorded, never re-sent by context", async () => {
 		const checkFile = writeHook("hook-check", "check", { timeout_secs: 30, budget_bytes: 4096 });
 		const h = await host("fast-check", {
 			entries: [{ id: "hook-check", predicate_hit: true }],
 			hooks: [checkFile],
 		});
 		await h.fire("session_start");
-		// No edits yet -> context returns undefined and runs no check
-		expect(await h.fire("context", { messages: [user("fix the bug")] })).toBeUndefined();
-		expect(h.execs.filter(a => a[0] === "check")).toHaveLength(0);
-
-		// Non-mutating tool result -> still no check
+		// A read runs no check.
 		await h.fire("tool_result", { toolName: "read", toolCallId: "r1", input: { path: "src/lib.rs" }, content: [], isError: false });
-		expect(await h.fire("context", { messages: [user("fix the bug")] })).toBeUndefined();
 		expect(h.execs.filter(a => a[0] === "check")).toHaveLength(0);
 
-		// Mutating tool result -> schedules check; awaiting context runs/finishes it and appends one hidden custom message
-		await h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false });
-		await h.fire("tool_result", { toolName: "write", toolCallId: "e2", input: { path: "src/helper.rs" }, content: [], isError: false });
-		const msgs = contextMessages(await h.fire("context", { messages: [user("fix the bug")] }));
-		const injected = msgs.at(-1) as Record<string, unknown>;
-		expect(injected).toMatchObject({
-			role: "custom",
-			customType: CHECK_TYPE,
-			display: false,
-		});
-		expect(String(injected.content)).toContain("src/lib.rs:4:13 [E0308] mismatched types");
-		expect(String(injected.content)).toContain("help: try using a conversion method: `x.to_string()`");
-
-		const checkArgv = h.execs.find(a => a[0] === "check") ?? [];
-		expect(checkArgv.slice(checkArgv.indexOf("--files"))).toEqual(["--files", "src/lib.rs", "src/helper.rs"]);
+		// Two edits of one batch: one check for both files, awaited by their tool_result handlers.
+		await Promise.all([
+			h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false }),
+			h.fire("tool_result", { toolName: "write", toolCallId: "e2", input: { path: "src/helper.rs" }, content: [], isError: false }),
+		]);
+		const checkArgv = h.execs.filter(a => a[0] === "check");
+		expect(checkArgv).toHaveLength(1);
+		expect(checkArgv[0]!.slice(checkArgv[0]!.indexOf("--files"))).toEqual(["--files", "src/lib.rs", "src/helper.rs"]);
+		const [card] = checks(h);
+		expect(checks(h)).toHaveLength(1);
+		expect(card!.options).toEqual({ deliverAs: "aside" });
+		expect(card!.message).toMatchObject({ customType: CHECK_TYPE, display: true, details: { kind: "cargo", ok: false, errors: 1 } });
+		expect(String(card!.message.content)).toContain("src/lib.rs:4:13 [E0308] mismatched types");
+		expect(String(card!.message.content)).toContain("help: try using a conversion method: `x.to_string()`");
 
 		const checkRecs = h.traceOf().filter(r => r.ev === "check_ran");
 		expect(checkRecs).toHaveLength(1);
-		expect(checkRecs[0]).toMatchObject({
-			hook_id: "hook-check",
-			kind: "cargo",
-			ok: false,
-			errors: 1,
-			duration_ms: 42,
-			files: ["src/lib.rs", "src/helper.rs"],
-		});
+		expect(checkRecs[0]).toMatchObject({ hook_id: "hook-check", kind: "cargo", ok: false, errors: 1, duration_ms: 42, files: ["src/lib.rs", "src/helper.rs"] });
 
-		// Next user input clears the previous turn's check message until another edit happens
+		// The aside is the only delivery: requests are not rewritten to carry it again.
+		expect(await h.fire("context", { messages: [user("fix the bug")] })).toBeUndefined();
+		// A new input starts a new file set.
 		await h.fire("input", { text: "thanks", source: "user" });
-		expect(await h.fire("context", { messages: [user("thanks")] })).toBeUndefined();
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e3", input: { path: "src/other.rs" }, content: [], isError: false });
+		const last = h.execs.filter(a => a[0] === "check").at(-1)!;
+		expect(last.slice(last.indexOf("--files"))).toEqual(["--files", "src/other.rs"]);
 	});
 
-	test("fast-check: a second edit aborts an in-flight check, restarts with the union of files, and clears lastCheckMsg when the new check yields nothing", async () => {
+	test("fast-check: a second edit aborts an in-flight check; only the run with the union of files is delivered", async () => {
 		const checkFile = writeHook("hook-check-abort", "check", { timeout_secs: 30, budget_bytes: 4096 });
 		const abortedSignals: boolean[] = [];
-		let firstStarted = Promise.withResolvers<void>();
-		let releaseFirst = Promise.withResolvers<void>();
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
 		let callCount = 0;
 		const state: HostState = {
 			entries: [{ id: "hook-check-abort", predicate_hit: true }],
@@ -610,23 +608,19 @@ describe("factory", () => {
 		h.ctx.cwd = "/repo/crates/a";
 		await h.fire("session_start");
 
-		// First edit starts after debounce
-		await h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false });
+		const first = h.fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "src/lib.rs" }, content: [], isError: false });
 		await firstStarted.promise;
-
-		// Second edit arrives while first check is in flight -> aborts first check and unions files
+		// The second edit arrives while the first check runs: it aborts it and checks both files.
 		await h.fire("tool_result", { toolName: "edit", toolCallId: "e2", input: { path: "/repo/crates/b/src/lib.rs" }, content: [], isError: false });
+		await first;
 		expect(abortedSignals).toEqual([true]);
-
-		const msgs = contextMessages(await h.fire("context", { messages: [user("fix")] }));
-		const injected = msgs.at(-1) as Record<string, unknown>;
-		expect(String(injected.content)).toContain("crates/b/src/lib.rs:1:1 [E0308]");
-
+		expect(checks(h)).toHaveLength(1);
+		expect(String(checks(h)[0]!.message.content)).toContain("crates/b/src/lib.rs:1:1 [E0308]");
 		const checkCalls = h.execs.filter(a => a[0] === "check");
 		expect(checkCalls).toHaveLength(2);
 		expect(checkCalls[1]!.slice(checkCalls[1]!.indexOf("--files"))).toEqual(["--files", "src/lib.rs", "/repo/crates/b/src/lib.rs"]);
 
-		// Only the non-aborted check recorded check_ran, with repo-top-normalized files
+		// Only the delivered run recorded check_ran, with repo-top-normalized files.
 		const checkRecs = h.traceOf().filter(r => r.ev === "check_ran");
 		expect(checkRecs).toHaveLength(1);
 		expect(checkRecs[0]!.files).toEqual(["crates/a/src/lib.rs", "crates/b/src/lib.rs"]);
@@ -635,9 +629,9 @@ describe("factory", () => {
 			"crates/b/src/lib.rs",
 		]);
 
-		// A subsequent edit whose check yields nothing overwrites (clears) lastCheckMsg
+		// A check with nothing to say delivers nothing.
 		await h.fire("tool_result", { toolName: "edit", toolCallId: "e3", input: { path: "README.md" }, content: [], isError: false });
-		expect(await h.fire("context", { messages: [user("fix")] })).toBeUndefined();
+		expect(checks(h)).toHaveLength(1);
 	});
 
 	const stuckFile = () => writeHook("hook-stuck", "stuck", { repeats: 3 });
@@ -704,10 +698,11 @@ describe("factory", () => {
 		await h.fire("session_start");
 		await h.digest(); // Esc
 		expect(h.titles, "one dialog: the review's, none from the session start").toHaveLength(1);
-		expect(h.statuses.length >= 2 && h.statuses.every(s => s === "rematch: 1 waiting · /rematch review"), "start and digest both show it").toBe(true);
+		const waiting = "◆ rematch ● 1 needs you alt+e";
+		expect(h.statuses.filter(s => s !== undefined).length >= 2 && h.statuses.filter(s => s !== undefined).every(s => s === waiting), "start and digest both show it").toBe(true);
 		await h.command("review"); // Later
 		expect(h.execs.filter(a => a[0] === "library"), "nothing approved or declined").toEqual([]);
-		expect(h.statuses.at(-1), "still pending after the digest cursor moved").toBe("rematch: 1 waiting · /rematch review");
+		expect(h.statuses.at(-1), "still pending after the digest cursor moved").toBe(waiting);
 		await h.command("review"); // Inspect, then Decline
 		expect(h.execs.filter(a => a[0] === "library")).toEqual([["library", "inspect", "hook-stuck"], ["library", "decline", "hook-stuck"]]);
 		expect(h.titles.at(-1)).toContain("inspected hook-stuck");

@@ -15,7 +15,8 @@ In a terminal, add `--text` for readable lines instead of JSON. How `/rematch` c
 |---|---|
 | During a session | traces it; no model call |
 | You correct the agent (*"no, …"*, *"revert that"*, an interrupt, ≥ 3 tool errors in any 6 consecutive results) | flags the session at exit |
-| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, ≤ 3 editor/classifier calls); news arrives as a toast, and the footer shows `rematch: N waiting · /rematch review` while any action needs your decision |
+| Next session start | starts a reflection in the background, detached, so it runs while you work (about 20 s, ≤ 3 editor/classifier calls); when something changed since the last session (kept, retired, applied automatically, a probe verdict) one `◆ rematch` card appears in the transcript (shown, never sent to the model). While an action needs your decision a line above the editor names it, and the footer reads `◆ rematch ✓ cargo 0.4s · 6 on trial · ● 1 needs you alt+e` |
+| After the agent edits files (`fast-check`) | checks the edited files before the next model request; the result is one `◆ rematch · fast-check` card in the transcript: a single line when clean, else the errors and the unedited callers it sent to the agent (`ctrl+o` shows exactly what the agent received). The footer shows `⠋ cargo` while it runs |
 | Later matching sessions | exposes provisional trials only in matching places (`views/<key>/`) and counts `matched`, `used`, `used_clean`, `recurrence` and `harm`; a reflect pass can also run 1 authorized automatic probe. ≥ 4 clean actual uses (`accepted_in_use`) or a supporting probe (`comparative_support`) → kept; 2 recurrences, 2 harms or a regressed probe → retired |
 
 The reflection uses the models you configured; `rematch doctor --text` shows which.
@@ -25,7 +26,7 @@ The reflection uses the models you configured; `rematch doctor --text` shows whi
 | Ask | You get |
 |---|---|
 | `/rematch status` | entries by status, waiting `actions`, `applied` personal instruction blocks, active automatic `trials`, personal `instructions` exposure, latest `probes`, detached jobs, and whether rematch is off |
-| `/rematch review` (`alt+e` in omp) | one dialog per waiting action (`Approve` / `Decline` / `Inspect` / `Later`); `Inspect` shows the full diff inside the dialog |
+| `/rematch review` (`alt+e` in omp) | the review panel: **Needs you** lists every waiting action with what approving does, why it waits, what a script did in its sandbox dry run and the diff (`a` approve, `d` decline, `i` full diff, `↑↓` item, `esc` later); **Applied** lists what rematch applied on its own and why (`u` undo, then `y`). Results show in the panel. Outside the TUI (RPC) each action is one dialog (`Approve` / `Decline` / `Inspect` / `Later`) |
 | `/rematch why` | for the last session: entries loaded, personal instructions loaded from `<agent_dir>/AGENTS.md`, predicate hits, redirects and their class, counters |
 | `/rematch library` | every entry with its raw counts and surfaces, plus waiting `actions`, `applied` blocks, running `trials` and personal `instructions` exposure |
 | `/rematch digest` | status changes since the last digest, plus every waiting action (listed every time until you decide) |
