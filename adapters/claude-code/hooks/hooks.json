@@ -1,5 +1,5 @@
 {
-  "description": "rematch: every event is forwarded unchanged to the rematch binary, which writes the trace (DESIGN §3, §18.1); SessionStart also starts `rematch reflect --pending` detached and returns the digest; PreToolUse asks the binary for the approved block/stuck verdict.",
+  "description": "rematch: every event is forwarded unchanged to the rematch binary, which writes the trace (DESIGN §3, §18.1); SessionStart and SessionEnd also start `rematch reflect --pending` detached, and SessionStart returns the digest; PreToolUse asks the binary for the approved block/stuck verdict.",
   "hooks": {
     "SessionStart": [
       {
@@ -25,7 +25,7 @@
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "trace-event"], "timeout": 10 }
+          { "type": "command", "command": "sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "trace-event"], "timeout": 35 }
         ]
       }
     ],
@@ -53,7 +53,7 @@
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "trace-event"], "timeout": 5 }
+          { "type": "command", "command": "sh", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.sh", "session-end"], "timeout": 5 }
         ]
       }
     ]

@@ -42,7 +42,7 @@ pub fn job_spec(ctx: &AppCtx, args: &RunArgs) -> Result<JobSpec> {
     if !task.repo.is_dir() {
         bail!("task {} repo {} is missing", task.id, task.repo.display());
     }
-    let verifier = match args.verifier.clone().or_else(|| task.verifier.clone()) {
+    let verifier = match args.verifier.clone().or_else(|| task.verifier.clone()).or_else(|| super::verifier::default_spec_for(&task.repo).map(|(v, _)| v)) {
         Some(v) => v,
         None => bail!(Usage("batch mode requires a verifier: pass --verifier or define it with `task add --verifier`".into())),
     };

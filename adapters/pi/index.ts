@@ -17,6 +17,9 @@ import {
 	CallHistory,
 	callKey,
 	changedPaths,
+	CHECK_DEBOUNCE_MS,
+	checkMessage,
+	normalizeCheckFiles,
 	changesLoaded,
 	COMMANDS,
 	commandToOperation,
@@ -421,6 +424,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let callHooks: Hook[] = [];
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
+	let checkHooks: Hook[] = [];
 	let profilePresent = false;
 
 	/** Match and sync `cwd`; a failed match keeps the previous hooks, a failed sync adds no dir. Never throws. */
@@ -448,8 +452,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			loadedEntries = piLoadedEntries(data, next);
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
-			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
+			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve" || h.mode === "check");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
+			checkHooks = next.filter(h => h.mode === "check");
 			promptFragments = promptFragmentsOf(data);
 		}
 		if (sync.ok && sync.data?.off !== true) {
@@ -486,7 +491,12 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let lastRetrieval: { key: string; units: RetrievedUnit[] } | null = null;
 	let lastTracedUnits = "";
 	let lastInjected: { content: string; message: Json } | null = null;
-
+	const pendingCheckFiles = new Set<string>();
+	let checkDebounceTimer: NodeJS.Timeout | undefined;
+	let checkAbort: AbortController | null = null;
+	let checkPromise: Promise<Json | null> | null = null;
+	let checkDirty = false;
+	let lastCheckMsg: Json | null = null;
 	const modelOf = (ctx: ExtensionContext): ModelRef | null => (ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null);
 
 	function write(ev: string, fields: Json): number | null {
@@ -620,6 +630,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			}
 		}
 		trace = null;
+		spawnReflect();
 	}
 
 	function spawnReflect(): void {
@@ -644,7 +655,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		if (lines.length > 5) ctx.ui.notify(`rematch: +${lines.length - 5} more (/rematch digest)`, "info");
 		const actions = reviewActionsOf(env.data);
 		ctx.ui.setStatus("rematch", pendingStatus(actions));
-		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for you — /rematch review; nothing changes until you decide`, "info");
+		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for your review — /rematch review; low-risk items are applied automatically and waiting items wait for your decision`, "info");
 		return actions;
 	}
 
@@ -892,6 +903,88 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		return lastInjected.message;
 	}
 
+	async function executeCheck(files: readonly string[], cwd: string, signal: AbortSignal): Promise<Json | null> {
+		const hook = checkHooks[0];
+		if (!hook || !trace || files.length === 0) return null;
+		const timeoutSecs = Math.max(1, Math.floor(hook.params.timeout_secs ?? 30));
+		const budgetBytes = Math.max(256, Math.floor(hook.params.budget_bytes ?? 4096));
+		const argv = [
+			"check", "--cwd", cwd, "--timeout", String(timeoutSecs), "--budget-bytes", String(budgetBytes),
+			"--files", ...files,
+		];
+		const env = await call(argv, { timeout: (timeoutSecs + 5) * 1000, signal, cwd });
+		if (signal.aborted || !env.ok || !isRecord(env.data)) return null;
+		const rendered = typeof env.data.rendered === "string" ? env.data.rendered.trim() : "";
+		if (!rendered) return null;
+		if (env.data.detected === true && trace) {
+			const serverFiles = stringsOf(env.data.files);
+			const normFiles = serverFiles.length > 0 ? serverFiles : normalizeCheckFiles(files, cwd, trace.repo);
+			write("check_ran", {
+				hook_id: hook.id,
+				kind: typeof env.data.kind === "string" ? env.data.kind : "check",
+				ok: env.data.ok === true,
+				errors: typeof env.data.errors === "number" ? env.data.errors : 0,
+				duration_ms: typeof env.data.duration_ms === "number" ? env.data.duration_ms : 0,
+				injected_bytes: Buffer.byteLength(rendered, "utf8"),
+				files: normFiles,
+			});
+		}
+		return checkMessage(rendered, {
+			hook_id: hook.id,
+			kind: env.data.kind ?? null,
+			ok: env.data.ok === true,
+			errors: env.data.errors ?? 0,
+			duration_ms: env.data.duration_ms ?? 0,
+		});
+	}
+
+	function startPendingCheck(cwd: string, signal?: AbortSignal): Promise<Json | null> {
+		clearTimeout(checkDebounceTimer);
+		checkDebounceTimer = undefined;
+		checkAbort?.abort();
+		const ctrl = new AbortController();
+		if (signal?.aborted) ctrl.abort();
+		else signal?.addEventListener("abort", () => ctrl.abort(), { once: true });
+		checkAbort = ctrl;
+		checkDirty = false;
+		const files = [...pendingCheckFiles];
+		const runPromise = executeCheck(files, cwd, ctrl.signal).then(msg => {
+			if (!ctrl.signal.aborted && checkAbort === ctrl) {
+				lastCheckMsg = msg;
+				checkPromise = null;
+			}
+			return lastCheckMsg;
+		});
+		checkPromise = runPromise;
+		return runPromise;
+	}
+
+	function scheduleCheck(paths: readonly string[], cwd: string): void {
+		if (checkHooks.length === 0 || paths.length === 0) return;
+		for (const p of paths) pendingCheckFiles.add(p);
+		checkDirty = true;
+		lastCheckMsg = null;
+		checkAbort?.abort();
+		checkAbort = null;
+		checkPromise = null;
+		clearTimeout(checkDebounceTimer);
+		checkDebounceTimer = setTimeout(() => {
+			checkDebounceTimer = undefined;
+			void startPendingCheck(cwd);
+		}, CHECK_DEBOUNCE_MS);
+		checkDebounceTimer.unref?.();
+	}
+
+	async function awaitCheckMessage(cwd: string, signal?: AbortSignal): Promise<Json | null> {
+		if (checkHooks.length === 0) return null;
+		if (checkDirty || checkDebounceTimer !== undefined) {
+			await startPendingCheck(cwd, signal);
+		} else if (checkPromise) {
+			await checkPromise.catch(() => null);
+		}
+		return lastCheckMsg;
+	}
+
 	// --- context: our transcript output out, then truncate + retrieve (fail open) ------------------
 	pi.on("context", async (event, ctx) => {
 		let messages: unknown[] | null = null;
@@ -908,6 +1001,12 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				if (extra) messages = [...(messages ?? event.messages), extra];
 			} catch (error) {
 				log(`retrieve hook failed: ${errorText(error)}`);
+			}
+			try {
+				const checkMsg = await awaitCheckMessage(ctx.cwd, ctx.signal);
+				if (checkMsg) messages = [...(messages ?? event.messages), checkMsg];
+			} catch (error) {
+				log(`check hook failed: ${errorText(error)}`);
 			}
 		}
 		return messages ? { messages: messages as typeof event.messages } : undefined;
@@ -956,6 +1055,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			lastRetrieval = null;
 			lastTracedUnits = "";
 			lastInjected = null;
+			pendingCheckFiles.clear();
+			clearTimeout(checkDebounceTimer);
+			checkDebounceTimer = undefined;
+			checkAbort?.abort();
+			checkAbort = null;
+			checkPromise = null;
+			checkDirty = false;
+			lastCheckMsg = null;
 			await openTrace(ctx, event.reason);
 			if (event.reason === "reload") return;
 			spawnReflect();
@@ -1004,6 +1111,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				skills_invoked: skillsInvoked(text),
 			});
 			trace.lastInput = text;
+			pendingCheckFiles.clear();
+			clearTimeout(checkDebounceTimer);
+			checkDebounceTimer = undefined;
+			checkAbort?.abort();
+			checkAbort = null;
+			checkPromise = null;
+			checkDirty = false;
+			lastCheckMsg = null;
 			if (label === "none") return;
 			trace.reasons.add(label.startsWith("mark:") ? label : `redirect:${label}`);
 			try {
@@ -1050,7 +1165,11 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				path: typeof rawPath === "string" ? stripSelectors(rawPath) : null,
 			});
 			if (trace.errors.push(isError)) trace.reasons.add("tool_error_cluster");
-			if (!isError) for (const p of changedPaths(event.toolName, input)) trace.changed.add(p);
+			if (!isError) {
+				const touched = changedPaths(event.toolName, input);
+				for (const p of touched) trace.changed.add(p);
+				if (touched.length > 0) scheduleCheck(touched, ctx.cwd);
+			}
 		}),
 	);
 

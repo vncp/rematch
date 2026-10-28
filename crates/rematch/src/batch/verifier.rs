@@ -2,6 +2,7 @@
 //! against a known result, or a reconcile receipt; never a model's opinion).
 //!
 //! Spec strings accepted by `run --verifier` / `task add --verifier`:
+//! - `check`: [`CheckVerifier`] (the repo's detected fast check via `rematch_core::check`)
 //! - `tests` / `test`: [`TestVerifier`] (cargo / pytest / bun autodetected from files)
 //! - `parity:<produced>=<expected>`: [`ParityVerifier`]; `<produced>` is relative to the
 //!   worktree, `<expected>` a file path or a 64-hex sha256
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+use rematch_core::check::{self, CheckSpec};
 use rematch_core::features::head;
 use rematch_core::ledger::sha256_hex;
 use rematch_core::Verdict;
@@ -38,6 +40,8 @@ pub struct ScriptVerifier {
 
 /// Runs the project's test suite, detected from the files present.
 pub struct TestVerifier;
+/// Runs the project's detected fast check (`rematch_core::check::detect`).
+pub struct CheckVerifier;
 
 /// sha256 of a produced file against an expected file or digest.
 pub struct ParityVerifier {
@@ -54,6 +58,9 @@ pub fn parse_spec(spec: &str) -> Result<Box<dyn Verifier>> {
     let s = spec.trim();
     if s.is_empty() {
         bail!("empty verifier");
+    }
+    if s == "check" {
+        return Ok(Box::new(CheckVerifier));
     }
     if s == "tests" || s == "test" {
         return Ok(Box::new(TestVerifier));
@@ -174,6 +181,47 @@ impl Verifier for ScriptVerifier {
 
     fn describe(&self) -> String {
         format!("script:{}", self.cmd)
+    }
+}
+
+/// Default verifier spec `(spec, source)` for a task in `repo` when none was explicitly set:
+/// the detected fast check (`check`), else the detected test suite (`tests`).
+pub fn default_spec_for(repo: &Path) -> Option<(String, String)> {
+    if let Some(c) = check::detect(repo) {
+        return Some(("check".into(), format!("detected: check ({})", c.kind.as_str())));
+    }
+    if TestVerifier::detect(repo).is_some() {
+        return Some(("tests".into(), "detected: tests".into()));
+    }
+    None
+}
+
+/// A task's explicit verifier, else [`default_spec_for`] its repository.
+pub fn resolve_spec_for_task(task: &Task) -> Option<(String, String)> {
+    if let Some(v) = task.verifier.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some((v.to_string(), "task".into()));
+    }
+    default_spec_for(&task.repo)
+}
+
+impl CheckVerifier {
+    pub fn detect(worktree: &Path) -> Option<CheckSpec> {
+        check::detect(worktree)
+    }
+}
+
+impl Verifier for CheckVerifier {
+    fn check(&self, task: &Task, worktree: &Path) -> Result<Verdict> {
+        let files: Vec<PathBuf> = task.editable.iter().map(PathBuf::from).collect();
+        let spec = check::detect_for_files(worktree, &files)
+            .ok_or_else(|| anyhow!("no fast check detected in {} (Cargo.toml, tsconfig.json, ruff/mypy/pyright, go.mod)", worktree.display()))?;
+        let rep = crate::check::run(&spec, &files, timeout(task));
+        let detail = rep.rendered.clone().unwrap_or_else(|| rep.command.join(" "));
+        Ok(verdict(rep.ok, None, head(&format!("{}: {detail}", rep.command.join(" ")), DETAIL_CHARS)))
+    }
+
+    fn describe(&self) -> String {
+        "check".into()
     }
 }
 
@@ -319,14 +367,38 @@ mod tests {
     }
 
     #[test]
-    fn batch_test_runner_detection() {
+    fn batch_test_runner_and_check_detection() {
         let d = tempfile::tempdir().unwrap();
+        check::clear_detect_cache();
         assert!(TestVerifier::detect(d.path()).is_none());
-        std::fs::write(d.path().join("pyproject.toml"), "").unwrap();
+        assert!(default_spec_for(d.path()).is_none());
+        std::fs::write(d.path().join("pytest.ini"), "").unwrap();
         assert_eq!(TestVerifier::detect(d.path()).unwrap()[0], "python3");
-        std::fs::write(d.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(default_spec_for(d.path()), Some(("tests".into(), "detected: tests".into())));
+        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n").unwrap();
+        check::clear_detect_cache();
         assert_eq!(TestVerifier::detect(d.path()).unwrap()[0], "cargo");
+        assert_eq!(default_spec_for(d.path()), Some(("check".into(), "detected: check (cargo)".into())));
+        assert!(parse_spec("check").is_ok());
         assert!(parse_spec("tests").is_ok());
         assert!(parse_spec("  ").is_err());
+    }
+
+    #[test]
+    fn batch_check_verifier_detects_subdirectory_crate_via_editable_files() {
+        let d = tempfile::tempdir().unwrap();
+        check::clear_detect_cache();
+        let sub = d.path().join("backend");
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        std::fs::write(sub.join("Cargo.toml"), "[package]\nname = \"backend\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::write(sub.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+        let mut t = task(d.path());
+        t.editable = vec!["backend/src/lib.rs".into()];
+        let v = parse_spec("check").unwrap();
+        assert!(is_pass(&v.check(&t, d.path()).unwrap()), "clean subdirectory crate passes");
+        std::fs::write(sub.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { \"bad\" }\n").unwrap();
+        let fail = v.check(&t, d.path()).unwrap();
+        assert!(!is_pass(&fail), "broken subdirectory crate fails");
+        assert!(detail_of(&fail).contains("E0308"), "{}", detail_of(&fail));
     }
 }

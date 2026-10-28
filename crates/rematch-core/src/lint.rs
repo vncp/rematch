@@ -695,11 +695,13 @@ pub const TRUNCATE_KEEP_CHARS: std::ops::RangeInclusive<u32> = 200..=100_000;
 pub const STUCK_REPEATS: std::ops::RangeInclusive<u32> = 2..=20;
 pub const RETRIEVE_BUDGET_BYTES: std::ops::RangeInclusive<u32> = 500..=65_536;
 pub const RETRIEVE_MIN_OVERLAP: std::ops::RangeInclusive<u32> = 1..=20;
+pub const CHECK_TIMEOUT_SECS: std::ops::RangeInclusive<u32> = 1..=300;
+pub const CHECK_BUDGET_BYTES: std::ops::RangeInclusive<u32> = 256..=65_536;
 
 /// Problems of a hook rule, per mode (empty = valid). Every mode needs a documented pass
 /// condition and a tool (`*` = any). `block`: field, message, a regex that compiles and
 /// matches neither the empty input nor every benign `probe`. `stuck`: message and
-/// `repeats` ≥ 2. `truncate`/`retrieve`: parameters within bounds. A parameter of another
+/// `repeats` ≥ 2. `truncate`/`retrieve`/`check`: parameters within bounds. A parameter of another
 /// mode is a problem (the rule would not do what it says).
 pub fn hook_problems(h: &HookRule, probes: &[String]) -> Vec<String> {
     let mut out = Vec::new();
@@ -710,16 +712,17 @@ pub fn hook_problems(h: &HookRule, probes: &[String]) -> Vec<String> {
     if h.tool.trim().is_empty() {
         out.push(format!("{mode} hook names no tool (use `*` for every tool)"));
     }
-    let given = [
-        ("max_age_turns", h.max_age_turns, HookMode::Truncate),
-        ("keep_chars", h.keep_chars, HookMode::Truncate),
-        ("repeats", h.repeats, HookMode::Stuck),
-        ("budget_bytes", h.budget_bytes, HookMode::Retrieve),
-        ("min_overlap", h.min_overlap, HookMode::Retrieve),
+    let given: &[(&str, Option<u32>, &[HookMode], &str)] = &[
+        ("max_age_turns", h.max_age_turns, &[HookMode::Truncate], "truncate"),
+        ("keep_chars", h.keep_chars, &[HookMode::Truncate], "truncate"),
+        ("repeats", h.repeats, &[HookMode::Stuck], "stuck"),
+        ("budget_bytes", h.budget_bytes, &[HookMode::Retrieve, HookMode::Check], "retrieve/check"),
+        ("min_overlap", h.min_overlap, &[HookMode::Retrieve], "retrieve"),
+        ("timeout_secs", h.timeout_secs, &[HookMode::Check], "check"),
     ];
-    for (name, v, owner) in given {
-        if v.is_some() && owner != h.mode {
-            out.push(format!("`{name}` belongs to {} hooks, not {mode}", crate::ledger::enum_str(&owner)));
+    for &(name, v, owners, owner_label) in given {
+        if v.is_some() && !owners.contains(&h.mode) {
+            out.push(format!("`{name}` belongs to {owner_label} hooks, not {mode}"));
         }
     }
     let mut bound = |name: &str, v: u32, r: std::ops::RangeInclusive<u32>| {
@@ -737,6 +740,10 @@ pub fn hook_problems(h: &HookRule, probes: &[String]) -> Vec<String> {
         HookParams::Retrieve { budget_bytes, min_overlap } => {
             bound("budget_bytes", budget_bytes, RETRIEVE_BUDGET_BYTES);
             bound("min_overlap", min_overlap, RETRIEVE_MIN_OVERLAP);
+        }
+        HookParams::Check { timeout_secs, budget_bytes } => {
+            bound("timeout_secs", timeout_secs, CHECK_TIMEOUT_SECS);
+            bound("budget_bytes", budget_bytes, CHECK_BUDGET_BYTES);
         }
     }
     if matches!(h.mode, HookMode::Block | HookMode::Stuck) && h.message.trim().is_empty() {

@@ -21,6 +21,4 @@ uuid.workspace = true
 libc.workspace = true
 unicase.workspace = true
 unicode-segmentation.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

@@ -45,6 +45,11 @@ fi
 if [ -n "$skills" ] && [ -d "$skills" ] && grep -rqs 'rematch-test-mutate' "$skills"; then
   mkdir -p "$cwd/data" && printf 'tampered\n' >"$cwd/data/expected.txt"
 fi
+# A skill containing `rematch-test-regress` makes the "agent" read that skill and delete `.rematch-marker`.
+if [ -n "$skills" ] && [ -d "$skills" ] && grep -rqs 'rematch-test-regress' "$skills"; then
+  marker_skill=$(grep -rls 'rematch-test-regress' "$skills" | grep '/SKILL\.md$' | head -n 1)
+  rm -f "$cwd/.rematch-marker"
+fi
 
 usage='{"input":100,"output":20,"cacheRead":0,"cacheWrite":0,"totalTokens":120}'
 printf '{"type":"session","version":3,"id":"0199f000-0000-7000-8000-%012d","timestamp":"2026-10-25T00:00:00.000Z","cwd":"%s"}\n' "$$" "$cwd"

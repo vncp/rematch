@@ -33,5 +33,7 @@ pub mod instructions; // personal `<agent_dir>/AGENTS.md` sections: exact-hash a
 pub mod project_views; // repo-local, ignored trial delivery for hosts without per-session roots (Codex, Claude Code agents)
 pub mod identity; // repo_remote normalization, subpath, HEAD (ADR 001)
 pub mod profile; // REMATCH_ROOT/profile: layout, views linked into omp/rematch, roles.yml (DESIGN §20)
+pub mod check; // fast check detection, scope narrowing, diagnostic parsing, impact extraction (DESIGN §10)
+pub mod sandbox; // script sandbox dry-run runner (`sandbox-exec` on macOS, `bwrap` on Linux)
 
 pub use types::*;

@@ -165,6 +165,27 @@ pub fn harmed(s: &SessionRecord, disabled: bool) -> bool {
     s.error_clusters > 0 || s.takeovers > 0 || disabled
 }
 
+/// Whether a `block` hook fired in `s` and was followed in the same session by a user
+/// correction/preference redirect (or any non-none redirect that was not classified as `Scope`
+/// or `None`).
+pub fn block_hook_harmed(entry: &Entry, s: &SessionRecord) -> bool {
+    if entry.kind != Kind::Hook || entry.hook.as_ref().is_none_or(|h| h.mode != HookMode::Block) {
+        return false;
+    }
+    if !s.hooks_applied.contains(&entry.id) {
+        return false;
+    }
+    let blocked_seq = s.hook_blocked_at.get(&entry.id).copied().unwrap_or(0);
+    s.redirects.iter().any(|r| {
+        r.seq > blocked_seq
+            && (matches!(redirect_class_of(r.class, &r.prelabel), Some(RedirectClass::Correction | RedirectClass::Preference))
+                || (r.class.is_none()
+                    && !r.prelabel.is_empty()
+                    && r.prelabel != "none"
+                    && !r.prelabel.starts_with("mark:scope")))
+    })
+}
+
 /// Fold one finished session into the counters of the entries that were loaded in it
 /// (the caller resolves `s.loaded_entries` to entries). An entry counts only on a
 /// count-time predicate hit ([`Place`]: the session's remote and subpath when both sides
@@ -202,7 +223,7 @@ pub fn fold_session(
             family: family.clone(),
             matched: 1,
             recurrence: recurred(e, s) as u32,
-            harm: harmed(s, disabled.contains(&e.id)) as u32,
+            harm: (harmed(s, disabled.contains(&e.id)) || block_hook_harmed(e, s)) as u32,
             tokens: s.tokens_in + s.tokens_out,
             turns: s.turns,
             ts: s.ended_at.unwrap_or(s.started_at),
@@ -879,5 +900,57 @@ mod tests {
         assert_eq!(fold_session(&l, &at("s-web", Some("web.frontend")), std::slice::from_ref(&e), &[]).unwrap().len(), 1);
         assert_eq!(fold_session(&l, &at("s-none", None), std::slice::from_ref(&e), &[]).unwrap().len(), 1, "undecided: not tested");
         assert_eq!(l.counters("e-web").unwrap().matched, 2);
+    }
+
+    #[test]
+    fn block_hook_retires_after_two_harmful_fires_and_credits_clean_completion_as_use() {
+        let (_t, l) = ledger();
+        let mut e = entry("h-block", "no-force-push", "repo", Status::Provisional);
+        e.kind = Kind::Hook;
+        e.hook = Some(crate::types::HookRule::block("bash", "command", "git push --force", "use --force-with-lease", "safe push passes"));
+        e.predicate.file_exts = vec![];
+        e.predicate.stems = vec![];
+        l.upsert_entry(&e).unwrap();
+
+        // Clean block: hook fires, agent completes without a redirect -> clean use, 0 harm.
+        let mut clean = session("s-clean", "repo", 1_000);
+        clean.loaded_entries = vec!["h-block".into()];
+        clean.hooks_applied = vec!["h-block".into()];
+        clean.hook_blocked_at.insert("h-block".into(), 2);
+        clean.turns = 2;
+        clean.run_completed = Some(true);
+        fold_session(&l, &clean, std::slice::from_ref(&e), &[]).unwrap();
+        let c = l.counters("h-block").unwrap();
+        assert_eq!((c.matched, c.used, c.used_clean, c.harm), (1, 1, 1, 0));
+
+        // Harmful fire 1: block fires at seq 2, followed by a user correction redirect at seq 4.
+        let mut h1 = session("s-harm-1", "repo", 2_000);
+        h1.loaded_entries = vec!["h-block".into()];
+        h1.hooks_applied = vec!["h-block".into()];
+        h1.hook_blocked_at.insert("h-block".into(), 2);
+        h1.redirects = vec![Redirect {
+            session_id: "s-harm-1".into(),
+            seq: 4,
+            prelabel: "negation".into(),
+            class: Some(RedirectClass::Correction),
+            confidence: Some(1.0),
+            text_head: "No, I needed that force push on this scratch branch".into(),
+            deliverable_head: String::new(),
+            t: 2_005,
+        }];
+        fold_session(&l, &h1, std::slice::from_ref(&e), &[]).unwrap();
+        let c = l.counters("h-block").unwrap();
+        assert_eq!(c.harm, 1);
+        assert_eq!(decide(&e, &c, None, 2_010), Decision::Continue);
+
+        // Harmful fire 2: block fires, followed by user disable -> 2nd harm -> Retire.
+        let mut h2 = session("s-harm-2", "repo", 3_000);
+        h2.loaded_entries = vec!["h-block".into()];
+        h2.hooks_applied = vec!["h-block".into()];
+        h2.hook_blocked_at.insert("h-block".into(), 2);
+        fold_session(&l, &h2, std::slice::from_ref(&e), &["h-block".to_string()]).unwrap();
+        let c = l.counters("h-block").unwrap();
+        assert_eq!(c.harm, 2);
+        assert_eq!(decide(&e, &c, None, 3_010), Decision::Retire);
     }
 }

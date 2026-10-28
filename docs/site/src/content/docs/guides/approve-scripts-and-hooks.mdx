@@ -5,10 +5,12 @@ description: Review the persistent action queue for personal instructions, scrip
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Skill, rule and fact text activate on their own as place-scoped trials (`trials`). Everything else waits in a **persistent action queue** until you decide: personal `AGENTS.md` instructions, scripts, compiled hooks, provisional subagents, automatic probe replays, exports and team or fork branches ([D29, D32](/rematch/background/decisions/)).
+Skill, rule and fact text, **data-only hooks** (`block`, `stuck`, `truncate`, `retrieve`, `check`), and **read-only subagents** activate automatically as scoped provisional trials and appear under `applied_automatically` with a one-command undo (`rematch library rollback <name>` or `rematch library disable <id>`; `rematch off` withdraws all).
 
-<Aside type="caution" title="Nothing waits out of sight">
-A waiting action stays in `actions` of `rematch status`, `rematch digest` and `rematch library ls` until you approve or decline it. The queue is recomputed on every call, so an action never disappears because the digest moved on. Nothing executable runs, and no text reaches your prompt, before you approve it.
+Pending review (`actions`) holds what still needs a person: personal `AGENTS.md` instructions, write-capable subagents, and scripts (unless covered by a standing `policy auto` rule), plus unsealed probe replays, exports, and team or fork branches ([D29, D32](/rematch/background/decisions/)).
+
+<Aside type="caution" title="Nothing waits out of sight, and nothing automatic is hidden">
+Every automatic adoption is listed in `applied_automatically` of `rematch status`, `rematch digest` and `rematch library ls` with what it is, where it lives, why it applied (`data-only`, `read-only`, `rule`, `comparative_support`, or `probe_regressed`), and its undo command. Every item that still needs a person stays in `actions` until you approve or decline it.
 </Aside>
 
 ## The review flow
@@ -25,7 +27,7 @@ Each item has a typed `id` that you pass to `library inspect`, `library approve`
 
 | Action ID | What approving does | What declining does |
 |---|---|---|
-| `<entry-id>` (kind `scripts`, `hook`, `agent`, joined with `+`) | makes `scripts/*` mode `0755`; compiles the hook to `<agent_dir>/extensions/rematch-hooks/<id>.ts`; links the provisional subagent into `~/.rematch/agents/` (Claude Code: a copy in matching repos' `.claude/agents/`) | **retires** the entry |
+| `<entry-id>` (kind `scripts`, `agent`, joined with `+`) | makes `scripts/*` mode `0755` (after reviewing the script and its sandbox dry-run observations); links the write-capable provisional subagent into `~/.rematch/agents/` (Claude Code: a copy in matching repos' `.claude/agents/`) | **retires** the entry |
 | `instructions:<entry-id>` | writes the fragment as a marked block into your personal `<agent_dir>/AGENTS.md` (omp) and turns on runtime insertion in Claude Code, Pi and OpenCode | declines that text only; **the entry stays** |
 | `instructions-conflict:<name>` | **restores** rematch's block over your edit (or removes it, if no text is approved any more) | **releases** the block: the markers go and your edited text stays as your own |
 | `instructions-sync` | rewrites the personal `AGENTS.md` to what your approvals and on/off say (after a failed write or a fixed permission) | — |
@@ -87,8 +89,14 @@ rematch library decline <action-id> --sha <hash>
 </TabItem>
 </Tabs>
 
-The model's own `rematch` tool, and shell commands it runs, are refused for every user-only control (approve, decline, pin, unpin, disable, rollback, export approval, mark, on, off, uninstall, `policy scope set|unset`), wherever the global flags sit. That is a control-plane rule, not a sandbox.
+The model's own `rematch` tool, and shell commands it runs, are refused for every user-only control (approve, decline, pin, unpin, disable, rollback, export approval, mark, on, off, uninstall, `policy scope set|unset`, `policy auto`, `policy probes` mutations), wherever the global flags sit. That is a control-plane rule, not a sandbox.
 
+## Standing `policy auto` rules and sandbox dry runs
+
+- **Data-only hooks (`block`, `stuck`, `truncate`, `retrieve`, `check`) and built-ins** compile on stage and run immediately as scoped provisional trials. If a `block` hook fires and is followed in the same session by a user correction/preference redirect or a `disable`, that session counts as **harm** (`RETIRE_AT = 2` retires it); if the agent completes the task cleanly without the blocked action, it counts as a clean use.
+- **Read-only subagents** whose `AGENT.md` `tools:` frontmatter is a subset of `read`, `grep`, `glob`, `find`, `lsp*`, `web_search`, `fetch`, `web_fetch` are exposed in matching places without approval. Subagents that omit `tools:` or request write/shell tools wait in `actions`.
+- **Scripts** run once on stage inside an OS sandbox dry run (`sandbox-exec` on macOS, `bwrap` on Linux) that denies network access and writes outside a temporary scratch directory. The dry run never approves a script by itself; its observed behavior (clean exit, temp writes, or blocked outside writes / network access) is recorded and included on the `scripts` review item in `actions`.
+- **Standing rules (`rematch policy auto add|remove|list <surface> <scope>`, user-only)** let you opt in to automatic approval for `scripts`, `agents` or `instructions` in a repo path, normalized remote, or `**` (instructions still respect `limits.always_on_bytes`), recording `"rule:<surface>:<scope>"` as the approver in the receipt.
 ## Personal `AGENTS.md` instructions
 
 An entry can carry an `AGENTS.fragment.md`: short text that belongs in the system prompt. Its personal home is your own user-level `AGENTS.md`, never a repo's.
@@ -164,27 +172,28 @@ A repo's `AGENTS.md` is a separate, optional route. It is written only on a bran
 | `stuck` | blocks a call identical (same tool, same arguments) to the N calls right before it; any other call in between resets it |
 | `truncate` | in the request sent to the model (never in the session file), tool outputs older than N user turns keep their first K characters, ending `…[rematch: truncated N chars, age K turns]` |
 | `retrieve` | before each request, appends one hidden message with the units of your loaded skills that match what you just asked and the files just touched, within a byte budget |
+| `check` | after file-editing tool calls, runs the repo's detected fast check (`rematch check`: Cargo, tsc, ruff, pyright, mypy, Go) scoped to the edited files plus `git grep` references for changed signatures in unedited files, and injects one compact message (≤ 4,096 B) before the next turn |
 
 ## Built-in hooks
 
-Three hook entries ship with rematch. They appear in the queue the first time the binary runs; they live in branch `shared` and match every session.
+Four data-only hook entries ship with rematch. They live in branch `shared`, match every session, and run automatically as trials (disable any with `rematch library disable <id>`):
 
 | Entry | Mode | Setting |
 |---|---|---|
 | `context-unit-retrieval` | `retrieve` | ≤ 6000 bytes, units sharing ≥ 2 stems with the request |
 | `tool-output-truncation` | `truncate` | outputs older than 6 user turns keep 1200 characters |
 | `stuck-detector` | `stuck` | the 4th identical call in a row is blocked |
+| `fast-check` | `check` | ≤ 30 s timeout, ≤ 4096 bytes of compiler/linter diagnostics, unedited caller impact, or `✓ <check> clean` after file edits |
 
 They are ordinary entries under the same counters:
 
-- Nothing of them loads, runs or counts until you approve them.
-- Once approved, a session counts as use when the hook evaluates or applies (`hook_evaluated`, `hook_applied`).
+- They compile on stage and run automatically as provisional trials (listed in `applied_automatically`).
+- A session counts as use when the hook evaluates or applies (`hook_evaluated`, `hook_applied`, `check_ran` with fixed errors).
 - Kept (`accepted_in_use`) after four clean completed sessions of such use.
-- Retired after two sessions with a recurring correction or preference, or two with harm (error cluster, takeover, disable).
-- Declining retires one for good.
+- Retired after two sessions with a recurring correction or preference, or two with harm (error cluster, takeover, post-block redirect, or disable).
 
 ```sh
-rematch builtins ls                   # status of the three
+rematch builtins ls                   # status of the four built-ins
 rematch builtins reinstall [name]     # stage a retired one again
 ```
 

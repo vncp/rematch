@@ -353,6 +353,27 @@ pub enum TraceRecord {
         #[serde(default)]
         bytes: u64,
     },
+    /// A `check` hook ran after file edits and injected diagnostics (or a clean receipt)
+    /// into the outgoing context (DESIGN §3, §10).
+    CheckRan {
+        seq: u32,
+        #[serde(default)]
+        t: UnixMs,
+        #[serde(default)]
+        hook_id: String,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        errors: u32,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default)]
+        injected_bytes: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
     /// Unknown `ev`, or a known `ev` whose fields did not parse. Kept verbatim.
     #[serde(untagged)]
     Other(Value),
@@ -380,6 +401,7 @@ impl TraceRecord {
             | Self::HookApplied { seq, .. }
             | Self::HookEvaluated { seq, .. }
             | Self::FragmentsSent { seq, .. }
+            | Self::CheckRan { seq, .. }
             | Self::SessionShutdown { seq, .. } => *seq,
             Self::Other(v) => v.get("seq").and_then(Value::as_u64).unwrap_or(0) as u32,
         }
@@ -399,6 +421,7 @@ impl TraceRecord {
             | Self::HookApplied { t, .. }
             | Self::HookEvaluated { t, .. }
             | Self::FragmentsSent { t, .. }
+            | Self::CheckRan { t, .. }
             | Self::SessionShutdown { t, .. } => *t,
             Self::Other(v) => v.get("t").and_then(Value::as_i64).unwrap_or(0),
         }
@@ -418,6 +441,7 @@ impl TraceRecord {
             Self::HookApplied { .. } => "hook_applied",
             Self::HookEvaluated { .. } => "hook_evaluated",
             Self::FragmentsSent { .. } => "fragments_sent",
+            Self::CheckRan { .. } => "check_ran",
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::Other(v) => v.get("ev").and_then(Value::as_str).unwrap_or(""),
         }
@@ -475,7 +499,7 @@ pub fn skills_in_text(text: &str) -> Vec<String> {
 /// excluded and read selectors stripped.
 pub fn paths_in_tool_input(input: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    for key in ["path", "file_path"] {
+    for key in ["path", "file_path", "filePath"] {
         if let Some(p) = input.get(key).and_then(Value::as_str) {
             push_file(&mut out, p);
         }
@@ -721,6 +745,13 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
     // came after it.
     let mut settled: Option<bool> = None;
     let mut turn_since_end = false;
+    // Per `(hook_id, kind)`: the error counts injected by previous `check_ran` records in this
+    // session, and the normalized files each check covered. The hook is credited as
+    // `hooks_applied` when it injected diagnostics (`errors > 0`) that the agent then fixed
+    // (a subsequent `check_ran` of the same `(hook_id, kind)` has fewer errors on overlapping
+    // normalized files, or both runs were unscoped repo-wide checks with `files` empty).
+    type CheckErrorHistory = std::collections::BTreeMap<(String, String), Vec<(u32, Vec<String>)>>;
+    let mut check_errors: CheckErrorHistory = CheckErrorHistory::new();
 
     for rec in records {
         match rec {
@@ -938,7 +969,13 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                     push_id(&mut s.retrieved_entries, &u.entry_id);
                 }
             }
-            TraceRecord::ToolBlocked { hook_id, .. } | TraceRecord::HookApplied { hook_id, .. } => {
+            TraceRecord::ToolBlocked { seq, hook_id, .. } => {
+                push_id(&mut s.hooks_applied, hook_id);
+                if !hook_id.is_empty() {
+                    s.hook_blocked_at.entry(hook_id.clone()).or_insert(*seq);
+                }
+            }
+            TraceRecord::HookApplied { hook_id, .. } => {
                 push_id(&mut s.hooks_applied, hook_id);
             }
             TraceRecord::HookEvaluated { hook_ids, .. } => {
@@ -954,6 +991,28 @@ pub fn fold_trace(records: &[TraceRecord], session_id: &str) -> SessionRecord {
                         if !f.sha.is_empty() {
                             s.fragment_shas.insert(id.to_string(), f.sha.clone());
                         }
+                    }
+                }
+            }
+            TraceRecord::CheckRan { hook_id, kind, errors, injected_bytes, files, .. } => {
+                if !hook_id.is_empty() {
+                    push_id(&mut s.loaded_entries, hook_id);
+                    let norm_files: Vec<String> = files
+                        .iter()
+                        .map(|f| f.replace('\\', "/").trim_start_matches("./").to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect();
+                    let prev = check_errors.entry((hook_id.clone(), kind.clone())).or_default();
+                    let fixed = prev.iter().any(|(prev_err, prev_files)| {
+                        *prev_err > *errors
+                            && ((prev_files.is_empty() && norm_files.is_empty())
+                                || prev_files.iter().any(|f| norm_files.contains(f)))
+                    });
+                    if fixed {
+                        push_id(&mut s.hooks_applied, hook_id);
+                    }
+                    if *errors > 0 && *injected_bytes > 0 {
+                        prev.push((*errors, norm_files));
                     }
                 }
             }
@@ -1515,5 +1574,53 @@ not json at all
 {"seq":4,"t":4,"ev":"input","text":"That's wrong. Every public function must have a docstring and be exported in __all__","prelabel":"negation"}"#,
         );
         assert_eq!(triage(&s, &recs).kind, TriageKind::Content);
+    }
+    #[test]
+    fn check_ran_credits_hook_only_when_errors_decrease_on_edited_files() {
+        // Clean check only -> not credited as hooks_applied
+        let clean_only = parse_trace(
+            r#"{"seq":0,"t":1,"ev":"session_start","cwd":"/r","branch_hint":"r","loaded_entries":["fc"]}
+{"seq":1,"t":2,"ev":"check_ran","hook_id":"fc","kind":"cargo","ok":true,"errors":0,"duration_ms":50,"injected_bytes":25,"files":["src/lib.rs"]}"#,
+        );
+        let s1 = fold_trace(&clean_only, "s1");
+        assert!(s1.hooks_applied.is_empty(), "{:?}", s1.hooks_applied);
+
+        // Error injected, but never fixed -> not credited as hooks_applied
+        let unfixed = parse_trace(
+            r#"{"seq":0,"t":1,"ev":"session_start","cwd":"/r","branch_hint":"r","loaded_entries":["fc"]}
+{"seq":1,"t":2,"ev":"check_ran","hook_id":"fc","kind":"cargo","ok":false,"errors":2,"duration_ms":50,"injected_bytes":120,"files":["src/lib.rs"]}"#,
+        );
+        let s2 = fold_trace(&unfixed, "s2");
+        assert!(s2.hooks_applied.is_empty());
+
+        // Error injected (2 errors on src/lib.rs), then fixed (0 errors on src/lib.rs) -> credited as hooks_applied
+        let fixed = parse_trace(
+            r#"{"seq":0,"t":1,"ev":"session_start","cwd":"/r","branch_hint":"r","loaded_entries":["fc"]}
+{"seq":1,"t":2,"ev":"check_ran","hook_id":"fc","kind":"cargo","ok":false,"errors":2,"duration_ms":50,"injected_bytes":120,"files":["src/lib.rs"]}
+{"seq":2,"t":3,"ev":"check_ran","hook_id":"fc","kind":"cargo","ok":true,"errors":0,"duration_ms":45,"injected_bytes":25,"files":["src/lib.rs"]}"#,
+        );
+        let s3 = fold_trace(&fixed, "s3");
+        assert_eq!(s3.hooks_applied, vec!["fc".to_string()]);
+        // Different file or different checker kind or mixed scoped/unscoped -> not credited
+        let unrelated = parse_trace(
+            "\
+{\"seq\":0,\"t\":1,\"ev\":\"session_start\",\"cwd\":\"/r\",\"branch_hint\":\"r\",\"loaded_entries\":[\"fc\"]}\n\
+{\"seq\":1,\"t\":2,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"cargo\",\"ok\":false,\"errors\":2,\"duration_ms\":50,\"injected_bytes\":120,\"files\":[\"src/lib.rs\"]}\n\
+{\"seq\":2,\"t\":3,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"cargo\",\"ok\":true,\"errors\":0,\"duration_ms\":45,\"injected_bytes\":25,\"files\":[\"src/other.rs\"]}\n\
+{\"seq\":3,\"t\":4,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"tsc\",\"ok\":true,\"errors\":0,\"duration_ms\":30,\"injected_bytes\":25,\"files\":[\"src/lib.rs\"]}\n\
+{\"seq\":4,\"t\":5,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"cargo\",\"ok\":true,\"errors\":0,\"duration_ms\":30,\"injected_bytes\":25,\"files\":[]}",
+        );
+        let s4 = fold_trace(&unrelated, "s4");
+        assert!(s4.hooks_applied.is_empty(), "{:?}", s4.hooks_applied);
+
+        // Unscoped repo-wide runs count against each other
+        let unscoped = parse_trace(
+            "\
+{\"seq\":0,\"t\":1,\"ev\":\"session_start\",\"cwd\":\"/r\",\"branch_hint\":\"r\",\"loaded_entries\":[\"fc\"]}\n\
+{\"seq\":1,\"t\":2,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"cargo\",\"ok\":false,\"errors\":1,\"duration_ms\":50,\"injected_bytes\":120,\"files\":[]}\n\
+{\"seq\":2,\"t\":3,\"ev\":\"check_ran\",\"hook_id\":\"fc\",\"kind\":\"cargo\",\"ok\":true,\"errors\":0,\"duration_ms\":45,\"injected_bytes\":25,\"files\":[]}",
+        );
+        let s5 = fold_trace(&unscoped, "s5");
+        assert_eq!(s5.hooks_applied, vec!["fc".to_string()]);
     }
 }

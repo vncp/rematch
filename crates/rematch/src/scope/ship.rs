@@ -730,8 +730,8 @@ mod tests {
         assert!(body.contains("Redirect class: correction"));
         assert!(body.contains("Repos where the predicate recurred: 2"));
         let receipts = ctx.ledger.list_receipts(Some(&e.id)).unwrap();
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].receipt.activation, Activation::Pr);
+        let pr_receipts: Vec<_> = receipts.iter().filter(|r| r.receipt.activation == Activation::Pr).collect();
+        assert_eq!(pr_receipts.len(), 1);
         // shipping again refuses (branch exists) and, listed explicitly, errors
         let err = cmd_ship(ctx, args(ShipScope::Team, None, vec![e.id.clone()])).unwrap_err();
         assert!(format!("{err:#}").contains("already exists"), "{err:#}");

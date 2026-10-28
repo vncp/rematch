@@ -43,7 +43,7 @@ In JSON, each `kept[]` item carries `matched`, `used`, `used_clean`, `use_unknow
 
 - **Real use is clean actual use.** `in_use` needs four clean completed sessions that read, invoked, retrieved or otherwise used the entry. Matched sessions alone, however many, never satisfy it.
 - **Unknown is not clean.** Sessions without native completion evidence (imported transcripts, old rows) are counted in `use_unknown` and never toward `in_use`.
-- **Comparative support is separate.** A keep backed by a bounded probe shows under `comparative_entries`; it is evidence on one authorized task in omp, not a real-use gain.
+- **Comparative support is separate.** A keep backed by a bounded probe (run automatically on a trace-grounded task with a sealed engine verifier, or on an approved user-verifier task) shows under `comparative_entries` and in the next digest under `applied automatically` with undo (`rematch library rollback <name>` or `rematch library disable <id>`); it is evidence on one task in omp, not a real-use gain.
 
 ## The two arms
 

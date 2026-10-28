@@ -245,17 +245,14 @@ fn approved_hooks_block_through_hook_check() {
     assert_eq!(check("ses_h", None, "cargo test")["block"], false, "nothing approved, nothing blocks");
     let ls = env.run(&["builtins", "ls"]);
     let stuck = ls["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
-    // The digest (the plugin's toast in the TUI) names every waiting action and the user's commands.
+    // The digest (the plugin's toast in the TUI) names staged built-in hooks and that they were
+    // applied automatically (no approval action waiting).
     let d = &send(&env, me, vec![json!({"kind": "digest"})])[0]["digest"];
     let toast = d["toast"].as_str().unwrap();
-    assert!(toast.contains("action(s) waiting") && toast.contains("/rematch-inspect "), "{toast}");
-    let a = d["actions"].as_array().unwrap().iter().find(|a| a["id"] == json!(stuck)).cloned().unwrap_or_else(|| panic!("{d}"));
-    let line = a["line"].as_str().unwrap();
-    assert!(line.contains(&format!("/rematch-approve {stuck}")) && line.contains(&format!("/rematch-decline {stuck}")), "{line}");
-    env.approve(&stuck);
+    assert!(toast.contains("staged hook") && !toast.contains("action(s) waiting"), "{toast}");
+    assert!(d["actions"].as_array().unwrap().is_empty(), "{d}");
     let load = send(&env, me, vec![json!({"kind": "load"})]);
-    assert_eq!(load[0]["hooks"], json!([{"id": stuck, "mode": "stuck", "tool": "*", "params": {"repeats": 3}}]), "{load:?}");
-
+    assert!(load[0]["hooks"].as_array().unwrap().contains(&json!({"id": stuck, "mode": "stuck", "tool": "*", "params": {"repeats": 3}})), "{load:?}");
     send(&env, me, vec![prompt("ses_h", 1_000, "make the payments tests pass")]);
     for (i, c) in ["k1", "k2", "k3"].iter().enumerate() {
         assert_eq!(check("ses_h", None, "cargo test -p payments")["block"], false, "call {i}");
@@ -267,8 +264,7 @@ fn approved_hooks_block_through_hook_check() {
     let b = recs.last().unwrap();
     assert_eq!((b["ev"].as_str(), b["hook_id"].as_str(), b["tool"].as_str()), (Some("tool_blocked"), Some(stuck.as_str()), Some("bash")));
     assert_eq!(b["args_hash"].as_str().unwrap().len(), 64);
-    assert_eq!(recs[0]["hooks_loaded"], json!([stuck]), "an approved stuck hook loads");
-    // Another call passes; a subagent (no trace) is never stuck-blocked.
+    assert!(recs[0]["hooks_loaded"].as_array().unwrap().contains(&json!(stuck)), "the active stuck hook loads");
     assert_eq!(check("ses_h", None, "cargo test -p ledger")["block"], false);
     assert_eq!(check("ses_child", Some("ses_h"), "cargo test -p payments")["block"], false);
     assert!(!env.trace_path("oc:ses_child").exists());
@@ -390,15 +386,8 @@ fn approved_retrieve_hook_adds_system_context_with_attribution() {
     let ls = env.run(&["builtins", "ls"]);
     let hook = ls["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "context-unit-retrieval").unwrap()["id"].as_str().unwrap().to_string();
 
-    // Not approved: no context, nothing recorded.
-    send(&env, me, vec![prompt("ses_r", 1_000, "Commit the ledger reconciliation changes after the tests")]);
-    assert!(send(&env, me, vec![json!({"kind": "retrieve", "session": "ses_r"})])[0].get("context").is_none());
-    send(&env, me, vec![json!({"kind": "shutdown"})]);
-
-    env.approve(&hook);
     let load = send(&env, me, vec![json!({"kind": "load"})]);
     assert!(load[0]["hooks"].as_array().unwrap().iter().any(|h| h["mode"] == "retrieve"), "{load:?}");
-    // Asked before the session's prompt reached the trace: no input yet, so nothing is decided
     // (the plugin caches nothing and asks again on the next request).
     let early = send(&env, me, vec![json!({"kind": "retrieve", "session": "ses_r2"})]);
     assert_eq!((early[0]["has_input"].as_bool(), early[0].get("context")), (Some(false), None), "{early:?}");
@@ -459,4 +448,51 @@ fn skill_loads_and_sent_fragments_credit_their_entries() {
     assert_eq!(recs.len(), 1, "{recs:?}");
     assert_eq!((recs[0]["host"].as_str(), recs[0]["bytes"].as_u64()), (Some("opencode"), Some(42)));
     assert_eq!(recs[0]["fragments"], json!([{"id": id, "name": "ledger-test-gate", "sha": sha, "via": "opencode:system.transform"}]));
+}
+
+#[test]
+fn check_event_runs_fast_check_and_records_check_ran() {
+    let env = Env::new();
+    let me = std::process::id();
+    std::fs::write(
+        env.repo.join("Cargo.toml"),
+        "[package]\nname = \"payments\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let lib_rs = env.repo.join("src/lib.rs");
+    std::fs::write(&lib_rs, "pub fn reconcile() -> String { \"bad\" }\n").unwrap();
+
+    let fc = env
+        .run(&["builtins", "ls"])["builtins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "fast-check")
+        .cloned()
+        .unwrap();
+    let fc_id = fc["id"].as_str().unwrap().to_string();
+    if fc["approved"] != true {
+        let _ = env.run(&["library", "approve", &fc_id, "--what", "hook"]);
+    }
+
+    send(&env, me, vec![prompt("ses_chk", 1_000, "Edit src/lib.rs")]);
+    let r = send(
+        &env,
+        me,
+        vec![json!({"kind": "check", "session": "ses_chk", "files": ["src/lib.rs"]})],
+    );
+    let ctx = r[0]["context"].as_str().unwrap_or_default();
+    assert!(
+        ctx.contains("src/lib.rs:1:") && ctx.contains("E0308") && ctx.contains("to_string"),
+        "expected cargo diagnostic in OpenCode check event response: {r:?}"
+    );
+    assert_eq!(r[0]["ok"], false);
+    assert_eq!(r[0]["check_kind"], "cargo");
+    let check_recs: Vec<Value> = trace(&env, "oc:ses_chk")
+        .into_iter()
+        .filter(|x| x["ev"] == "check_ran")
+        .collect();
+    assert_eq!(check_recs.len(), 1, "{check_recs:?}");
+    assert_eq!(check_recs[0]["hook_id"], fc_id);
+    assert_eq!(check_recs[0]["kind"], "cargo");
 }

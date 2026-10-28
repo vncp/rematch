@@ -89,6 +89,7 @@ fn event(env: &Env, name: &str, fields: Value) -> Out {
     let op = match name {
         "PreToolUse" => "hook-check",
         "SessionStart" => "session-start",
+        "SessionEnd" => "session-end",
         _ => "trace-event",
     };
     let out = run_hook(env, op, &p.to_string(), &[]);
@@ -154,8 +155,8 @@ fn hooks_trace_flag_reflect_and_link() {
     std::os::unix::fs::symlink(&legacy, &link).unwrap();
 
     // SessionStart: the relay re-points the plugin's skills/ to the shared dir, removes the
-    // legacy dir and asks for a re-scan; the digest names what was staged and the approvals
-    // waiting (the three built-in hooks), each with the command that grants it.
+    // legacy dir and asks for a re-scan; the digest names what was staged and what was applied
+    // automatically (the four built-in data-only hooks), each with its undo command.
     let o = event(&env, "SessionStart", json!({"source":"startup","model":"claude-opus-5-5"}));
     let reply = o.json();
     assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "SessionStart");
@@ -166,8 +167,8 @@ fn hooks_trace_flag_reflect_and_link() {
         .to_string();
     let shown = reply["systemMessage"].as_str().unwrap();
     assert!(shown.starts_with("rematch digest\n- staged hook context-unit-retrieval in shared"), "{shown}");
-    assert!(shown.contains(&format!("/rematch:rematch-approve {stuck}")) && shown.contains(&format!("/rematch:rematch-decline {stuck}")), "{shown}");
-    assert!(shown.contains(&format!("/rematch:rematch-inspect {stuck}")) && shown.contains("action(s) waiting for you"), "{shown}");
+    assert!(shown.contains(&"applied automatically: hook stuck-detector (stuck)".to_string()) && shown.contains(&format!("undo: `rematch library disable {stuck}`")), "{shown}");
+    assert!(!shown.contains("action(s) waiting for you"), "{shown}");
     let context = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains(shown) && context.contains("never run `rematch library approve`"), "{context}");
     assert!(!context.contains("<approval id="), "a proposal's text never enters Claude's context: {context}");
@@ -175,9 +176,9 @@ fn hooks_trace_flag_reflect_and_link() {
     assert!(!legacy.exists());
 
     let o = event(&env, "UserPromptSubmit", json!({"prompt":"Add the ledger reconciliation command to the payments crate"}));
-    assert!(o.stdout.trim().is_empty(), "no retrieve hook approved: {:?}", o.stdout);
+    assert!(o.stdout.trim().is_empty(), "no loaded package units: {:?}", o.stdout);
     let o = event(&env, "PreToolUse", json!({"tool_name":"Read","tool_input":{"file_path":file},"tool_use_id":"toolu_1"}));
-    assert_eq!((o.code, o.stdout.trim()), (0, ""), "nothing approved, nothing blocks");
+    assert_eq!((o.code, o.stdout.trim()), (0, ""), "read passes");
     event(
         &env,
         "PostToolUse",
@@ -215,7 +216,7 @@ fn hooks_trace_flag_reflect_and_link() {
     assert_eq!(
         evs(&recs),
         vec![
-            "session_start", "input", "tool_result", "tool_result", "tool_result", "tool_result", "tool_result", "turn_end", "turn_end",
+            "session_start", "input", "hook_evaluated", "tool_result", "tool_result", "tool_result", "tool_result", "tool_result", "turn_end", "turn_end",
             "agent_end", "input", "tool_result", "turn_end", "agent_end", "session_shutdown",
         ],
         "{recs:#?}"
@@ -229,23 +230,23 @@ fn hooks_trace_flag_reflect_and_link() {
     assert_eq!(s0["repo"], json!(repo));
     assert_eq!(s0["model"], json!({"provider":"anthropic","id":"claude-opus-5-5"}));
     assert_eq!(s0["mode"], "claude-code:startup");
-    assert_eq!(s0["loaded_entries"], json!([]));
-    // Identity (ADR 001): the fake repo has no remote, so a local identity; cwd is the toplevel.
+    assert_eq!(s0["loaded_entries"].as_array().unwrap().len(), 2, "stuck-detector and fast-check built-ins load at start: {s0}");
     assert!(s0["repo_remote"].as_str().unwrap().starts_with("local:"), "{s0}");
     assert_eq!(s0["subpath"], "");
     assert_eq!((recs[1]["prelabel"].as_str(), recs[1]["idle"].as_bool()), (Some("none"), Some(true)));
-    assert_eq!((recs[2]["tool"].as_str(), recs[2]["path"].as_str()), (Some("read"), Some(file.as_str())));
-    assert_eq!(recs[2]["content_head"], "pub fn reconcile() {}");
-    assert_eq!(recs[3]["tool"], "edit");
-    assert_eq!((recs[4]["tool"].as_str(), recs[4]["is_error"].as_bool()), (Some("bash"), Some(true)));
-    assert!(recs[4]["content_head"].as_str().unwrap().starts_with("Exit code 101"));
-    assert_eq!(recs[8]["text_head"], "Added the reconcile command and committed it.");
-    assert_eq!(recs[8]["model"], json!({"provider":"anthropic","id":"claude-opus-5-5"}));
-    assert_eq!(recs[8]["usage"]["input"], 100);
-    assert_eq!((recs[9]["turns"].as_u64(), recs[9]["yielded"].as_bool()), (Some(2), Some(true)));
-    assert_eq!((recs[10]["prelabel"].as_str(), recs[10]["idle"].as_bool()), (Some("negation"), Some(true)));
-    assert_eq!(recs[10]["after_deliverable"], "Added the reconcile command and committed it.");
-    assert_eq!(recs[12]["text_head"], "Tests pass now; committed after running them.");
+    assert_eq!(recs[2]["ev"], "hook_evaluated");
+    assert_eq!((recs[3]["tool"].as_str(), recs[3]["path"].as_str()), (Some("read"), Some(file.as_str())));
+    assert_eq!(recs[3]["content_head"], "pub fn reconcile() {}");
+    assert_eq!(recs[4]["tool"], "edit");
+    assert_eq!((recs[5]["tool"].as_str(), recs[5]["is_error"].as_bool()), (Some("bash"), Some(true)));
+    assert!(recs[5]["content_head"].as_str().unwrap().starts_with("Exit code 101"));
+    assert_eq!(recs[9]["text_head"], "Added the reconcile command and committed it.");
+    assert_eq!(recs[9]["model"], json!({"provider":"anthropic","id":"claude-opus-5-5"}));
+    assert_eq!(recs[9]["usage"]["input"], 100);
+    assert_eq!((recs[10]["turns"].as_u64(), recs[10]["yielded"].as_bool()), (Some(2), Some(true)));
+    assert_eq!((recs[11]["prelabel"].as_str(), recs[11]["idle"].as_bool()), (Some("negation"), Some(true)));
+    assert_eq!(recs[11]["after_deliverable"], "Added the reconcile command and committed it.");
+    assert_eq!(recs[13]["text_head"], "Tests pass now; committed after running them.");
     let shutdown = recs.last().unwrap();
     assert_eq!(shutdown["flagged"], true);
     assert_eq!(shutdown["reasons"], json!(["tool_error_cluster", "redirect:negation"]));
@@ -296,7 +297,7 @@ fn hooks_trace_flag_reflect_and_link() {
     let mirror: Value = serde_json::from_str(&std::fs::read_to_string(staged.join("rematch.json")).unwrap()).unwrap();
     let sha = mirror["content_sha256"].clone();
     assert!(sha.is_string(), "content_sha256 set at stage: {sha}");
-    assert_eq!(s[0]["loaded_entries"], json!([{"id": id, "version": 1, "sha": sha}]), "versioned loaded_entries");
+    assert!(s[0]["loaded_entries"].as_array().unwrap().contains(&json!({"id": id, "version": 1, "sha": sha})), "versioned loaded_entries: {:?}", s[0]["loaded_entries"]);
     assert_eq!(s[0]["visible_entries"], json!([id]), "listed in this session's context");
     assert_eq!(s[0]["staging_dirs"], json!([env.root.join("skills")]), "the plugin mounts the kept library");
     assert!(s[0]["exposure_view"].as_str().unwrap().starts_with("payments-"), "{:?}", s[0]);
@@ -313,8 +314,7 @@ fn hooks_trace_flag_reflect_and_link() {
     assert!(!o.json()["systemMessage"].as_str().unwrap().contains("staged"), "nothing new since the last digest, approvals still wait");
     assert!(!o.json()["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().contains("Skills on trial"), "{}", o.json());
     assert_eq!(std::fs::read_link(view.join("run-tests-before-commit")).unwrap(), staged);
-    assert_eq!(trace_of(&env, &format!("cc:{elsewhere}"))[0]["loaded_entries"], json!([]));
-
+    assert!(!trace_of(&env, &format!("cc:{elsewhere}"))[0]["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str()));
     // Retired: the link is pruned at once.
     env.run(&["library", "disable", &id]);
     assert!(std::fs::symlink_metadata(view.join("run-tests-before-commit")).is_err());
@@ -325,11 +325,10 @@ fn approved_stuck_hook_blocks_the_repeat() {
     let env = Env::new();
     let ls = env.run(&["builtins", "ls"]);
     let stuck = ls["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
-    env.approve(&stuck);
 
     event(&env, "SessionStart", json!({"source":"startup"}));
     let s0 = &trace(&env)[0];
-    assert_eq!(s0["hooks_loaded"], json!([stuck]));
+    assert!(s0["hooks_loaded"].as_array().unwrap().contains(&json!(stuck)), "{s0}");
     assert!(s0["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(stuck)));
     event(&env, "UserPromptSubmit", json!({"prompt":"make the payments tests pass"}));
     // Claude Code sends PreToolUse and PostToolUse(Failure) the same tool_input.
@@ -383,8 +382,6 @@ fn approved_retrieve_hook_adds_context_once() {
     let ls = env.run(&["builtins", "ls"]);
     let hook =
         ls["builtins"].as_array().unwrap().iter().find(|x| x["name"] == "context-unit-retrieval").unwrap()["id"].as_str().unwrap().to_string();
-    env.approve(&hook);
-
     event(&env, "SessionStart", json!({"source":"startup"}));
     let s0 = &trace(&env)[0];
     assert!(!s0["loaded_entries"].as_array().unwrap().iter().any(|e| e["id"] == json!(hook)), "a retrieve hook credits through retrieval records");
@@ -527,12 +524,11 @@ fn provisional_agents_reach_their_repo_not_the_plugin() {
         assert_eq!(code, 0, "{v}");
         v
     };
-    // A provisional agent is copied only once approved, and never into the plugin's agents/ (every
-    // session on the machine reads it): into this repo's ignored `.claude/agents/`.
-    sync();
+    // `editor-agent.sh` is a read-only agent (`tools: read, grep`), so it is auto-approved on
+    // stage and never copied into the plugin's agents/ (every session on the machine reads it):
+    // into this repo's ignored `.claude/agents/`.
     let local = env.repo.join(".claude/agents/log-triage.md");
-    assert!(std::fs::symlink_metadata(&copy).is_err() && !local.exists(), "not approved: not copied");
-    env.approve(&id);
+    assert!(std::fs::symlink_metadata(&copy).is_err() && !local.exists(), "before SessionStart/sync: not copied to repo yet");
 
     // The first session copies it as a real file in Claude Code's agent format (omp's `@smol`
     // role and tool names do not carry over as they are). Claude Code read its agents before
@@ -623,4 +619,56 @@ fn approved_fragments_reach_session_start_and_survive_compaction() {
     let next_sent: Vec<Value> = trace_of(&env, &format!("cc:{next}")).into_iter().filter(|r| r["ev"] == "fragments_sent").collect();
     assert_eq!(next_sent.iter().map(|r| r["fragments"][0]["sha"].clone()).collect::<Vec<_>>(), vec![json!(fsha)], "{next_sent:?}");
     assert!(!env.repo.join("AGENTS.md").exists(), "the user's AGENTS.md is never written");
+}
+
+#[test]
+fn post_tool_use_fast_check_returns_additional_context_with_diagnostic() {
+    let env = Env::new();
+    // Make env.repo a real Cargo package so `rematch check` detects Cargo.
+    std::fs::write(
+        env.repo.join("Cargo.toml"),
+        "[package]\nname = \"payments\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let lib_rs = env.repo.join("src/lib.rs");
+    std::fs::write(&lib_rs, "pub fn reconcile() -> String { \"bad\" }\n").unwrap();
+
+    // Ensure fast-check hook is active (if not already auto-compiled, approve it).
+    let fc = env
+        .run(&["builtins", "ls"])["builtins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "fast-check")
+        .cloned()
+        .unwrap();
+    let fc_id = fc["id"].as_str().unwrap().to_string();
+    if fc["approved"] != true {
+        let _ = env.run(&["library", "approve", &fc_id, "--what", "hook"]);
+    }
+
+    event(&env, "SessionStart", json!({"source":"startup"}));
+    let file = lib_rs.to_string_lossy().into_owned();
+    let o = event(
+        &env,
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": file, "old_string": "x", "new_string": "y"},
+            "tool_use_id": "toolu_edit_err",
+            "tool_response": {"filePath": file, "structuredPatch": []},
+        }),
+    );
+    let reply = o.json();
+    assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PostToolUse", "{reply}");
+    let ctx = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+    assert!(
+        ctx.contains("src/lib.rs:1:") && ctx.contains("E0308") && ctx.contains("to_string"),
+        "expected cargo E0308 diagnostic + help in PostToolUse additionalContext: {ctx}"
+    );
+    let check_recs: Vec<Value> = trace(&env).into_iter().filter(|r| r["ev"] == "check_ran").collect();
+    assert_eq!(check_recs.len(), 1, "{check_recs:?}");
+    assert_eq!(check_recs[0]["hook_id"], fc_id);
+    assert_eq!(check_recs[0]["kind"], "cargo");
+    assert_eq!(check_recs[0]["ok"], false);
 }

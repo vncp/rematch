@@ -229,6 +229,7 @@ export function changedPaths(tool: string, input: unknown): string[] {
 	};
 	push(input.path);
 	push(input.file_path);
+	push(input.filePath);
 	if (Array.isArray(input.paths)) for (const p of input.paths) push(p);
 	if (name === "edit" || name === "apply_patch") {
 		for (const key of ["input", "patch"]) {
@@ -389,7 +390,7 @@ export function shellWords(input: string): string[] {
 
 export const OPERATIONS = [
 	"doctor", "import", "reflect", "match", "digest", "record", "create", "improve", "activate", "run",
-	"status", "library", "why", "task", "transfer", "ship", "count", "mark", "off", "on", "uninstall", "builtins", "anchor",
+	"status", "library", "why", "task", "transfer", "ship", "count", "mark", "off", "on", "uninstall", "builtins", "anchor", "check", "policy",
 ] as const;
 export type Operation = (typeof OPERATIONS)[number];
 
@@ -440,6 +441,12 @@ export function userOnlyReason(argv: readonly string[]): string | null {
 	if (cmd === "policy" && sub === "scope" && (verb === "set" || verb === "unset")) {
 		return `policy scope ${verb} is reserved to the user: rematch policy scope ${verb} in their own shell`;
 	}
+	if (cmd === "policy" && sub === "auto") {
+		return `policy auto${verb ? ` ${verb}` : ""} is reserved to the user: rematch policy auto in their own shell`;
+	}
+	if (cmd === "policy" && sub === "probes" && argv.some(a => /^--(?:daily|max-parallel)(?:=|$)/.test(a))) {
+		return "policy probes is reserved to the user: rematch policy probes in their own shell";
+	}
 	return null;
 }
 
@@ -487,6 +494,7 @@ export function approvalFor(operation: string, args: readonly string[] = []): "r
 	if (operation === "library") return sub === undefined || ["ls", "why", "inspect"].includes(sub) ? "read" : "exec";
 	if (operation === "transfer") return sub === undefined || sub === "suggest" ? "read" : "exec";
 	if (operation === "builtins") return sub === "reinstall" ? "exec" : "read";
+	if (operation === "policy") return sub === undefined || sub === "show" ? "read" : "exec";
 	return "exec";
 }
 
@@ -532,6 +540,7 @@ export function buildArgv(operation: string, rawArgs: readonly string[], session
 		}
 		case "match":
 		case "digest":
+		case "check":
 			return [operation, ...(hasFlag(args, "--cwd") ? args : ["--cwd", cwd, ...args])];
 		case "record":
 			return ["record", ...(hasFlag(args, "--session") || !sessionId ? args : ["--session", sessionId, ...args])];
@@ -551,12 +560,13 @@ export function markClass(args: readonly string[]): string | null {
 /** Binary argv after whose success the loaded set changed (hook modules written or removed): re-match. */
 export function changesLoaded(argv: readonly string[]): boolean {
 	if (argv[0] === "activate") return true;
+	if (argv[0] === "policy" && argv[1] === "auto" && (argv[2] === "add" || argv[2] === "remove")) return true;
 	return argv[0] === "library" && ["approve", "disable", "rollback"].includes(argv[1] ?? "");
 }
 
 export const COMMANDS = [
 	"why", "status", "library", "create", "improve", "run", "activate", "mark", "off", "on", "disable",
-	"rollback", "approve", "decline", "inspect", "review", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor",
+	"rollback", "approve", "decline", "inspect", "review", "ship", "transfer", "digest", "doctor", "uninstall", "builtins", "anchor", "check", "policy",
 ] as const;
 
 /** `/rematch <sub> …` → (operation, arguments). `disable|rollback|approve|decline|inspect` live under `library`; `review` opens the review dialog (handled by the command). */
@@ -679,7 +689,7 @@ export function reviewTarget(words: readonly string[]): string | null {
 // `export default { id, mode, tool, field, regex, message, pass_condition, params }`; the modes live here.
 // `block`/`stuck` run on `tool_call` and fail closed; `truncate`/`retrieve` run on `context` and fail open.
 
-export const HOOK_MODES = ["block", "truncate", "stuck", "retrieve"] as const;
+export const HOOK_MODES = ["block", "truncate", "stuck", "retrieve", "check"] as const;
 export type HookMode = (typeof HOOK_MODES)[number];
 export type Hook = {
 	id: string;
@@ -697,6 +707,7 @@ const MODE_PARAMS: Record<HookMode, readonly string[]> = {
 	truncate: ["max_age_turns", "keep_chars"],
 	stuck: ["repeats"],
 	retrieve: ["budget_bytes", "min_overlap"],
+	check: ["timeout_secs", "budget_bytes"],
 };
 
 /** Validate a module's default export; throws on anything the binary would not have written. */
@@ -871,6 +882,40 @@ export function retrievalMessage(units: readonly RetrievedUnit[], timestamp = Da
 		content: `[rematch] Units of skills loaded in this session that match the current request, retrieved by the harness (the whole skill: skill://<name>).\n\n${body}`,
 		details: { units: units.map(u => ({ entry_id: u.entry_id, path: u.path })) },
 	};
+}
+
+export const CHECK_TYPE = "com.vncp.rematch.check";
+export const CHECK_DEBOUNCE_MS = 50;
+
+/**
+ * The one message `check` appends after file edits: an omp/Pi `CustomMessage` (`role: "custom"`,
+ * hidden), carrying diagnostics, unedited caller impact references, or `✓ <check> clean in Xs`.
+ */
+export function checkMessage(rendered: string, details: Json = {}, timestamp = Date.now()): Json {
+	return {
+		role: "custom",
+		customType: CHECK_TYPE,
+		display: false,
+		timestamp,
+		content: rendered,
+		details,
+	};
+}
+
+/** Normalize edited file paths relative to `repoTop` (forward slashes, no `./` prefix) for `check_ran`. */
+export function normalizeCheckFiles(files: readonly string[], cwd: string, repoTop: string | null = null): string[] {
+	const base = path.resolve(repoTop ?? cwd);
+	const out: string[] = [];
+	for (const raw of files) {
+		if (!raw) continue;
+		const abs = path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(cwd, raw);
+		const rel = path.relative(base, abs);
+		const norm = (!rel.startsWith("..") && !path.isAbsolute(rel) ? rel : raw)
+			.replace(/\\/g, "/")
+			.replace(/^(?:\.\/)+/, "");
+		if (norm && !out.includes(norm)) out.push(norm);
+	}
+	return out;
 }
 
 /** One versioned `session_start.loaded_entries` item (ADR 001). */
@@ -1096,6 +1141,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let callHooks: Hook[] = [];
 	let contextHooks: Hook[] = [];
 	let retrieveHooks: Hook[] = [];
+	let checkHooks: Hook[] = [];
 	let tracksCalls = false;
 	/** `match.instructions.exposed`: personal AGENTS.md sections omp loads in this session. */
 	let instructionsExposed: Json[] = [];
@@ -1160,8 +1206,9 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			loadedEntries = loadedEntriesOf(data, next);
 			hooks = next;
 			callHooks = next.filter(h => h.mode === "block" || h.mode === "stuck");
-			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve");
+			contextHooks = next.filter(h => h.mode === "truncate" || h.mode === "retrieve" || h.mode === "check");
 			retrieveHooks = next.filter(h => h.mode === "retrieve");
+			checkHooks = next.filter(h => h.mode === "check");
 			tracksCalls = next.some(h => h.mode === "stuck");
 			instructionsExposed = recordsOf(isRecord(data.instructions) ? data.instructions.exposed : undefined);
 		} catch (error) {
@@ -1206,7 +1253,13 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let lastTracedUnits = "";
 	/** The appended retrieval message, reused while the unit contents are unchanged. */
 	let lastInjected: { content: string; message: Json } | null = null;
-
+	/** Files edited in the current turn awaiting `fast-check`, plus any in-flight/settled check message. */
+	const pendingCheckFiles = new Set<string>();
+	let checkDebounceTimer: NodeJS.Timeout | undefined;
+	let checkAbort: AbortController | null = null;
+	let checkPromise: Promise<Json | null> | null = null;
+	let checkDirty = false;
+	let lastCheckMsg: Json | null = null;
 	// `agent` is absent on hosts older than the identity API: treat those as main.
 	const isMain = (ctx: ExtensionContext) => ctx.agent?.kind !== "sub";
 	const sessionIdOf = (ctx: ExtensionContext): string | null => {
@@ -1347,6 +1400,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			}
 		}
 		trace = null;
+		spawnReflect();
 	}
 
 	/** News as toasts, and the actions waiting as a persistent footer status (never a dialog: the session is not blocked). */
@@ -1360,7 +1414,7 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		} catch (error) {
 			log("debug", `setStatus failed: ${errorText(error)}`);
 		}
-		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for you — /rematch review (alt+e); nothing changes until you decide`, "info");
+		if (actions.length > 0) ctx.ui.notify(`rematch: ${actions.length} action(s) waiting for your review — /rematch review (alt+e); low-risk items are applied automatically and waiting items wait for your decision`, "info");
 		return actions;
 	}
 
@@ -1420,6 +1474,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		lastRetrieval = null;
 		lastTracedUnits = "";
 		lastInjected = null;
+		pendingCheckFiles.clear();
+		clearTimeout(checkDebounceTimer);
+		checkDebounceTimer = undefined;
+		checkAbort?.abort();
+		checkAbort = null;
+		checkPromise = null;
+		checkDirty = false;
+		lastCheckMsg = null;
 		await openTrace(ctx);
 		spawnReflect();
 		// Dialogs may outlive the handler budget: present detached, never throwing.
@@ -1659,6 +1721,86 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		return lastInjected.message;
 	}
 
+	/** Run `rematch check` for `files`, record `check_ran` in the trace, and build the hidden context message. */
+	async function executeCheck(files: readonly string[], cwd: string, isMainSession: boolean, signal: AbortSignal): Promise<Json | null> {
+		const hook = checkHooks[0];
+		if (!hook || files.length === 0) return null;
+		const timeoutSecs = Math.max(1, Math.floor(hook.params.timeout_secs ?? 30));
+		const budgetBytes = Math.max(256, Math.floor(hook.params.budget_bytes ?? 4096));
+		const argv = [
+			"check", "--cwd", cwd, "--timeout", String(timeoutSecs), "--budget-bytes", String(budgetBytes),
+			"--files", ...files,
+		];
+		const env = await call(argv, { timeout: (timeoutSecs + 5) * 1000, signal });
+		if (signal.aborted || !env.ok || !isRecord(env.data)) return null;
+		const rendered = typeof env.data.rendered === "string" ? env.data.rendered.trim() : "";
+		if (!rendered) return null;
+		if (env.data.detected === true && trace && isMainSession) {
+			const serverFiles = stringsOf(env.data.files);
+			const normFiles = serverFiles.length > 0 ? serverFiles : normalizeCheckFiles(files, cwd, trace.repo);
+			write("check_ran", {
+				hook_id: hook.id,
+				kind: typeof env.data.kind === "string" ? env.data.kind : "check",
+				ok: env.data.ok === true,
+				errors: typeof env.data.errors === "number" ? env.data.errors : 0,
+				duration_ms: typeof env.data.duration_ms === "number" ? env.data.duration_ms : 0,
+				injected_bytes: Buffer.byteLength(rendered, "utf8"),
+				files: normFiles,
+			});
+		}
+		return checkMessage(rendered, {
+			hook_id: hook.id,
+			kind: env.data.kind ?? null,
+			ok: env.data.ok === true,
+			errors: env.data.errors ?? 0,
+			duration_ms: env.data.duration_ms ?? 0,
+		});
+	}
+
+	function startPendingCheck(cwd: string, isMainSession: boolean): Promise<Json | null> {
+		clearTimeout(checkDebounceTimer);
+		checkDebounceTimer = undefined;
+		checkAbort?.abort();
+		const ctrl = new AbortController();
+		checkAbort = ctrl;
+		checkDirty = false;
+		const files = [...pendingCheckFiles];
+		const runPromise = executeCheck(files, cwd, isMainSession, ctrl.signal).then(msg => {
+			if (!ctrl.signal.aborted && checkAbort === ctrl) {
+				lastCheckMsg = msg;
+				checkPromise = null;
+			}
+			return lastCheckMsg;
+		});
+		checkPromise = runPromise;
+		return runPromise;
+	}
+
+	function scheduleCheck(paths: readonly string[], cwd: string, isMainSession: boolean): void {
+		if (checkHooks.length === 0 || paths.length === 0) return;
+		for (const p of paths) pendingCheckFiles.add(p);
+		checkDirty = true;
+		lastCheckMsg = null;
+		checkAbort?.abort();
+		checkAbort = null;
+		checkPromise = null;
+		clearTimeout(checkDebounceTimer);
+		checkDebounceTimer = setTimeout(() => {
+			checkDebounceTimer = undefined;
+			void startPendingCheck(cwd, isMainSession);
+		}, CHECK_DEBOUNCE_MS);
+		checkDebounceTimer.unref?.();
+	}
+
+	async function awaitCheckMessage(cwd: string, isMainSession: boolean): Promise<Json | null> {
+		if (checkHooks.length === 0) return null;
+		if (checkDirty || checkDebounceTimer !== undefined) {
+			await startPendingCheck(cwd, isMainSession);
+		} else if (checkPromise) {
+			await checkPromise.catch(() => null);
+		}
+		return lastCheckMsg;
+	}
 	// --- context hooks (truncate, retrieve): fail open, outgoing request only ---------------------
 	pi.on("context", async (event, ctx) => {
 		if (!enabled) return undefined;
@@ -1684,6 +1826,12 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 			if (extra) messages = [...(messages ?? event.messages), extra];
 		} catch (error) {
 			log("warn", `retrieve hook failed: ${errorText(error)}`);
+		}
+		try {
+			const checkMsg = await awaitCheckMessage(ctx.cwd, isMain(ctx));
+			if (checkMsg) messages = [...(messages ?? event.messages), checkMsg];
+		} catch (error) {
+			log("warn", `check hook failed: ${errorText(error)}`);
 		}
 		return messages ? { messages: messages as typeof event.messages } : undefined;
 	});
@@ -1739,6 +1887,14 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				skills_invoked: skillsInvoked(text),
 			});
 			trace.lastInput = text;
+			pendingCheckFiles.clear();
+			clearTimeout(checkDebounceTimer);
+			checkDebounceTimer = undefined;
+			checkAbort?.abort();
+			checkAbort = null;
+			checkPromise = null;
+			checkDirty = false;
+			lastCheckMsg = null;
 			if (label === "none") return;
 			trace.reasons.add(label.startsWith("mark:") ? label : `redirect:${label}`);
 			try {
@@ -1770,7 +1926,11 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 				path: typeof rawPath === "string" ? stripSelectors(rawPath) : null,
 			});
 			if (trace.errors.push(isError)) trace.reasons.add("tool_error_cluster");
-			if (!isError) for (const p of changedPaths(event.toolName, input)) trace.changed.add(p);
+			if (!isError) {
+				const touched = changedPaths(event.toolName, input);
+				for (const p of touched) trace.changed.add(p);
+				if (touched.length > 0) scheduleCheck(touched, ctx.cwd, isMain(ctx));
+			}
 		}),
 	);
 

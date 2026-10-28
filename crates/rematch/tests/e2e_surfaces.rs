@@ -83,24 +83,18 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     let dir = env.root.join("staging/payments/log-triage");
     assert!(dir.join("AGENT.md").is_file() && !dir.join("SKILL.md").exists(), "an agent is AGENT.md + rematch.json");
 
-    // provisional, not approved yet: no staging link, not in match; the digest offers it
+    // `editor-agent.sh` has `tools: read, grep` (a subset of READ_ONLY_AGENT_TOOLS), so the
+    // read-only provisional agent is exposed automatically on stage without waiting for approval!
     let cwd = env.repo.to_str().unwrap();
     let link = env.root.join("agents/log-triage.md");
-    assert!(std::fs::symlink_metadata(&link).is_err(), "a provisional agent loads only once approved");
-    let m = env.run(&["match", "--cwd", cwd]);
-    assert!(m["entries"].as_array().unwrap().iter().all(|e| e["id"] != id.as_str()), "{m}");
-    let g = env.run(&["digest", "--cwd", cwd]);
-    let a = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id.as_str()).cloned().expect("agent offered");
-    assert_eq!(a["kind"], "agent");
-    let diff = a["diff"].as_str().unwrap();
-    assert!(diff.starts_with("+++ AGENT.md\n---\n") && diff.contains("first failing step"), "{a}");
-    assert_eq!(env.entry(&id)["pending"], json!(["agent"]));
-    let r = env.approve(&id);
-    assert_eq!((r["approved"].clone(), r["receipts"][0]["entry"].clone()), (json!(["agent"]), json!(id)), "{r}");
+    assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("AGENT.md"), "read-only provisional agent is linked on stage");
     assert_eq!(env.entry(&id)["pending"], json!([]));
-
-    // approved: <root>/agents/<name>.md → the staged AGENT.md (extension/agents links to <root>/agents)
-    assert_eq!(std::fs::read_link(&link).unwrap(), dir.join("AGENT.md"));
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert!(g["approvals"].as_array().unwrap().iter().all(|a| a["id"] != id.as_str()), "read-only agent needs no approval action: {g}");
+    assert!(
+        g["applied_automatically"].as_array().unwrap().iter().any(|a| a["id"] == id.as_str() && a["why"] == "read-only"),
+        "listed under applied_automatically: {g}"
+    );
     let d = doc(&link);
     assert_eq!(d.get_str("name"), Some("log-triage"), "omp requires name");
     assert!(d.get_str("description").is_some_and(|s| s.starts_with("Use for a long build")), "omp requires description");
@@ -111,7 +105,7 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
 
     // match lists it (so the trace's loaded_entries carries it) without a staging dir
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!(m["skill_dirs"], json!([]), "{m}");
+    assert_eq!(m["skill_dirs"], json!([env.root.join("staging/shared")]), "built-in hooks are in staging/shared; payments staging has no non-agent skill: {m}");
     let me = m["entries"].as_array().unwrap().iter().find(|e| e["id"] == id.as_str()).cloned().expect("agent listed");
     assert_eq!((me["kind"].as_str(), me["status"].as_str(), me["predicate_hit"].as_bool()), (Some("agent"), Some("provisional"), Some(true)));
 
@@ -135,7 +129,7 @@ fn agent_entries_load_through_the_plugin_root_then_the_agent_dir() {
     // retire a provisional agent: the staging link goes with it
     let other = staged(&env, "other-triage", "triage long build logs elsewhere", "editor-agent.sh");
     let link2 = env.root.join("agents/other-triage.md");
-    env.approve(&other);
+    assert_eq!(std::fs::read_link(&link2).unwrap(), env.root.join("staging/payments/other-triage/AGENT.md"));
     assert_eq!(doc(&link2).get_str("name"), Some("other-triage"), "the user's name wins in AGENT.md too");
     env.run(&["library", "disable", &other]);
     assert!(std::fs::symlink_metadata(&link2).is_err(), "retired agents unload");
@@ -332,4 +326,244 @@ fn a_kept_fork_candidate_stays_a_pending_action_until_approved() {
     let g = env.run(&["digest", "--cwd", cwd]);
     assert_eq!(g["ship_ready"], json!([]), "{g}");
     assert!(fork_action(&g).is_none(), "{g}");
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_scripts_stay_pending_with_sandbox_observations_until_rule_or_user_approval() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    if rematch_core::sandbox::available_runner().is_none() {
+        eprintln!("skipping sandbox dry-run e2e test: neither sandbox-exec (macOS) nor bwrap (Linux) is available");
+        return;
+    }
+    let cwd = env.repo.to_str().unwrap();
+    // 1. Clean script (writes only to $TMPDIR, exits 0) -> stays 0644 and pending on stage, with clean dry-run observation on the review item
+    let clean_editor = env.home.join("editor-clean-script.sh");
+    std::fs::write(
+        &clean_editor,
+        r##"#!/bin/sh
+cat <<'EOF'
+```json
+{
+  "decision": "EDIT",
+  "entry": {
+    "kind": "script",
+    "name": "clean-helper",
+    "description": "Use when running the deterministic helper script.",
+    "trigger_line": "Use when running the deterministic helper script.",
+    "files": {
+      "SKILL.md": "---\nname: clean-helper\ndescription: Use when running the deterministic helper script.\n---\n\n## Trigger\nUse when running the deterministic helper script.\n\n## Procedure\nRun `scripts/check.sh`.\n",
+      "scripts/check.sh": "#!/bin/sh\nset -eu\necho ok > \"$TMPDIR/scratch.txt\"\n"
+    },
+    "hook": null,
+    "stems": ["clean", "helper"]
+  },
+  "manifest": {
+    "evidence": {"session_id": "", "seq": 1},
+    "predicted_fix": "deterministic check",
+    "predicted_regression": "none",
+    "rationale": "seq 1: helper script"
+  }
+}
+```
+EOF
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&clean_editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dc = env.run(&[
+        "create",
+        "clean-helper",
+        "--from",
+        "description",
+        "--description",
+        "deterministic helper script",
+        "--editor",
+        clean_editor.to_str().unwrap(),
+    ]);
+    let id_clean = dc["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "clean-helper", "--unverified"]);
+    let clean_script = env.root.join("staging/payments/clean-helper/scripts/check.sh");
+    assert_eq!(std::fs::metadata(&clean_script).unwrap().permissions().mode() & 0o777, 0o644, "dry run never auto-approves scripts");
+    assert_eq!(env.entry(&id_clean)["pending"], json!(["scripts"]), "clean script still awaits approval");
+    let g = env.run(&["digest", "--cwd", cwd]);
+    let a_clean = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id_clean.as_str()).cloned().expect("clean script is a review item");
+    assert!(a_clean["diff"].as_str().unwrap().contains("sandbox dry run clean"), "diff shows clean dry run: {a_clean}");
+    assert!(
+        g["applied_automatically"].as_array().unwrap().iter().all(|a| a["id"] != id_clean.as_str()),
+        "not in applied_automatically without a rule: {g}"
+    );
+
+    // 2. Writing script (attempts to write outside the sandbox temp dir, into $HOME/pwned.txt)
+    let writer_editor = env.home.join("editor-writer-script.sh");
+    std::fs::write(
+        &writer_editor,
+        r##"#!/bin/sh
+cat <<'EOF'
+```json
+{
+  "decision": "EDIT",
+  "entry": {
+    "kind": "script",
+    "name": "write-outside",
+    "description": "Use when writing outside.",
+    "trigger_line": "Use when writing outside.",
+    "files": {
+      "SKILL.md": "---\nname: write-outside\ndescription: Use when writing outside.\n---\n\n## Trigger\nUse when writing outside.\n\n## Procedure\nRun `scripts/write.sh`.\n",
+      "scripts/write.sh": "#!/bin/sh\necho pwn > \"$HOME/outside-target.txt\"\n"
+    },
+    "hook": null,
+    "stems": ["write", "outsid"]
+  },
+  "manifest": {
+    "evidence": {"session_id": "", "seq": 1},
+    "predicted_fix": "writes file",
+    "predicted_regression": "none",
+    "rationale": "seq 1: helper script"
+  }
+}
+```
+EOF
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&writer_editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let d = env.run(&[
+        "create",
+        "write-outside",
+        "--from",
+        "description",
+        "--description",
+        "write outside sandbox",
+        "--editor",
+        writer_editor.to_str().unwrap(),
+    ]);
+    let id_write = d["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "write-outside", "--unverified"]);
+    let write_script = env.root.join("staging/payments/write-outside/scripts/write.sh");
+    assert_eq!(std::fs::metadata(&write_script).unwrap().permissions().mode() & 0o777, 0o644, "writing script stays 0644");
+    assert_eq!(env.entry(&id_write)["pending"], json!(["scripts"]));
+    let g = env.run(&["digest", "--cwd", cwd]);
+    let a = g["approvals"].as_array().unwrap().iter().find(|a| a["id"] == id_write.as_str()).cloned().expect("writing script is a review item");
+    let diff = a["diff"].as_str().unwrap();
+    let reason = a["reason"].as_str().unwrap();
+    assert!(diff.contains("--- sandbox dry run") && diff.contains("outside-target.txt"), "diff shows observed write: {diff}");
+    assert!(reason.contains("Sandbox dry run:") && (reason.contains("Operation not permitted") || reason.contains("Permission denied") || reason.contains("outside-target.txt")), "reason shows violation: {reason}");
+
+    // 3. Standing `policy auto add scripts **` rule approves existing and newly staged scripts with `why: "rule"`.
+    let auto_out = env.run(&["policy", "auto", "add", "scripts", "**", "--cwd", cwd]);
+    assert!(auto_out["applied"].as_array().unwrap().contains(&json!("clean-helper")), "{auto_out}");
+    assert_eq!(std::fs::metadata(&clean_script).unwrap().permissions().mode() & 0o777, 0o755, "rule-approved script is 0755");
+    assert_eq!(env.entry(&id_clean)["pending"], json!([]));
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert!(
+        g["applied_automatically"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == id_clean.as_str() && a["why"] == "rule" && a["rule"] == "scripts:**" && a["undo"] == format!("rematch library disable {id_clean}")),
+        "{g}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_block_hook_is_live_without_approval_and_two_harmful_fires_retire_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let cwd = env.repo.to_str().unwrap();
+    let hook_editor = env.home.join("editor-block-hook.sh");
+    std::fs::write(
+        &hook_editor,
+        r##"#!/bin/sh
+cat <<'EOF'
+```json
+{
+  "decision": "EDIT",
+  "entry": {
+    "kind": "hook",
+    "name": "no-secrets-read",
+    "description": "Use when reading project files; never read secrets.txt.",
+    "trigger_line": "Use when reading project files.",
+    "files": {
+      "SKILL.md": "---\nname: no-secrets-read\ndescription: Use when reading project files; never read secrets.txt.\n---\n\n## Trigger\nUse when reading project files.\n\n## Laws\n- Never read `secrets.txt`; ask the user instead.\n"
+    },
+    "hook": {
+      "mode": "block",
+      "tool": "read",
+      "field": "path",
+      "regex": "(?:^|/)secrets\\.txt$",
+      "message": "rematch: secrets.txt is off limits; ask the user.",
+      "pass_condition": "Every read of a file not named secrets.txt passes."
+    },
+    "stems": ["read", "secret"]
+  },
+  "manifest": {
+    "evidence": {"session_id": "", "seq": 1},
+    "predicted_fix": "blocks secret reads",
+    "predicted_regression": "none",
+    "rationale": "seq 1: prevent reading secrets.txt"
+  }
+}
+```
+EOF
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook_editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let d = env.run(&[
+        "create",
+        "no-secrets-read",
+        "--from",
+        "description",
+        "--description",
+        "never read the secrets file",
+        "--editor",
+        hook_editor.to_str().unwrap(),
+    ]);
+    let id = d["id"].as_str().unwrap().to_string();
+    env.run(&["activate", "no-secrets-read", "--unverified"]);
+    // Live without approval and listed as applied_automatically.
+    assert!(env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts")).is_file(), "compiled on stage");
+    assert_eq!(env.entry(&id)["pending"], json!([]));
+    let g = env.run(&["digest", "--cwd", cwd]);
+    assert!(g["approvals"].as_array().unwrap().iter().all(|a| a["id"] != id.as_str()), "no approval action: {g}");
+    assert!(
+        g["applied_automatically"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == id.as_str() && a["why"] == "data-only" && a["undo"] == format!("rematch library disable {id}")),
+        "{g}"
+    );
+    let m = env.run(&["match", "--cwd", cwd]);
+    assert!(m["hooks"].as_array().unwrap().iter().any(|h| h.as_str().unwrap().ends_with(&format!("{id}.ts"))), "{m}");
+
+    // Two sessions where the block hook fires and is followed by a user correction redirect retire it.
+    let repo_s = env.repo.to_string_lossy().into_owned();
+    for (i, sid) in ["0192c4a0-0000-7000-8000-000000000801", "0192c4a0-0000-7000-8000-000000000802"].iter().enumerate() {
+        let t0 = 10_000 + (i as i64) * 1_000;
+        env.write_records(
+            sid,
+            &[
+                json!({"seq":0,"t":t0,"ev":"session_start","session_id":sid,"cwd":repo_s,"repo":repo_s,"branch_hint":"payments",
+                       "model":{"provider":"anthropic","id":"claude-opus-5-5"},"loaded_entries":[{"id":id,"version":1}],
+                       "hooks_loaded":[id],"staging_dirs":[]}),
+                json!({"seq":1,"t":t0+1,"ev":"input","text":"Read the secrets file in the repo","source":"interactive","idle":true,"prelabel":"none"}),
+                json!({"seq":2,"t":t0+2,"ev":"tool_blocked","tool":"read","call_id":"c1","args_hash":"a".repeat(64),"hook_id":id}),
+                json!({"seq":3,"t":t0+3,"ev":"turn_end","model":{"provider":"anthropic","id":"claude-opus-5-5"},"usage":{"input":10,"output":5},"stop_reason":"stop","text_head":"Blocked."}),
+                json!({"seq":4,"t":t0+4,"ev":"agent_end","turns":1,"is_terminal":true,"yielded":true}),
+                json!({"seq":5,"t":t0+5,"ev":"input","text":"No, that's wrong, I wanted to force push this branch","source":"interactive","idle":true,"after_deliverable":"Blocked.","prelabel":"negation"}),
+                json!({"seq":6,"t":t0+6,"ev":"turn_end","model":{"provider":"anthropic","id":"claude-opus-5-5"},"usage":{"input":10,"output":5},"stop_reason":"stop","text_head":"Ok."}),
+                json!({"seq":7,"t":t0+7,"ev":"agent_end","turns":1,"is_terminal":true,"yielded":true}),
+                json!({"seq":8,"t":t0+8,"ev":"session_shutdown","reasons":["redirect:negation"],"flagged":true}),
+            ],
+        );
+    }
+    let c = env.run(&["count", "--editor", &script("editor-ok.sh")]);
+    let e = env.entry(&id);
+    assert_eq!(e["status"], "retired", "retired after two harmful block fires: {c} / {e}");
+    assert_eq!(e["counters"]["harm"], 2, "{e}");
+    assert!(!env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts")).exists(), "compiled hook removed on retire");
 }

@@ -109,6 +109,8 @@ pub struct InstructionRecord {
     pub fragment_sha256: Sha256Hex,
     pub target: PathBuf,
     pub at: UnixMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
 }
 
 /// Where a desired block's text comes from.
@@ -129,6 +131,8 @@ pub struct Desired {
     /// The local entry credited with the exposure, if any.
     pub entry: Option<EntryId>,
     pub source: Source,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
 }
 
 impl Desired {
@@ -292,6 +296,18 @@ fn record(ledger: &Ledger, r: InstructionRecord) -> Result<Receipt> {
 }
 
 fn new_record(paths: &RematchPaths, decision: Decision, entry: Option<EntryId>, name: &str, version: Option<u32>, sha: &str) -> InstructionRecord {
+    new_record_with(paths, decision, entry, name, version, sha, None)
+}
+
+fn new_record_with(
+    paths: &RematchPaths,
+    decision: Decision,
+    entry: Option<EntryId>,
+    name: &str,
+    version: Option<u32>,
+    sha: &str,
+    approver: Option<String>,
+) -> InstructionRecord {
     InstructionRecord {
         what: RECORD_WHAT.into(),
         decision,
@@ -301,6 +317,7 @@ fn new_record(paths: &RematchPaths, decision: Decision, entry: Option<EntryId>, 
         fragment_sha256: sha.to_string(),
         target: target(paths),
         at: now_ms(),
+        approver,
     }
 }
 
@@ -397,7 +414,7 @@ pub fn pending(ledger: &Ledger, paths: &RematchPaths) -> Result<Vec<Pending>> {
         if blocked.is_none() {
             blocked = validate_name(&e.name).err().map(|x| format!("{x:#}"));
         }
-        let candidate = Desired { name: e.name.clone(), sha: sha.clone(), text: text.clone(), entry: Some(e.id.clone()), source: Source::Ledger };
+        let candidate = Desired { name: e.name.clone(), sha: sha.clone(), text: text.clone(), entry: Some(e.id.clone()), source: Source::Ledger, approver: None };
         let bytes = candidate.bytes();
         if blocked.is_none() {
             blocked = over_budget(ledger, paths, &recs, &e, &sha)?;
@@ -625,7 +642,7 @@ pub fn desired(
                 _ => ledger.get_blob(&r.fragment_sha256)?.and_then(|b| String::from_utf8(b).ok()),
             };
             let Some(text) = text.filter(|t| check_text(t).is_ok()) else { continue };
-            all.insert(name.to_string(), Desired { name: name.to_string(), sha: r.fragment_sha256.clone(), text, entry: Some(credit), source: Source::Ledger });
+            all.insert(name.to_string(), Desired { name: name.to_string(), sha: r.fragment_sha256.clone(), text, entry: Some(credit), source: Source::Ledger, approver: r.approver.clone() });
             break;
         }
     }
@@ -638,7 +655,7 @@ pub fn desired(
             continue;
         }
         let credited = live.iter().find(|(e, s)| e.name == name && s.as_deref() == Some(sha.as_str())).map(|(e, _)| e.id.clone());
-        all.insert(name.clone(), Desired { name, sha, text, entry: credited, source: Source::Profile });
+        all.insert(name.clone(), Desired { name, sha, text, entry: credited, source: Source::Profile, approver: None });
     }
     // Budget: edited blocks stay (the user's bytes), and so do unedited ones in the desired bytes
     // (approved and admitted before; a lowered limit never takes them out silently). The rest
@@ -1259,6 +1276,11 @@ pub fn exposure(ledger: &Ledger, paths: &RematchPaths) -> Result<Exposure> {
 /// Approve the exact fragment of a loadable entry. `sha` is the fragment hash (≥ 8 hex) the
 /// user reviewed; a fragment that changed since, or that would not fit the budget, is refused.
 pub fn approve(ledger: &Ledger, paths: &RematchPaths, entry: &str, sha: &str) -> Result<(Receipt, Sync)> {
+    approve_with(ledger, paths, entry, sha, None)
+}
+
+/// [`approve`] recording `approver` (e.g. `"rule:instructions:**"`) in the receipt certificate.
+pub fn approve_with(ledger: &Ledger, paths: &RematchPaths, entry: &str, sha: &str, approver: Option<&str>) -> Result<(Receipt, Sync)> {
     let e = ledger.find_entry(entry)?.ok_or_else(|| anyhow!("no entry {entry:?}"))?;
     if !loadable(&e) {
         bail!("entry {} is {:?}; only provisional, kept or pinned entries contribute personal instructions", e.id, e.status);
@@ -1274,16 +1296,39 @@ pub fn approve(ledger: &Ledger, paths: &RematchPaths, entry: &str, sha: &str) ->
     if let Some(why) = over_budget(ledger, paths, &recs, &e, &cur)? {
         bail!("{why}");
     }
-    let block = Desired { name: e.name.clone(), sha: cur.clone(), text: text.clone(), entry: Some(e.id.clone()), source: Source::Ledger };
+    let block = Desired { name: e.name.clone(), sha: cur.clone(), text: text.clone(), entry: Some(e.id.clone()), source: Source::Ledger, approver: approver.map(str::to_string) };
     check_room(ledger, paths, &e, block.bytes())?;
     ledger.put_blob(text.as_bytes())?;
     // The same text reaches the system prompt of matched main sessions on hosts without a
     // personal file rematch manages (Claude Code, Pi, OpenCode: `library::prompt_fragments`).
     if !library::fragment_approved(&e) {
-        library::approve(ledger, paths, &e.id, Approval::Prompt)?;
+        library::approve_with(ledger, paths, &e.id, Approval::Prompt, approver, None)?;
     }
-    let receipt = record(ledger, new_record(paths, Decision::Approved, Some(e.id.clone()), &e.name, Some(e.version), &cur))?;
+    let receipt = record(ledger, new_record_with(paths, Decision::Approved, Some(e.id.clone()), &e.name, Some(e.version), &cur, approver.map(str::to_string)))?;
     Ok((receipt, sync_after(ledger, paths, "the approval")?))
+}
+
+/// Apply standing `policy.json` `auto` rules for `instructions` to undecided fragments of
+/// loadable rematch-owned entries that fit within the always-on byte budget.
+pub fn apply_auto_rules(ledger: &Ledger, paths: &RematchPaths) -> Result<Vec<(Entry, Receipt)>> {
+    let rules = crate::domain::load_auto_rules(paths)?;
+    if !rules.iter().any(|r| r.surface == crate::domain::AutoSurface::Instructions) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for p in pending(ledger, paths)? {
+        if p.blocked.is_some() {
+            continue;
+        }
+        let Some(rule) = crate::domain::matching_auto_rule(&rules, crate::domain::AutoSurface::Instructions, &p.entry.predicate) else {
+            continue;
+        };
+        let approver = format!("rule:{}:{}", rule.surface.as_str(), rule.scope);
+        if let Ok((receipt, _)) = approve_with(ledger, paths, &p.entry.id, &p.fragment_sha256, Some(&approver)) {
+            out.push((p.entry, receipt));
+        }
+    }
+    Ok(out)
 }
 
 /// [`sync`] after a recorded decision: a failed write says the decision stands and how the drift
@@ -1458,7 +1503,7 @@ mod tests {
     use super::*;
 
     fn d(name: &str, text: &str) -> Desired {
-        Desired { name: name.into(), sha: sha256_hex(text.as_bytes()), text: text.into(), entry: None, source: Source::Ledger }
+        Desired { name: name.into(), sha: sha256_hex(text.as_bytes()), text: text.into(), entry: None, source: Source::Ledger, approver: None }
     }
 
     fn run(cur: &str, want: &[Desired]) -> (String, Sync) {
@@ -1565,7 +1610,7 @@ mod tests {
     }
 
     fn block_bytes(name: &str, text: &str) -> usize {
-        Desired { name: name.into(), sha: sha256_hex(text.as_bytes()), text: text.into(), entry: None, source: Source::Ledger }.bytes()
+        Desired { name: name.into(), sha: sha256_hex(text.as_bytes()), text: text.into(), entry: None, source: Source::Ledger, approver: None }.bytes()
     }
 
     fn with_profile(paths: &RematchPaths) {

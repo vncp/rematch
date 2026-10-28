@@ -80,7 +80,7 @@ fn retrieve_ranks_loaded_package_units_within_the_budget() {
 }
 
 #[test]
-fn builtins_install_once_and_wait_for_approval() {
+fn builtins_install_once_and_activate_automatically() {
     let env = Env::new();
     let ls = env.run(&["builtins", "ls"]);
     let items = ls["builtins"].as_array().unwrap();
@@ -88,9 +88,14 @@ fn builtins_install_once_and_wait_for_approval() {
         items.iter().map(|x| (x["name"].as_str().unwrap(), x["mode"].as_str().unwrap(), x["status"].as_str().unwrap())).collect();
     assert_eq!(
         got,
-        vec![("context-unit-retrieval", "retrieve", "provisional"), ("tool-output-truncation", "truncate", "provisional"), ("stuck-detector", "stuck", "provisional")]
+        vec![
+            ("context-unit-retrieval", "retrieve", "provisional"),
+            ("tool-output-truncation", "truncate", "provisional"),
+            ("stuck-detector", "stuck", "provisional"),
+            ("fast-check", "check", "provisional"),
+        ]
     );
-    assert!(items.iter().all(|x| x["approved"] == false));
+    assert!(items.iter().all(|x| x["approved"] == true));
     let hook: Value = serde_json::from_str(
         &std::fs::read_to_string(env.root.join("staging/shared/tool-output-truncation/hook.json")).unwrap(),
     )
@@ -98,30 +103,18 @@ fn builtins_install_once_and_wait_for_approval() {
     assert_eq!(hook["mode"], "truncate");
     assert_eq!((hook["max_age_turns"].as_u64(), hook["keep_chars"].as_u64()), (Some(6), Some(1200)));
 
-    // unapproved: no shared dir, no hook module, not counted
-    let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
-    assert_eq!((m["skill_dirs"].clone(), m["hooks"].clone(), m["entries"].clone()), (json!([]), json!([]), json!([])), "{m}");
-
-    // offered once each in the digest; approving compiles a data-only module
-    let g = env.run(&["digest", "--cwd", env.repo.to_str().unwrap()]);
-    let approvals = g["approvals"].as_array().unwrap();
-    assert_eq!(approvals.len(), 3, "{g}");
-    let stuck = approvals.iter().find(|a| a["name"] == "stuck-detector").unwrap();
-    assert_eq!(stuck["kind"], "hook");
-    assert!(stuck["diff"].as_str().unwrap().contains(r#"params: {"repeats":3},"#), "{stuck}");
-    let id = stuck["id"].as_str().unwrap().to_string();
-    env.approve(&id);
-    let module = std::fs::read_to_string(env.agent.join("extensions/rematch-hooks").join(format!("{id}.ts"))).unwrap();
+    let stuck_id = items.iter().find(|x| x["name"] == "stuck-detector").unwrap()["id"].as_str().unwrap().to_string();
+    let module = std::fs::read_to_string(env.agent.join("extensions/rematch-hooks").join(format!("{stuck_id}.ts"))).unwrap();
     assert!(module.contains(r#"mode: "stuck","#) && !module.contains("=>"), "{module}");
     let m = env.run(&["match", "--cwd", env.repo.to_str().unwrap()]);
     assert_eq!(m["skill_dirs"], json!([env.root.join("staging").join("shared")]));
-    assert!(m["entries"].as_array().unwrap().iter().any(|e| e["id"] == id.as_str() && e["predicate_hit"] == true), "{m}");
+    assert!(m["entries"].as_array().unwrap().iter().any(|e| e["id"] == stuck_id.as_str() && e["predicate_hit"] == true), "{m}");
 
     // idempotent across runs
     env.run(&["library", "ls"]);
     let ls = env.run(&["library", "ls"]);
     let n = ls["entries"].as_array().unwrap().iter().filter(|e| e["origin"]["source"] == "builtin").count();
-    assert_eq!(n, 3);
+    assert_eq!(n, 4);
 }
 
 /// A clean finished session in the payments repo: `loaded` at session start, then (when
@@ -175,7 +168,6 @@ fn retrieval_record_credits_the_hook_and_the_package_through_count() {
     let pkg = staged(&env, "ledger-test-gate", "Run the ledger tests before committing payment changes");
     write(&env.root.join("staging/payments/ledger-test-gate/units/reconcile.md"), "# Ledger reconciliation\n\nRun the reconciliation migration before the ledger tests.\n");
     let hook = builtin(&env, "context-unit-retrieval")["id"].as_str().unwrap().to_string();
-    env.approve(&hook);
     assert_eq!(builtin(&env, "context-unit-retrieval")["approved"], true);
     let retrieval = || {
         json!({"ev":"retrieval","entry_ids":[hook],"units":[{"entry_id":pkg,"path":"units/reconcile.md","bytes":80}],"bytes":80})
@@ -220,4 +212,85 @@ fn retrieval_record_credits_the_hook_and_the_package_through_count() {
     // The retrieve hook applied in 4 clean completed sessions: actual use, so it is kept too.
     let h = builtin(&env, "context-unit-retrieval");
     assert_eq!((h["counters"]["matched"].as_u64(), h["status"].as_str()), (Some(4), Some("kept")), "{h}");
+}
+
+#[test]
+fn rematch_check_reports_cargo_error_with_help_and_impact_then_clean() {
+    let env = Env::new();
+    let cargo_repo = env.home.join("cargo-demo");
+    std::fs::create_dir_all(cargo_repo.join("src")).unwrap();
+    std::fs::write(
+        cargo_repo.join("Cargo.toml"),
+        "[package]\nname = \"cargo-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cargo_repo.join("src/lib.rs"),
+        "pub fn compute_amount(x: i32) -> i32 { x }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cargo_repo.join("src/caller.rs"),
+        "pub fn use_it() -> i32 { crate::compute_amount(1) }\n",
+    )
+    .unwrap();
+
+    // Initialize git so impact diff works
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .current_dir(&cargo_repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+
+    // Clean repo -> ok: true, ✓ cargo clean
+    let clean = env.run(&["check", "--cwd", cargo_repo.to_str().unwrap()]);
+    assert_eq!(clean["detected"], true, "{clean}");
+    assert_eq!(clean["ok"], true, "{clean}");
+    assert_eq!(clean["kind"], "cargo", "{clean}");
+    assert!(
+        clean["rendered"].as_str().unwrap_or_default().contains("✓ cargo clean in"),
+        "{clean}"
+    );
+
+    // Introduce a type error + signature change in src/lib.rs while src/caller.rs stays unedited
+    std::fs::write(
+        cargo_repo.join("src/lib.rs"),
+        "pub fn compute_amount(x: i32, extra: i32) -> String { \"hello\" }\n",
+    )
+    .unwrap();
+
+    let bad = env.run(&[
+        "check",
+        "--cwd",
+        cargo_repo.to_str().unwrap(),
+        "--files",
+        "src/lib.rs",
+    ]);
+    assert_eq!(bad["ok"], false, "{bad}");
+    assert!(bad["errors"].as_u64().unwrap_or(0) >= 1, "{bad}");
+    let diags = bad["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.iter().any(|d| {
+            d["file"] == "src/lib.rs"
+                && d["line"] == 1
+                && d["code"] == "E0308"
+                && d["help"].as_str().unwrap_or_default().contains("to_string")
+        }),
+        "expected E0308 with to_string help: {bad}"
+    );
+    let impact = bad["impact"].as_array().unwrap();
+    assert!(
+        impact.iter().any(|r| r["file"] == "src/caller.rs" && r["symbol"] == "compute_amount"),
+        "expected impact ref in unedited src/caller.rs: {bad}"
+    );
+    let rendered = bad["rendered"].as_str().unwrap_or_default();
+    assert!(rendered.contains("src/lib.rs:1:") && rendered.contains("help:"), "{rendered}");
+    assert!(rendered.contains("src/caller.rs:1 (compute_amount):"), "{rendered}");
 }

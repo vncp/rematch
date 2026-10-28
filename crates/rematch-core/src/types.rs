@@ -145,16 +145,18 @@ pub enum HookMode {
     Stuck,
     /// `context`: append the loaded packages' units that overlap the current request.
     Retrieve,
+    /// `context` / after-edit: run the repo's detected fast check (`rematch check`) after file edits.
+    Check,
 }
 
-/// Declarative rule compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts` on
-/// approval. Mode parameters are flat optional fields; [`HookRule::params`] resolves
+/// Declarative rule compiled to `~/.omp/agent/extensions/rematch-hooks/<id>.ts`.
+/// Mode parameters are flat optional fields; [`HookRule::params`] resolves
 /// them with the mode defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookRule {
     #[serde(default)]
     pub mode: HookMode,
-    /// Tool the rule applies to (`*` = every tool; ignored by `retrieve`).
+    /// Tool the rule applies to (`*` = every tool; ignored by `retrieve`/`check`).
     pub tool: String,
     /// Input field inspected by `block` (e.g. `command`, `path`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -176,6 +178,8 @@ pub struct HookRule {
     pub budget_bytes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_overlap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u32>,
 }
 
 /// Resolved mode parameters of a [`HookRule`] (the `params` of the compiled module).
@@ -186,6 +190,7 @@ pub enum HookParams {
     Truncate { max_age_turns: u32, keep_chars: u32 },
     Stuck { repeats: u32 },
     Retrieve { budget_bytes: u32, min_overlap: u32 },
+    Check { timeout_secs: u32, budget_bytes: u32 },
 }
 
 pub const DEFAULT_TRUNCATE_MAX_AGE_TURNS: u32 = 6;
@@ -193,6 +198,8 @@ pub const DEFAULT_TRUNCATE_KEEP_CHARS: u32 = 1200;
 pub const DEFAULT_STUCK_REPEATS: u32 = 3;
 pub const DEFAULT_RETRIEVE_BUDGET_BYTES: u32 = 6000;
 pub const DEFAULT_RETRIEVE_MIN_OVERLAP: u32 = 2;
+pub const DEFAULT_CHECK_TIMEOUT_SECS: u32 = 30;
+pub const DEFAULT_CHECK_BUDGET_BYTES: u32 = 4096;
 
 impl HookRule {
     /// `block` rule (the shape the editor proposes).
@@ -209,6 +216,7 @@ impl HookRule {
             repeats: None,
             budget_bytes: None,
             min_overlap: None,
+            timeout_secs: None,
         }
     }
 
@@ -223,6 +231,10 @@ impl HookRule {
             HookMode::Retrieve => HookParams::Retrieve {
                 budget_bytes: self.budget_bytes.unwrap_or(DEFAULT_RETRIEVE_BUDGET_BYTES),
                 min_overlap: self.min_overlap.unwrap_or(DEFAULT_RETRIEVE_MIN_OVERLAP),
+            },
+            HookMode::Check => HookParams::Check {
+                timeout_secs: self.timeout_secs.unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS),
+                budget_bytes: self.budget_bytes.unwrap_or(DEFAULT_CHECK_BUDGET_BYTES),
             },
         }
     }
@@ -804,6 +816,9 @@ pub struct SessionRecord {
     /// Hooks that changed the session: `tool_blocked`, `retrieval.entry_ids`, `hook_applied`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks_applied: Vec<EntryId>,
+    /// Earliest `tool_blocked` seq per hook id in the session (for post-block redirect harm).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hook_blocked_at: BTreeMap<EntryId, u32>,
     /// Hooks that evaluated a matching call and let it pass (`hook_evaluated`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks_evaluated: Vec<EntryId>,

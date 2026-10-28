@@ -358,8 +358,10 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
     }
     let actions = crate::actions::pending(ctx)?;
     let applied = crate::actions::applied(ctx)?;
+    let auto_applied = crate::actions::applied_automatically(ctx)?;
     lines.extend(actions.iter().map(crate::actions::Action::line));
     lines.extend(crate::actions::applied_line(&applied));
+    lines.extend(auto_applied.iter().map(crate::actions::AutoApplied::line));
     if lines.is_empty() {
         lines.push("library is empty".into());
     }
@@ -368,6 +370,7 @@ fn ls(ctx: &AppCtx) -> Result<Value> {
         "profile_kept": elsewhere.iter().map(|k| k.to_json()).collect::<Vec<_>>(),
         "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
         "applied": applied.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        "applied_automatically": auto_applied,
         "trials": crate::actions::trials(ctx)?,
         "instructions": rematch_core::instructions::exposure(&ctx.ledger, &ctx.paths)?,
         "lines": lines,

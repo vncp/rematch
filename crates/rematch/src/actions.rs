@@ -390,6 +390,159 @@ pub fn applied_line(applied: &[Action]) -> Option<String> {
     ))
 }
 
+/// One artifact or decision rematch applied without asking the user (`applied_automatically`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutoApplied {
+    pub id: String,
+    pub name: String,
+    pub what: String,
+    pub where_target: String,
+    /// `data-only` | `read-only` | `rule` | `comparative_support` | `probe_regressed`.
+    pub why: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<Value>,
+    pub undo: String,
+}
+
+impl AutoApplied {
+    pub fn line(&self) -> String {
+        let why = match &self.rule {
+            Some(r) => format!("{} ({r})", self.why),
+            None => self.why.clone(),
+        };
+        format!("applied automatically: {} in {} ({why}) — undo: `{}`", self.what, self.where_target, self.undo)
+    }
+}
+
+fn undo_for_entry(e: &Entry) -> String {
+    if matches!(e.status, Status::Kept | Status::Pinned) && e.predecessor.is_some() {
+        format!("rematch library rollback {}", e.name)
+    } else {
+        format!("rematch library disable {}", e.id)
+    }
+}
+
+/// Everything rematch applied automatically without a user prompt: data-only hooks, read-only
+/// provisional subagents, surfaces matched by a standing `policy.json` `auto` rule, and automatic
+/// probe keep/retire decisions. Empty while rematch is off.
+pub fn applied_automatically(ctx: &AppCtx) -> Result<Vec<AutoApplied>> {
+    if ctx.paths.is_off() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for st in [Status::Provisional, Status::Kept, Status::Pinned] {
+        for e in ctx.ledger.list_entries(&EntryFilter { status: Some(st), ..Default::default() })? {
+            if e.kind == Kind::Lesson {
+                continue;
+            }
+            let undo = undo_for_entry(&e);
+            if e.kind == Kind::Hook && library::is_data_only_hook(&e) {
+                let mode = e.hook.as_ref().map(|h| enum_str(&h.mode)).unwrap_or_else(|| "hook".into());
+                out.push(AutoApplied {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    what: format!("hook {} ({mode})", e.name),
+                    where_target: format!("<agent_dir>/extensions/rematch-hooks/{}.ts", e.id),
+                    why: "data-only".into(),
+                    rule: None,
+                    observed: None,
+                    undo: undo.clone(),
+                });
+            }
+            if e.kind == Kind::Agent && e.status == Status::Provisional && library::agent_approved(&e) {
+                let rec = library::latest_approval_record(&ctx.ledger, &e.id, Approval::Agent);
+                let approver = rec.as_ref().and_then(|r| r.approver.as_deref());
+                let rule = approver.and_then(|a| a.strip_prefix("rule:")).map(str::to_string);
+                if approver == Some("read-only") || rule.is_some() || (approver.is_none() && library::agent_is_read_only(&e)) {
+                    out.push(AutoApplied {
+                        id: e.id.clone(),
+                        name: e.name.clone(),
+                        what: format!("agent {}", e.name),
+                        where_target: library::agent_link(&ctx.paths, &e.name).display().to_string(),
+                        why: if rule.is_some() { "rule".into() } else { "read-only".into() },
+                        rule,
+                        observed: None,
+                        undo: undo.clone(),
+                    });
+                }
+            }
+            if !e.approved_scripts.is_empty() && library::unapproved_scripts(&e).is_empty() {
+                if let Some(rec) = library::latest_approval_record(&ctx.ledger, &e.id, Approval::Scripts) {
+                    if let Some(approver) = rec.approver.as_deref() {
+                        let Some(rule) = approver.strip_prefix("rule:").map(str::to_string) else { continue };
+                        out.push(AutoApplied {
+                            id: e.id.clone(),
+                            name: e.name.clone(),
+                            what: format!("scripts of {} ({})", e.name, e.approved_scripts.join(", ")),
+                            where_target: e.path.join("scripts").display().to_string(),
+                            why: "rule".into(),
+                            rule: Some(rule),
+                            observed: rec.observed,
+                            undo: undo.clone(),
+                        });
+                    }
+                }
+            }
+            if matches!(e.status, Status::Kept | Status::Pinned)
+                && e.retention.as_ref().is_some_and(|r| r.reason == rematch_core::types::RetentionReason::ComparativeSupport)
+            {
+                out.push(AutoApplied {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    what: format!("kept {} {}", enum_str(&e.kind), e.name),
+                    where_target: e.path.display().to_string(),
+                    why: "comparative_support".into(),
+                    rule: None,
+                    observed: None,
+                    undo: undo.clone(),
+                });
+            }
+        }
+    }
+    for e in ctx.ledger.list_entries(&EntryFilter { status: Some(Status::Retired), ..Default::default() })? {
+        let regressed = crate::probes::record_of(ctx, &e.id).is_some_and(|r| r.status == crate::probes::ProbeStatus::Regresses)
+            || e.status_note.as_deref().is_some_and(|n| n.starts_with("bounded comparison regressed"));
+        if regressed {
+            out.push(AutoApplied {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                what: format!("retired {} {}", enum_str(&e.kind), e.name),
+                where_target: e.path.display().to_string(),
+                why: "probe_regressed".into(),
+                rule: None,
+                observed: None,
+                undo: undo_for_entry(&e),
+            });
+        }
+    }
+    let ex = instructions::exposure(&ctx.ledger, &ctx.paths)?;
+    let recs = instructions::records(&ctx.ledger, &ctx.paths)?;
+    let set = instructions::desired(&ctx.ledger, &ctx.paths, &recs, false, None)?;
+    let shown = ex.target.display().to_string();
+    for x in ex.exposed.iter().filter(|x| x.source != "stale") {
+        let Some(w) = set.blocks.get(&x.name).filter(|w| w.sha == x.sha) else { continue };
+        let Some(approver) = w.approver.as_deref() else { continue };
+        let rule = approver.strip_prefix("rule:").map(str::to_string);
+        out.push(AutoApplied {
+            id: format!("{INSTRUCTIONS_APPLIED}{}", w.name),
+            name: w.name.clone(),
+            what: format!("instructions {}", w.name),
+            where_target: shown.clone(),
+            why: if rule.is_some() { "rule".into() } else { approver.into() },
+            rule,
+            observed: None,
+            undo: w
+                .entry
+                .as_deref()
+                .map(|id| format!("rematch library disable {id}"))
+                .unwrap_or_else(|| format!("rematch library inspect {INSTRUCTIONS_APPLIED}{}", w.name)),
+        });
+    }
+    Ok(out)
+}
+
 /// An approved text (applied, or over the budget) as an `instructions-applied:<name>` action:
 /// decline withdraws it; the reason says how far a withdrawal reaches.
 fn text_action(ctx: &AppCtx, w: &instructions::Desired, shown: &str, profile: bool, state: &str) -> Action {
@@ -460,6 +613,13 @@ fn entry_actions(ctx: &AppCtx, out: &mut Vec<Action>) -> Result<()> {
                         for (rel, p) in &files {
                             let bytes = std::fs::read(p).unwrap_or_default();
                             a.diff.push_str(&format!("+++ {rel} (sha256 {})\n{}\n", sha256_hex(&bytes), String::from_utf8_lossy(&bytes)));
+                        }
+                        if let Some(rep) = rematch_core::sandbox::latest_report(&ctx.ledger, &e) {
+                            let obs: Vec<String> = rep.scripts.iter().map(rematch_core::sandbox::ScriptDryRun::summary_line).collect();
+                            if !obs.is_empty() {
+                                reason = format!("{reason}\n\nSandbox dry run:\n{}", obs.join("\n"));
+                                a.diff.push_str(&format!("--- sandbox dry run\n{}\n", obs.join("\n")));
+                            }
                         }
                         targets.push(e.path.join("scripts").display().to_string());
                         effects.push("executable");
