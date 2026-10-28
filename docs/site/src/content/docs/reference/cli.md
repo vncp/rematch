@@ -476,7 +476,7 @@ Usage: rematch library [OPTIONS] <COMMAND>
 Commands:
   ls             Every entry with raw counters
   why            Loaded entries, predicate hits, redirects and counters of a session (default: latest for --cwd)
-  disable        Retire an entry now (user disable; counts as harm for that session)
+  disable        Retire an entry now (user disable; counts as harm for that session). `id` is an entry id or the name of exactly one live entry
   rollback       Restore the predecessor of a kept skill or agent; retire the current one
   pin            
   unpin          
@@ -527,7 +527,7 @@ Options:
 ### rematch library disable
 
 ```text
-Retire an entry now (user disable; counts as harm for that session)
+Retire an entry now (user disable; counts as harm for that session). `id` is an entry id or the name of exactly one live entry
 
 Usage: rematch library disable [OPTIONS] <ID>
 

@@ -122,14 +122,17 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
             continue;
         }
         seen = seen.max(since);
-        changed.push(json!({"id": e.id, "name": e.name, "status": e.status, "since": since}));
+        let c = ctx.ledger.counters(&e.id)?;
+        changed.push(json!({
+            "id": e.id, "name": e.name, "kind": e.kind, "status": e.status, "since": since,
+            "branch": e.branch, "note": e.status_note, "counters": c,
+        }));
         // Imported registrations (forge/brownfield, files left in place) were not staged:
         // one summary line instead of one per entry.
         if e.status == Status::Provisional && matches!(e.origin, rematch_core::types::Origin::Import { .. }) && e.version <= 1 && e.sibling_of.is_none() && !e.path.starts_with(&ctx.paths.staging) {
             registered += 1;
             continue;
         }
-        let c = ctx.ledger.counters(&e.id)?;
         lines.push(status_line(&e, &c));
     }
     if registered > 0 {
@@ -211,6 +214,10 @@ pub fn cmd_digest(ctx: &AppCtx) -> Result<Value> {
         "changed": changed,
         "approvals": approvals,
         "actions": actions.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
+        // What waits for a decision (approvable) apart from what cannot be approved as is
+        // (blocked: e.g. a probe that needs a verifier); both are ids of `actions`.
+        "needs_you": actions.iter().filter(|a| a.approvable()).map(|a| a.id.as_str()).collect::<Vec<_>>(),
+        "blocked": actions.iter().filter(|a| a.blocked.is_some()).map(|a| a.id.as_str()).collect::<Vec<_>>(),
         "applied": crate::actions::applied(ctx)?.iter().map(crate::actions::Action::compact).collect::<Vec<_>>(),
         "applied_automatically": auto_applied,
         "trials": crate::actions::trials(ctx)?,

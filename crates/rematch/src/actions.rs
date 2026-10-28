@@ -172,6 +172,14 @@ pub struct Action {
     pub reaches: Vec<Reach>,
     pub reload: Option<String>,
     pub since: Option<i64>,
+    /// The entry's place (branch: a repo key or `shared`), for display; not in the snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    /// What a staged script did in its sandbox dry run ([`rematch_core::sandbox::SandboxReport::observed`]):
+    /// `{runner, clean, exit_code, writes_outside, network, scripts}`; derived from the same
+    /// report as the diff's `--- sandbox dry run` lines, so not in the snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<Value>,
 }
 
 impl Action {
@@ -197,6 +205,8 @@ impl Action {
             reaches: Vec::new(),
             reload: None,
             since: None,
+            place: None,
+            observed: None,
         }
     }
 
@@ -395,6 +405,8 @@ pub fn applied_line(applied: &[Action]) -> Option<String> {
 pub struct AutoApplied {
     pub id: String,
     pub name: String,
+    /// The entry kind (`hook`, `agent`, `script`, `skill`, …) or `instructions`.
+    pub kind: String,
     pub what: String,
     pub where_target: String,
     /// `data-only` | `read-only` | `rule` | `comparative_support` | `probe_regressed`.
@@ -403,25 +415,49 @@ pub struct AutoApplied {
     pub rule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<Value>,
+    /// The command that undoes it, by entry name when that names one live entry.
     pub undo: String,
+    /// `rematch` argv of [`AutoApplied::undo`] (hosts run this); `None` when nothing undoes it
+    /// (a retirement, a text without its entry).
+    pub undo_argv: Option<Vec<String>>,
 }
 
 impl AutoApplied {
+    /// One `--text` line. A hook's module path (`<agent_dir>/extensions/rematch-hooks/<id>.ts`)
+    /// is left out: the line names the hook.
     pub fn line(&self) -> String {
         let why = match &self.rule {
             Some(r) => format!("{} ({r})", self.why),
             None => self.why.clone(),
         };
-        format!("applied automatically: {} in {} ({why}) — undo: `{}`", self.what, self.where_target, self.undo)
+        let place = if self.kind == "hook" { String::new() } else { format!(" in {}", self.where_target) };
+        format!("applied automatically: {}{place} ({why}) — undo: `{}`", self.what, self.undo)
     }
 }
 
-fn undo_for_entry(e: &Entry) -> String {
+/// The live (not retired) entries named `name`.
+pub fn live_named(ctx: &AppCtx, name: &str) -> Result<Vec<Entry>> {
+    Ok(ctx
+        .ledger
+        .list_entries(&EntryFilter { name: Some(name.to_string()), ..Default::default() })?
+        .into_iter()
+        .filter(|e| e.status != Status::Retired)
+        .collect())
+}
+
+/// The argv undoing an automatic change to live entry `e`: `library rollback <name>` for a kept
+/// version with a predecessor, else `library disable <name>` when `e` is the one live entry of
+/// that name (`library disable` resolves it), else `library disable <id>`.
+fn undo_argv_for(ctx: &AppCtx, e: &Entry) -> Result<Vec<String>> {
     if matches!(e.status, Status::Kept | Status::Pinned) && e.predecessor.is_some() {
-        format!("rematch library rollback {}", e.name)
-    } else {
-        format!("rematch library disable {}", e.id)
+        return Ok(vec!["library".into(), "rollback".into(), e.name.clone()]);
     }
+    let unique = live_named(ctx, &e.name)?.len() == 1;
+    Ok(vec!["library".into(), "disable".into(), if unique { e.name.clone() } else { e.id.clone() }])
+}
+
+fn command_of(argv: &[String]) -> String {
+    format!("rematch {}", argv.join(" "))
 }
 
 /// Everything rematch applied automatically without a user prompt: data-only hooks, read-only
@@ -437,67 +473,59 @@ pub fn applied_automatically(ctx: &AppCtx) -> Result<Vec<AutoApplied>> {
             if e.kind == Kind::Lesson {
                 continue;
             }
-            let undo = undo_for_entry(&e);
+            let undo_argv = undo_argv_for(ctx, &e)?;
+            let item = |kind: &str, what: String, where_target: String, why: &str, rule: Option<String>, observed: Option<Value>| AutoApplied {
+                id: e.id.clone(),
+                name: e.name.clone(),
+                kind: kind.into(),
+                what,
+                where_target,
+                why: why.into(),
+                rule,
+                observed,
+                undo: command_of(&undo_argv),
+                undo_argv: Some(undo_argv.clone()),
+            };
             if e.kind == Kind::Hook && library::is_data_only_hook(&e) {
                 let mode = e.hook.as_ref().map(|h| enum_str(&h.mode)).unwrap_or_else(|| "hook".into());
-                out.push(AutoApplied {
-                    id: e.id.clone(),
-                    name: e.name.clone(),
-                    what: format!("hook {} ({mode})", e.name),
-                    where_target: format!("<agent_dir>/extensions/rematch-hooks/{}.ts", e.id),
-                    why: "data-only".into(),
-                    rule: None,
-                    observed: None,
-                    undo: undo.clone(),
-                });
+                out.push(item(
+                    "hook",
+                    format!("hook {} ({mode})", e.name),
+                    format!("<agent_dir>/extensions/rematch-hooks/{}.ts", e.id),
+                    "data-only",
+                    None,
+                    None,
+                ));
             }
             if e.kind == Kind::Agent && e.status == Status::Provisional && library::agent_approved(&e) {
                 let rec = library::latest_approval_record(&ctx.ledger, &e.id, Approval::Agent);
                 let approver = rec.as_ref().and_then(|r| r.approver.as_deref());
                 let rule = approver.and_then(|a| a.strip_prefix("rule:")).map(str::to_string);
                 if approver == Some("read-only") || rule.is_some() || (approver.is_none() && library::agent_is_read_only(&e)) {
-                    out.push(AutoApplied {
-                        id: e.id.clone(),
-                        name: e.name.clone(),
-                        what: format!("agent {}", e.name),
-                        where_target: library::agent_link(&ctx.paths, &e.name).display().to_string(),
-                        why: if rule.is_some() { "rule".into() } else { "read-only".into() },
-                        rule,
-                        observed: None,
-                        undo: undo.clone(),
-                    });
+                    let why = if rule.is_some() { "rule" } else { "read-only" };
+                    out.push(item("agent", format!("agent {}", e.name), library::agent_link(&ctx.paths, &e.name).display().to_string(), why, rule, None));
                 }
             }
             if !e.approved_scripts.is_empty() && library::unapproved_scripts(&e).is_empty() {
                 if let Some(rec) = library::latest_approval_record(&ctx.ledger, &e.id, Approval::Scripts) {
                     if let Some(approver) = rec.approver.as_deref() {
                         let Some(rule) = approver.strip_prefix("rule:").map(str::to_string) else { continue };
-                        out.push(AutoApplied {
-                            id: e.id.clone(),
-                            name: e.name.clone(),
-                            what: format!("scripts of {} ({})", e.name, e.approved_scripts.join(", ")),
-                            where_target: e.path.join("scripts").display().to_string(),
-                            why: "rule".into(),
-                            rule: Some(rule),
-                            observed: rec.observed,
-                            undo: undo.clone(),
-                        });
+                        out.push(item(
+                            "script",
+                            format!("scripts of {} ({})", e.name, e.approved_scripts.join(", ")),
+                            e.path.join("scripts").display().to_string(),
+                            "rule",
+                            Some(rule),
+                            rec.observed,
+                        ));
                     }
                 }
             }
             if matches!(e.status, Status::Kept | Status::Pinned)
                 && e.retention.as_ref().is_some_and(|r| r.reason == rematch_core::types::RetentionReason::ComparativeSupport)
             {
-                out.push(AutoApplied {
-                    id: e.id.clone(),
-                    name: e.name.clone(),
-                    what: format!("kept {} {}", enum_str(&e.kind), e.name),
-                    where_target: e.path.display().to_string(),
-                    why: "comparative_support".into(),
-                    rule: None,
-                    observed: None,
-                    undo: undo.clone(),
-                });
+                let kind = enum_str(&e.kind);
+                out.push(item(&kind, format!("kept {kind} {}", e.name), e.path.display().to_string(), "comparative_support", None, None));
             }
         }
     }
@@ -505,15 +533,18 @@ pub fn applied_automatically(ctx: &AppCtx) -> Result<Vec<AutoApplied>> {
         let regressed = crate::probes::record_of(ctx, &e.id).is_some_and(|r| r.status == crate::probes::ProbeStatus::Regresses)
             || e.status_note.as_deref().is_some_and(|n| n.starts_with("bounded comparison regressed"));
         if regressed {
+            // A retirement has no undo command: `library disable` of a retired entry changes nothing.
             out.push(AutoApplied {
                 id: e.id.clone(),
                 name: e.name.clone(),
+                kind: enum_str(&e.kind),
                 what: format!("retired {} {}", enum_str(&e.kind), e.name),
                 where_target: e.path.display().to_string(),
                 why: "probe_regressed".into(),
                 rule: None,
                 observed: None,
-                undo: undo_for_entry(&e),
+                undo: format!("rematch library disable {}", e.id),
+                undo_argv: None,
             });
         }
     }
@@ -525,19 +556,26 @@ pub fn applied_automatically(ctx: &AppCtx) -> Result<Vec<AutoApplied>> {
         let Some(w) = set.blocks.get(&x.name).filter(|w| w.sha == x.sha) else { continue };
         let Some(approver) = w.approver.as_deref() else { continue };
         let rule = approver.strip_prefix("rule:").map(str::to_string);
+        let entry = w.entry.as_deref().map(|id| ctx.ledger.get_entry(id)).transpose()?.flatten();
+        let undo_argv = match &entry {
+            Some(e) if e.status != Status::Retired => Some(undo_argv_for(ctx, e)?),
+            _ => None,
+        };
         out.push(AutoApplied {
             id: format!("{INSTRUCTIONS_APPLIED}{}", w.name),
             name: w.name.clone(),
+            kind: "instructions".into(),
             what: format!("instructions {}", w.name),
             where_target: shown.clone(),
             why: if rule.is_some() { "rule".into() } else { approver.into() },
             rule,
             observed: None,
-            undo: w
-                .entry
-                .as_deref()
-                .map(|id| format!("rematch library disable {id}"))
-                .unwrap_or_else(|| format!("rematch library inspect {INSTRUCTIONS_APPLIED}{}", w.name)),
+            undo: match (&undo_argv, w.entry.as_deref()) {
+                (Some(argv), _) => command_of(argv),
+                (None, Some(id)) => format!("rematch library disable {id}"),
+                (None, None) => format!("rematch library inspect {INSTRUCTIONS_APPLIED}{}", w.name),
+            },
+            undo_argv,
         });
     }
     Ok(out)
@@ -602,6 +640,7 @@ fn entry_actions(ctx: &AppCtx, out: &mut Vec<Action>) -> Result<()> {
             a.entry = Some(ActionEntry::of(&e));
             a.scope = "machine".into();
             a.since = Some(e.status_since.unwrap_or(e.updated_at));
+            a.place = Some(e.branch.clone());
             let mut reason = reason_of(&e);
             let mut targets = Vec::new();
             let mut effects = Vec::new();
@@ -615,6 +654,7 @@ fn entry_actions(ctx: &AppCtx, out: &mut Vec<Action>) -> Result<()> {
                             a.diff.push_str(&format!("+++ {rel} (sha256 {})\n{}\n", sha256_hex(&bytes), String::from_utf8_lossy(&bytes)));
                         }
                         if let Some(rep) = rematch_core::sandbox::latest_report(&ctx.ledger, &e) {
+                            a.observed = Some(rep.observed());
                             let obs: Vec<String> = rep.scripts.iter().map(rematch_core::sandbox::ScriptDryRun::summary_line).collect();
                             if !obs.is_empty() {
                                 reason = format!("{reason}\n\nSandbox dry run:\n{}", obs.join("\n"));

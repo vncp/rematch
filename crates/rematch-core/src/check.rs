@@ -543,11 +543,27 @@ impl CheckSpec {
 fn normalize_rel_path(raw: &str, cwd: &Path) -> String {
     let p = Path::new(raw);
     let rel = if p.is_absolute() {
-        p.strip_prefix(cwd).unwrap_or(p).to_string_lossy().into_owned()
+        relative_to(p, cwd).unwrap_or_else(|| p.to_path_buf()).to_string_lossy().into_owned()
     } else {
         raw.to_string()
     };
     rel.replace('\\', "/")
+}
+
+/// `p` relative to `base`, also when either is reached through a symlink (`/tmp` →
+/// `/private/tmp` on macOS, a symlinked home). The nearest existing ancestor of `p` is
+/// canonicalized, since an edited file may be gone.
+fn relative_to(p: &Path, base: &Path) -> Option<PathBuf> {
+    if let Ok(r) = p.strip_prefix(base) {
+        return Some(r.to_path_buf());
+    }
+    let base = std::fs::canonicalize(base).ok()?;
+    for a in p.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(a) {
+            return real.join(p.strip_prefix(a).ok()?).strip_prefix(&base).ok().map(Path::to_path_buf);
+        }
+    }
+    None
 }
 
 /// Parse `cargo check --message-format=json` stdout into diagnostics (errors first, with
@@ -1252,5 +1268,27 @@ mod tests {
         assert!(!merged.iter().any(|r| r.file == "src/lib.rs"));
         assert!(!merged.iter().any(|r| r.file.starts_with("target/")));
         assert_eq!(merged[0].file, "src/other_1.rs");
+    }
+
+    /// A file edited through a symlinked path (macOS `/tmp` → `/private/tmp`, a symlinked
+    /// home) is still the edited file: its own lines are never reported as callers.
+    #[cfg(unix)]
+    #[test]
+    fn impact_excludes_edited_file_reached_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/lib.rs"), "pub fn reconcile() {}\n").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let refs = |file: &str| ImpactRef { symbol: "reconcile".into(), file: file.into(), line: 1, text: "reconcile()".into() };
+        let merged = merge_impact_refs(
+            vec![refs("src/lib.rs"), refs("src/api.rs")],
+            &[link.join("src/lib.rs")],
+            &[],
+            &std::fs::canonicalize(&real).unwrap(),
+            IMPACT_MAX_LINES,
+        );
+        assert_eq!(merged.iter().map(|r| r.file.as_str()).collect::<Vec<_>>(), ["src/api.rs"]);
     }
 }

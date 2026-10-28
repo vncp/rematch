@@ -462,7 +462,7 @@ EOF
             .as_array()
             .unwrap()
             .iter()
-            .any(|a| a["id"] == id_clean.as_str() && a["why"] == "rule" && a["rule"] == "scripts:**" && a["undo"] == format!("rematch library disable {id_clean}")),
+            .any(|a| a["id"] == id_clean.as_str() && a["why"] == "rule" && a["rule"] == "scripts:**" && a["undo"] == "rematch library disable clean-helper" && a["undo_argv"] == json!(["library", "disable", "clean-helper"])),
         "{g}"
     );
 }
@@ -534,7 +534,10 @@ EOF
             .as_array()
             .unwrap()
             .iter()
-            .any(|a| a["id"] == id.as_str() && a["why"] == "data-only" && a["undo"] == format!("rematch library disable {id}")),
+            .any(|a| a["id"] == id.as_str()
+                && a["why"] == "data-only"
+                && a["kind"] == "hook"
+                && a["undo"] == format!("rematch library disable {}", a["name"].as_str().unwrap_or_default())),
         "{g}"
     );
     let m = env.run(&["match", "--cwd", cwd]);
