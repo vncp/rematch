@@ -169,6 +169,32 @@ fn create_description_is_a_draft_until_activated() {
 }
 
 #[test]
+fn create_eval_prompt_seeds_the_suite_that_eval_init_and_trigger_read() {
+    let env = Env::new();
+    let prompt = "Commit the payment ledger change after running its tests";
+    let d = env.run(&[
+        "create", "ledger-test-gate", "--from", "description", "--description", "Run the ledger tests before committing payment changes",
+        "--editor", &script("editor-ok.sh"), "--eval-prompt", prompt,
+    ]);
+    assert_eq!(d["outcome"], "staged", "{d}");
+    let path = env.root.join("drafts/ledger-test-gate/evals/evals.json");
+    let suite: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!((suite["skill_name"].as_str(), suite["cases"][0]["id"].as_str(), suite["cases"][0]["prompt"].as_str()), (Some("ledger-test-gate"), Some("case-1"), Some(prompt)), "{suite}");
+    let q = suite["trigger_eval"].as_array().unwrap();
+    assert_eq!((q[0]["query"].as_str(), q[0]["should_trigger"].as_bool(), q[1]["should_trigger"].as_bool()), (Some(prompt), Some(true), Some(false)), "{suite}");
+    assert!(d["lines"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("rematch eval run ledger-test-gate --activate")), "{d}");
+
+    let i = env.run(&["eval", "init", "ledger-test-gate", "--prompt", prompt, "Reconcile the ledger after a payment import"]);
+    assert_eq!((i["created"].as_bool(), i["added"].clone()), (Some(false), json!(["case-2"])), "a prompt already present is not added twice: {i}");
+    let t = env.run(&["eval", "trigger", "ledger-test-gate", "--cwd", env.repo.to_str().unwrap()]);
+    assert_eq!(t["queries"].as_array().unwrap().len(), 2, "{t}");
+    assert_eq!(t["queries"][1]["triggered"], false, "the seeded off-topic query: {t}");
+    assert!(t["lines"][0].as_str().unwrap().starts_with("trigger eval ledger-test-gate (draft)"), "{t}");
+    let (v, code) = env.run_cmd(env.cmd(&["eval", "run", "no-such-skill"]));
+    assert_eq!(code, 1, "{v}");
+}
+
+#[test]
 fn create_from_sessions_needs_three_references() {
     let env = Env::new();
     for i in 0..2 {

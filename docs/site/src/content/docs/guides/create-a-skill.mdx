@@ -46,7 +46,7 @@ Runs the task once in batch mode (one rollout, no candidates) to obtain a trace,
 ## From a description
 
 ```sh
-rematch create <name> --from description --description "…" [--files path …]
+rematch create <name> --from description --description "…" [--files path …] [--eval-prompt "…" …]
 ```
 
 The result is a **draft**: visible in the library, never loaded. Activate it when you are willing to test it:
@@ -60,6 +60,20 @@ rematch activate <name> --unverified        # provisional on your say-so
 No proposal exists without an execution behind it. Editing a harness without one degraded results in the research behind rematch: [D1](/rematch/background/decisions/).
 </Aside>
 
+## Evaluate before you activate
+
+`--eval-prompt` (on any `create`) seeds `<entry>/evals/evals.json`; `rematch eval init <name>` creates or extends it later. The suite holds `cases` (a prompt, an optional `expected_output` and verifier) and `trigger_eval` queries that should, or should not, bring the skill in. An Anthropic skill-creator `evals/evals.json` reads as is.
+
+```sh
+rematch eval init <name> --prompt "Review the checkout form" --verifier tests
+rematch eval trigger <name>                  # free: predicate, retrieval, budgets
+rematch eval run <name> --activate           # rollouts: baseline vs with the skill
+```
+
+- **`eval trigger`** checks, without a model call, each query against the skill's predicate (precision, recall, pass rate, and the stems a missed query needs), the units `retrieve` would inject for it, every recorded session the predicate would match or miss, and lint: catalog line, description and router bytes, checkable laws, the `Use when …` clause.
+- **`eval run`** runs each case twice in fresh worktrees of `--cwd`'s repo, once with the repo's harness without the entry and once with it (drafts included), judged by the case's verifier (else `--verifier`, else the repo's detected check or tests; `--max-time`, default 180 s). It writes a self-contained side-by-side report to `~/.rematch/evals/<name>/report.html` with `results.json` and the traces, and records a receipt.
+- **`--activate`** promotes a draft only when no case regressed and either a case improved on the verifier, or no with-skill verifier failed and every with-skill run completed cleanly and read the skill. The winning trace becomes its evidence.
+
 ## What you get
 
 A skill package:
@@ -70,5 +84,6 @@ A skill package:
 | `units/` | procedures and pitfalls |
 | `facts/` | measured values, each with `as_of` |
 | `scripts/` | anything deterministic (non-executable until approved) |
+| `evals/` | the eval suite (`evals.json`), never loaded |
 
 Below about 8 KB the package collapses to one file. Layout: [entry layout](/rematch/reference/entry-layout/).

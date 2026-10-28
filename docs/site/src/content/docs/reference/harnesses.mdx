@@ -18,10 +18,10 @@ Reflection model calls and batch rollouts still use **omp**, even when evidence 
 | Stuck-call detection | Yes | Completed calls | Yes | Completed calls | No |
 | Skill-unit retrieval | Before requests | Once per prompt | Before requests | Experimental system transform | No |
 | Old-output truncation | Yes | No API for it | Yes | Experimental message transform | No |
-| Post-edit fast check (`fast-check`) | After each edit batch, before the next request: one displayed aside (the card is what the agent receives) | `PostToolUse` `additionalContext` | Before next request (`context`, hidden); a display-only card at turn end | Experimental system transform | No (post-hoc only) |
+| Post-edit fast check (`fast-check`) | After each edit batch, before the next request: one displayed aside (the card is what the agent receives) | `PostToolUse`: visible `◆ rematch` `systemMessage` + `additionalContext` diagnostics | Before next request (`context`, hidden); a display-only card at turn end | Experimental system transform | No (post-hoc only) |
 | Generated subagents | Yes, once approved | Adapted copies, once approved | No native subagent definitions | Not delivered | No |
 | Personal instructions (approved `AGENTS.fragment.md`) | Marked block in `<agent_dir>/AGENTS.md`, loaded natively; no runtime insertion | Runtime: session-start context | Runtime: `before_agent_start` | Runtime: system transform | No: skills only |
-| Digest and waiting actions | `◆ rematch` footer, needs-you line above the editor, a session-start card when something changed, review panel (`alt+e`) with an Applied tab and undo; transcript cards for checks and `/rematch` output | Session-start message | Same footer, line, cards and panel as omp (`/rematch review`; dialogs in RPC) | TUI toast or `/rematch-digest` | CLI/optional status skill |
+| Digest and waiting actions | `◆ rematch` footer, needs-you line above the editor, a session-start card when something changed, review panel (`alt+e`) with an Applied tab and undo; transcript cards for checks and `/rematch` output | Session-start message, `/rematch:rematch-review`, and optional `scripts/statusline.sh` `◆ rematch` footer | Same footer, line, cards and panel as omp (`/rematch review`; dialogs in RPC) | TUI toast or `/rematch-digest` | CLI/optional status skill |
 | User approval (`--sha` bound) | Dialog supplies the hash; or the command | Command printed with its hash | Dialog supplies the hash; or the command | Command printed with its hash | CLI |
 | Detached reflection trigger | Session start | Session start | Session start | Plugin start | Manual |
 | History importer | Yes | Yes | Native session files | Read-only SQLite store | Rollout files |
@@ -38,11 +38,12 @@ Pi and OpenCode acceptance tests launch their **real pinned runtimes** with a lo
 | In Claude Code | Same as |
 |---|---|
 | `/rematch:rematch-status` | `rematch status` + the skills and agents synced for this directory |
+| `/rematch:rematch-review` | walk through waiting actions and automatic changes for this directory, with diffs and bound approve/decline/undo commands |
 | `/rematch:rematch-why [cc:<id>]` | `rematch library why` (default: the latest session here) |
 | `/rematch:rematch-library` | every entry with its raw counters |
 | `/rematch:rematch-mark correction` | overrides the classifier for the last turn of this session |
 | `/rematch:rematch-inspect <id>` | `rematch library inspect <id>`: one waiting action in full, with its approve and decline commands |
-| `/rematch:rematch-approve <id> --sha <hash>` · `/rematch:rematch-decline <id> --sha <hash>` | the review dialog's Approve / Decline in omp (the session-start message prints both commands with the hash) |
+| `/rematch:rematch-approve <id> --sha <hash>` · `/rematch:rematch-decline <id> --sha <hash>` | the review dialog's Approve / Decline in omp (the session-start message and `/rematch:rematch-review` print both commands with the hash) |
 | `/rematch:rematch-off` · `/rematch:rematch-on` | `/rematch off` · `/rematch on` (`on` also re-links the skills for this directory) |
 
 - Only you can run `mark`, `approve`, `decline`, `off` and `on`; Claude cannot invoke them.

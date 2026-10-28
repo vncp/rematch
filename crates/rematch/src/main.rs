@@ -12,6 +12,7 @@ pub mod digest;
 pub mod doctor;
 pub mod editor;
 pub mod envelope;
+pub mod eval_cmd;
 pub mod import_cmd;
 pub mod improve;
 pub mod jobs;
@@ -88,6 +89,8 @@ enum Cmd {
     Improve(improve::ImproveArgs),
     /// Draft → provisional.
     Activate(create::ActivateArgs),
+    /// Skill evals: init a suite, check trigger accuracy, run side-by-side with-skill vs baseline rollouts (HTML report; --activate gates a draft).
+    Eval(eval_cmd::EvalArgs),
     /// Batch run with a verifier (detached; returns a job id).
     Run(batch::run::RunArgs),
     /// Internal: detached batch worker.
@@ -165,6 +168,7 @@ impl Cmd {
             Cmd::Create(_) => "create",
             Cmd::Improve(_) => "improve",
             Cmd::Activate(_) => "activate",
+            Cmd::Eval(_) => "eval",
             Cmd::Run(_) => "run",
             Cmd::RunWorker(_) => "run-worker",
             Cmd::Status { .. } => "status",
@@ -206,6 +210,7 @@ fn dispatch(ctx: &AppCtx, cmd: Cmd) -> anyhow::Result<Value> {
         Cmd::Create(a) => create::cmd_create(ctx, a),
         Cmd::Improve(a) => improve::cmd_improve(ctx, a),
         Cmd::Activate(a) => create::cmd_activate(ctx, a),
+        Cmd::Eval(a) => eval_cmd::cmd_eval(ctx, a),
         Cmd::Run(a) => batch::run::cmd_run(ctx, a),
         Cmd::RunWorker(a) => batch::worker::cmd_run_worker(ctx, a),
         Cmd::Status { job } => jobs::cmd_status(ctx, job.as_deref()),

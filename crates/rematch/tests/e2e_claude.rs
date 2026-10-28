@@ -663,6 +663,11 @@ fn post_tool_use_fast_check_returns_additional_context_with_diagnostic() {
     );
     let reply = o.json();
     assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PostToolUse", "{reply}");
+    let sys_msg = reply["systemMessage"].as_str().unwrap_or_default();
+    assert!(
+        sys_msg.starts_with("◆ rematch · fast-check · ✗ cargo 1 error in ") && sys_msg.contains("src/lib.rs:1:") && sys_msg.contains("E0308"),
+        "PostToolUse surfaces a visible ◆ rematch systemMessage to the user: {sys_msg}"
+    );
     let ctx = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
     assert!(
         ctx.contains("src/lib.rs:1:") && ctx.contains("E0308") && ctx.contains("to_string"),
@@ -673,4 +678,22 @@ fn post_tool_use_fast_check_returns_additional_context_with_diagnostic() {
     assert_eq!(check_recs[0]["hook_id"], fc_id);
     assert_eq!(check_recs[0]["kind"], "cargo");
     assert_eq!(check_recs[0]["ok"], false);
+
+    // StatusLine: renders the single ANSI footer line with the latest check state and trial count.
+    let sl = run_hook(
+        &env,
+        "status-line",
+        &json!({
+            "session_id": UUID,
+            "workspace": {"current_dir": env.repo},
+        })
+        .to_string(),
+        &[],
+    );
+    assert_eq!(sl.code, 0, "{:?}", sl.stderr);
+    assert!(
+        sl.stdout.contains("◆") && sl.stdout.contains("rematch") && sl.stdout.contains("✗ cargo 1 error") && sl.stdout.contains("on trial"),
+        "status-line renders the ◆ rematch ANSI footer: {:?}",
+        sl.stdout
+    );
 }

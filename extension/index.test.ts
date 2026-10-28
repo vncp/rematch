@@ -7,12 +7,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import rematch, {
 	appendPromptFragments,
+	approvalFor,
+	buildArgv,
 	CallHistory,
 	callKey,
 	changedPaths,
 	changesLoaded,
 	CHECK_TYPE,
 	checkMessage,
+	commandToOperation,
 	FILES_CHANGED_MAX,
 	filesChanged,
 	hookFromModule,
@@ -34,6 +37,7 @@ import rematch, {
 	shadowedByCustomDirs,
 	stuckReason,
 	subpathOf,
+	timeoutFor,
 	truncateToolResults,
 	truncationMarker,
 	withPromptBlock,
@@ -249,6 +253,16 @@ describe("argv and match helpers", () => {
 		const data = { entries: [{ id: "a", version: 2, sha: "ab" }, { id: "r" }, { id: "s", version: 1, sha: "" }, { id: "miss", predicate_hit: false }, { name: "no id" }] };
 		expect(loadedEntriesOf(data, [retrieve, stuck()])).toEqual([{ id: "a", version: 2, sha: "ab" }, { id: "s", version: 1 }]);
 		expect(loadedEntriesOf(undefined, [])).toEqual([]);
+	});
+
+	test("eval: a /rematch subcommand and a tool operation; the binary gets --cwd; trigger is a read", () => {
+		expect(commandToOperation(["eval", "run", "ux-review", "--activate"])).toEqual({ operation: "eval", args: ["run", "ux-review", "--activate"] });
+		expect(buildArgv("eval", ["trigger", "ux-review"], null, "/repo")).toEqual(["eval", "--cwd", "/repo", "trigger", "ux-review"]);
+		expect(buildArgv("eval", ["run", "ux-review", "--cwd", "/other"], null, "/repo")).toEqual(["eval", "run", "ux-review", "--cwd", "/other"]);
+		expect(approvalFor("eval", ["trigger", "ux-review"])).toBe("read");
+		expect(approvalFor("eval", ["run", "ux-review", "--activate"])).toBe("exec");
+		expect(approvalFor("eval", ["init", "ux-review"])).toBe("exec");
+		expect(timeoutFor("eval")).toBe(600_000);
 	});
 });
 

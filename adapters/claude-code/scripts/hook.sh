@@ -19,6 +19,9 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 reflect=
 case "$op" in
 	trace-event | hook-check) ;;
+	status-line)
+		op=trace-event
+		;;
 	session-start | session-end)
 		op=trace-event
 		if [ -n "${OMP_BIN:-}" ]; then

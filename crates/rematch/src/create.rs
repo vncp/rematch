@@ -51,6 +51,9 @@ pub struct CreateArgs {
     /// `cd x && cargo test --workspace`), ranked by their overlap with the request.
     #[arg(long, value_delimiter = ',')]
     pub ran: Vec<String>,
+    /// Seed `<entry>/evals/evals.json` with these case prompts (then `rematch eval trigger|run <name>`).
+    #[arg(long = "eval-prompt", num_args = 1..)]
+    pub eval_prompt: Vec<String>,
     /// Scripted editor command (tests).
     #[arg(long)]
     pub editor: Option<String>,
@@ -109,11 +112,21 @@ pub fn cmd_create(ctx: &AppCtx, a: CreateArgs) -> Result<Value> {
     {
         bail!("an active entry named {} already exists (`rematch improve {}` revises it)", a.name, a.name);
     }
-    match a.from {
+    let mut out = match a.from {
         From::Sessions => from_sessions(ctx, &a),
         From::Task => from_task(ctx, &a),
         From::Description => from_description(ctx, &a),
+    }?;
+    if !a.eval_prompt.is_empty() && out["outcome"] == "staged" {
+        let id = out["id"].as_str().unwrap_or_default().to_string();
+        let e = ctx.ledger.get_entry(&id)?.ok_or_else(|| anyhow!("staged entry {id} not in the ledger"))?;
+        let path = crate::eval_cmd::write_default_evals(&e.path, &e.name, &e.trigger_line, &a.eval_prompt)?;
+        if let Some(lines) = out["lines"].as_array_mut() {
+            lines.push(json!(format!("eval suite {} ({} prompt(s)): `rematch eval trigger {}`, `rematch eval run {} --activate`", path.display(), a.eval_prompt.len(), e.name, e.name)));
+        }
+        out["evals"] = json!(path);
     }
+    Ok(out)
 }
 
 /// Matching sessions with their overlap and stem jaccard, best first.

@@ -131,6 +131,13 @@ rematch library inspect <action-id> --text
 rematch create public-python-api --from sessions \
   --description "Document public Python functions and export them in __all__"
 
+# Draft a skill from a description with an eval suite, check its trigger for free,
+# then run it side by side against the baseline and promote the draft if it wins.
+rematch create checkout-ux-review --from description \
+  --description "Review checkout pages for accessibility" --eval-prompt "Review the checkout form"
+rematch eval trigger checkout-ux-review --text
+rematch eval run checkout-ux-review --activate --text   # report: ~/.rematch/evals/<name>/report.html
+
 # Audit an existing skill and propose a revised sibling from its history.
 rematch improve public-python-api
 
