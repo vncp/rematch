@@ -1373,12 +1373,15 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 	let checkAbort: AbortController | null = null;
 	/** The kind the last check reported (`cargo`, `tsc`, …), named while the next one runs. */
 	let lastCheckKind: string | null = null;
+	/** Whether the previous delivered check in this input segment reported errors/timeout/impact. */
+	let lastCheckHadIssues = false;
 	/** Drop pending files and supersede any running check (a new input, a new session). */
 	const resetChecks = () => {
 		pendingCheckFiles.clear();
 		checkGeneration++;
 		checkAbort?.abort();
 		checkAbort = null;
+		lastCheckHadIssues = false;
 	};
 	// `agent` is absent on hosts older than the identity API: treat those as main.
 	const isMain = (ctx: ExtensionContext) => ctx.agent?.kind !== "sub";
@@ -1954,10 +1957,18 @@ export default async function rematch(pi: ExtensionAPI): Promise<void> {
 		}
 		// Superseded: the later run reports. Nothing to say (no checker here): the footer keeps the last result.
 		if (generation !== checkGeneration || ctrl.signal.aborted) return;
-		board.check = result ? checkStateOf(result.details, result.rendered) : before;
-		if (board.check?.state === "done" && board.check.kind) lastCheckKind = board.check.kind;
+		const state = result ? checkStateOf(result.details, result.rendered) : before;
+		board.check = state;
+		if (state?.state === "done" && state.kind) lastCheckKind = state.kind;
 		showBoard(ctx);
-		if (!result) return;
+		if (!result || !state || state.state !== "done") return;
+		const hasIssues = state.timedOut || !state.ok || state.errors > 0 || state.impact > 0;
+		const recoveredFromError = !hasIssues && lastCheckHadIssues;
+		lastCheckHadIssues = hasIssues;
+		// Only inject a transcript card when there are errors/callers to fix, or once to confirm
+		// that an earlier error in this turn is now resolved; clean consecutive edits update only
+		// the footer (`✓ cargo 0.3s`) without spamming cards between every turn.
+		if (!hasIssues && !recoveredFromError) return;
 		pi.sendMessage({ customType: CHECK_TYPE, content: result.rendered, display: true, details: result.details }, { deliverAs: "aside" });
 	}
 

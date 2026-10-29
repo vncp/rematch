@@ -122,10 +122,10 @@ pub fn specs() -> Vec<Builtin> {
             hook: check,
             laws: "## Laws\n\
                    - After file-editing tool calls finish, the harness runs the repo's detected fast check (`rematch check`: Cargo, tsc, ruff, pyright, mypy, or Go) scoped to the edited files, plus `git grep` references for any function or type whose signature or name changed in `git diff`.\n\
-                   - Before the next model request, at most one compact message (≤ 4096 bytes) is injected: compiler/linter errors and `help:` suggestions first, then caller references in unedited files (capped at 20 lines), or a one-line `✓ <check> clean in Xs` receipt.\n\
+                   - Before the next model request, at most one compact message (≤ 4096 bytes) is injected: compiler/linter errors and `help:` suggestions first, then caller references in unedited files (capped at 20 lines), or a one-line `✓ <check> passed in Xs` receipt.\n\
                    - Nothing runs and nothing is injected on turns that do not edit files.\n\n\
                    ## Pitfalls\n\
-                   - When the injected check already reports `✓ <check> clean`, avoid re-running the same check manually unless you edited again or need full test execution.\n",
+                   - When the injected check already reports `✓ <check> passed`, avoid re-running the same check manually unless you edited again or need full test execution.\n",
         },
     ]
 }

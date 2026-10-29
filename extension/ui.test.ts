@@ -149,7 +149,7 @@ describe("width safety", () => {
 	const surfaces: [string, (w: number) => string[]][] = [
 		["check card", w => checkCardLines(COLOR, w, rendered, { kind: "cargo", ok: false, errors: 2, duration_ms: 400 }, false)],
 		["check card expanded", w => checkCardLines(COLOR, w, rendered, { kind: "cargo", ok: false, errors: 2, duration_ms: 400 }, true)],
-		["clean check", w => checkCardLines(COLOR, w, "✓ cargo clean in 0.4s", { kind: "cargo", ok: true, errors: 0, duration_ms: 400 }, false)],
+		["clean check", w => checkCardLines(COLOR, w, "✓ cargo check passed in 0.4s", { kind: "cargo", ok: true, errors: 0, duration_ms: 400 }, false)],
 		["digest card", w => digestCardLines(COLOR, w, digestRows(digest, [action()], "alt+e", ["fast-check", "stuck-detector"]).rows, false)],
 		["review panel", w => reviewPanelLines(COLOR, w, reviewPanel([action()], [applied()]))],
 		["applied tab", w => reviewPanelLines(COLOR, w, panelKey(reviewPanel([action()], [applied()]), "tab").state)],

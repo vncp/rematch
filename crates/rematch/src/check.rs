@@ -309,14 +309,16 @@ pub fn collect_impact(repo_top: &Path, files: &[PathBuf], deadline: Instant) -> 
 
 /// CLI handler for `rematch check`.
 pub fn cmd_check(ctx: &AppCtx, args: CheckArgs) -> Result<Value> {
-    let repo_top = check::find_repo_top(&ctx.cwd);
     let resolved_files: Vec<PathBuf> = args
         .files
         .iter()
         .map(|f| if f.is_absolute() { f.clone() } else { ctx.cwd.join(f) })
         .collect();
+    let repo_top = resolved_files
+        .first()
+        .map(|f| check::find_repo_top_for_file(f, &ctx.cwd))
+        .unwrap_or_else(|| check::find_repo_top(&ctx.cwd));
     let spec = check::detect_for_files(&repo_top, &resolved_files);
-
     if args.detect_only {
         let scoped = spec.as_ref().map(|s| s.scope_for(&resolved_files));
         let lines = match &scoped {
@@ -335,7 +337,8 @@ pub fn cmd_check(ctx: &AppCtx, args: CheckArgs) -> Result<Value> {
         }));
     }
 
-    let normalized_files = normalize_check_files(&repo_top, &resolved_files);
+    let effective_top = spec.as_ref().map(|s| s.cwd.as_path()).unwrap_or(&repo_top);
+    let normalized_files = normalize_check_files(effective_top, &resolved_files);
     let timeout = Duration::from_secs(u64::from(args.timeout.max(1)));
     let Some(spec) = spec else {
         let mut lines = Vec::new();

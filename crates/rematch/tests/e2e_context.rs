@@ -249,13 +249,13 @@ fn rematch_check_reports_cargo_error_with_help_and_impact_then_clean() {
     git(&["add", "."]);
     git(&["commit", "-qm", "init"]);
 
-    // Clean repo -> ok: true, ✓ cargo clean
+    // Clean repo -> ok: true, ✓ cargo check passed
     let clean = env.run(&["check", "--cwd", cargo_repo.to_str().unwrap()]);
     assert_eq!(clean["detected"], true, "{clean}");
     assert_eq!(clean["ok"], true, "{clean}");
     assert_eq!(clean["kind"], "cargo", "{clean}");
     assert!(
-        clean["rendered"].as_str().unwrap_or_default().contains("✓ cargo clean in"),
+        clean["rendered"].as_str().unwrap_or_default().contains("✓ cargo check passed in"),
         "{clean}"
     );
 
