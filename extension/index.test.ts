@@ -643,9 +643,24 @@ describe("factory", () => {
 			"crates/b/src/lib.rs",
 		]);
 
-		// A check with nothing to say delivers nothing.
-		await h.fire("tool_result", { toolName: "edit", toolCallId: "e3", input: { path: "README.md" }, content: [], isError: false });
-		expect(checks(h)).toHaveLength(1);
+		// 4. Clean consecutive edits update the footer without spamming transcript cards; a clean
+		// run right after an error DOES emit one recovery card, and a second clean run stays quiet.
+		state.onCheck = async () => ({
+			detected: true,
+			ok: true,
+			kind: "cargo",
+			errors: 0,
+			duration_ms: 15,
+			files: ["crates/b/src/lib.rs"],
+			rendered: "✓ cargo check passed in 0.0s",
+		});
+		// Previous delivered check had 1 error (lastCheckHadIssues = true) -> recovery card emitted once.
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e3", input: { path: "/repo/crates/b/src/lib.rs" }, content: [], isError: false });
+		expect(checks(h)).toHaveLength(2);
+		expect(String(checks(h)[1]!.message.content)).toContain("✓ cargo check passed");
+		// Next edit is also clean -> no duplicate clean card injected.
+		await h.fire("tool_result", { toolName: "edit", toolCallId: "e4", input: { path: "/repo/crates/b/src/lib.rs" }, content: [], isError: false });
+		expect(checks(h)).toHaveLength(2);
 	});
 
 	const stuckFile = () => writeHook("hook-stuck", "stuck", { repeats: 3 });

@@ -302,7 +302,7 @@ PLUGIN_UI_LINES = [
     ("out", "│   src/lib.rs:3:25  E0308  mismatched types (expected `u32`, found `String`)                            │"),
     ("warn", "│   ↳ 1 caller in unedited files: src/api.rs:12 total()                                                 │"),
     ("accent", "╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯"),
-    ("ok", "◆ rematch · ✓ cargo clean in 0.1s"),
+    ("ok", "◆ rematch · ✓ cargo check passed in 0.1s"),
     ("gap", ""),
     ("accent", "╭─ ◆ rematch · review ─────────────────────────────────────────────────────── [Needs you 1] Applied 4 ─╮"),
     ("warn", "│ ❯ ● ledger-snapshot   script · payments                                                               │"),

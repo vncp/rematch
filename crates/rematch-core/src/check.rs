@@ -38,6 +38,18 @@ impl CheckKind {
             CheckKind::Go => "go",
         }
     }
+
+    /// Unambiguous human label for the check command (`cargo check`, not `cargo`).
+    pub fn pass_label(self) -> &'static str {
+        match self {
+            CheckKind::Cargo => "cargo check",
+            CheckKind::Tsc => "tsc",
+            CheckKind::Ruff => "ruff check",
+            CheckKind::Mypy => "mypy",
+            CheckKind::Pyright => "pyright",
+            CheckKind::Go => "go vet",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,9 +153,26 @@ pub fn detect(repo_top: &Path) -> Option<CheckSpec> {
     spec
 }
 
-/// Detect a check appropriate for `files` inside `repo_top` (e.g. a polyglot repo with Cargo + TS).
+/// Walk ancestors from `p` (or its parent directory if `p` is a file) to find the nearest git
+/// worktree top or project root.
+pub fn find_repo_top_for_file(p: &Path, fallback_cwd: &Path) -> PathBuf {
+    let abs = if p.is_absolute() { p.to_path_buf() } else { fallback_cwd.join(p) };
+    let start = abs
+        .ancestors()
+        .find(|a| a.is_dir())
+        .or_else(|| abs.parent())
+        .unwrap_or(fallback_cwd);
+    find_repo_top(start)
+}
+
+/// Detect a check appropriate for `files` (resolving the project/workspace root from the edited
+/// files first when they live in a different repository than `repo_top`).
 pub fn detect_for_files(repo_top: &Path, files: &[PathBuf]) -> Option<CheckSpec> {
-    let top = crate::paths::canonicalize(repo_top).unwrap_or_else(|_| repo_top.to_path_buf());
+    let fallback_top = crate::paths::canonicalize(repo_top).unwrap_or_else(|_| repo_top.to_path_buf());
+    let top = files
+        .first()
+        .map(|f| find_repo_top_for_file(f, &fallback_top))
+        .unwrap_or_else(|| fallback_top.clone());
     if !files.is_empty() {
         let exts: HashSet<String> = files
             .iter()
@@ -190,42 +219,58 @@ fn detect_uncached(repo_top: &Path) -> Option<CheckSpec> {
     None
 }
 
-fn detect_cargo(repo_top: &Path, files: &[PathBuf]) -> Option<CheckSpec> {
-    if repo_top.join("Cargo.toml").is_file() {
-        return Some(CheckSpec {
-            kind: CheckKind::Cargo,
-            argv: vec![
-                "cargo".into(),
-                "check".into(),
-                "--message-format=json".into(),
-                "--workspace".into(),
-                "--all-targets".into(),
-                "--quiet".into(),
-            ],
-            cwd: repo_top.to_path_buf(),
-        });
-    }
-    for f in files {
-        let abs = if f.is_absolute() { f.clone() } else { repo_top.join(f) };
-        for a in abs.ancestors() {
-            if a.join("Cargo.toml").is_file() {
-                return Some(CheckSpec {
-                    kind: CheckKind::Cargo,
-                    argv: vec![
-                        "cargo".into(),
-                        "check".into(),
-                        "--message-format=json".into(),
-                        "--workspace".into(),
-                        "--all-targets".into(),
-                        "--quiet".into(),
-                    ],
-                    cwd: a.to_path_buf(),
-                });
+/// Nearest Cargo workspace root (`[workspace]` in `Cargo.toml`) or package root above `dir`.
+fn find_cargo_root(dir: &Path, stop_at: Option<&Path>) -> Option<PathBuf> {
+    let mut pkg_root: Option<PathBuf> = None;
+    for a in dir.ancestors() {
+        let manifest = a.join("Cargo.toml");
+        if manifest.is_file() {
+            if std::fs::read_to_string(&manifest)
+                .ok()
+                .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+                .is_some_and(|t| t.contains_key("workspace"))
+            {
+                return Some(a.to_path_buf());
             }
-            if a == repo_top {
-                break;
+            if pkg_root.is_none() {
+                pkg_root = Some(a.to_path_buf());
             }
         }
+        if stop_at.is_some_and(|s| a == s) {
+            break;
+        }
+    }
+    pkg_root
+}
+
+fn cargo_spec(cwd: PathBuf) -> CheckSpec {
+    CheckSpec {
+        kind: CheckKind::Cargo,
+        argv: vec![
+            "cargo".into(),
+            "check".into(),
+            "--message-format=json".into(),
+            "--workspace".into(),
+            "--all-targets".into(),
+            "--quiet".into(),
+        ],
+        cwd,
+    }
+}
+
+fn detect_cargo(repo_top: &Path, files: &[PathBuf]) -> Option<CheckSpec> {
+    // Prefer the edited files' own Cargo workspace/package first (even when the session cwd is in
+    // another repository or a parent directory).
+    for f in files {
+        let abs = if f.is_absolute() { f.clone() } else { repo_top.join(f) };
+        let file_top = find_repo_top_for_file(&abs, repo_top);
+        let start = abs.parent().unwrap_or(&abs);
+        if let Some(root) = find_cargo_root(start, Some(&file_top)).or_else(|| find_cargo_root(start, None)) {
+            return Some(cargo_spec(root));
+        }
+    }
+    if repo_top.join("Cargo.toml").is_file() {
+        return Some(cargo_spec(repo_top.to_path_buf()));
     }
     None
 }
@@ -1028,14 +1073,14 @@ pub fn is_ignored_impact_path(rel_path: &str) -> bool {
 /// 1. Timeout line if timed out (`[rematch fast-check] <kind> timed out after Xs`)
 /// 2. Errors/warnings first (`file:line:col [code] message` + `help: ...`)
 /// 3. Impact references in unedited files (`impact (<symbol>): file:line: text`)
-/// 4. One-line `✓ <kind> clean in X.Xs` when clean (`ok && errors == 0`)
+/// 4. One-line `✓ <kind> passed in X.Xs` when clean (`ok && errors == 0`)
 ///
 /// Bounded to `budget_bytes` (e.g. 4096) with a truncation note.
 pub fn render_report(report: &CheckReport, budget_bytes: usize) -> (String, bool) {
     let budget = budget_bytes.max(256);
     let kind_name = report.kind.map(CheckKind::as_str).unwrap_or("check");
+    let pass_label = report.kind.map(CheckKind::pass_label).unwrap_or("check");
     let secs = report.duration_ms as f64 / 1000.0;
-
     let mut lines = Vec::new();
     let errors: Vec<&Diagnostic> = report
         .diagnostics
@@ -1090,7 +1135,7 @@ pub fn render_report(report: &CheckReport, budget_bytes: usize) -> (String, bool
     }
 
     if !report.timed_out && report.ok && errors.is_empty() {
-        lines.push(format!("✓ {kind_name} clean in {secs:.1}s"));
+        lines.push(format!("✓ {pass_label} passed in {secs:.1}s"));
     }
 
     let full = lines.join("\n");
@@ -1197,6 +1242,26 @@ mod tests {
             tsc_narrowed.argv.windows(2).any(|w| w == ["-p", "packages/web/tsconfig.json"]),
             "expected narrowed tsconfig in {:?}",
             tsc_narrowed.argv
+        );
+
+        // Cross-repo editing: when session cwd is in `aporia` (its own Cargo workspace), editing a
+        // file in sibling repo `figura` selects `figura`'s Cargo workspace, not `aporia`'s.
+        let aporia = tmp.path().join("aporia");
+        let figura = tmp.path().join("figura");
+        std::fs::create_dir_all(aporia.join(".git")).unwrap();
+        std::fs::create_dir_all(aporia.join("src")).unwrap();
+        std::fs::write(aporia.join("Cargo.toml"), "[package]\nname = \"aporia\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::create_dir_all(figura.join(".git")).unwrap();
+        std::fs::create_dir_all(figura.join("crates/core/src")).unwrap();
+        std::fs::write(figura.join("Cargo.toml"), "[workspace]\nmembers = [\"crates/core\"]\n").unwrap();
+        std::fs::write(figura.join("crates/core/Cargo.toml"), "[package]\nname = \"figura-core\"\nversion = \"0.1.0\"\n").unwrap();
+        let edited = figura.join("crates/core/src/lib.rs");
+        std::fs::write(&edited, "pub fn draw() {}\n").unwrap();
+        let cross = detect_for_files(&aporia, &[edited]).expect("detect figura cargo");
+        assert_eq!(
+            crate::paths::canonicalize(&cross.cwd).unwrap(),
+            crate::paths::canonicalize(&figura).unwrap(),
+            "edited file's workspace wins over session cwd's workspace"
         );
     }
 

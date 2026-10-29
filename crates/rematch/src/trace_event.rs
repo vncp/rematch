@@ -1064,17 +1064,23 @@ fn format_check_system_message(kind: &str, rep: &rematch_core::check::CheckRepor
         }
         return lines.join("\n");
     }
+    let label = match kind {
+        "cargo" => "cargo check",
+        "ruff" => "ruff check",
+        "go" => "go vet",
+        other => other,
+    };
     if callers > 0 {
         let first = &rep.impact[0];
         return format!(
-            "◆ rematch · ✓ {kind} clean in {secs:.1}s · {callers} caller{} in unedited files ({}:{} {}) → sent to Claude",
+            "◆ rematch · ✓ {label} passed in {secs:.1}s · {callers} caller{} in unedited files ({}:{} {}) → sent to Claude",
             if callers == 1 { "" } else { "s" },
             first.file,
             first.line,
             first.symbol
         );
     }
-    format!("◆ rematch · ✓ {kind} clean in {secs:.1}s")
+    format!("◆ rematch · ✓ {label} passed in {secs:.1}s")
 }
 
 /// Claude Code `statusLine` command (`StatusLine` event or statusLine stdin JSON): renders the

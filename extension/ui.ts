@@ -283,17 +283,25 @@ export function checkStateOf(details: CheckDetails, rendered: string): CheckStat
 	};
 }
 
+function checkPassLabel(kind: string): string {
+	if (kind === "cargo") return "cargo check";
+	if (kind === "ruff") return "ruff check";
+	if (kind === "go") return "go vet";
+	return kind;
+}
+
 /**
- * The transcript card of one check run. Clean: one line `◆ rematch · ✓ cargo clean in 0.4s`.
+ * The transcript card of one check run. Clean: one line `◆ rematch · ✓ cargo check passed in 0.4s`.
  * Otherwise a box: what the agent was sent, the first 3 diagnostics and the unedited callers;
  * expanded, the exact text the agent received.
  */
 export function checkCardLines(t: UiTheme, width: number, rendered: string, details: CheckDetails, expanded: boolean): string[] {
 	const c = checkStateOf(details, rendered);
 	const kind = c.kind ?? "check";
+	const label = checkPassLabel(kind);
 	const parsed = parseCheck(rendered);
 	const clean = !c.timedOut && c.ok && c.errors === 0 && parsed.impact.length === 0 && parsed.diagnostics.length === 0;
-	if (clean) return [truncate(`${mark(t)} ${t.fg("dim", "·")} ${t.fg("success", "✓")} ${t.fg("dim", `${kind} clean in ${seconds(c.durationMs)}`)}`, width)];
+	if (clean) return [truncate(`${mark(t)} ${t.fg("dim", "·")} ${t.fg("success", "✓")} ${t.fg("dim", `${label} passed in ${seconds(c.durationMs)}`)}`, width)];
 	const inner = Math.max(1, width - 4);
 	const sent = t.fg("dim", "→ sent to the agent");
 	let head: string;
@@ -304,7 +312,7 @@ export function checkCardLines(t: UiTheme, width: number, rendered: string, deta
 	} else {
 		// It compiles: the callers are a hint to look at, not a failure.
 		const n = parsed.impact.length;
-		head = `${t.fg("success", `✓ ${kind} clean`)} ${t.fg("dim", `· ${n} caller${n === 1 ? "" : "s"} in unedited files`)} ${sent}`;
+		head = `${t.fg("success", `✓ ${label} passed`)} ${t.fg("dim", `· ${n} caller${n === 1 ? "" : "s"} in unedited files`)} ${sent}`;
 	}
 	const body: string[] = [head];
 	if (expanded) {

@@ -395,6 +395,8 @@ Options:
       --files <FILES>...              
       --ran <RAN>                     `--from sessions`: the references are sessions whose bash commands have every one of these words (comma-separated, case-folded; `--ran cargo,test` finds `cd x && cargo test --workspace`), ranked by their overlap with the request
       --eval-prompt <EVAL_PROMPT>...  Seed `<entry>/evals/evals.json` with these case prompts (then `rematch eval trigger|run <name>`)
+      --stems <STEMS>...              Explicit predicate stems (comma-separated or repeated; default: derived from the request/editor)
+      --exts <EXTS>...                Explicit predicate file extensions (comma-separated or repeated, e.g. `tex,md,pdf`; default: none for `--from description`, or derived from sessions/task)
       --editor <EDITOR>               Scripted editor command (tests)
   -h, --help                          Print help
 ```
@@ -484,6 +486,7 @@ Arguments:
   <ENTRY>  Entry id or name (draft, provisional, kept or pinned)
 
 Options:
+      --fix        Apply suggested stems from missed positive trigger_eval queries and sync on-disk draft edits into the ledger
       --text       Human-readable output instead of the JSON envelope
       --cwd <DIR>  Directory the command runs against (repo/cwd for match, digest, create, …)
   -h, --help       Print help
